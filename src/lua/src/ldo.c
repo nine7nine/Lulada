@@ -63,15 +63,22 @@
 #elif defined(LUA_USE_POSIX)				/* }{ */
 
 /* in POSIX, try _longjmp/_setjmp (more efficient) */
-#define LUAI_THROW(L,c)		_longjmp((c)->b, 1)
-#define LUAI_TRY(L,c,a)		if (_setjmp((c)->b) == 0) { a }
+/* winelib patch: parenthesized form bypasses glibc's `#define setjmp(env)
+ * _setjmp(env)` macro.  Without the parens, the preprocessor expands
+ * setjmp() to _setjmp() and the linker resolves _setjmp to Wine's
+ * statically-linked MSVCRT _setjmp (which goes through PE SEH machinery
+ * in ntdll and crashes).  With parens, the call goes directly to
+ * glibc's setjmp() function. */
+#define LUAI_THROW(L,c)		(_longjmp)((c)->b, 1)
+#define LUAI_TRY(L,c,a)		if ((_setjmp)((c)->b) == 0) { a }
 #define luai_jmpbuf		jmp_buf
 
 #else							/* }{ */
 
 /* ISO C handling with long jumps */
-#define LUAI_THROW(L,c)		longjmp((c)->b, 1)
-#define LUAI_TRY(L,c,a)		if (setjmp((c)->b) == 0) { a }
+/* winelib patch: see above — parens bypass glibc's setjmp macro. */
+#define LUAI_THROW(L,c)		(longjmp)((c)->b, 1)
+#define LUAI_TRY(L,c,a)		if ((setjmp)((c)->b) == 0) { a }
 #define luai_jmpbuf		jmp_buf
 
 #endif							/* } */
