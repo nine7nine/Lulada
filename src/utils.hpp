@@ -449,6 +449,11 @@ inline static String fromBase64 (const String& input)
 StringArray compiledAudioPluginFormats();
 bool isRunningInWine();
 
+/* Augment a plugin search path with Wine prefix locations for VST /
+ * VST3 under winelib builds.  No-op on native builds or when
+ * WINEPREFIX is unset.  See utils.cpp for the full path list. */
+void addWinePluginPaths (juce::FileSearchPath& path, const juce::String& formatName);
+
 } // namespace Util
 
 class DataURI

@@ -654,35 +654,58 @@ void PluginListComponent::editPluginPath (const String& f)
 {
     jassert (propertiesToUse);
 
-    FileSearchPathListComponent pathList;
-    pathList.setSize (400, 260);
+    /* The previous implementation called window.runModalLoop() — a
+     * synchronous blocking modal that owns the event loop for the
+     * AlertWindow's lifetime.  JUCE's FileSearchPathListComponent's
+     * "+" / "change..." buttons in turn call FileChooser::launchAsync,
+     * which registers a NEW async modal on top.  Async modals require
+     * the message loop to dispatch their events, but runModalLoop only
+     * dispatches events to ITS own modal target — so the launched
+     * FileChooser silently never opens.  This was the immediate bug
+     * preventing VST plugin paths from being added under our winelib
+     * Element host.
+     *
+     * Fix: use enterModalState + async callback.  Keeps the modal
+     * semantics (Save / Cancel) but lets the message loop continue
+     * pumping, so async-modal children (FileChooser) can open and
+     * dispatch their own events normally.  The dialog and the path
+     * list component are held alive by the captured lambda; the
+     * setLastSearchPath save happens when the user picks Save. */
+    auto pathList = std::make_unique<FileSearchPathListComponent>();
+    pathList->setSize (400, 260);
 
     if (auto* const fmt = plugins.getAudioPluginFormat (f))
-    {
-        pathList.setPath (getLastSearchPath (*propertiesToUse, *fmt));
-    }
+        pathList->setPath (getLastSearchPath (*propertiesToUse, *fmt));
     else if (auto format = plugins.getProvider (f))
-    {
-        pathList.setPath (getLastSearchPath (*propertiesToUse, *format));
-    }
+        pathList->setPath (getLastSearchPath (*propertiesToUse, *format));
 
     String message (f);
     message << TRANS (" plugin path");
-    AlertWindow window (message, String(), AlertWindow::NoIcon);
+    auto window = std::make_unique<AlertWindow> (message, String(), AlertWindow::NoIcon);
 
-    window.addCustomComponent (&pathList);
-    window.addButton (TRANS ("Save"), 1, KeyPress (KeyPress::returnKey));
-    window.addButton (TRANS ("Cancel"), 0, KeyPress (KeyPress::escapeKey));
+    window->addCustomComponent (pathList.get());
+    window->addButton (TRANS ("Save"), 1, KeyPress (KeyPress::returnKey));
+    window->addButton (TRANS ("Cancel"), 0, KeyPress (KeyPress::escapeKey));
 
-    const int result = window.runModalLoop();
+    auto* windowPtr   = window.get();
+    auto* pathListPtr = pathList.get();
 
-    if (1 == result)
-    {
-        if (auto* const fmt = plugins.getAudioPluginFormat (f))
-            setLastSearchPath (*propertiesToUse, *fmt, pathList.getPath());
-        else if (auto format = plugins.getProvider (f))
-            setLastSearchPath (*propertiesToUse, *format, pathList.getPath());
-    }
+    windowPtr->enterModalState (true,
+        ModalCallbackFunction::create (
+            [this, f, ownedWindow = std::move (window), ownedPathList = std::move (pathList), pathListPtr] (int result)
+            {
+                if (result == 1 && propertiesToUse != nullptr)
+                {
+                    if (auto* const fmt = plugins.getAudioPluginFormat (f))
+                        setLastSearchPath (*propertiesToUse, *fmt, pathListPtr->getPath());
+                    else if (auto format = plugins.getProvider (f))
+                        setLastSearchPath (*propertiesToUse, *format, pathListPtr->getPath());
+                }
+                // ownedWindow + ownedPathList destruct here, after the
+                // dialog has been dismissed and any FileChooser child
+                // modals have completed.
+            }),
+        false);
 }
 
 void PluginListComponent::optionsMenuCallback (int result)
@@ -817,8 +840,13 @@ void PluginListComponent::filesDropped (const StringArray& files, int, int)
 
 FileSearchPath PluginListComponent::getLastSearchPath (PropertiesFile& properties, AudioPluginFormat& format)
 {
-    return FileSearchPath (properties.getValue (Settings::lastPluginScanPathPrefix + format.getName(),
-                                                format.getDefaultLocationsToSearch().toString()));
+    FileSearchPath path (properties.getValue (Settings::lastPluginScanPathPrefix + format.getName(),
+                                              format.getDefaultLocationsToSearch().toString()));
+    // Winelib: augment with Wine prefix Common Files\VST2/VST3 dirs so
+    // a fresh install finds Windows plugins out of the box.  No-op on
+    // native builds.  Idempotent (addIfNotAlreadyThere internally).
+    element::Util::addWinePluginPaths (path, format.getName());
+    return path;
 }
 
 FileSearchPath PluginListComponent::getLastSearchPath (PropertiesFile& properties, NodeProvider& format)

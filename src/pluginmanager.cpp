@@ -601,6 +601,9 @@ private:
                 for (int j = 0; j < defaults.getNumPaths(); ++j)
                     path.addIfNotAlreadyThere (defaults[j]);
             }
+            // Winelib: add Wine prefix Common Files\VST2/VST3 dirs to
+            // the scan path.  See Util::addWinePluginPaths.
+            element::Util::addWinePluginPaths (path, format->getName());
             const auto found = format->searchPathsForPlugins (path, true, false);
 
             ScopedLock sl (lock);
