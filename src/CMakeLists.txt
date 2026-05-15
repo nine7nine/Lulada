@@ -127,8 +127,24 @@ if(CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
 endif()
 
 # VST2 enable host support
+#
+# Under winelib, always enable VST2 host support and point at the
+# system-installed Steinberg VST2 SDK 2.4 (Arch's `vst2sdk` package,
+# installed at /usr/src/vst2sdk/).  We can't ship our own copy of
+# Steinberg's SDK — its license forbids redistribution — and we can't
+# extend a clean-room replacement like vestige with Steinberg-derived
+# symbols without tainting the clean-room status.  System install is
+# the only viable path for JUCE-as-host coverage (vestige is too thin;
+# JUCE references ERect, effVendorSpecific, kVstTransportRecording,
+# VstTimeInfo::smpteFrameRate, etc.).
+if(CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
+    set(ELEMENT_ENABLE_VST2 ON CACHE BOOL "Auto-enabled under winelib (Steinberg VST2 SDK 2.4)" FORCE)
+    set(ELEMENT_VST2_SDK_PATH "/usr/src/vst2sdk"
+        CACHE PATH "Auto-set under winelib to Arch's vst2sdk package (Steinberg 2.4)" FORCE)
+endif()
+
 if(ELEMENT_ENABLE_VST2)
-    message(STATUS "VST2 Plugin support enabled")
+    message(STATUS "VST2 Plugin support enabled (SDK path: ${ELEMENT_VST2_SDK_PATH})")
     juce_set_vst2_sdk_path("${ELEMENT_VST2_SDK_PATH}")
     target_compile_definitions(element PUBLIC JUCE_PLUGINHOST_VST=1)
     target_link_libraries(element PUBLIC juce_vst2_sdk)

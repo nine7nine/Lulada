@@ -55,7 +55,12 @@ if(WIN32 AND ELEMENT_ENABLE_ASIO)
 endif()
 
 # JUCE VST2 SDK path setup
-if(ELEMENT_ENABLE_VST2)
+#
+# Default points at the user's local Steinberg VST2 SDK install for
+# native builds.  Under winelib (winegcc), src/CMakeLists.txt overrides
+# this to the vendored vestige header shipped in the JUCE clone — guard
+# here so we don't shadow that override with the Steinberg path.
+if(ELEMENT_ENABLE_VST2 AND NOT (CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+"))
     set(ELEMENT_VST2_SDK_PATH "${USER_HOME_DIRECTORY}/SDKs/vstsdk2.4")
     # set(JUCE_GLOBAL_VST2_SDK_PATH "${ELEMENT_VST2_SDK_PATH}")
     message(STATUS "VST2 SDK Path: ${ELEMENT_VST2_SDK_PATH}")
