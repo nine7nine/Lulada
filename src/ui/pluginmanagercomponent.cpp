@@ -687,10 +687,9 @@ void PluginListComponent::editPluginPath (const String& f)
     window->addButton (TRANS ("Save"), 1, KeyPress (KeyPress::returnKey));
     window->addButton (TRANS ("Cancel"), 0, KeyPress (KeyPress::escapeKey));
 
-    auto* windowPtr   = window.get();
     auto* pathListPtr = pathList.get();
 
-    windowPtr->enterModalState (true,
+    window->enterModalState (true,
         ModalCallbackFunction::create (
             [this, f, ownedWindow = std::move (window), ownedPathList = std::move (pathList), pathListPtr] (int result)
             {
@@ -757,6 +756,12 @@ void PluginListComponent::optionsMenuCallback (int result)
         }
 
         case 9: {
+           #if defined (__WINE__)
+            // LV2 is Linux-native and not registered under __WINE__;
+            // scanning would hit Carla's LV2 bundles and hang the
+            // host.  No-op the menu action.
+            break;
+           #else
             if (auto* world = ViewHelpers::getGlobals (this))
                 plugins.saveUserPlugins (world->settings());
 
@@ -767,6 +772,7 @@ void PluginListComponent::optionsMenuCallback (int result)
                                                TRANS ("Searching for all possible plug-in URIs...")));
 
             break;
+           #endif
         }
 
         default: {
@@ -874,7 +880,11 @@ static StringArray scanAllFormats (PluginManager& p)
 {
     const StringArray supported (Util::compiledAudioPluginFormats());
     StringArray filtered;
+   #if ! defined (__WINE__)
+    // LV2 is Linux-native and not registered under __WINE__ —
+    // see Util::compiledAudioPluginFormats + addDefaultFormats.
     filtered.add ("LV2");
+   #endif
     filtered.add ("CLAP");
     for (int i = 0; i < p.getAudioPluginFormats().getNumFormats(); ++i)
     {

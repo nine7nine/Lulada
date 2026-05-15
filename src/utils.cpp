@@ -23,10 +23,19 @@ StringArray compiledAudioPluginFormats()
 #if JUCE_PLUGINHOST_VST3
     fmts.add ("VST3");
 #endif
-#if JUCE_PLUGINHOST_LADSPA
+    /* LADSPA and LV2 are Linux-native plugin formats — they don't help
+     * a winelib host load Windows plugins, and Carla's LV2 bundles in
+     * particular hang the scanner (Element ends up trying to load
+     * kxstudio.sf.net plugin URIs that pull in Carla's massive JUCE-
+     * based plugin host as a side effect, leaving the UI near-frozen).
+     * The addDefaultFormats gate in pluginmanager.cpp already excludes
+     * them under __WINE__; this list has to match or LV2 / LADSPA leak
+     * back in via paths-by-name lookups in the scanner thread + the
+     * options-menu UI. */
+#if JUCE_PLUGINHOST_LADSPA && ! defined (__WINE__)
     fmts.add ("LADSPA");
 #endif
-#if JUCE_PLUGINHOST_LV2
+#if JUCE_PLUGINHOST_LV2 && ! defined (__WINE__)
     fmts.add ("LV2");
 #endif
     fmts.add ("CLAP");

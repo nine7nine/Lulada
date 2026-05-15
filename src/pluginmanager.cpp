@@ -687,7 +687,14 @@ private:
             for (int i = 0; i < formats.getNumFormats(); ++i)
                 if (formats.getFormat (i)->getName() != "Element" && formats.getFormat (i)->canScanForPlugins())
                     formatsToScan.add (formats.getFormat (i)->getName());
+           #if ! defined (__WINE__)
+            // LV2 is Linux-native and not registered as an
+            // AudioPluginFormat under __WINE__ — see addDefaultFormats
+            // + Util::compiledAudioPluginFormats.  Don't queue it for
+            // scanning either or the scanner will try to load Carla's
+            // LV2 bundles, which hang the winelib host.
             formatsToScan.add ("LV2");
+           #endif
         }
 
         scanner = std::make_unique<PluginScanner> (owner);
