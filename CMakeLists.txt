@@ -77,6 +77,15 @@ juce_add_gui_app(element_app
 
 target_sources(element_app PRIVATE src/main.cc)
 target_link_libraries(element_app PRIVATE kv::element)
+
+# Winelib host: the WinelibPluginHostInit static initializer in
+# src/main.cc calls OleInitialize() (ole32) and SetPriorityClass()
+# (kernel32, autolinked).  Without `-lole32` the OleInitialize symbol
+# is unresolved.  This mirrors what yabridge/src/wine-host links
+# against for the same purpose.
+if(DEFINED __WINE__ OR CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
+    target_link_libraries(element_app PRIVATE ole32)
+endif()
 set_target_properties(element_app PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden

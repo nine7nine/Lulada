@@ -587,7 +587,20 @@ private:
 
             auto* const format = manager.getFormat (i);
             FileSearchPath path = paths[format->getName()];
-            path.addPath (format->getDefaultLocationsToSearch());
+            // Dedupe by canonical File (not raw string) so user-configured
+            // paths and the format's default paths can't double-scan the
+            // same plugin.  Under winelib hosts (__WINE__), JUCE's VST3
+            // default returns the Wine prefix VST3 dir which the user may
+            // also have in Element.conf — adding it twice causes the same
+            // Windows PE to load twice in-process and trip the plugin's
+            // static-state collision (u-he ACE/Zebra2 crash on second
+            // factory creation).  addIfNotAlreadyThere uses File equality
+            // which normalizes trailing slashes / relative segments.
+            {
+                auto defaults = format->getDefaultLocationsToSearch();
+                for (int j = 0; j < defaults.getNumPaths(); ++j)
+                    path.addIfNotAlreadyThere (defaults[j]);
+            }
             const auto found = format->searchPathsForPlugins (path, true, false);
 
             ScopedLock sl (lock);
@@ -751,12 +764,31 @@ void PluginManager::addDefaultFormats()
             audioPlugs.addFormat (std::make_unique<VST3PluginFormat>());
 #endif
 
-#if JUCE_PLUGINHOST_LV2
+#if JUCE_PLUGINHOST_LV2 && ! defined (__WINE__)
+        // Under winelib (Win32 plugin host pivot), do NOT register the
+        // LV2 plugin format.  Reason: LV2 plugins are Linux native .so
+        // files; loading them via dlopen in our winelib process pulls
+        // in their copies of JUCE (e.g. Carla's LV2 plugins built
+        // against carla_juce) into the same process, and the two JUCE
+        // instances clash on global singletons —
+        //   "Carla assertion failure: numScopedInitInstances == 0
+        //    in file carla_juce.cpp, line 80"
+        // — corrupting host JUCE state which later manifests as RPC
+        // and COM-marshalling failures when a Windows VST3 plugin
+        // tries to initialise (u-he ACE / Zebra2 die in their RPC
+        // path AFTER the carla LV2 scan).
+        //
+        // When dual Linux+Win32 hosting is added in Phase 5+, this
+        // gate flips back open — but at that point JUCE-singleton
+        // pollution will need its own answer (probably per-plugin
+        // dlopen with RTLD_LOCAL plus version-scoped symbol hiding).
         else if (fmt == "LV2")
             audioPlugs.addFormat (std::make_unique<LV2PluginFormat>());
 #endif
 
-#if JUCE_PLUGINHOST_LADSPA
+#if JUCE_PLUGINHOST_LADSPA && ! defined (__WINE__)
+        // Same rationale as LV2 — LADSPA is Linux-native, won't help
+        // us host Windows plugins, can introduce ABI noise.
         else if (fmt == "LADSPA")
             audioPlugs.addFormat (std::make_unique<LADSPAPluginFormat>());
 #endif

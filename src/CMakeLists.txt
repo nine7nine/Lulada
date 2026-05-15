@@ -110,6 +110,22 @@ if(WIN32 AND ELEMENT_ENABLE_ASIO)
     target_compile_definitions(element PUBLIC JUCE_ASIO=1)
 endif()
 
+# Winelib host: enable JUCE's ASIO driver support so the audio callback
+# thread is a real Win32 thread (proper TEB / COM apartment / TLS init)
+# instead of a JUCE-promoted pthread.  Solves the pthread-calls-Win32-
+# plugin context-mismatch class of failures (the same one yabridge
+# documents via its Win32Thread wrapper in wine-host/utils.h).
+#
+# On Linux, JACK lands the audio through wineasio.dll or the locally
+# built nspaasio.dll, both of which register under HKLM\Software\ASIO
+# and JUCE's ASIO driver enumerator picks up.  We use JUCE's bundled
+# ASIO SDK headers (native/asio/iasiodrv.h) — no external Steinberg SDK
+# download required.  JUCE_ASIO_USE_EXTERNAL_SDK stays at its default 0.
+if(CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
+    message(STATUS "Winelib ASIO support enabled (JUCE bundled SDK)")
+    target_compile_definitions(element PUBLIC JUCE_ASIO=1)
+endif()
+
 # VST2 enable host support
 if(ELEMENT_ENABLE_VST2)
     message(STATUS "VST2 Plugin support enabled")
