@@ -88,19 +88,21 @@ void addWinePluginPaths (juce::FileSearchPath& path, const juce::String& formatN
             path.addIfNotAlreadyThere (dir);
     };
 
+    /* Our winelib host is x86_64.  Don't add the Program Files (x86)
+     * (32-bit) plugin directories — 32-bit DLLs can't be LoadLibraryW'd
+     * by a 64-bit process, and the scanner just logs them as
+     * "Deactivated after failing to initialise correctly", cluttering
+     * the plugin list with permanently-broken entries.  If we ever ship
+     * a 32-bit winelib build, gate this on the build's arch. */
     if (formatName == "VST")
     {
         addIfExists (prefix + "/drive_c/Program Files/Common Files/VST2");
-        addIfExists (prefix + "/drive_c/Program Files (x86)/Common Files/VST2");
         addIfExists (prefix + "/drive_c/Program Files/Steinberg/VstPlugins");
-        addIfExists (prefix + "/drive_c/Program Files (x86)/Steinberg/VstPlugins");
         addIfExists (prefix + "/drive_c/Program Files/Common Files/VST");
-        addIfExists (prefix + "/drive_c/Program Files (x86)/Common Files/VST");
     }
     else if (formatName == "VST3")
     {
         addIfExists (prefix + "/drive_c/Program Files/Common Files/VST3");
-        addIfExists (prefix + "/drive_c/Program Files (x86)/Common Files/VST3");
     }
 #else
     juce::ignoreUnused (path, formatName);
