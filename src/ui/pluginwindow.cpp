@@ -90,36 +90,26 @@ public:
 
     void updateSize()
     {
-        const int height = jmax (editor->getHeight(), 100) + toolbar->getHeight();
-        setSize (editor->getWidth(), height + 4);
+        // Toolbar disabled — JUCE 8's Toolbar::getThickness() returns
+        // 0 for an item-less Toolbar, so the resized() block below
+        // never positioned anything anyway; the 24px space we were
+        // reserving here just produced a black gap at the bottom of
+        // the plugin window.  Drop the reserved space and the 4px
+        // padding entirely so the plugin GUI fills the window.
+        const int height = jmax (editor->getHeight(), 100);
+        setSize (editor->getWidth(), height);
     }
 
     void resized() override
     {
         editor->removeComponentListener (this);
-        auto r (getLocalBounds().reduced (2));
+        auto r (getLocalBounds());
 
-        if (toolbar->getThickness())
-        {
-            auto r2 = r.removeFromTop (toolbar->getThickness());
-            toolbar->setBounds (r2);
-
-            auto r3 = r2.withSizeKeepingCentre (r2.getWidth(), 16);
-            r3.removeFromRight (4);
-
-            nodeButton.setBounds (r3.removeFromRight (16));
-            r3.removeFromRight (4);
-
-            powerButton.setBounds (r3.removeFromLeft (16));
-
-            r3.removeFromLeft (4);
-            onTopButton.setBounds (r3.removeFromLeft (16));
-
-            r3.removeFromRight (4);
-        }
-
+        // Toolbar disabled — editor fills the entire content area.
+        // Internal-type editors (NodeEditor::resizable()) get the
+        // same full area via resizeInternalType.
         if (! resizeInternalType (r))
-            editor->setBounds (0, r.getY(), editor->getWidth(), editor->getHeight());
+            editor->setBounds (0, 0, editor->getWidth(), editor->getHeight());
         editor->addComponentListener (this);
     }
 
