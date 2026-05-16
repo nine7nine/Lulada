@@ -44,6 +44,12 @@ const char* Settings::authPreviewUpdatesKey = "authPreviewUpdates";
 const char* Settings::authAppcastUrlKey = "authAppcastUrl";
 const char* Settings::transportStartStopContinue = "transportStartStopContinueKey";
 
+/* Element-NSPA: forced JACK audio port counts.  0 = auto (mirror
+ * hardware).  > 0 = create N ports regardless of physical hardware
+ * channel count.  See JackAudioIODevice + Audio preferences panel. */
+const char* Settings::audioJackInputPortCountKey  = "audioJackInputPortCount";
+const char* Settings::audioJackOutputPortCountKey = "audioJackOutputPortCount";
+
 //=============================================================================
 enum OptionsMenuItemId
 {
@@ -138,6 +144,12 @@ bool Settings::getBool (std::string_view key, bool fallback) const noexcept
 {
     auto p = getProps();
     return p != nullptr ? p->getBoolValue (key.data(), fallback) : fallback;
+}
+
+int Settings::getInt (std::string_view key, int fallback) const noexcept
+{
+    auto p = getProps();
+    return p != nullptr ? p->getIntValue (key.data(), fallback) : fallback;
 }
 
 void Settings::set (std::string_view key, const var& value)

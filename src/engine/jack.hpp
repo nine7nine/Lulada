@@ -55,17 +55,40 @@ using JackStatus = jack_status_t;
 class JackClient final
 {
 public:
-    /** Make a new JACK client */
+    /** Make a new JACK client.
+     *
+     *  numMainInputs / numMainOutputs:
+     *    > 0  — force this many JACK input/output ports regardless of
+     *           hardware.  JackAudioIODevice creates the requested
+     *           count and JUCE's audio engine sees N channels.  Useful
+     *           for plugin-host workloads that want more channels than
+     *           the connected interface exposes physically.
+     *    = 0  — auto, mirror physical hardware port count (upstream
+     *           behaviour).
+     *
+     *  Default is 0 / 0 so a freshly-constructed JackClient preserves
+     *  the upstream mirror-hardware semantics unless explicitly
+     *  overridden via the setters below or the Element Audio
+     *  preferences panel.
+     */
     explicit JackClient (const juce::String& name = juce::String(),
-                         int numMainInputs = 2,
+                         int numMainInputs = 0,
                          const juce::String& mainInputPrefix = "main_in_",
-                         int numMainOutputs = 2,
+                         int numMainOutputs = 0,
                          const juce::String& mainOutputPrefix = "main_out_");
 
     ~JackClient();
 
     int getNumMainInputs() const { return numMainIns; }
     int getNumMainOutputs() const { return numMainOuts; }
+
+    /** Set the forced JACK input port count.  > 0 forces N inputs;
+     *  0 reverts to mirror-hardware behaviour.  Takes effect on the
+     *  next JackAudioIODevice open — caller is responsible for
+     *  triggering an audio-device restart for the change to apply. */
+    void setNumMainInputs (int n) noexcept  { numMainIns  = n > 0 ? n : 0; }
+    void setNumMainOutputs (int n) noexcept { numMainOuts = n > 0 ? n : 0; }
+
     const juce::String& getMainOutputPrefix() const { return mainOutPrefix; }
     const juce::String& getMainInputPrefix() const { return mainInPrefix; }
 

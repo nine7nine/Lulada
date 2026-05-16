@@ -84,6 +84,10 @@ private:
     std::unique_ptr<juce::ComboBox> deviceTypeDropDown;
     std::unique_ptr<juce::Label> deviceTypeDropDownLabel;
     std::unique_ptr<Component> audioDeviceSettingsComp;
+    /* Element-NSPA: separate slot for JACK-specific extras (forced port
+     * count combos) shown alongside the standard panel when the
+     * selected audio driver is JACK. */
+    std::unique_ptr<Component> audioDeviceJackExtrasComp;
     String audioDeviceSettingsCompType;
     int itemHeight;
     const int minOutputChannels, maxOutputChannels, minInputChannels, maxInputChannels;

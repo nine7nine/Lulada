@@ -1,9 +1,13 @@
 // Copyright 2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <element/context.hpp>
 #include <element/devices.hpp>
+#include <element/settings.hpp>
 
+#include "engine/jack.hpp"
 #include "ui/audiodeviceselector.hpp"
+#include "ui/viewhelpers.hpp"
 
 using namespace juce;
 
@@ -935,47 +939,48 @@ private:
 //==============================================================================
 
 #if KV_JACK_AUDIO
-class JackDeviceSettingsPanel : public Component,
-                                private ChangeListener
+/* Element-NSPA: JACK-specific extension panel that surfaces the
+ * forced-port-count controls atop the standard AudioDeviceSettingsPanel.
+ *
+ * The two ComboBoxes ("Input ports" / "Output ports") let the user pick
+ * a fixed JACK port count (Auto / 2 / 4 / 8 / 16 / 32) independent of
+ * the connected hardware.  "Auto" preserves the upstream
+ * mirror-physical-hardware behaviour.  A non-Auto value causes
+ * JackAudioIODevice to create exactly N ports named "main_in_*" /
+ * "main_out_*" — the JACK matrix (qjackctl/Carla/pw-link) becomes the
+ * user's tool for wiring those ports to physical hardware.
+ *
+ * Setting changes are persisted via Element::Settings and applied
+ * immediately by closing + restarting the audio device. */
+class JackExtraSettingsPanel : public Component
 {
 public:
-    JackDeviceSettingsPanel (AudioIODeviceType& t, AudioDeviceSetupDetails& s)
-        : type (t), setup (s)
+    JackExtraSettingsPanel (AudioDeviceSetupDetails details)
+        : setup (details)
     {
-        auto& devs = *dynamic_cast<DeviceManager*> (setup.manager);
-        auto& client = devs.getJackClient();
+        portCountChoices.add ("Auto (mirror hardware)");
+        for (int v : { 2, 4, 8, 16, 32 })
+        {
+            portCountChoices.add (String (v));
+            portCountValues.add (v);
+        }
 
-        addAndMakeVisible (inputPorts);
-        setupSpinBox (inputPorts);
-        inputPorts.setValue (client.getNumMainInputs());
-        inputPorts.setEnabled (false);
+        setupCombo (inputPorts, "Input ports:", inputPortsLabel);
+        setupCombo (outputPorts, "Output ports:", outputPortsLabel);
 
-        addAndMakeVisible (outputPorts);
-        setupSpinBox (outputPorts);
-        outputPorts.setValue (client.getNumMainOutputs());
-        outputPorts.setEnabled (false);
+        loadFromSettings();
 
-        updateControls();
-        setup.manager->addChangeListener (this);
+        inputPorts.onChange  = [this] { onInputPortCountChanged(); };
+        outputPorts.onChange = [this] { onOutputPortCountChanged(); };
     }
 
-    ~JackDeviceSettingsPanel()
-    {
-        setup.manager->removeChangeListener (this);
-    }
-
-    void paint (Graphics& g) override
-    {
-        ignoreUnused (g);
-    }
+    void paint (Graphics&) override {}
 
     void resized() override
     {
         if (auto* parent = findParentComponentOfClass<AudioDeviceSelectorComponent>())
         {
             Rectangle<int> r (proportionOfWidth (0.35f), 0, proportionOfWidth (0.6f), 3000);
-
-            const int maxListBoxHeight = 100;
             const int h = parent->getItemHeight();
             const int space = h / 4;
 
@@ -987,46 +992,100 @@ public:
 
             setSize (getWidth(), r.getY());
         }
-        else
-        {
-            jassertfalse;
-        }
-    }
-
-    void updateControls()
-    {
-        if (inputPortsLabel == nullptr)
-        {
-            inputPortsLabel.reset (new Label ({}, TRANS ("Total input ports:")));
-            inputPortsLabel->setJustificationType (Justification::centredRight);
-            inputPortsLabel->attachToComponent (&inputPorts, true);
-        }
-
-        if (outputPortsLabel == nullptr)
-        {
-            outputPortsLabel.reset (new Label ({}, TRANS ("Total output ports:")));
-            outputPortsLabel->setJustificationType (Justification::centredRight);
-            outputPortsLabel->attachToComponent (&outputPorts, true);
-        }
     }
 
 private:
-    AudioIODeviceType& type;
     AudioDeviceSetupDetails setup;
     std::unique_ptr<Label> inputPortsLabel, outputPortsLabel;
-    Slider inputPorts, outputPorts;
+    ComboBox inputPorts, outputPorts;
+    StringArray portCountChoices;
+    juce::Array<int> portCountValues;
 
-    static void setupSpinBox (Slider& slider)
+    void setupCombo (ComboBox& cb, const String& labelText, std::unique_ptr<Label>& label)
     {
-        slider.setRange (0.0, 32.0, 1.0);
-        slider.setSliderStyle (Slider::IncDecButtons);
-        slider.setTextBoxStyle (Slider::TextBoxLeft, true, 90, 22);
-        slider.textFromValueFunction = [] (double value) -> String { return String (roundToInt (value)); };
+        addAndMakeVisible (cb);
+        cb.setEditableText (false);
+        /* itemId 1 == "Auto" (value 0); itemId 2..6 == 2,4,8,16,32. */
+        for (int i = 0; i < portCountChoices.size(); ++i)
+            cb.addItem (portCountChoices[i], i + 1);
+
+        label.reset (new Label ({}, TRANS (labelText)));
+        label->setJustificationType (Justification::centredRight);
+        label->attachToComponent (&cb, true);
     }
 
-    void changeListenerCallback (ChangeBroadcaster*) override
+    int currentValueFromCombo (const ComboBox& cb) const
     {
+        const int selected = cb.getSelectedId();
+        if (selected <= 1) return 0;                       /* Auto */
+        const int idx = selected - 2;
+        return idx >= 0 && idx < portCountValues.size() ? portCountValues[idx] : 0;
     }
+
+    int idForValue (int value) const
+    {
+        if (value <= 0) return 1;                          /* Auto */
+        for (int i = 0; i < portCountValues.size(); ++i)
+            if (portCountValues[i] == value) return i + 2;
+        return 1;                                           /* fall back to Auto for unknown */
+    }
+
+    Settings* findSettings()
+    {
+        if (auto* ctx = ViewHelpers::getGlobals (this))
+            return &ctx->settings();
+        return nullptr;
+    }
+
+    DeviceManager* findDeviceManager()
+    {
+        return dynamic_cast<DeviceManager*> (setup.manager);
+    }
+
+    void loadFromSettings()
+    {
+        if (auto* settings = findSettings())
+        {
+            inputPorts.setSelectedId  (idForValue (settings->getInt (Settings::audioJackInputPortCountKey,  0)), dontSendNotification);
+            outputPorts.setSelectedId (idForValue (settings->getInt (Settings::audioJackOutputPortCountKey, 0)), dontSendNotification);
+        }
+        else
+        {
+            inputPorts.setSelectedId (1, dontSendNotification);
+            outputPorts.setSelectedId (1, dontSendNotification);
+        }
+    }
+
+    void applyAndRestart()
+    {
+        auto* settings = findSettings();
+        auto* devs     = findDeviceManager();
+        if (settings == nullptr || devs == nullptr)
+            return;
+        devs->applyJackPortCountsFromSettings (*settings);
+        /* Restart with the same setup the AudioDeviceSelector already
+         * has so the new port count takes effect on the active JACK
+         * client.  closeAudioDevice + restartLastAudioDevice rebuilds
+         * the JackAudioIODevice which honours the updated counts. */
+        devs->closeAudioDevice();
+        devs->restartLastAudioDevice();
+    }
+
+    void onInputPortCountChanged()
+    {
+        if (auto* settings = findSettings())
+            settings->set (Settings::audioJackInputPortCountKey, currentValueFromCombo (inputPorts));
+        applyAndRestart();
+    }
+
+    void onOutputPortCountChanged()
+    {
+        if (auto* settings = findSettings())
+            settings->set (Settings::audioJackOutputPortCountKey, currentValueFromCombo (outputPorts));
+        applyAndRestart();
+    }
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JackExtraSettingsPanel)
 };
 #endif
 
@@ -1144,6 +1203,15 @@ void AudioDeviceSelectorComponent::resized()
         r.removeFromTop (space);
     }
 
+    if (audioDeviceJackExtrasComp != nullptr)
+    {
+        audioDeviceJackExtrasComp->resized();
+        audioDeviceJackExtrasComp->setBounds (r.removeFromTop (audioDeviceJackExtrasComp->getHeight())
+                                                  .withX (0)
+                                                  .withWidth (getWidth()));
+        r.removeFromTop (space);
+    }
+
     if (midiInputsList != nullptr)
     {
         midiInputsList->setRowHeight (jmin (22, itemHeight));
@@ -1223,24 +1291,25 @@ void AudioDeviceSelectorComponent::updateAllControls()
             details.maxNumOutputChannels = maxOutputChannels;
             details.useStereoPairs = showChannelsAsStereoPairs;
 
-            // if (type->getTypeName() != "JACK")
-            if (true)
             {
                 auto* sp = new AudioDeviceSettingsPanel (*type, details, hideAdvancedOptionsWithButton);
                 audioDeviceSettingsComp.reset (sp);
                 addAndMakeVisible (sp);
                 sp->updateAllControls();
             }
-            else
+
+           #if KV_JACK_AUDIO
+            /* Element-NSPA: when the selected audio driver is JACK,
+             * surface the extra port-count controls beneath the
+             * standard panel. */
+            audioDeviceJackExtrasComp.reset();
+            if (type->getTypeName() == "JACK")
             {
-#if KV_JACK_AUDIO
-                auto* sp = new JackDeviceSettingsPanel (*type, details);
-                audioDeviceSettingsComp.reset (sp);
-                addAndMakeVisible (sp);
-#else
-                jassertfalse; // can't setup for jack if not enabled
-#endif
+                auto* extras = new JackExtraSettingsPanel (details);
+                audioDeviceJackExtrasComp.reset (extras);
+                addAndMakeVisible (extras);
             }
+           #endif
         }
     }
 

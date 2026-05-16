@@ -391,9 +391,22 @@ public:
         {
             element::jack_set_error_function (errorCallback);
 
+            /* Element-NSPA: forced port count.  If the JackClient was
+             * configured with numMainInputs/Outputs > 0 (via the Audio
+             * preferences panel), create exactly that many JACK ports
+             * instead of mirroring the connected hardware client.  When
+             * 0, fall through to the upstream behaviour of one Element
+             * port per port on the system: (or whatever) client. */
+            const int forcedInputs  = client.getNumMainInputs();
+            const int forcedOutputs = client.getNumMainOutputs();
+
+            const int inputPortsToCreate  = forcedInputs  > 0 ? forcedInputs
+                                                              : getInputChannelNames().size();
+            const int outputPortsToCreate = forcedOutputs > 0 ? forcedOutputs
+                                                              : getOutputChannelNames().size();
+
             // open input ports
-            const StringArray inputChannels (getInputChannelNames());
-            for (int i = 0; i < inputChannels.size(); ++i)
+            for (int i = 0; i < inputPortsToCreate; ++i)
             {
                 String inputChannelName (client.getMainInputPrefix());
                 if (inputChannelName.isEmpty())
@@ -405,8 +418,7 @@ public:
             }
 
             // open output ports
-            const StringArray outputChannels (getOutputChannelNames());
-            for (int i = 0; i < outputChannels.size(); ++i)
+            for (int i = 0; i < outputPortsToCreate; ++i)
             {
                 String outputChannelName (client.getMainOutputPrefix());
                 if (outputChannelName.isEmpty())
@@ -440,8 +452,41 @@ public:
         return names;
     }
 
-    StringArray getOutputChannelNames() override { return getChannelNames (outputName, true); }
-    StringArray getInputChannelNames() override { return getChannelNames (inputName, false); }
+    /* Element-NSPA: when the user has forced a port count via the
+     * Audio preferences panel, return synthetic labels matching the
+     * port count we created in the constructor.  The JUCE
+     * AudioDeviceSelector UI uses these for the "Active input/output
+     * channels" checklist, and the AudioIODeviceCallback uses the
+     * count to know how many channels to allocate.  When forced == 0,
+     * fall through to the upstream behaviour of returning the
+     * connected hardware client's port names. */
+    StringArray getOutputChannelNames() override
+    {
+        const int forced = client.getNumMainOutputs();
+        if (forced <= 0)
+            return getChannelNames (outputName, true);
+
+        StringArray names;
+        const String prefix (client.getMainOutputPrefix().isEmpty() ? "out_"
+                                                                    : client.getMainOutputPrefix());
+        for (int i = 1; i <= forced; ++i)
+            names.add (prefix + String (i));
+        return names;
+    }
+
+    StringArray getInputChannelNames() override
+    {
+        const int forced = client.getNumMainInputs();
+        if (forced <= 0)
+            return getChannelNames (inputName, false);
+
+        StringArray names;
+        const String prefix (client.getMainInputPrefix().isEmpty() ? "in_"
+                                                                   : client.getMainInputPrefix());
+        for (int i = 1; i <= forced; ++i)
+            names.add (prefix + String (i));
+        return names;
+    }
 
     Array<double> getAvailableSampleRates() override
     {

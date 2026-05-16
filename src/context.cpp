@@ -72,6 +72,12 @@ private:
         log.reset (new Log());
         devices.reset (new DeviceManager());
         settings.reset (new Settings());
+
+        /* Element-NSPA: apply persisted JACK port counts to the
+         * DeviceManager's embedded JackClient now that Settings has
+         * been initialised.  Subsequent UI-driven changes call this
+         * again via the Audio preferences panel. */
+        devices->applyJackPortCountsFromSettings (*settings);
         mapping.reset (new MappingEngine());
         midi.reset (new MidiEngine());
         presets.reset (new PresetManager());

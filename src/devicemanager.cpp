@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <element/devices.hpp>
+#include <element/settings.hpp>
 #include "engine/jack.hpp"
 
 namespace element {
@@ -106,5 +107,21 @@ kv::JackClient& DeviceManager::getJackClient()
     return impl->jack;
 }
 #endif
+
+void DeviceManager::applyJackPortCountsFromSettings (Settings& settings)
+{
+   #if ELEMENT_USE_JACK
+    /* Element-NSPA: read the persisted forced port counts and push
+     * them into the embedded JackClient.  0 = auto (mirror physical
+     * hardware), > 0 = create exactly N JACK ports.  The change takes
+     * effect on the next JackAudioIODevice open. */
+    const int inCount  = settings.getInt (Settings::audioJackInputPortCountKey,  0);
+    const int outCount = settings.getInt (Settings::audioJackOutputPortCountKey, 0);
+    impl->jack.setNumMainInputs  (inCount);
+    impl->jack.setNumMainOutputs (outCount);
+   #else
+    juce::ignoreUnused (settings);
+   #endif
+}
 
 } // namespace element

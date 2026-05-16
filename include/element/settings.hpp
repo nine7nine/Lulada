@@ -54,7 +54,15 @@ public:
     static const char* authAppcastUrlKey;
     static const char* transportStartStopContinue;
 
+    /* Element-NSPA: forced JACK audio port count.  0 = auto (mirror
+     * physical hardware port count, upstream behaviour).  > 0 = create
+     * exactly N JACK input/output ports regardless of the connected
+     * hardware. */
+    static const char* audioJackInputPortCountKey;
+    static const char* audioJackOutputPortCountKey;
+
     bool getBool (std::string_view key, bool fallback = false) const noexcept;
+    int  getInt  (std::string_view key, int  fallback = 0) const noexcept;
 
     void set (std::string_view key, const juce::var& value);
 
