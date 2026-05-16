@@ -119,6 +119,15 @@ void DeviceManager::applyJackPortCountsFromSettings (Settings& settings)
     const int outCount = settings.getInt (Settings::audioJackOutputPortCountKey, 0);
     impl->jack.setNumMainInputs  (inCount);
     impl->jack.setNumMainOutputs (outCount);
+
+    /* Same shape for MIDI: 0 means no Element-exposed JACK MIDI ports
+     * (falls through to JUCE's ALSA-seq backend via MidiInput); > 0
+     * registers N native JACK MIDI ports with sample-accurate
+     * timestamps via the JackAudioIODevice MIDI drain/fill path. */
+    const int midiInCount  = settings.getInt (Settings::audioJackInputMidiPortCountKey,  0);
+    const int midiOutCount = settings.getInt (Settings::audioJackOutputMidiPortCountKey, 0);
+    impl->jack.setNumMidiInputs  (midiInCount);
+    impl->jack.setNumMidiOutputs (midiOutCount);
    #else
     juce::ignoreUnused (settings);
    #endif

@@ -89,6 +89,16 @@ public:
     void setNumMainInputs (int n) noexcept  { numMainIns  = n > 0 ? n : 0; }
     void setNumMainOutputs (int n) noexcept { numMainOuts = n > 0 ? n : 0; }
 
+    /** Element-NSPA: forced JACK MIDI port counts.  Same semantics as
+     *  the audio port count setters above.  N MIDI input ports are
+     *  registered as "midi_in_1".."midi_in_N" and N MIDI output ports
+     *  as "midi_out_1".."midi_out_M".  Takes effect on next audio
+     *  device open. */
+    int getNumMidiInputs()  const { return numMidiIns; }
+    int getNumMidiOutputs() const { return numMidiOuts; }
+    void setNumMidiInputs  (int n) noexcept { numMidiIns  = n > 0 ? n : 0; }
+    void setNumMidiOutputs (int n) noexcept { numMidiOuts = n > 0 ? n : 0; }
+
     const juce::String& getMainOutputPrefix() const { return mainOutPrefix; }
     const juce::String& getMainInputPrefix() const { return mainInPrefix; }
 
@@ -133,6 +143,14 @@ private:
     jack_client_t* client;
     juce::String name, mainInPrefix, mainOutPrefix;
     int numMainIns, numMainOuts;
+    /* Element-NSPA: forced MIDI port counts (0 = none).  Unlike the
+     * audio counts, there's no "mirror hardware" mode for MIDI — JACK
+     * MIDI is a host-declared concept, so 0 simply means no Element-
+     * exposed JACK MIDI ports.  Counts > 0 cause JackAudioIODevice to
+     * register that many JACK MIDI ports + add per-period drain/fill
+     * to the audio process callback. */
+    int numMidiIns  = 0;
+    int numMidiOuts = 0;
     juce::Array<JackPort::Ptr> ports;
 };
 

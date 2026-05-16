@@ -61,6 +61,14 @@ public:
     static const char* audioJackInputPortCountKey;
     static const char* audioJackOutputPortCountKey;
 
+    /* Element-NSPA: native JACK MIDI port count.  0 = no Element JACK
+     * MIDI ports (the ALSA-seq fallback via JUCE MidiInput stays
+     * active).  > 0 = Element registers N JACK MIDI input/output ports
+     * with sample-accurate timestamps.  Recommended over ALSA-seq for
+     * low-latency MIDI workflows. */
+    static const char* audioJackInputMidiPortCountKey;
+    static const char* audioJackOutputMidiPortCountKey;
+
     bool getBool (std::string_view key, bool fallback = false) const noexcept;
     int  getInt  (std::string_view key, int  fallback = 0) const noexcept;
 

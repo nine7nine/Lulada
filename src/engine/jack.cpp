@@ -25,6 +25,8 @@
 
 #include <jack/weakjack.h>
 #include <jack/jack.h>
+#include <jack/midiport.h>
+#include <jack/ringbuffer.h>
 
 #include "engine/jack.hpp"
 
@@ -103,6 +105,35 @@ JUCE_DECL_JACK_FUNCTION (int, jack_port_name_size, (), ());
 JUCE_DECL_JACK_FUNCTION (char*, jack_get_client_name, (jack_client_t * client), (client));
 
 JUCE_DECL_VOID_JACK_FUNCTION (jack_free, (void* ptr), (ptr))
+
+/* Element-NSPA: JACK MIDI bindings.  Native JACK MIDI is sample-accurate
+ * (per-event jack_nframes_t timestamps within the buffer) and avoids the
+ * ALSA-seq millisecond quantisation that plagues low-latency MIDI work.
+ * Pattern mirrors wine-nspa's winejack.drv/jackmidi.c — JACK ringbuffer
+ * carries events between the RT JACK callback and Element's non-RT
+ * consumer thread; one wakeup-pipe write per period rather than per
+ * event to keep syscalls out of the RT path. */
+JUCE_DECL_JACK_FUNCTION (int,  jack_midi_event_get,
+                         (jack_midi_event_t * event, void* port_buffer, uint32_t event_index),
+                         (event, port_buffer, event_index))
+JUCE_DECL_JACK_FUNCTION (uint32_t, jack_midi_get_event_count,
+                         (void* port_buffer),
+                         (port_buffer))
+JUCE_DECL_VOID_JACK_FUNCTION (jack_midi_clear_buffer, (void* port_buffer), (port_buffer))
+JUCE_DECL_JACK_FUNCTION (int,  jack_midi_event_write,
+                         (void* port_buffer, jack_nframes_t time,
+                          const jack_midi_data_t* data, size_t data_size),
+                         (port_buffer, time, data, data_size))
+
+JUCE_DECL_JACK_FUNCTION (jack_ringbuffer_t*, jack_ringbuffer_create, (size_t sz), (sz))
+JUCE_DECL_VOID_JACK_FUNCTION (jack_ringbuffer_free, (jack_ringbuffer_t * rb), (rb))
+JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_read_space,  (const jack_ringbuffer_t* rb), (rb))
+JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_write_space, (const jack_ringbuffer_t* rb), (rb))
+JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_read,   (jack_ringbuffer_t * rb, char* dest, size_t cnt), (rb, dest, cnt))
+JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_peek,   (jack_ringbuffer_t * rb, char* dest, size_t cnt), (rb, dest, cnt))
+JUCE_DECL_VOID_JACK_FUNCTION (jack_ringbuffer_read_advance, (jack_ringbuffer_t * rb, size_t cnt), (rb, cnt))
+JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_write,  (jack_ringbuffer_t * rb, const char* src, size_t cnt), (rb, src, cnt))
+JUCE_DECL_JACK_FUNCTION (int,    jack_ringbuffer_mlock,  (jack_ringbuffer_t * rb), (rb))
 
 #if JUCE_DEBUG
 #define JACK_LOGGING_ENABLED 1
@@ -431,6 +462,45 @@ public:
 
             inChans.calloc (totalNumberOfInputChannels + 2);
             outChans.calloc (totalNumberOfOutputChannels + 2);
+
+            /* Element-NSPA: register JACK MIDI ports + RT ringbuffers.
+             * Both counts are configured via JackClient setters from the
+             * Audio preferences panel; 0 means no Element JACK MIDI
+             * ports.  Ringbuffers are mlocked so the JACK callback
+             * never page-faults; OOM at jack_ringbuffer_create simply
+             * disables the MIDI path without aborting. */
+            const int midiInsToCreate  = client.getNumMidiInputs();
+            const int midiOutsToCreate = client.getNumMidiOutputs();
+
+            if (midiInsToCreate > 0 || midiOutsToCreate > 0)
+            {
+                if (! inMidiRb)
+                {
+                    inMidiRb  = element::jack_ringbuffer_create (NSPA_MIDI_RB_BYTES);
+                    if (inMidiRb)  element::jack_ringbuffer_mlock (inMidiRb);
+                }
+                if (! outMidiRb)
+                {
+                    outMidiRb = element::jack_ringbuffer_create (NSPA_MIDI_RB_BYTES);
+                    if (outMidiRb) element::jack_ringbuffer_mlock (outMidiRb);
+                }
+            }
+
+            for (int i = 0; i < midiInsToCreate; ++i)
+            {
+                String name ("midi_in_");
+                name << (i + 1);
+                inputMidiPorts.add (element::jack_port_register (
+                    client, name.toUTF8(), JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0));
+            }
+
+            for (int i = 0; i < midiOutsToCreate; ++i)
+            {
+                String name ("midi_out_");
+                name << (i + 1);
+                outputMidiPorts.add (element::jack_port_register (
+                    client, name.toUTF8(), JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0));
+            }
         }
     }
 
@@ -439,6 +509,12 @@ public:
         close();
         if (client.isOpen())
             client.close();
+
+        /* Element-NSPA: tear down MIDI ringbuffers.  Ports are owned by
+         * the JACK client and freed when the client is closed; only the
+         * Element-side ringbuffers need explicit cleanup here. */
+        if (inMidiRb)  { element::jack_ringbuffer_free (inMidiRb);  inMidiRb  = nullptr; }
+        if (outMidiRb) { element::jack_ringbuffer_free (outMidiRb); outMidiRb = nullptr; }
     }
 
     StringArray getChannelNames (const String& clientName, bool forInput) const
@@ -709,6 +785,81 @@ private:
                     outChans[numActiveOutChans++] = (float*) out;
         }
 
+        /* Element-NSPA: native JACK MIDI input drain.  For each Element-
+         * registered MIDI input port, read JACK MIDI events and push
+         * them (with port-index header) into the inMidiRb ringbuffer.
+         * The non-RT MidiEngine consumer drains the ringbuffer and
+         * dispatches to MidiInputCallback subscribers.  No syscalls
+         * here — the JACK callback is RT-critical. */
+        if (inMidiRb && ! inputMidiPorts.isEmpty())
+        {
+            const int numPorts = inputMidiPorts.size();
+            for (int p = 0; p < numPorts; ++p)
+            {
+                auto* port = inputMidiPorts.getUnchecked (p);
+                if (! port) continue;
+                void* buf = element::jack_port_get_buffer (port, static_cast<jack_nframes_t> (numSamples));
+                if (! buf) continue;
+
+                const uint32_t count = element::jack_midi_get_event_count (buf);
+                for (uint32_t j = 0; j < count; ++j)
+                {
+                    jack_midi_event_t ev;
+                    if (element::jack_midi_event_get (&ev, buf, j) != 0 || ev.size == 0 || ev.size > NSPA_MIDI_EVENT_MAX)
+                        continue;
+
+                    unsigned char hdr[NSPA_MIDI_HDR_BYTES];
+                    hdr[0] = static_cast<unsigned char> (p);
+                    hdr[1] = static_cast<unsigned char> (ev.size & 0xFFu);
+                    hdr[2] = static_cast<unsigned char> ((ev.size >> 8) & 0xFFu);
+
+                    const size_t needed = NSPA_MIDI_HDR_BYTES + ev.size;
+                    if (element::jack_ringbuffer_write_space (inMidiRb) < needed)
+                        break; /* ringbuffer full this period; drop until next */
+
+                    element::jack_ringbuffer_write (inMidiRb, reinterpret_cast<const char*> (hdr), NSPA_MIDI_HDR_BYTES);
+                    element::jack_ringbuffer_write (inMidiRb, reinterpret_cast<const char*> (ev.buffer), ev.size);
+                }
+            }
+        }
+
+        /* Element-NSPA: native JACK MIDI output fill.  Clear all output
+         * port buffers first, then drain the outMidiRb ringbuffer and
+         * dispatch each event to its target port at sample offset 0
+         * (sample-accurate output scheduling is a future enhancement). */
+        if (outMidiRb && ! outputMidiPorts.isEmpty())
+        {
+            const int numOutPorts = outputMidiPorts.size();
+            void* outBufs[64];  /* matches NSPA_MIDI_MAX_OUT_CACHE — see header */
+            const int numCached = jmin (numOutPorts, 64);
+            for (int p = 0; p < numCached; ++p)
+            {
+                auto* port = outputMidiPorts.getUnchecked (p);
+                outBufs[p] = port ? element::jack_port_get_buffer (port, static_cast<jack_nframes_t> (numSamples)) : nullptr;
+                if (outBufs[p]) element::jack_midi_clear_buffer (outBufs[p]);
+            }
+
+            while (element::jack_ringbuffer_read_space (outMidiRb) >= NSPA_MIDI_HDR_BYTES)
+            {
+                unsigned char hdr[NSPA_MIDI_HDR_BYTES];
+                if (element::jack_ringbuffer_peek (outMidiRb, reinterpret_cast<char*> (hdr), NSPA_MIDI_HDR_BYTES) < NSPA_MIDI_HDR_BYTES)
+                    break;
+                const uint8_t portIdx = hdr[0];
+                const uint16_t evSize = static_cast<uint16_t> (hdr[1] | (static_cast<uint16_t> (hdr[2]) << 8));
+                if (evSize == 0 || evSize > NSPA_MIDI_EVENT_MAX) break;
+
+                if (element::jack_ringbuffer_read_space (outMidiRb) < NSPA_MIDI_HDR_BYTES + evSize)
+                    break;
+                element::jack_ringbuffer_read_advance (outMidiRb, NSPA_MIDI_HDR_BYTES);
+
+                unsigned char data[NSPA_MIDI_EVENT_MAX];
+                element::jack_ringbuffer_read (outMidiRb, reinterpret_cast<char*> (data), evSize);
+
+                if (portIdx < numCached && outBufs[portIdx])
+                    element::jack_midi_event_write (outBufs[portIdx], 0, data, evSize);
+            }
+        }
+
         const ScopedLock sl (callbackLock);
 
         if (callback != nullptr)
@@ -821,6 +972,23 @@ private:
     int totalNumberOfOutputChannels = 0;
     Array<jack_port_t*> inputPorts, outputPorts;
     BigInteger activeInputChannels, activeOutputChannels;
+
+    /* Element-NSPA: native JACK MIDI port storage + RT-safe ringbuffers.
+     * Pattern from wine-nspa/dlls/winejack.drv/jackmidi.c.  Both
+     * ringbuffers are mlocked to prevent paging on the RT JACK callback.
+     * Header format on the wire (3 bytes per event):
+     *     [0] port index (uint8)
+     *     [1] event size low byte
+     *     [2] event size high byte
+     * followed by raw MIDI bytes.  Caps per-event at NSPA_MIDI_EVENT_MAX
+     * to bound the ringbuffer write attempt; oversize events drop. */
+    Array<jack_port_t*> inputMidiPorts, outputMidiPorts;
+    jack_ringbuffer_t*  inMidiRb  = nullptr;
+    jack_ringbuffer_t*  outMidiRb = nullptr;
+
+    static constexpr size_t NSPA_MIDI_RB_BYTES   = 16 * 1024;
+    static constexpr size_t NSPA_MIDI_EVENT_MAX  = 1024;
+    static constexpr size_t NSPA_MIDI_HDR_BYTES  = 3;
 
     std::atomic<int> xruns { 0 };
 

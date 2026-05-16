@@ -50,6 +50,12 @@ const char* Settings::transportStartStopContinue = "transportStartStopContinueKe
 const char* Settings::audioJackInputPortCountKey  = "audioJackInputPortCount";
 const char* Settings::audioJackOutputPortCountKey = "audioJackOutputPortCount";
 
+/* Element-NSPA: native JACK MIDI port counts.  0 = no Element-exposed
+ * JACK MIDI ports.  See JackAudioIODevice MIDI drain/fill + Audio
+ * preferences panel. */
+const char* Settings::audioJackInputMidiPortCountKey  = "audioJackInputMidiPortCount";
+const char* Settings::audioJackOutputMidiPortCountKey = "audioJackOutputMidiPortCount";
+
 //=============================================================================
 enum OptionsMenuItemId
 {
