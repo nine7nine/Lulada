@@ -965,17 +965,13 @@ public:
             portCountValues.add (v);
         }
 
-        setupCombo (inputPorts,      "Audio in ports:",  inputPortsLabel);
-        setupCombo (outputPorts,     "Audio out ports:", outputPortsLabel);
-        setupCombo (inputMidiPorts,  "MIDI in ports:",   inputMidiPortsLabel);
-        setupCombo (outputMidiPorts, "MIDI out ports:",  outputMidiPortsLabel);
+        setupCombo (inputPorts,  "Audio in ports:",  inputPortsLabel);
+        setupCombo (outputPorts, "Audio out ports:", outputPortsLabel);
 
         loadFromSettings();
 
-        inputPorts.onChange       = [this] { onPortCountChanged (Settings::audioJackInputPortCountKey,      inputPorts); };
-        outputPorts.onChange      = [this] { onPortCountChanged (Settings::audioJackOutputPortCountKey,     outputPorts); };
-        inputMidiPorts.onChange   = [this] { onPortCountChanged (Settings::audioJackInputMidiPortCountKey,  inputMidiPorts); };
-        outputMidiPorts.onChange  = [this] { onPortCountChanged (Settings::audioJackOutputMidiPortCountKey, outputMidiPorts); };
+        inputPorts.onChange  = [this] { onPortCountChanged (Settings::audioJackInputPortCountKey,  inputPorts); };
+        outputPorts.onChange = [this] { onPortCountChanged (Settings::audioJackOutputPortCountKey, outputPorts); };
     }
 
     void paint (Graphics&) override {}
@@ -988,10 +984,8 @@ public:
             const int h = parent->getItemHeight();
             const int space = h / 4;
 
-            inputPorts.setBounds (r.removeFromTop (22));      r.removeFromTop (space);
-            outputPorts.setBounds (r.removeFromTop (22));     r.removeFromTop (space);
-            inputMidiPorts.setBounds (r.removeFromTop (22));  r.removeFromTop (space);
-            outputMidiPorts.setBounds (r.removeFromTop (22)); r.removeFromTop (space);
+            inputPorts.setBounds  (r.removeFromTop (22)); r.removeFromTop (space);
+            outputPorts.setBounds (r.removeFromTop (22)); r.removeFromTop (space);
 
             setSize (getWidth(), r.getY());
         }
@@ -999,8 +993,8 @@ public:
 
 private:
     AudioDeviceSetupDetails setup;
-    std::unique_ptr<Label> inputPortsLabel, outputPortsLabel, inputMidiPortsLabel, outputMidiPortsLabel;
-    ComboBox inputPorts, outputPorts, inputMidiPorts, outputMidiPorts;
+    std::unique_ptr<Label> inputPortsLabel, outputPortsLabel;
+    ComboBox inputPorts, outputPorts;
     StringArray portCountChoices;
     juce::Array<int> portCountValues;
 
@@ -1048,15 +1042,11 @@ private:
     void loadFromSettings()
     {
         auto* settings = findSettings();
-        const int audioIn   = settings ? settings->getInt (Settings::audioJackInputPortCountKey,      0) : 0;
-        const int audioOut  = settings ? settings->getInt (Settings::audioJackOutputPortCountKey,     0) : 0;
-        const int midiIn    = settings ? settings->getInt (Settings::audioJackInputMidiPortCountKey,  0) : 0;
-        const int midiOut   = settings ? settings->getInt (Settings::audioJackOutputMidiPortCountKey, 0) : 0;
+        const int audioIn  = settings ? settings->getInt (Settings::audioJackInputPortCountKey,  0) : 0;
+        const int audioOut = settings ? settings->getInt (Settings::audioJackOutputPortCountKey, 0) : 0;
 
-        inputPorts.setSelectedId       (idForValue (audioIn),  dontSendNotification);
-        outputPorts.setSelectedId      (idForValue (audioOut), dontSendNotification);
-        inputMidiPorts.setSelectedId   (idForValue (midiIn),   dontSendNotification);
-        outputMidiPorts.setSelectedId  (idForValue (midiOut),  dontSendNotification);
+        inputPorts.setSelectedId  (idForValue (audioIn),  dontSendNotification);
+        outputPorts.setSelectedId (idForValue (audioOut), dontSendNotification);
     }
 
     void applyAndRestart()

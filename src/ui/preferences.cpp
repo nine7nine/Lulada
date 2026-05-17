@@ -808,10 +808,38 @@ public:
         startStopCont.addListener (this);
 
 #if ELEMENT_USE_JACK
-        /* Element-NSPA: JACK MIDI ports are the only MIDI surface in
-         * this fork.  The legacy ALSA-seq "Active MIDI Inputs" section
-         * is compiled out below — the JACK section owns the full lower
-         * area of the panel. */
+        /* Element: JACK MIDI is the only MIDI surface in this fork.
+         * Port-count sliders live here on the MIDI page (moved out of
+         * the Audio prefs panel — they have nothing to do with audio
+         * devices) and drive the per-port toggle list directly below. */
+        addAndMakeVisible (jackMidiPortCountHeader);
+        jackMidiPortCountHeader.setText ("JACK MIDI Port Count", dontSendNotification);
+        jackMidiPortCountHeader.setFont (Font (FontOptions (12.0f).withStyle ("Bold")));
+
+        addAndMakeVisible (jackMidiInPortCountLabel);
+        jackMidiInPortCountLabel.setText ("MIDI in ports", dontSendNotification);
+        jackMidiInPortCountLabel.setFont (Font (FontOptions (12.0f)));
+
+        addAndMakeVisible (jackMidiOutPortCountLabel);
+        jackMidiOutPortCountLabel.setText ("MIDI out ports", dontSendNotification);
+        jackMidiOutPortCountLabel.setFont (Font (FontOptions (12.0f)));
+
+        const StringArray midiPortChoices { "0 (off)", "2", "4", "8", "16", "32" };
+        const Array<int>  midiPortValues  {  0,         2,   4,   8,   16,   32  };
+        jackMidiPortCountValues = midiPortValues;
+
+        addAndMakeVisible (jackMidiInPortCount);
+        addAndMakeVisible (jackMidiOutPortCount);
+        for (int i = 0; i < midiPortChoices.size(); ++i)
+        {
+            jackMidiInPortCount.addItem  (midiPortChoices[i], i + 1);
+            jackMidiOutPortCount.addItem (midiPortChoices[i], i + 1);
+        }
+
+        jackMidiInPortCount.onChange  = [this] { applyJackMidiPortCount (true);  };
+        jackMidiOutPortCount.onChange = [this] { applyJackMidiPortCount (false); };
+        refreshJackMidiPortCountFromSettings();
+
         addAndMakeVisible (jackMidiHeader);
         jackMidiHeader.setText ("JACK MIDI Ports", dontSendNotification);
         jackMidiHeader.setFont (Font (FontOptions (12.0f).withStyle ("Bold")));
@@ -888,8 +916,25 @@ public:
         r.removeFromTop (roundToInt ((double) spacingBetweenSections * 1.5));
 
 #if ELEMENT_USE_JACK
-        /* Element-NSPA: JACK MIDI section owns the full lower area
-         * of the panel — the ALSA-seq list is compiled out. */
+        /* Element: JACK MIDI section owns the lower area of the panel.
+         * Stack: port-count header → two ComboBoxes → ports header →
+         * per-port toggle list (scrolls if N is large). */
+        jackMidiPortCountHeader.setBounds (r.removeFromTop (24));
+        const int comboW = jmax (96, getWidth() / 3);
+        const int labelW = jmax (90, getWidth() / 3);
+        {
+            auto row = r.removeFromTop (settingHeight);
+            jackMidiInPortCountLabel.setBounds (row.removeFromLeft (labelW));
+            jackMidiInPortCount.setBounds (row.removeFromLeft (comboW));
+        }
+        r.removeFromTop (4);
+        {
+            auto row = r.removeFromTop (settingHeight);
+            jackMidiOutPortCountLabel.setBounds (row.removeFromLeft (labelW));
+            jackMidiOutPortCount.setBounds (row.removeFromLeft (comboW));
+        }
+        r.removeFromTop (spacingBetweenSections);
+
         jackMidiHeader.setBounds (r.removeFromTop (24));
         jackMidiView.setBounds (r);
         if (jackMidiPorts)
@@ -1369,6 +1414,59 @@ private:
     std::unique_ptr<JackMidiPorts> jackMidiPorts;
     Label jackMidiHeader;
     Viewport jackMidiView;
+
+    /* Element: JACK MIDI port-count controls (moved from the Audio
+     * prefs panel).  ComboBoxes drive Settings keys
+     * audioJackInput/OutputMidiPortCountKey; on change we push the new
+     * count into JackClient + restart the audio device so the
+     * registered JACK MIDI ports match. */
+    Label jackMidiPortCountHeader;
+    Label jackMidiInPortCountLabel, jackMidiOutPortCountLabel;
+    ComboBox jackMidiInPortCount, jackMidiOutPortCount;
+    Array<int> jackMidiPortCountValues;
+
+    int currentJackMidiPortCount (const ComboBox& cb) const
+    {
+        const int selected = cb.getSelectedId();
+        if (selected <= 0) return 0;
+        const int idx = selected - 1;
+        return idx >= 0 && idx < jackMidiPortCountValues.size() ? jackMidiPortCountValues[idx] : 0;
+    }
+
+    int jackMidiPortCountIdForValue (int value) const
+    {
+        for (int i = 0; i < jackMidiPortCountValues.size(); ++i)
+            if (jackMidiPortCountValues[i] == value) return i + 1;
+        return 1; /* fall back to first entry (0/off) */
+    }
+
+    void refreshJackMidiPortCountFromSettings()
+    {
+        const int inCount  = settings.getUserSettings()->getIntValue (Settings::audioJackInputMidiPortCountKey,  0);
+        const int outCount = settings.getUserSettings()->getIntValue (Settings::audioJackOutputMidiPortCountKey, 0);
+        jackMidiInPortCount.setSelectedId  (jackMidiPortCountIdForValue (inCount),  dontSendNotification);
+        jackMidiOutPortCount.setSelectedId (jackMidiPortCountIdForValue (outCount), dontSendNotification);
+    }
+
+    void applyJackMidiPortCount (bool isInput)
+    {
+        const int value = currentJackMidiPortCount (isInput ? jackMidiInPortCount : jackMidiOutPortCount);
+        settings.getUserSettings()->setValue (isInput ? Settings::audioJackInputMidiPortCountKey
+                                                     : Settings::audioJackOutputMidiPortCountKey,
+                                              value);
+
+        /* Push counts into JackClient + force the audio device to
+         * close + reopen with the updated MIDI port set.  Audio port
+         * counts are left at whatever the user already configured;
+         * setAudioDeviceSetup pulls the full state from the manager
+         * so audio side is unchanged. */
+        auto& devs = world.devices();
+        devs.applyJackPortCountsFromSettings (world.settings());
+
+        juce::AudioDeviceManager::AudioDeviceSetup current;
+        devs.getAudioDeviceSetup (current);
+        devs.setAudioDeviceSetup (current, true);
+    }
 #endif
     Viewport midiInputView;
 

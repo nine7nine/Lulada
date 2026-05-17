@@ -304,8 +304,20 @@ void SessionService::loadNewSessionData()
         if (numIn  <= 0) numIn  = 2;
         if (numOut <= 0) numOut = 2;
         currentSession->clear();
+        /* On the JACK build the graph's abstract MIDI ports + the
+         * Graph I/O MIDI pseudo-nodes they drive are unused — JACK
+         * MIDI flows via JackMidiInputNode/All directly.  Start with
+         * 0 MIDI ports so new graphs come up clean (Audio In + Audio
+         * Out only). */
+#if ELEMENT_USE_JACK
+        constexpr bool wantGraphMidiIn  = false;
+        constexpr bool wantGraphMidiOut = false;
+#else
+        constexpr bool wantGraphMidiIn  = true;
+        constexpr bool wantGraphMidiOut = true;
+#endif
         currentSession->addGraph (
-            Graph::create ("Graph", numIn, numOut, true, true),
+            Graph::create ("Graph", numIn, numOut, wantGraphMidiIn, wantGraphMidiOut),
             true);
     }
 }

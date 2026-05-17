@@ -495,8 +495,17 @@ private:
 #endif
         props.add (new GraphChannelCountPropertyComponent (g, PortType::Audio, true));
         props.add (new GraphChannelCountPropertyComponent (g, PortType::Audio, false));
+#if ! ELEMENT_USE_JACK
+        /* Element: MIDI Ins/Outs sliders drive the legacy Graph I/O
+         * `MIDI Input` / `MIDI Output` pseudo-nodes only.  On the
+         * JACK build those routes are unused — JACK MIDI is wired
+         * through JackMidiInputNode/All — so the sliders are hidden.
+         * Existing graphs with pseudo-nodes still work (IONodeEnforcer
+         * follows the saved port count); new graphs default to 0
+         * MIDI ports and stay clean. */
         props.add (new GraphChannelCountPropertyComponent (g, PortType::Midi, true));
         props.add (new GraphChannelCountPropertyComponent (g, PortType::Midi, false));
+#endif
         // props.add (new BooleanPropertyComponent (g.getPropertyAsValue (tags::persistent),
         //                                          TRANS("Persistent"),
         //                                          TRANS("Don't unload when deactivated")));

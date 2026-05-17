@@ -66,6 +66,16 @@ private:
 
         const bool wantsAudioIn = graph.getNumPorts (PortType::Audio, true) > 0;
         const bool wantsAudioOut = graph.getNumPorts (PortType::Audio, false) > 0;
+        /* Element: pseudo-node auto-management is driven by the
+         * graph's abstract port count.  On the JACK build new graphs
+         * default to 0 MIDI ports (see Node::createDefaultGraph) and
+         * the right-click + Graph properties surfaces for adding them
+         * are hidden, so the auto-creation path stays dormant for
+         * fresh sessions.  Existing sessions with MIDI pseudo-nodes
+         * continue to work — they're the only path for routing
+         * non-JACK MIDI sources (virtual keyboard, generated MIDI
+         * clock routed to input, plugin-mode host MIDI) into the
+         * graph. */
         const bool wantsMidiIn = graph.getNumPorts (PortType::Midi, true) > 0;
         const bool wantsMidiOut = graph.getNumPorts (PortType::Midi, false) > 0;
 

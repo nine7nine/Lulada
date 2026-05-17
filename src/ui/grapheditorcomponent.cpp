@@ -487,8 +487,16 @@ void GraphEditorComponent::mouseDown (const MouseEvent& e)
             menu.addSectionHeader ("Graph I/O");
             menu.addItem (1, "Audio Inputs", true, graph.hasAudioInputNode());
             menu.addItem (2, "Audio Outputs", true, graph.hasAudioOutputNode());
+#if ! ELEMENT_USE_JACK
+            /* Element: MIDI Input/Output Graph I/O pseudo-nodes are
+             * the only entry/exit for non-JACK MIDI sources (vkb,
+             * generated MIDI clock, plugin-mode host MIDI).  On the
+             * JACK build those routes are unused — JACK MIDI flows via
+             * JackMidiInputNode/All directly — so the entries are
+             * compiled out to keep the canvas clean. */
             menu.addItem (3, "MIDI Input", true, graph.hasMidiInputNode());
             menu.addItem (4, "MIDI Output", true, graph.hasMidiOutputNode());
+#endif
             menu.addSeparator();
 #endif
 #if ! ELEMENT_USE_JACK

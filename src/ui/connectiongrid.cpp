@@ -330,8 +330,13 @@ private:
             menu.addSectionHeader ("Graph I/O");
             menu.addItem (1, "Audio Inputs", true, graph.hasAudioInputNode());
             menu.addItem (2, "Audio Outputs", true, graph.hasAudioOutputNode());
+#if ! ELEMENT_USE_JACK
+            /* Element: see grapheditorcomponent for rationale — JACK
+             * build hides the MIDI pseudo-node entries since JACK MIDI
+             * nodes own that surface. */
             menu.addItem (3, "MIDI Input", true, graph.hasMidiInputNode());
             menu.addItem (4, "MIDI Output", true, graph.hasMidiOutputNode());
+#endif
 #endif
         }
 

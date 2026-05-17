@@ -305,11 +305,21 @@ void EngineService::addGraph()
     if (numIn  <= 0) numIn  = 2;
     if (numOut <= 0) numOut = 2;
 
+    /* See SessionService::loadNewSessionData for the JACK rationale —
+     * no abstract MIDI ports on new graphs because JACK MIDI bypasses
+     * the Graph I/O pseudo-nodes entirely. */
+#if ELEMENT_USE_JACK
+    constexpr bool wantGraphMidiIn  = false;
+    constexpr bool wantGraphMidiOut = false;
+#else
+    constexpr bool wantGraphMidiIn  = true;
+    constexpr bool wantGraphMidiOut = true;
+#endif
     Node node (Graph::create ("Graph " + String (session->getNumGraphs() + 1),
                               numIn,
                               numOut,
-                              true,
-                              true));
+                              wantGraphMidiIn,
+                              wantGraphMidiOut));
 
     addGraph (node, false);
 }
