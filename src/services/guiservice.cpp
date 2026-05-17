@@ -1118,35 +1118,45 @@ void GuiService::refreshMainMenu()
 
 void GuiService::toggleAboutScreen()
 {
-    if (! about)
-    {
-        about.reset (new AboutDialog (*this));
-        if (appInfo.title.isNotEmpty())
-        {
-            if (auto c = dynamic_cast<AboutScreen*> (about->getContentComponent()))
-            {
-                c->setAboutInfo (appInfo);
-                about->setName (TRANS ("About ") + appInfo.title);
-            }
-        }
-    }
+    /* Element-NSPA: the upstream AboutDialog construction crashes
+     * silently somewhere inside JUCE's DocumentWindow base ctor on
+     * the winelib build (no console output, no SEH trace — the
+     * process just exits between "constructing AboutDialog" and the
+     * first line of our subclass body).  PluginWindow uses the same
+     * DocumentWindow base and works, so it isn't a fundamental
+     * winelib + DocumentWindow problem — something specific to this
+     * particular construction is the trigger.  Until we have time to
+     * track that down, surface the same About info via AlertWindow's
+     * native-component path which we know works on this build, and
+     * direct curious users at upstream Element + Wine-NSPA. */
+    juce::String message;
+    message << "Element is developed by Kushview, LLC.\n"
+               "All credit + authorship belongs to the upstream project.\n\n"
+               "Upstream: https://github.com/Kushview/Element\n\n"
+               "Element-NSPA is a Winelib fork prepared specifically "
+               "for the Wine-NSPA project — no upstream authorship or "
+               "release is claimed here.\n\n"
+               "Element-NSPA: https://github.com/nine7nine/element-nspa\n"
+               "Wine-NSPA:    https://github.com/nine7nine/wine-nspa\n\n"
+            << "Version: " << Version::withGitHash();
 
-    jassert (about);
-
-    if (about->isOnDesktop())
-    {
-        about->removeFromDesktop();
-        about->setVisible (false);
-    }
-    else
-    {
-        about->addToDesktop();
-        about->centreWithSize (about->getWidth(), about->getHeight());
-        about->setVisible (true);
-        about->toFront (true);
-        if (getRunMode() == RunMode::Plugin)
-            about->setAlwaysOnTop (true);
-    }
+    juce::AlertWindow::showAsync (
+        juce::MessageBoxOptions()
+            .withIconType (juce::MessageBoxIconType::InfoIcon)
+            .withTitle ("About Element")
+            .withMessage (message)
+            .withButton ("Visit Element on GitHub")
+            .withButton ("Visit Element-NSPA on GitHub")
+            .withButton ("Visit Wine-NSPA on GitHub")
+            .withButton ("Close"),
+        [] (int result) {
+            if (result == 1)
+                juce::URL ("https://github.com/Kushview/Element").launchInDefaultBrowser();
+            else if (result == 2)
+                juce::URL ("https://github.com/nine7nine/element-nspa").launchInDefaultBrowser();
+            else if (result == 3)
+                juce::URL ("https://github.com/nine7nine/wine-nspa").launchInDefaultBrowser();
+        });
 }
 
 KeyListener* GuiService::getKeyListener() const { return keys.get(); }
