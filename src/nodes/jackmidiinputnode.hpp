@@ -5,8 +5,13 @@
 
 #if ELEMENT_USE_JACK
 
+#include <atomic>
+
+#include <element/context.hpp>
 #include <element/devices.hpp>
+#include <element/engine.hpp>
 #include <element/node.h>
+#include <element/services.hpp>
 
 #include "nodes/baseprocessor.hpp"
 #include "engine/jack.hpp"
@@ -23,25 +28,46 @@ namespace element {
  *  the user per-source routing (e.g. controller A → midi_in_1 → synth
  *  A; controller B → midi_in_2 → synth B).
  *
- *  The JackMidiInputProvider pointer is resolved on every processBlock
- *  via dynamic_cast against the current AudioIODevice.  This is a
- *  single vtable comparison (~ns) on the RT thread, and gracefully
- *  produces silence when no JACK device is active. */
-class JackMidiInputNode : public BaseProcessor
+ *  ─── Program-change translation ─────────────────────────────────────
+ *
+ *  Some VST plugins ignore inbound MIDI Program Change messages but
+ *  do honour the VST setProgram dispatcher call.  When
+ *  translateProgramChange is enabled, this node detects 0xCx events
+ *  on the RT thread, drops them from the forwarded MIDI stream, and
+ *  schedules an async dispatch to every plugin reachable downstream
+ *  via the graph's MIDI connections.  EngineService walks the graph
+ *  on the message thread and invokes setCurrentProgram on each match,
+ *  matching the workaround pattern from fsthost (jfst/process.c
+ *  MIDI_PC_SELF mode) but per-input rather than per-host-instance. */
+class JackMidiInputNode : public BaseProcessor,
+                          private juce::AsyncUpdater
 {
 public:
-    explicit JackMidiInputNode (DeviceManager& dm)
-        : devices (dm)
+    explicit JackMidiInputNode (Context& ctx)
+        : context (ctx)
     {
         setPlayConfigDetails (0, 0, 44100.0, 512);
     }
 
-    ~JackMidiInputNode() override = default;
+    ~JackMidiInputNode() override
+    {
+        cancelPendingUpdate();
+    }
 
     int  getPortIndex() const noexcept { return portIndex; }
     void setPortIndex (int p) noexcept
     {
         portIndex = juce::jlimit (0, 31, p);
+    }
+
+    bool getTranslateProgramChange() const noexcept
+    {
+        return translateProgramChange.load (std::memory_order_relaxed);
+    }
+
+    void setTranslateProgramChange (bool on) noexcept
+    {
+        translateProgramChange.store (on, std::memory_order_relaxed);
     }
 
     inline const juce::String getName() const override
@@ -75,7 +101,7 @@ public:
     {
         midiMessages.clear();
 
-        auto* dev = devices.getCurrentAudioDevice();
+        auto* dev = context.devices().getCurrentAudioDevice();
         auto* provider = dynamic_cast<JackMidiInputProvider*> (dev);
         if (provider == nullptr)
             return;
@@ -84,8 +110,37 @@ public:
             return;
 
         const auto& src = provider->getCurrentJackMidiInputForPort (portIndex);
-        if (! src.isEmpty())
-            midiMessages.addEvents (src, 0, -1, 0);
+        if (src.isEmpty())
+            return;
+
+        /* Forward every event — including Program Changes — to
+         * downstream plugins.  Many VSTs (especially older VST3 with
+         * their own preset systems) only switch programs in response
+         * to inbound MIDI PC; dropping it would defeat the common
+         * case.  Toggle adds the setCurrentProgram dispatch as a
+         * best-effort *backup* for plugins that DON'T honour inbound
+         * PC but DO honour the VST setProgram call. */
+        midiMessages.addEvents (src, 0, -1, 0);
+
+        if (! translateProgramChange.load (std::memory_order_relaxed))
+            return;
+
+        /* Backup dispatch: scan for PC, queue the latest program for
+         * the message-thread setCurrentProgram broadcast.  PCs arrive
+         * at human rates (knob/button press), so last-write-wins via
+         * std::atomic<int> is fine — no SPSC queue needed. */
+        bool sawPC = false;
+        for (const auto m : src)
+        {
+            const auto& msg = m.getMessage();
+            if (msg.isProgramChange())
+            {
+                pendingProgram.store (msg.getProgramChangeNumber(), std::memory_order_relaxed);
+                sawPC = true;
+            }
+        }
+        if (sawPC)
+            triggerAsyncUpdate(); /* lock-free, RT-safe */
     }
 
     inline double getTailLengthSeconds() const override { return 0.0; }
@@ -99,13 +154,16 @@ public:
     inline const juce::String getProgramName (int) override { return {}; }
     inline void changeProgramName (int, const juce::String&) override {}
 
-    inline juce::AudioProcessorEditor* createEditor() override { return nullptr; }
-    inline bool hasEditor() const override { return false; }
+    inline juce::AudioProcessorEditor* createEditor() override;
+    inline bool hasEditor() const override { return true; }
 
     inline void getStateInformation (juce::MemoryBlock& destData) override
     {
         juce::ValueTree vt ("JackMidiInputNode");
         vt.setProperty ("port", portIndex, nullptr);
+        vt.setProperty ("translateProgramChange",
+                        translateProgramChange.load (std::memory_order_relaxed),
+                        nullptr);
         if (auto xml = vt.createXml())
             copyXmlToBinary (*xml, destData);
     }
@@ -116,7 +174,12 @@ public:
         {
             const auto vt = juce::ValueTree::fromXml (*xml);
             if (vt.hasType ("JackMidiInputNode"))
+            {
                 portIndex = juce::jlimit (0, 31, (int) vt.getProperty ("port", 0));
+                translateProgramChange.store (
+                    (bool) vt.getProperty ("translateProgramChange", false),
+                    std::memory_order_relaxed);
+            }
         }
     }
 
@@ -128,11 +191,106 @@ protected:
     }
 
 private:
-    DeviceManager& devices;
+    /** Message-thread drain.  Pulls the last pending program number
+        (-1 sentinel if none) and asks EngineService to walk the graph
+        downstream from this node, invoking setCurrentProgram on every
+        plugin reached.  setCurrentProgram may allocate / reload
+        samples in the plugin, which is why this is off the RT path. */
+    void handleAsyncUpdate() override
+    {
+        const int program = pendingProgram.exchange (-1, std::memory_order_relaxed);
+        if (program < 0)
+            return;
+        if (auto* engineSvc = context.services().find<EngineService>())
+            engineSvc->dispatchProgramChangeFromNode (this, program);
+    }
+
+    Context& context;
     int portIndex = 0;
+    std::atomic<bool> translateProgramChange { false };
+    std::atomic<int>  pendingProgram { -1 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JackMidiInputNode)
 };
+
+/** Minimal editor exposing the per-input PC-translate toggle.  Opens
+    via the block's gear button.  Kept tiny on purpose — the only
+    knob this node has worth a UI affordance is the PC translation
+    workaround; port binding is fixed at creation and visible in the
+    node's name. */
+class JackMidiInputNodeEditor : public juce::AudioProcessorEditor
+{
+public:
+    explicit JackMidiInputNodeEditor (JackMidiInputNode& proc)
+        : juce::AudioProcessorEditor (proc), owner (proc)
+    {
+        setOpaque (true);
+
+        portLabel.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+        portLabel.setText (owner.getName(), juce::dontSendNotification);
+        portLabel.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (portLabel);
+
+        translateLabel.setFont (juce::Font (juce::FontOptions (11.0f)));
+        translateLabel.setText ("Also call setProgram on downstream plugins",
+                                juce::dontSendNotification);
+        translateLabel.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (translateLabel);
+
+        translateButton.setButtonText ("");
+        translateButton.setToggleState (owner.getTranslateProgramChange(),
+                                        juce::dontSendNotification);
+        translateButton.onClick = [this] {
+            owner.setTranslateProgramChange (translateButton.getToggleState());
+        };
+        addAndMakeVisible (translateButton);
+
+        hint.setFont (juce::Font (juce::FontOptions (10.5f).withStyle ("Italic")));
+        hint.setText ("Program Change events are always forwarded to plugins.  This "
+                      "toggle ADDITIONALLY invokes setCurrentProgram on every plugin "
+                      "downstream of this node — a safety net for plugins that ignore "
+                      "inbound MIDI PC but honour the VST setProgram dispatcher.  "
+                      "Has no effect on plugins exposing fewer than 2 programs.",
+                      juce::dontSendNotification);
+        hint.setJustificationType (juce::Justification::topLeft);
+        hint.setMinimumHorizontalScale (1.0f);
+        addAndMakeVisible (hint);
+
+        setSize (420, 180);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (findColour (juce::ResizableWindow::backgroundColourId));
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (10);
+        portLabel.setBounds (r.removeFromTop (22));
+        r.removeFromTop (6);
+
+        auto row = r.removeFromTop (24);
+        translateButton.setBounds (row.removeFromLeft (44));
+        row.removeFromLeft (8);
+        translateLabel.setBounds (row);
+
+        r.removeFromTop (6);
+        hint.setBounds (r);
+    }
+
+private:
+    JackMidiInputNode& owner;
+    juce::Label portLabel;
+    juce::Label translateLabel;
+    juce::ToggleButton translateButton;
+    juce::Label hint;
+};
+
+inline juce::AudioProcessorEditor* JackMidiInputNode::createEditor()
+{
+    return new JackMidiInputNodeEditor (*this);
+}
 
 } // namespace element
 

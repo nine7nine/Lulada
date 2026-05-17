@@ -65,6 +65,17 @@ public:
         sink node bound to element:midi_out_<portIndex+1>. */
     Node addJackMidiOutputNode (int portIndex);
 
+    /** Element-NSPA: deliver a Program Change to every plugin
+        downstream of the given source AudioProcessor (walking the
+        active root graph's MIDI connections), bypassing the plugin's
+        MIDI parser and calling juce::AudioProcessor::setCurrentProgram
+        directly.  Workaround for VST plugins that don't honour
+        inbound MIDI PC — modelled on fsthost's MIDI_PC_SELF mode but
+        scoped per-input rather than per-host-instance.  Called from
+        JackMidiInputNode's message-thread async update; safe to
+        allocate / reload samples in the plugin. */
+    void dispatchProgramChangeFromNode (juce::AudioProcessor* source, int program);
+
     /** Removes a node from the current graph */
     void removeNode (const uint32);
 

@@ -172,7 +172,7 @@ void ElementAudioPluginFormat::findAllTypesForFile (OwnedArray<PluginDescription
     else if (fileOrId == EL_NODE_ID_JACK_MIDI_INPUT)
     {
         auto* const desc = ds.add (new PluginDescription());
-        JackMidiInputNode (_context.devices()).fillInPluginDescription (*desc);
+        JackMidiInputNode (_context).fillInPluginDescription (*desc);
     }
     else if (fileOrId == EL_NODE_ID_JACK_MIDI_OUTPUT)
     {
@@ -257,7 +257,7 @@ AudioPluginInstance* ElementAudioPluginFormat::instantiatePlugin (const PluginDe
         base = std::make_unique<MidiDeviceProcessor> (false, _context.midi());
 #if ELEMENT_USE_JACK
     else if (desc.fileOrIdentifier == EL_NODE_ID_JACK_MIDI_INPUT)
-        base = std::make_unique<JackMidiInputNode> (_context.devices());
+        base = std::make_unique<JackMidiInputNode> (_context);
     else if (desc.fileOrIdentifier == EL_NODE_ID_JACK_MIDI_OUTPUT)
         base = std::make_unique<JackMidiOutputNode> (_context.devices());
 #endif

@@ -986,6 +986,87 @@ Node EngineService::addPlugin (GraphManager& c, const PluginDescription& desc)
 }
 
 #if ELEMENT_USE_JACK
+void EngineService::dispatchProgramChangeFromNode (juce::AudioProcessor* source, int program)
+{
+    if (source == nullptr || program < 0 || program > 127)
+        return;
+    auto* const rootMgr = graphs->findActiveRootGraphManager();
+    if (rootMgr == nullptr)
+        return;
+    auto& graph = rootMgr->getRootGraph();
+
+    /* Locate the Processor wrapping `source` in the active root
+     * graph.  We only support nodes that live at the root level for
+     * MVP — sub-graphs are not walked. */
+    uint32 sourceNodeId = 0;
+    for (int i = 0; i < graph.getNumNodes(); ++i)
+    {
+        if (auto* p = graph.getNode (i))
+        {
+            if (p->getAudioProcessor() == source)
+            {
+                sourceNodeId = p->nodeId;
+                break;
+            }
+        }
+    }
+    if (sourceNodeId == 0)
+        return;
+
+    /* BFS through MIDI connections downstream from the source node.
+     * Follows only connections whose sourcePort matches each visited
+     * node's MIDI output port, so audio / control connections aren't
+     * traversed.  Visited set bounds the walk against cycles. */
+    juce::SortedSet<uint32> visited;
+    juce::Array<uint32> frontier;
+    visited.add (sourceNodeId);
+    frontier.add (sourceNodeId);
+
+    while (! frontier.isEmpty())
+    {
+        const uint32 current = (uint32) frontier.getFirst();
+        frontier.remove (0);
+
+        auto* const currentProc = graph.getNodeForId (current);
+        if (currentProc == nullptr)
+            continue;
+        const uint32 midiOut = currentProc->getMidiOutputPort();
+
+        for (int i = 0; i < graph.getNumConnections(); ++i)
+        {
+            const auto* const conn = graph.getConnection (i);
+            if (conn == nullptr) continue;
+            if (conn->sourceNode != current) continue;
+            if (conn->sourcePort != midiOut) continue;
+            if (visited.contains (conn->destNode)) continue;
+            visited.add (conn->destNode);
+            frontier.add (conn->destNode);
+        }
+    }
+
+    /* Apply setCurrentProgram to every visited node except the
+     * source.  Internal Element nodes typically expose one program
+     * and treat the call as a no-op; real VST/VST3/AU plugins switch
+     * via the VST setProgram dispatcher.  Bounds-checked against
+     * each plugin's actual program count — out-of-range PCs are
+     * dropped silently per VST convention. */
+    for (int i = 0; i < graph.getNumNodes(); ++i)
+    {
+        auto* const p = graph.getNode (i);
+        if (p == nullptr) continue;
+        if (p->nodeId == sourceNodeId) continue;
+        if (! visited.contains (p->nodeId)) continue;
+
+        auto* const ap = p->getAudioProcessor();
+        if (ap == nullptr) continue;
+        const int nprog = ap->getNumPrograms();
+        if (nprog <= 1) continue;          /* nothing to switch */
+        if (program >= nprog) continue;    /* out of range */
+
+        ap->setCurrentProgram (program);
+    }
+}
+
 Node EngineService::addJackMidiOutputNode (int portIndex)
 {
     ProcessorPtr ptr;
