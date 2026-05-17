@@ -1065,13 +1065,39 @@ private:
         auto* devs     = findDeviceManager();
         if (settings == nullptr || devs == nullptr)
             return;
+
         devs->applyJackPortCountsFromSettings (*settings);
-        /* Restart with the same setup the AudioDeviceSelector already
-         * has so the new port count takes effect on the active JACK
-         * client.  closeAudioDevice + restartLastAudioDevice rebuilds
-         * the JackAudioIODevice which honours the updated counts. */
-        devs->closeAudioDevice();
-        devs->restartLastAudioDevice();
+
+        /* Also expand the AudioDeviceManager's active-channel mask so
+         * Element's in-app Audio In/Out graph nodes (which mirror the
+         * JUCE active-channel BigInteger, not the registered JACK
+         * port count) widen to match.  Without this the user sees N
+         * JACK ports in the patchbay but only 2 channels in Element's
+         * internal routing — the JUCE selector preserves the stereo
+         * default unless we explicitly mark the new channels active. */
+        const int inCount  = settings->getInt (Settings::audioJackInputPortCountKey,  0);
+        const int outCount = settings->getInt (Settings::audioJackOutputPortCountKey, 0);
+
+        juce::AudioDeviceManager::AudioDeviceSetup current;
+        devs->getAudioDeviceSetup (current);
+
+        if (inCount > 0)
+        {
+            current.inputChannels.clear();
+            current.inputChannels.setRange (0, inCount, true);
+            current.useDefaultInputChannels = false;
+        }
+        if (outCount > 0)
+        {
+            current.outputChannels.clear();
+            current.outputChannels.setRange (0, outCount, true);
+            current.useDefaultOutputChannels = false;
+        }
+
+        /* setAudioDeviceSetup closes + reopens the JackAudioIODevice
+         * with the updated JackClient port counts AND the widened
+         * active-channel masks in one step. */
+        devs->setAudioDeviceSetup (current, true);
     }
 
     void onPortCountChanged (const char* settingsKey, ComboBox& cb)

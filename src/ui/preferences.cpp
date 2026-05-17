@@ -18,6 +18,7 @@
 #include "engine/midipanic.hpp"
 #include "messages.hpp"
 #include "auth.hpp"
+#include "ui/audiodeviceselector.hpp"
 #include "services/oscservice.hpp"
 #include "ui/buttons.hpp"
 #include "ui/viewhelpers.hpp"
@@ -710,8 +711,12 @@ public:
     void resized() override { devs.setBounds (getLocalBounds()); }
 
 private:
-    // element::AudioDeviceSelectorComponent devs;
-    juce::AudioDeviceSelectorComponent devs;
+    /* Element-NSPA: use Element's enhanced AudioDeviceSelectorComponent
+     * (not juce::) so the Preferences > Audio panel surfaces the JACK
+     * port-count + JACK MIDI controls in JackExtraSettingsPanel.  The
+     * upstream-disabled line below was effectively dead code — JUCE's
+     * stock selector has no awareness of Element's JACK extras. */
+    element::AudioDeviceSelectorComponent devs;
     [[maybe_unused]] DeviceManager& devices;
 };
 
