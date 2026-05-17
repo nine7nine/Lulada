@@ -433,6 +433,36 @@ public:
         tempMidi.clear();
         processCurrentGraph (buffer, tempMidi);
 
+#if ELEMENT_USE_JACK
+        /* Element: route the Graph I/O `MIDI Output` pseudo-node's
+         * buffer to JACK MIDI output port 0 when available.  Without
+         * this, anything that lands in the graph's top-level MIDI
+         * output (clock generator, ScriptNode, downstream of a
+         * MidiOutputDevice node placed by the user) would silently
+         * drop on the JACK build.  Per-port routing remains available
+         * via explicit JackMidiOutputNode instances downstream of the
+         * source — those write to whichever port the user picked.
+         *
+         * Activity tick is driven from JackAudioIODevice's per-period
+         * flag (consumeMidiOutputActivity), so any JackMidiOutputNode
+         * writes ALSO contribute — no duplicate ticks when both this
+         * path and a per-port node fire in the same period. */
+        if (jackMidiOutputSink != nullptr && ! tempMidi.isEmpty()
+            && jackMidiOutputSink->getNumJackMidiOutputPorts() > 0)
+        {
+            for (const auto m : tempMidi)
+            {
+                const auto& msg = m.getMessage();
+                const auto* raw = msg.getRawData();
+                const int size = msg.getRawDataSize();
+                if (raw != nullptr && size > 0)
+                    jackMidiOutputSink->writeJackMidiOutput (0, m.samplePosition, raw, size);
+            }
+        }
+
+        if (jackMidiOutputSink != nullptr && jackMidiOutputSink->consumeMidiOutputActivity())
+            midiIOMonitor->sent();
+#else
         {
             ScopedLock lockMidiOut (engine.world.midi().getMidiOutputLock());
             if (auto* const midiOut = engine.world.midi().getDefaultMidiOutput())
@@ -449,6 +479,7 @@ public:
                 }
             }
         }
+#endif
 
         for (int c = 0; c < numOutputChannels; ++c)
             outMeters.getObjectPointerUnchecked (c)->updateLevel (outputChannelData, c, numSamples);
@@ -460,13 +491,23 @@ public:
         messageCollector.removeNextBlockOfMessages (midi, numSamples);
 
 #if ELEMENT_USE_JACK
-        /* Element-NSPA: merge sample-accurate JACK MIDI input into the
+        /* Element: merge sample-accurate JACK MIDI input into the
          * top-level graph buffer.  The provider owns the buffer for the
          * lifetime of this audio callback (same RT thread, same period).
          * Events arrive with their original jack_midi_event_t::time as
          * the sample offset, so addEvents preserves sub-period timing.
          * No locking: same-thread synchronous handoff from
-         * JackAudioIODevice::process() into the audio callback. */
+         * JackAudioIODevice::process() into the audio callback.
+         *
+         * After merging into the graph buffer, walk every per-port
+         * input buffer and dispatch each event through the MidiEngine
+         * callback chain.  Without this step, MIDI Clock sync, MIDI
+         * Start/Stop/Continue, MIDI Learn, and MappingEngine all see
+         * nothing on the JACK build — they subscribe to MidiEngine,
+         * which on JACK opens no juce::MidiInputs.  AudioEngine's own
+         * subscription handler (registered at activate()) skips its
+         * MessageCollector enqueue under ELEMENT_USE_JACK to avoid
+         * double-injecting events that are already in `midi`. */
         if (jackMidiInputProvider != nullptr)
         {
             const auto& jackMidi = jackMidiInputProvider->getCurrentJackMidiInput();
@@ -488,6 +529,16 @@ public:
                         break; /* one tick per period is plenty */
                     }
                 }
+            }
+
+            const int numJackInPorts = jackMidiInputProvider->getNumJackMidiInputPorts();
+            for (int p = 0; p < numJackInPorts; ++p)
+            {
+                const auto& portBuf = jackMidiInputProvider->getCurrentJackMidiInputForPort (p);
+                if (portBuf.isEmpty())
+                    continue;
+                for (const auto m : portBuf)
+                    engine.world.midi().dispatchIncomingFromJack (p, m.getMessage());
             }
         }
 #endif
@@ -583,12 +634,15 @@ public:
         const int numChansOut = device->getActiveOutputChannels().countNumberOfSetBits();
 
 #if ELEMENT_USE_JACK
-        /* Element-NSPA: capture the device's JACK MIDI input provider
-         * (if any) before audio starts.  Single dynamic_cast at start;
-         * the RT path just dereferences the cached pointer.  Non-JACK
-         * device types return nullptr — MIDI delivery falls back to
-         * the legacy MidiMessageCollector path. */
+        /* Element: capture the device's JACK MIDI provider + sink
+         * (if any) before audio starts.  Single dynamic_cast pair at
+         * start; the RT path just dereferences the cached pointers.
+         * Non-JACK device types return nullptr — MIDI delivery falls
+         * back to the legacy MidiMessageCollector path on input, and
+         * the Graph I/O `midiOutputNode` output silently drops (same
+         * as if no JACK MIDI output ports were configured). */
         jackMidiInputProvider = dynamic_cast<JackMidiInputProvider*> (device);
+        jackMidiOutputSink    = dynamic_cast<JackMidiOutputSink*>    (device);
 #endif
 
         audioAboutToStart (newSampleRate, newBlockSize, numChansIn, numChansOut);
@@ -643,6 +697,7 @@ public:
         graphs.releaseBuffers();
 #if ELEMENT_USE_JACK
         jackMidiInputProvider = nullptr;
+        jackMidiOutputSink    = nullptr;
 #endif
     }
 
@@ -650,8 +705,19 @@ public:
     {
         if (! message.isActiveSense() && ! message.isMidiClock())
             midiIOMonitor->received();
+
+        /* On the JACK build the JACK input drain has already merged
+         * this event into the graph's top-level MidiBuffer for the
+         * current period — enqueuing it on the MessageCollector here
+         * would re-inject it at the start of the NEXT period.  Skip
+         * the enqueue and let the per-period merge be the sole graph
+         * entry point.  The clock / Start-Stop branches below still
+         * run; they are the reason MidiEngine::dispatchIncomingFromJack
+         * routes JACK events through this callback in the first place. */
+#if ! ELEMENT_USE_JACK
         if (audioStarted.load (std::memory_order_acquire))
             messageCollector.addMessageToQueue (message);
+#endif
         const bool clockWanted = processMidiClock.get() > 0 && sessionWantsExternalClock.get() > 0;
         const bool doStartStop = startStopCont.get() != 0;
 
@@ -822,14 +888,19 @@ private:
     std::atomic<bool> audioStarted { false };
 
 #if ELEMENT_USE_JACK
-    /* Element-NSPA: pointer to the active JACK driver's RT-inline MIDI
-     * input buffer, captured via dynamic_cast in audioDeviceAboutToStart.
-     * Used by processCurrentGraph to merge sample-accurate JACK MIDI
-     * events into the top-level MidiBuffer that flows into the root
-     * graph.  Lifetime is bounded by the audio callback start/stop
-     * pair — JackAudioIODevice cannot be destroyed while the callback
-     * is live. */
+    /* Element: pointers to the active JACK driver's RT-inline MIDI
+     * provider and sink, captured via dynamic_cast in
+     * audioDeviceAboutToStart.  Used by processCurrentGraph + the
+     * outer audio callback to (a) merge sample-accurate JACK MIDI
+     * input into the top-level graph MidiBuffer + dispatch each
+     * event through the MidiEngine callback chain, and (b) route
+     * the graph's MIDI output buffer to JACK output port 0 directly
+     * (no ringbuffer round-trip, no period delay).  Lifetime is
+     * bounded by the audio callback start/stop pair —
+     * JackAudioIODevice cannot be destroyed while the callback is
+     * live. */
     JackMidiInputProvider* jackMidiInputProvider = nullptr;
+    JackMidiOutputSink*    jackMidiOutputSink    = nullptr;
 #endif
 
     ReferenceCountedArray<AudioEngine::LevelMeter> inMeters, outMeters;

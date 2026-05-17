@@ -332,6 +332,29 @@ void MidiEngine::handleIncomingMidiMessageInt (MidiInput* source, const MidiMess
     }
 }
 
+void MidiEngine::dispatchIncomingFromJack (int portIndex, const MidiMessage& message)
+{
+    if (message.isActiveSense())
+        return;
+
+    /* Synthesised device identifier matching the JACK port naming
+     * scheme (element:midi_in_<N+1>).  Subscribers filtering by
+     * device match here; subscribers with an empty filter or marked
+     * as `consumer` match every port regardless.  We deliberately
+     * do not dereference the `source` MidiInput* — JACK events have
+     * no JUCE MidiInput backing them, so every callback in this
+     * fork that may receive a JACK event ignores the source pointer. */
+    String portId;
+    portId << "element:midi_in_" << (portIndex + 1);
+
+    const ScopedLock sl (midiCallbackLock);
+    for (auto& mc : midiCallbacks)
+    {
+        if (mc.consumer || mc.device.isEmpty() || mc.device == portId)
+            mc.callback->handleIncomingMidiMessage (nullptr, message);
+    }
+}
+
 void MidiEngine::processMidiBuffer (const MidiBuffer& buffer, int nframes, double sampleRate)
 {
     MidiMessage message;

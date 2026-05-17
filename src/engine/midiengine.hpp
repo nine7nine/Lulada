@@ -101,6 +101,16 @@ public:
 
     void processMidiBuffer (const MidiBuffer& buffer, int nframes, double sampleRate);
 
+    /** Element: dispatch a single JACK-sourced MIDI event through the
+        engine's callback chain.  Invoked from the audio callback after
+        a per-port drain so MIDI Learn / controller mappings / clock /
+        Start-Stop-Continue all see JACK MIDI events even though no
+        juce::MidiInput backs them.  The callback's `source` argument
+        is nullptr — every registered consumer in this fork ignores it.
+        Subscribers filtering by device identifier match the synthetic
+        port id "element:midi_in_<portIndex+1>". */
+    void dispatchIncomingFromJack (int portIndex, const juce::MidiMessage& message);
+
     CriticalSection& getMidiOutputLock() { return midiOutputLock; }
 
 private:

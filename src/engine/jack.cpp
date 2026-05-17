@@ -103,20 +103,24 @@ JUCE_DECL_JACK_FUNCTION (jack_port_t*, jack_port_by_name, (jack_client_t * clien
 
 JUCE_DECL_JACK_FUNCTION (int, jack_client_name_size, (), ());
 JUCE_DECL_JACK_FUNCTION (int, jack_port_name_size, (), ());
-/* Element-NSPA: jack_get_client_name returns JACK-internal storage —
+/* Element: jack_get_client_name returns JACK-internal storage —
  * NOT malloc'd — and must not be jack_free'd.  Returning const char*
  * here keeps callers honest. */
 JUCE_DECL_JACK_FUNCTION (const char*, jack_get_client_name, (jack_client_t * client), (client));
 
 JUCE_DECL_VOID_JACK_FUNCTION (jack_free, (void* ptr), (ptr))
 
-/* Element-NSPA: JACK MIDI bindings.  Native JACK MIDI is sample-accurate
- * (per-event jack_nframes_t timestamps within the buffer) and avoids the
- * ALSA-seq millisecond quantisation that plagues low-latency MIDI work.
- * Pattern mirrors wine-nspa's winejack.drv/jackmidi.c — JACK ringbuffer
- * carries events between the RT JACK callback and Element's non-RT
- * consumer thread; one wakeup-pipe write per period rather than per
- * event to keep syscalls out of the RT path. */
+/* Element: native JACK MIDI bindings.  Sample-accurate (per-event
+ * jack_nframes_t timestamps within the period buffer), no ALSA-seq
+ * millisecond quantisation.  Both directions are RT-inline:
+ *   - Inbound  — JACK process callback reads events into per-port
+ *                MidiBuffers consumed synchronously by the audio
+ *                callback that runs from the same thread.
+ *   - Outbound — output port buffers are cleared + cached at the
+ *                start of the period (before the audio callback);
+ *                graph nodes write events directly via libjack with
+ *                their original sample offsets preserved.  No
+ *                ringbuffer round-trip, no one-period delay. */
 JUCE_DECL_JACK_FUNCTION (int,  jack_midi_event_get,
                          (jack_midi_event_t * event, void* port_buffer, uint32_t event_index),
                          (event, port_buffer, event_index))
@@ -128,16 +132,6 @@ JUCE_DECL_JACK_FUNCTION (int,  jack_midi_event_write,
                          (void* port_buffer, jack_nframes_t time,
                           const jack_midi_data_t* data, size_t data_size),
                          (port_buffer, time, data, data_size))
-
-JUCE_DECL_JACK_FUNCTION (jack_ringbuffer_t*, jack_ringbuffer_create, (size_t sz), (sz))
-JUCE_DECL_VOID_JACK_FUNCTION (jack_ringbuffer_free, (jack_ringbuffer_t * rb), (rb))
-JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_read_space,  (const jack_ringbuffer_t* rb), (rb))
-JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_write_space, (const jack_ringbuffer_t* rb), (rb))
-JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_read,   (jack_ringbuffer_t * rb, char* dest, size_t cnt), (rb, dest, cnt))
-JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_peek,   (jack_ringbuffer_t * rb, char* dest, size_t cnt), (rb, dest, cnt))
-JUCE_DECL_VOID_JACK_FUNCTION (jack_ringbuffer_read_advance, (jack_ringbuffer_t * rb, size_t cnt), (rb, cnt))
-JUCE_DECL_JACK_FUNCTION (size_t, jack_ringbuffer_write,  (jack_ringbuffer_t * rb, const char* src, size_t cnt), (rb, src, cnt))
-JUCE_DECL_JACK_FUNCTION (int,    jack_ringbuffer_mlock,  (jack_ringbuffer_t * rb), (rb))
 
 #if JUCE_DEBUG
 #define JACK_LOGGING_ENABLED 1
@@ -435,21 +429,10 @@ int JackPort::connect (const JackPort& other) { return jack_connect (client, get
 
 int JackPort::getFlags() const { return element::jack_port_flags (port); }
 
-/* Element-NSPA: JACK MIDI output ringbuffer layout (inbound is now
- * RT-inline via juce::MidiBuffer and needs no ringbuffer).  Outbound
- * crosses threads — Element's audio callback writes from the graph
- * thread, the JACK process callback (RT) reads — so a lock-free
- * ringbuffer is still the right primitive.  Header on the wire
- * (NSPA_MIDI_HDR_BYTES bytes per event):
- *     [0] port index (uint8)
- *     [1] event size low byte
- *     [2] event size high byte
- * followed by raw MIDI bytes.  NSPA_MIDI_EVENT_MAX bounds per-event
- * size so the consumer can read into a fixed-size stack buffer;
- * oversize events are dropped at the writer. */
-static constexpr size_t NSPA_MIDI_RB_BYTES  = 16 * 1024;
-static constexpr size_t NSPA_MIDI_EVENT_MAX = 1024;
-static constexpr size_t NSPA_MIDI_HDR_BYTES = 3;
+/* Element: cap on cached JACK MIDI output port buffers per period.
+ * Matches the 32-bit per-port enable mask in JackClient; raising
+ * this also requires widening that mask. */
+static constexpr int MAX_JACK_MIDI_OUT_PORTS = 32;
 
 //==============================================================================
 class JackAudioIODevice : public AudioIODevice,
@@ -479,7 +462,7 @@ public:
         {
             element::jack_set_error_function (errorCallback);
 
-            /* Element-NSPA: forced port count.  If the JackClient was
+            /* Element: forced port count.  If the JackClient was
              * configured with numMainInputs/Outputs > 0 (via the Audio
              * preferences panel), create exactly that many JACK ports
              * instead of mirroring the connected hardware client.  When
@@ -520,31 +503,16 @@ public:
             inChans.calloc (totalNumberOfInputChannels + 2);
             outChans.calloc (totalNumberOfOutputChannels + 2);
 
-            /* Element-NSPA: register JACK MIDI ports.  Counts are
+            /* Element: register JACK MIDI ports.  Counts are
              * configured via JackClient setters from the Audio
              * preferences panel; 0 means no Element JACK MIDI ports.
-             *
-             * Inbound MIDI is delivered RT-inline via the
-             * currentPeriodMidiInput juce::MidiBuffer (sample-accurate,
-             * zero added latency).  No ringbuffer needed for the
-             * inbound path.
-             *
-             * Outbound MIDI crosses threads — Element's graph callback
-             * writes events from the audio thread that get pulled into
-             * the JACK process callback's port buffers — so a lock-free
-             * mlocked ringbuffer is the right primitive.  OOM at
-             * jack_ringbuffer_create simply disables the MIDI output
-             * path without aborting. */
+             * Both directions are RT-inline (see the bindings comment
+             * at the top of this file) — no ringbuffer or cross-thread
+             * handoff. */
             const int midiInsToCreate  = client.getNumMidiInputs();
             const int midiOutsToCreate = client.getNumMidiOutputs();
 
-            if (midiOutsToCreate > 0 && ! outMidiRb)
-            {
-                outMidiRb = element::jack_ringbuffer_create (NSPA_MIDI_RB_BYTES);
-                if (outMidiRb) element::jack_ringbuffer_mlock (outMidiRb);
-            }
-
-            /* Element-NSPA: preallocate the inbound MidiBuffers so the
+            /* Element: preallocate the inbound MidiBuffers so the
              * RT drain into them does not allocate.  ensureSize reserves
              * `numBytes` event bytes (events + headers); a single 4-byte
              * note costs ~16 bytes after metadata, so 4 KB per buffer
@@ -584,12 +552,6 @@ public:
         close();
         if (client.isOpen())
             client.close();
-
-        /* Element-NSPA: tear down outbound MIDI ringbuffer.  Ports are
-         * owned by the JACK client and freed when the client is closed;
-         * the inbound path uses a juce::MidiBuffer member with no
-         * external resources, so no cleanup needed there. */
-        if (outMidiRb) { element::jack_ringbuffer_free (outMidiRb); outMidiRb = nullptr; }
     }
 
     StringArray getChannelNames (const String& clientName, bool forInput) const
@@ -603,7 +565,7 @@ public:
         return names;
     }
 
-    /* Element-NSPA: when the user has forced a port count via the
+    /* Element: when the user has forced a port count via the
      * Audio preferences panel, return synthetic labels matching the
      * port count we created in the constructor.  The JUCE
      * AudioDeviceSelector UI uses these for the "Active input/output
@@ -795,7 +757,7 @@ public:
     BigInteger getActiveOutputChannels() const override { return activeOutputChannels; }
     BigInteger getActiveInputChannels() const override { return activeInputChannels; }
 
-    /* Element-NSPA: JackMidiInputProvider overrides.  AudioEngine reads
+    /* Element: JackMidiInputProvider overrides.  AudioEngine reads
      * the combined buffer once per audio callback from the same RT
      * thread that the JACK process callback populated it on —
      * same-thread, synchronous, no locking needed.  JackMidiInputNode
@@ -820,40 +782,55 @@ public:
         return currentPeriodMidiInputPerPort.size();
     }
 
-    /* Element-NSPA: JackMidiOutputSink overrides.  pushJackMidiOutput
-     * is invoked from a graph node's processBlock — which on Element's
-     * JACK setup runs on the same RT thread as the JACK process
-     * callback.  Same-thread writer + reader on outMidiRb means the
-     * ringbuffer's lock-free semantics are overkill (no contention)
-     * but harmless; events queued mid-callback are picked up by the
-     * NEXT period's drain (one-period output delay, matching the
-     * established pattern in wine-nspa/dlls/winejack.drv/jackmidi.c). */
-    bool pushJackMidiOutput (int portIndex, const juce::uint8* data, int size) noexcept override
+    /* Element: JackMidiOutputSink overrides.  writeJackMidiOutput
+     * is invoked from a graph node's processBlock — which on the
+     * standalone JACK setup runs synchronously inside the same RT
+     * thread as the JACK process callback.  process() caches each
+     * configured output port's libjack buffer (and clears it) BEFORE
+     * dispatching the audio callback, so by the time the graph
+     * render runs, every write goes straight to libjack with the
+     * caller's sample offset preserved.  No ringbuffer, no period
+     * delay, one libjack-internal copy. */
+    bool writeJackMidiOutput (int portIndex,
+                              int sampleOffset,
+                              const juce::uint8* data,
+                              int size) noexcept override
     {
-        if (outMidiRb == nullptr || data == nullptr)
+        if (data == nullptr || size <= 0)
             return false;
-        if (portIndex < 0 || portIndex >= outputMidiPorts.size())
-            return false;
-        if (size <= 0 || size > static_cast<int> (NSPA_MIDI_EVENT_MAX))
+        if (portIndex < 0 || portIndex >= cachedNumOutPorts)
             return false;
 
-        unsigned char hdr[NSPA_MIDI_HDR_BYTES];
-        hdr[0] = static_cast<unsigned char> (portIndex);
-        hdr[1] = static_cast<unsigned char> (size & 0xFFu);
-        hdr[2] = static_cast<unsigned char> ((size >> 8) & 0xFFu);
+        void* buf = cachedOutBufs[portIndex];
+        if (buf == nullptr)
+            return false; /* port disabled or buffer unavailable */
 
-        const size_t needed = NSPA_MIDI_HDR_BYTES + static_cast<size_t> (size);
-        if (element::jack_ringbuffer_write_space (outMidiRb) < needed)
+        /* Clamp negative offsets to 0 — JackMidiOutputNode may receive
+         * an event with a stale samplePosition < 0 from upstream
+         * scheduling (e.g. MidiMessageCollector replaying queued
+         * events).  Sample offsets >= numSamples are technically
+         * invalid for the current period; libjack tolerates them by
+         * deferring the write, but they shouldn't happen in practice. */
+        const jack_nframes_t time = static_cast<jack_nframes_t> (sampleOffset > 0 ? sampleOffset : 0);
+        if (element::jack_midi_event_write (buf, time, data, static_cast<size_t> (size)) != 0)
             return false;
-
-        element::jack_ringbuffer_write (outMidiRb, reinterpret_cast<const char*> (hdr), NSPA_MIDI_HDR_BYTES);
-        element::jack_ringbuffer_write (outMidiRb, reinterpret_cast<const char*> (data), static_cast<size_t> (size));
+        midiOutputDidSend.store (true, std::memory_order_relaxed);
         return true;
     }
 
     int getNumJackMidiOutputPorts() const noexcept override
     {
         return outputMidiPorts.size();
+    }
+
+    /** Element: returns true and clears the flag if any successful
+        JACK MIDI output write landed during the most recent period.
+        Polled once per audio callback by AudioEngine to drive the UI
+        activity indicator.  Same-thread same-period — no ordering
+        beyond per-access atomicity required. */
+    bool consumeMidiOutputActivity() noexcept
+    {
+        return midiOutputDidSend.exchange (false, std::memory_order_relaxed);
     }
 
     int getOutputLatencyInSamples() override
@@ -921,7 +898,7 @@ private:
                     outChans[numActiveOutChans++] = (float*) out;
         }
 
-        /* Element-NSPA: native JACK MIDI input drain — RT-inline,
+        /* Element: native JACK MIDI input drain — RT-inline,
          * sample-accurate.  For each Element-registered MIDI input
          * port, read JACK MIDI events and push them into
          * currentPeriodMidiInput preserving jack_midi_event_t::time as
@@ -943,10 +920,10 @@ private:
         if (! inputMidiPorts.isEmpty())
         {
             const int numPorts = inputMidiPorts.size();
-            /* Element-NSPA: read the per-port enable mask once per
-             * period.  Single relaxed atomic load — UI thread can
-             * mutate the mask concurrently; we don't need ordering
-             * stronger than per-access atomicity. */
+            /* Element: read the per-port enable mask once per period.
+             * Single relaxed atomic load — UI thread can mutate the
+             * mask concurrently; we don't need ordering stronger than
+             * per-access atomicity. */
             const uint32_t inputMask = client.getMidiInputEnableMask();
             for (int p = 0; p < numPorts; ++p)
             {
@@ -961,7 +938,7 @@ private:
                 for (uint32_t j = 0; j < count; ++j)
                 {
                     jack_midi_event_t ev;
-                    if (element::jack_midi_event_get (&ev, buf, j) != 0 || ev.size == 0 || ev.size > NSPA_MIDI_EVENT_MAX)
+                    if (element::jack_midi_event_get (&ev, buf, j) != 0 || ev.size == 0)
                         continue;
 
                     /* Sample-accurate offset: ev.time is the JACK frame
@@ -985,53 +962,34 @@ private:
             }
         }
 
-        /* Element-NSPA: native JACK MIDI output fill.  Clear all output
-         * port buffers first, then drain the outMidiRb ringbuffer and
-         * dispatch each event to its target port at sample offset 0
-         * (sample-accurate output scheduling is a future enhancement). */
-        if (outMidiRb && ! outputMidiPorts.isEmpty())
+        /* Element: native JACK MIDI output — clear + cache every
+         * configured output port's libjack buffer BEFORE the audio
+         * callback.  JackMidiOutputNode (and any other graph consumer
+         * that finds the sink via dynamic_cast) writes events directly
+         * via writeJackMidiOutput, which targets the cached buffer
+         * with the caller's original sample offset.  Disabled ports
+         * cache a null pointer so writeJackMidiOutput drops cleanly.
+         * cachedOutBufs / cachedNumOutPorts are only valid for the
+         * duration of this process() call; they are not touched after
+         * the audio callback returns. */
+        cachedNumOutPorts = juce::jmin (outputMidiPorts.size(), MAX_JACK_MIDI_OUT_PORTS);
+        if (cachedNumOutPorts > 0)
         {
-            const int numOutPorts = outputMidiPorts.size();
-            void* outBufs[64];  /* matches NSPA_MIDI_MAX_OUT_CACHE — see header */
-            const int numCached = jmin (numOutPorts, 64);
-            for (int p = 0; p < numCached; ++p)
+            const uint32_t outputMask = client.getMidiOutputEnableMask();
+            for (int p = 0; p < cachedNumOutPorts; ++p)
             {
                 auto* port = outputMidiPorts.getUnchecked (p);
-                outBufs[p] = port ? element::jack_port_get_buffer (port, static_cast<jack_nframes_t> (numSamples)) : nullptr;
-                if (outBufs[p]) element::jack_midi_clear_buffer (outBufs[p]);
-            }
-
-            /* Element-NSPA: outbound per-port enable mask.  Same shape
-             * as inbound — single relaxed atomic load per period. */
-            const uint32_t outputMask = client.getMidiOutputEnableMask();
-
-            while (element::jack_ringbuffer_read_space (outMidiRb) >= NSPA_MIDI_HDR_BYTES)
-            {
-                unsigned char hdr[NSPA_MIDI_HDR_BYTES];
-                if (element::jack_ringbuffer_peek (outMidiRb, reinterpret_cast<char*> (hdr), NSPA_MIDI_HDR_BYTES) < NSPA_MIDI_HDR_BYTES)
-                    break;
-                const uint8_t portIdx = hdr[0];
-                const uint16_t evSize = static_cast<uint16_t> (hdr[1] | (static_cast<uint16_t> (hdr[2]) << 8));
-                if (evSize == 0 || evSize > NSPA_MIDI_EVENT_MAX) break;
-
-                if (element::jack_ringbuffer_read_space (outMidiRb) < NSPA_MIDI_HDR_BYTES + evSize)
-                    break;
-                element::jack_ringbuffer_read_advance (outMidiRb, NSPA_MIDI_HDR_BYTES);
-
-                unsigned char data[NSPA_MIDI_EVENT_MAX];
-                element::jack_ringbuffer_read (outMidiRb, reinterpret_cast<char*> (data), evSize);
-
-                /* Drop events targeting a disabled port (toggled off
-                 * in the MIDI preferences panel).  Still drained from
-                 * the ringbuffer so it doesn't back up. */
-                if (portIdx < numCached
-                    && outBufs[portIdx]
-                    && (outputMask & (1u << static_cast<unsigned> (portIdx))))
+                if (port == nullptr || ! (outputMask & (1u << static_cast<unsigned> (p))))
                 {
-                    element::jack_midi_event_write (outBufs[portIdx], 0, data, evSize);
+                    cachedOutBufs[p] = nullptr;
+                    continue;
                 }
+                void* buf = element::jack_port_get_buffer (port, static_cast<jack_nframes_t> (numSamples));
+                cachedOutBufs[p] = buf;
+                if (buf) element::jack_midi_clear_buffer (buf);
             }
         }
+        midiOutputDidSend.store (false, std::memory_order_relaxed);
 
         const ScopedLock sl (callbackLock);
 
@@ -1050,6 +1008,15 @@ private:
             for (int i = 0; i < numActiveOutChans; ++i)
                 juce::zeromem (outChans[i], static_cast<size_t> (numSamples) * sizeof (float));
         }
+
+        /* Buffer pointers are only valid inside this JACK process
+         * callback.  Invalidate them now so a stray writeJackMidiOutput
+         * fired outside the callback window (e.g. a late MIDI flush
+         * during shutdown) drops cleanly instead of dereferencing
+         * freed JACK port memory. */
+        for (int p = 0; p < cachedNumOutPorts; ++p)
+            cachedOutBufs[p] = nullptr;
+        cachedNumOutPorts = 0;
     }
 
     static int processCallback (jack_nframes_t nframes, void* callbackArgument)
@@ -1146,30 +1113,38 @@ private:
     Array<jack_port_t*> inputPorts, outputPorts;
     BigInteger activeInputChannels, activeOutputChannels;
 
-    /* Element-NSPA: native JACK MIDI port storage.
+    /* Element: native JACK MIDI port storage.  Both directions are
+     * RT-inline — see the bindings comment at the top of this file
+     * for the threading model.
      *
-     *   inputMidiPorts:  drained RT-inline into currentPeriodMidiInput
-     *                    every JACK process callback.  AudioEngine
-     *                    consumes the buffer in the synchronous audio
-     *                    callback that follows (same thread, same
-     *                    period) via the JackMidiInputProvider
-     *                    interface.  No cross-thread handoff needed.
+     *   inputMidiPorts:   drained at the start of every JACK process
+     *                     callback into currentPeriodMidiInput + per-
+     *                     port buffers (read by the audio callback /
+     *                     JackMidiInputNode on the same thread).
      *
-     *   outputMidiPorts: filled per period from outMidiRb, which is
-     *                    written by Element's audio thread (graph
-     *                    callback).  The ringbuffer is mlocked to
-     *                    prevent paging from the RT reader; outbound-
-     *                    only since the inbound path is now intra-
-     *                    thread.  Header format on the wire (3 bytes):
-     *                        [0] port index (uint8)
-     *                        [1] event size low byte
-     *                        [2] event size high byte
-     *                    followed by raw MIDI bytes.  Caps per-event
-     *                    at NSPA_MIDI_EVENT_MAX. */
+     *   outputMidiPorts:  cleared + their libjack buffers cached into
+     *                     cachedOutBufs[] BEFORE the audio callback.
+     *                     JackMidiOutputNode writes events directly to
+     *                     the cached buffer via writeJackMidiOutput
+     *                     with the event's original sample offset. */
     Array<jack_port_t*> inputMidiPorts, outputMidiPorts;
-    jack_ringbuffer_t*  outMidiRb = nullptr;
 
-    /* Element-NSPA: per-period inbound JACK MIDI staging buffers.
+    /* Per-period cache of libjack output port buffers.  Populated at
+     * the top of process(); cleared after the audio callback returns
+     * so out-of-window writes drop instead of touching freed memory.
+     * Indexed by JACK MIDI output port number (0-based).  A null
+     * pointer means the port is disabled by the user mask or
+     * unavailable for some other reason. */
+    void* cachedOutBufs[MAX_JACK_MIDI_OUT_PORTS] {};
+    int   cachedNumOutPorts = 0;
+
+    /* Outbound MIDI activity flag — flipped by writeJackMidiOutput on
+     * any successful send, polled + cleared by AudioEngine after the
+     * graph render so the UI activity indicator ticks once per period
+     * if any JACK MIDI output was emitted. */
+    std::atomic<bool> midiOutputDidSend { false };
+
+    /* Element: per-period inbound JACK MIDI staging buffers.
      * Populated by the JACK process callback (RT) at sample-accurate
      * offsets, read by AudioEngine via getCurrentJackMidiInput() and
      * by JackMidiInputNode via getCurrentJackMidiInputForPort() in

@@ -26,7 +26,7 @@ struct Jack
     static int getPortNameSize();
 };
 
-/** Element-NSPA: sample-accurate JACK MIDI input handoff.
+/** Element: sample-accurate JACK MIDI input handoff.
  *
  *  JUCE's AudioIODeviceCallback API has no MIDI parameter, so the JACK
  *  driver exposes per-period MIDI events through this side-channel:
@@ -69,31 +69,45 @@ public:
     virtual int getNumJackMidiInputPorts() const noexcept = 0;
 };
 
-/** Element-NSPA: outbound JACK MIDI sink — symmetric counterpart of
+/** Element: outbound JACK MIDI sink — symmetric counterpart of
  *  JackMidiInputProvider.  Implemented by JackAudioIODevice, queried
  *  via dynamic_cast from JackMidiOutputNode.
  *
  *  Calls land on the same RT thread as the JACK process callback
- *  (Element's audio callback IS the JACK process callback in the
- *  middle of its work).  pushMidiEvent writes to a lock-free
- *  jack_ringbuffer (mlocked) — the JACK process callback drains it
- *  into the actual midi_out_N port buffers at the start of the next
- *  period.  That's a one-period delay; acceptable for outbound MIDI
- *  (Wine drivers + most DAWs run the same shape). */
+ *  (JUCE's audio callback IS the JACK process callback in the middle
+ *  of its work).  JackAudioIODevice clears and caches every JACK MIDI
+ *  output port's buffer at the start of each period, BEFORE the audio
+ *  callback runs.  writeJackMidiOutput then dispatches each event
+ *  directly to libjack via jack_midi_event_write with the caller's
+ *  sample offset — zero added latency, no ringbuffer round-trip,
+ *  sample-accurate output scheduling.  The cached buffer pointer is
+ *  valid only for the duration of the audio callback that opened it. */
 class JackMidiOutputSink
 {
 public:
     virtual ~JackMidiOutputSink() = default;
 
-    /** Queue a MIDI event for delivery on element:midi_out_<portIndex+1>.
-        Returns true if the event was queued (ringbuffer had room); false
-        on full ring or out-of-range port index.  The data buffer is
-        copied; caller does not need to keep it alive. */
-    virtual bool pushJackMidiOutput (int portIndex, const juce::uint8* data, int size) noexcept = 0;
+    /** Write a MIDI event directly to element:midi_out_<portIndex+1>
+        at the given sample offset within the current period.  Returns
+        true on success; false on out-of-range port index, disabled
+        port, null port buffer, or libjack rejection (e.g. event too
+        large for the port buffer).  The data buffer is copied by
+        libjack; caller does not need to keep it alive. */
+    virtual bool writeJackMidiOutput (int portIndex,
+                                      int sampleOffset,
+                                      const juce::uint8* data,
+                                      int size) noexcept = 0;
 
     /** Number of configured JACK MIDI output ports.  Bounds the valid
-        range for pushJackMidiOutput. */
+        range for writeJackMidiOutput. */
     virtual int getNumJackMidiOutputPorts() const noexcept = 0;
+
+    /** Element: returns true (and resets the flag) if any successful
+        writeJackMidiOutput call landed during the current period.
+        Polled by AudioEngine once per audio callback to light the
+        UI "MIDI Tx" indicator.  Same-thread same-period; relaxed
+        atomic semantics are sufficient. */
+    virtual bool consumeMidiOutputActivity() noexcept = 0;
 };
 
 class JackPort final : public juce::ReferenceCountedObject
@@ -161,7 +175,7 @@ public:
     void setNumMainInputs (int n) noexcept  { numMainIns  = n > 0 ? n : 0; }
     void setNumMainOutputs (int n) noexcept { numMainOuts = n > 0 ? n : 0; }
 
-    /** Element-NSPA: forced JACK MIDI port counts.  Same semantics as
+    /** Element: forced JACK MIDI port counts.  Same semantics as
      *  the audio port count setters above.  N MIDI input ports are
      *  registered as "midi_in_1".."midi_in_N" and N MIDI output ports
      *  as "midi_out_1".."midi_out_M".  Takes effect on next audio
@@ -171,7 +185,7 @@ public:
     void setNumMidiInputs  (int n) noexcept { numMidiIns  = n > 0 ? n : 0; }
     void setNumMidiOutputs (int n) noexcept { numMidiOuts = n > 0 ? n : 0; }
 
-    /** Element-NSPA: per-port enable bitmasks for native JACK MIDI.
+    /** Element: per-port enable bitmasks for native JACK MIDI.
         Bit N (0-indexed) controls whether events from / to midi_in_N+1
         / midi_out_N+1 are routed through the JACK driver's RT drain/
         fill paths.  Read with relaxed atomics from the RT JACK process
@@ -257,7 +271,7 @@ public:
     /** Query for ports */
     void getPorts (juce::StringArray& dest, juce::String nameRegex = {}, juce::String typeRegex = {}, uint64_t flags = 0);
 
-    /** Element-NSPA: return the list of remote ports currently connected
+    /** Element: return the list of remote ports currently connected
         to one of Element's own JACK MIDI ports.  portIndex is 0-based
         and resolved against the configured port count + naming scheme
         ("<client>:midi_in_<N+1>" / "<client>:midi_out_<N+1>").  Used by
@@ -274,7 +288,7 @@ private:
     jack_client_t* client;
     juce::String name, mainInPrefix, mainOutPrefix;
     int numMainIns, numMainOuts;
-    /* Element-NSPA: forced MIDI port counts (0 = none).  Unlike the
+    /* Element: forced MIDI port counts (0 = none).  Unlike the
      * audio counts, there's no "mirror hardware" mode for MIDI — JACK
      * MIDI is a host-declared concept, so 0 simply means no Element-
      * exposed JACK MIDI ports.  Counts > 0 cause JackAudioIODevice to
@@ -282,7 +296,7 @@ private:
      * to the audio process callback. */
     int numMidiIns  = 0;
     int numMidiOuts = 0;
-    /* Element-NSPA: per-port enable bitmasks (bit N = port N+1).
+    /* Element: per-port enable bitmasks (bit N = port N+1).
      * Default = all enabled.  Live-readable from the RT JACK process
      * callback via relaxed atomics; UI mutates via the setters above. */
     std::atomic<uint32_t> midiInEnableMask  { ~0u };

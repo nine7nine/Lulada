@@ -306,11 +306,12 @@ void Services::handleMessage (const Message& msg)
         sess->openFile (osm->file);
         find<UI>()->recentFiles().addFile (osm->file);
     }
+#if ! ELEMENT_USE_JACK
     else if (const auto* mdm = dynamic_cast<const AddMidiDeviceMessage*> (&msg))
     {
         ec->addMidiDeviceNode (mdm->device, mdm->inputDevice);
     }
-#if ELEMENT_USE_JACK
+#else
     else if (const auto* jmim = dynamic_cast<const AddJackMidiInputMessage*> (&msg))
     {
         ec->addJackMidiInputNode (jmim->portIndex);

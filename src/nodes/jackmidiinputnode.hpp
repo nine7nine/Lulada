@@ -18,7 +18,7 @@
 
 namespace element {
 
-/** Element-NSPA: native JACK MIDI input source node.
+/** Element: native JACK MIDI input source node.
  *
  *  Each instance is bound to a single JACK MIDI input port
  *  (element:midi_in_<portIndex+1>).  At processBlock time it copies

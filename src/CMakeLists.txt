@@ -67,7 +67,14 @@ target_compile_definitions(element
         JUCE_PLUGINHOST_LV2=1
         JUCE_PLUGINHOST_VST3=1
         JUCE_PLUGINHOST_AU=1
-        JUCE_VST3_CAN_REPLACE_VST2=0)
+        JUCE_VST3_CAN_REPLACE_VST2=0
+        # Element: JACK-only audio + MIDI on this fork — JUCE's ALSA
+        # backend (audio device + ALSA-seq MIDI) is compiled out
+        # entirely.  Native JACK handles both directions with sample-
+        # accurate, RT-inline delivery.  See engine/jack.cpp +
+        # engine/midiengine.cpp for the JACK pipeline.
+        JUCE_ALSA=0
+        JUCE_USE_ALSA=0)
 
 target_link_libraries(element
     PUBLIC

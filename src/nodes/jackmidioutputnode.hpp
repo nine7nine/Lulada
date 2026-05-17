@@ -13,15 +13,20 @@
 
 namespace element {
 
-/** Element-NSPA: native JACK MIDI output sink node.
+/** Element: native JACK MIDI output sink node.
  *
  *  Each instance is bound to a single JACK MIDI output port
  *  (element:midi_out_<portIndex+1>).  At processBlock time it iterates
- *  the input MIDI buffer and pushes each event into the
- *  JackMidiOutputSink — written to outMidiRb on the same RT thread,
- *  drained into the actual JACK port buffer at the start of the next
- *  period.  One-period output delay, matching the wine-nspa WinMM
- *  JACK driver pattern.
+ *  the input MIDI buffer and writes each event directly to libjack via
+ *  the JackMidiOutputSink with the event's original sample offset
+ *  preserved — zero added latency, sample-accurate output scheduling.
+ *
+ *  The graph render runs synchronously inside the JACK process
+ *  callback (JUCE's audio callback IS the JACK process callback on
+ *  this device type), so the output port buffer cached by
+ *  JackAudioIODevice::process() at the top of the period is live and
+ *  writable at exactly this point.  There is no ringbuffer round-trip
+ *  and no one-period delay.
  *
  *  Multiple instances can coexist with different port indices, giving
  *  the user per-destination routing (drum machine track →
@@ -86,13 +91,17 @@ public:
             return;
         }
 
+        /* Iterate with sample positions preserved — JackAudioIODevice
+         * has already cached + cleared the libjack buffer for this
+         * period, so each write lands at the event's original frame
+         * offset within the current numSamples. */
         for (const auto m : midiMessages)
         {
             const auto& msg = m.getMessage();
             const auto* raw = msg.getRawData();
             const int size = msg.getRawDataSize();
             if (raw != nullptr && size > 0)
-                sink->pushJackMidiOutput (portIndex, raw, size);
+                sink->writeJackMidiOutput (portIndex, m.samplePosition, raw, size);
         }
 
         midiMessages.clear();

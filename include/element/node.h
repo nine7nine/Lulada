@@ -26,13 +26,22 @@ extern "C" {
 #define EL_NODE_ID_MIDI_CHANNEL_MAP   "element.midiChannelMap"
 #define EL_NODE_ID_MIDI_INPUT_DEVICE  "element.midiInputDevice"
 #define EL_NODE_ID_MIDI_OUTPUT_DEVICE "element.midiOutputDevice"
-/* Element-NSPA: native JACK MIDI input node — receives events from one
+/* Element: native JACK MIDI input node — receives events from one
  * specific element:midi_in_N JACK port, sample-accurate, RT-inline. */
 #define EL_NODE_ID_JACK_MIDI_INPUT    "element.jackMidiInput"
-/* Element-NSPA: native JACK MIDI output node — sends events to one
- * specific element:midi_out_N JACK port via outMidiRb (one-period
- * delivery delay, symmetric to wine-nspa's WinMM JACK driver). */
+/* Element: native JACK MIDI output node — sends events to one
+ * specific element:midi_out_N JACK port directly via libjack,
+ * sample-accurate, zero added latency. */
 #define EL_NODE_ID_JACK_MIDI_OUTPUT   "element.jackMidiOutput"
+/* Element: combined-mode JACK MIDI source/sink nodes — receive every
+ * enabled inbound JACK MIDI port merged into a single stream, or
+ * broadcast a single MIDI stream to every enabled outbound JACK MIDI
+ * port.  Functional equivalent of the legacy ALSA-seq
+ * MidiInput/OutputDevice nodes (which have no working backing on the
+ * JACK build), for users who want one MIDI source/sink without per-
+ * port routing. */
+#define EL_NODE_ID_JACK_MIDI_INPUT_ALL  "element.jackMidiInputAll"
+#define EL_NODE_ID_JACK_MIDI_OUTPUT_ALL "element.jackMidiOutputAll"
 #define EL_NODE_ID_PLACEHOLDER        "element.placeholder"
 #define EL_NODE_ID_REVERB             "element.reverb"
 #define EL_NODE_ID_WET_DRY            "element.wetDry"
@@ -83,6 +92,8 @@ extern "C" {
 #define EL_NODE_UID_MIDI_SET_LIST         1028
 #define EL_NODE_UID_JACK_MIDI_INPUT       1029
 #define EL_NODE_UID_JACK_MIDI_OUTPUT      1030
+#define EL_NODE_UID_JACK_MIDI_INPUT_ALL   1031
+#define EL_NODE_UID_JACK_MIDI_OUTPUT_ALL  1032
 
 #ifdef __cplusplus
 }
