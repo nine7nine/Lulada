@@ -295,9 +295,19 @@ void EngineService::addGraph()
     auto engine = world.audio();
     auto session = world.session();
 
+    /* Element: prefer the device's registered port count.  See the
+     * matching reasoning in SessionService::loadNewSessionData. */
+    auto* device = world.devices().getCurrentAudioDevice();
+    int numIn  = device != nullptr ? device->getInputChannelNames().size()  : 2;
+    int numOut = device != nullptr ? device->getOutputChannelNames().size() : 2;
+    if (numIn  <= 0) numIn  = engine ? engine->getNumChannels (true)  : 2;
+    if (numOut <= 0) numOut = engine ? engine->getNumChannels (false) : 2;
+    if (numIn  <= 0) numIn  = 2;
+    if (numOut <= 0) numOut = 2;
+
     Node node (Graph::create ("Graph " + String (session->getNumGraphs() + 1),
-                              engine->getNumChannels (true),
-                              engine->getNumChannels (false),
+                              numIn,
+                              numOut,
                               true,
                               true));
 

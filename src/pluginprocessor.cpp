@@ -466,7 +466,14 @@ void PluginProcessor::initialize()
     // re-loads back to back.
     engine->prepareExternalPlayback (sampleRate, bufferSize, getTotalNumInputChannels(), getTotalNumOutputChannels());
     session->clear();
-    session->addGraph (Node::createDefaultGraph ("Graph 1"), true);
+    /* Match the initial graph's audio I/O channel count to whatever
+     * the plugin host is currently giving us — 8-in/8-out hosts spawn
+     * an 8-channel Audio In + Audio Out node pair instead of the
+     * historical hard-coded stereo default. */
+    session->addGraph (Node::createDefaultGraph ("Graph 1",
+                                                 getTotalNumInputChannels(),
+                                                 getTotalNumOutputChannels()),
+                       true);
 
     auto& services (context->services());
     services.activate();

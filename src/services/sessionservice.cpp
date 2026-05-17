@@ -4,6 +4,7 @@
 #include <element/graph.hpp>
 #include <element/node.hpp>
 #include <element/context.hpp>
+#include <element/devices.hpp>
 #include <element/settings.hpp>
 #include <element/services.hpp>
 #include <element/engine.hpp>
@@ -287,10 +288,21 @@ void SessionService::loadNewSessionData()
 
     if (! wasLoaded)
     {
-        auto engine = context().audio();
-        int fallbackCount = 2;
-        int numIn = engine != nullptr ? engine->getNumChannels (true) : fallbackCount;
-        int numOut = engine != nullptr ? engine->getNumChannels (false) : fallbackCount;
+        /* Element: prefer the device's registered port count over the
+         * audio engine's *active* channel count.  AudioEngine::
+         * getNumChannels reflects which channels are currently
+         * connected / checked in the JUCE Active Channels selector,
+         * which can be a subset of the device's actual port count.
+         * The user expects the Graph I/O Audio In/Out node port
+         * count to match what they configured (e.g. 8 JACK output
+         * ports), not just whatever subset they happen to have
+         * connected to a downstream destination at session-create
+         * time. */
+        auto* device = context().devices().getCurrentAudioDevice();
+        int numIn  = device != nullptr ? device->getInputChannelNames().size()  : 2;
+        int numOut = device != nullptr ? device->getOutputChannelNames().size() : 2;
+        if (numIn  <= 0) numIn  = 2;
+        if (numOut <= 0) numOut = 2;
         currentSession->clear();
         currentSession->addGraph (
             Graph::create ("Graph", numIn, numOut, true, true),

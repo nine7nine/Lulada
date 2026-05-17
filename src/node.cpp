@@ -176,23 +176,43 @@ bool Node::hasModifiedName() const noexcept
 }
 
 //=============================================================================
-Node Node::createDefaultGraph (const String& name)
+Node Node::createDefaultGraph (const String& name, int numAudioIns, int numAudioOuts)
 {
     Node graph (types::Graph);
     graph.setProperty (tags::name, name);
     ValueTree gports = graph.getPortsValueTree();
 
+    /* Clamp to a sane range — 0 collapses to a stereo default so the
+     * graph isn't completely silent.  Upper bound matches the largest
+     * channel count Element's MeterBridge can reasonably display. */
+    if (numAudioIns  <= 0) numAudioIns  = 2;
+    if (numAudioOuts <= 0) numAudioOuts = 2;
+    numAudioIns  = std::min (numAudioIns,  32);
+    numAudioOuts = std::min (numAudioOuts, 32);
+
     int portIdx = 0;
-    gports.addChild (Port ("Audio In 1", tags::audio, tags::input, portIdx++).data(), -1, 0);
-    gports.addChild (Port ("Audio In 2", tags::audio, tags::input, portIdx++).data(), -1, 0);
+    for (int i = 1; i <= numAudioIns; ++i)
+        gports.addChild (Port ("Audio In " + String (i), tags::audio, tags::input, portIdx++).data(), -1, 0);
+#if ! ELEMENT_USE_JACK
     gports.addChild (Port ("MIDI In", tags::midi, tags::input, portIdx++).data(), -1, 0);
-    gports.addChild (Port ("Audio Out 1", tags::audio, tags::output, portIdx++).data(), -1, 0);
-    gports.addChild (Port ("Audio Out 2", tags::audio, tags::output, portIdx++).data(), -1, 0);
+#endif
+    for (int i = 1; i <= numAudioOuts; ++i)
+        gports.addChild (Port ("Audio Out " + String (i), tags::audio, tags::output, portIdx++).data(), -1, 0);
+#if ! ELEMENT_USE_JACK
     gports.addChild (Port ("MIDI Out", tags::midi, tags::output, portIdx++).data(), -1, 0);
+#endif
 
     ValueTree nodes = graph.getNodesValueTree();
+#if ! ELEMENT_USE_JACK
     const auto types = StringArray ({ "audio.input", "audio.output", "midi.input", "midi.output" });
     const auto names = StringArray ({ "Audio In", "Audio Out", "MIDI In", "MIDI Out" });
+#else
+    /* Element: JACK build does not auto-instantiate the legacy MIDI
+     * pseudo-nodes — see IONodeEnforcer in graphmanager.cpp + the
+     * dedicated JackMidi*Node graph nodes. */
+    const auto types = StringArray ({ "audio.input", "audio.output" });
+    const auto names = StringArray ({ "Audio In", "Audio Out" });
+#endif
     uint32 nodeId = 1;
 
     for (const auto& t : types)
@@ -212,23 +232,20 @@ Node Node::createDefaultGraph (const String& name)
             ioNode.setProperty (tags::relativeX, 0.25f, 0)
                 .setProperty (tags::relativeY, 0.25f, 0)
                 .setProperty ("numAudioIns", 0, 0)
-                .setProperty ("numAudioOuts", 2, 0);
+                .setProperty ("numAudioOuts", numAudioIns, 0);
 
-            Port port ("Port", tags::audio, tags::output, (uint32) portIdx++);
-            ports.addChild (port.data(), -1, 0);
-            port = Port ("Port", tags::audio, tags::output, (int) portIdx++);
-            ports.addChild (port.data(), -1, 0);
+            for (int i = 0; i < numAudioIns; ++i)
+                ports.addChild (Port ("Port", tags::audio, tags::output, (uint32) portIdx++).data(), -1, 0);
         }
         else if (t == "audio.output")
         {
             ioNode.setProperty (tags::relativeX, 0.25f, 0)
                 .setProperty (tags::relativeY, 0.75f, 0)
-                .setProperty ("numAudioIns", 2, 0) // TODO: Needed?
-                .setProperty ("numAudioOuts", 0, 0); // TODO: Needed?
+                .setProperty ("numAudioIns", numAudioOuts, 0)
+                .setProperty ("numAudioOuts", 0, 0);
 
-            Port port ("Port", tags::audio, tags::input, (uint32) portIdx++);
-            ports.addChild (port.data(), -1, 0);
-            port = Port ("Port", tags::audio, tags::input, (int) portIdx++);
+            for (int i = 0; i < numAudioOuts; ++i)
+                ports.addChild (Port ("Port", tags::audio, tags::input, (uint32) portIdx++).data(), -1, 0);
         }
         else if (t == "midi.input")
         {

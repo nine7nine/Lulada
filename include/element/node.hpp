@@ -475,8 +475,14 @@ public:
     */
     static bool connectionExists (const juce::ValueTree& arcs, const uint32 sourceNode, const uint32 sourcePort, const uint32 destNode, const uint32 destPort, const bool checkMissing = false);
 
-    /** Creates a default graph structure with optional name */
-    static Node createDefaultGraph (const juce::String& name = String());
+    /** Creates a default graph structure with optional name + audio
+        I/O channel counts.  Counts default to 2 (stereo); the JACK
+        build's callers pass the active audio device's channel count
+        so e.g. an 8-channel device produces an 8-channel Graph I/O
+        Audio In + Audio Out node pair on first session creation. */
+    static Node createDefaultGraph (const juce::String& name = String(),
+                                    int numAudioIns  = 2,
+                                    int numAudioOuts = 2);
 
     /** Creates an empty graph model */
     static Node createGraph (const juce::String& name = String());
