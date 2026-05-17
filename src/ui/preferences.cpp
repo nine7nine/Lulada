@@ -738,6 +738,13 @@ public:
           world (g),
           panic (*this)
     {
+#if ! ELEMENT_USE_JACK
+        /* Element-NSPA: the MIDI Output Device combo and output-latency
+         * slider drive JUCE's ALSA-seq MidiOutput pipeline, which this
+         * fork no longer uses (native JACK MIDI is the only output
+         * path; routing happens on the graph's midi_out_N ports).
+         * Compiled out under ELEMENT_USE_JACK to keep the prefs panel
+         * lean. */
         addAndMakeVisible (midiOutputLabel);
         midiOutputLabel.setFont (Font (FontOptions (12.0, Font::bold)));
         midiOutputLabel.setText ("MIDI Output Device", dontSendNotification);
@@ -763,9 +770,6 @@ public:
             if (auto e = world.audio())
                 e->applySettings (world.settings());
         };
-#if JUCE_WINDOWS
-        midiOutLatencyLabel.setEnabled (false);
-        midiOutLatency.setEnabled (false);
 #endif
 
         addAndMakeVisible (generateClockLabel);
@@ -804,11 +808,10 @@ public:
         startStopCont.addListener (this);
 
 #if ELEMENT_USE_JACK
-        /* Element-NSPA: JACK MIDI port section.  Appears above the
-         * legacy ALSA-seq "Active MIDI Inputs" list so users see the
-         * sample-accurate path first.  Header text reflects the
-         * configured port counts; the per-port list is populated by
-         * JackMidiPorts::updatePorts(). */
+        /* Element-NSPA: JACK MIDI ports are the only MIDI surface in
+         * this fork.  The legacy ALSA-seq "Active MIDI Inputs" section
+         * is compiled out below — the JACK section owns the full lower
+         * area of the panel. */
         addAndMakeVisible (jackMidiHeader);
         jackMidiHeader.setText ("JACK MIDI Ports", dontSendNotification);
         jackMidiHeader.setFont (Font (FontOptions (12.0f).withStyle ("Bold")));
@@ -816,15 +819,15 @@ public:
         jackMidiPorts = std::make_unique<JackMidiPorts> (*this);
         jackMidiView.setViewedComponent (jackMidiPorts.get(), false);
         addAndMakeVisible (jackMidiView);
-#endif
-
+#else
         addAndMakeVisible (midiInputHeader);
-        midiInputHeader.setText ("Active MIDI Inputs (ALSA-seq)", dontSendNotification);
+        midiInputHeader.setText ("Active MIDI Inputs", dontSendNotification);
         midiInputHeader.setFont (Font (FontOptions (12.0f).withStyle ("Bold")));
 
         midiInputs = std::make_unique<MidiInputs> (*this);
         midiInputView.setViewedComponent (midiInputs.get(), false);
         addAndMakeVisible (midiInputView);
+#endif
 
         setSize (300, 460);
 
@@ -843,11 +846,12 @@ public:
 
     void timerCallback() override
     {
+#if ! ELEMENT_USE_JACK
         if ((midiInputs && midiInputs->getNumDevices() != MidiInput::getAvailableDevices().size()) || midiOutput.getNumItems() - 1 != MidiOutput::getAvailableDevices().size())
         {
             updateDevices();
         }
-#if ELEMENT_USE_JACK
+#else
         /* Element-NSPA: rebuild the JACK port list when the configured
          * port count changes (user moved the Audio prefs slider) or
          * just refresh the connection labels otherwise. */
@@ -870,10 +874,12 @@ public:
         const int settingHeight = 22;
 
         Rectangle<int> r (getLocalBounds());
+#if ! ELEMENT_USE_JACK
         auto r2 = r.removeFromTop (settingHeight);
         midiOutputLabel.setBounds (r2.removeFromLeft (getWidth() / 2));
         midiOutput.setBounds (r2.withSizeKeepingCentre (r2.getWidth(), settingHeight));
         layoutSetting (r, midiOutLatencyLabel, midiOutLatency, getWidth() / 4);
+#endif
         layoutSetting (r, generateClockLabel, generateClock);
         layoutSetting (r, sendClockToInputLabel, sendClockToInput);
         layoutSetting (r, startStopContLabel, startStopCont);
@@ -882,30 +888,17 @@ public:
         r.removeFromTop (roundToInt ((double) spacingBetweenSections * 1.5));
 
 #if ELEMENT_USE_JACK
-        /* Element-NSPA: JACK MIDI section.  Allocate the upper third
-         * of the remaining region to the JACK port list; the legacy
-         * ALSA-seq list keeps the lower portion.  When no JACK MIDI
-         * ports are configured the section collapses to just the
-         * header so it stays informative without wasting space. */
+        /* Element-NSPA: JACK MIDI section owns the full lower area
+         * of the panel — the ALSA-seq list is compiled out. */
         jackMidiHeader.setBounds (r.removeFromTop (24));
-
-        int jackHeight = 0;
-        if (jackMidiPorts && (jackMidiPorts->numInputs > 0 || jackMidiPorts->numOutputs > 0))
-        {
-            const int desired = jackMidiPorts->computeHeight();
-            jackHeight = jmin (desired, r.getHeight() / 2);
-        }
-        jackMidiView.setBounds (r.removeFromTop (jackHeight));
+        jackMidiView.setBounds (r);
         if (jackMidiPorts)
             jackMidiPorts->updateSize();
-
-        r.removeFromTop (spacingBetweenSections);
-#endif
-
+#else
         midiInputHeader.setBounds (r.removeFromTop (24));
-
         midiInputView.setBounds (r);
         midiInputs->updateSize();
+#endif
     }
 
     void buttonClicked (Button* button) override
@@ -1381,6 +1374,7 @@ private:
 
     void updateDevices()
     {
+#if ! ELEMENT_USE_JACK
         outputs = MidiOutput::getAvailableDevices();
         midiOutput.clear (dontSendNotification);
         midiOutput.setTextWhenNoChoicesAvailable ("<none>");
@@ -1394,14 +1388,14 @@ private:
             ++i;
         }
 
-        midiInputs->updateDevices();
-#if ELEMENT_USE_JACK
+        if (midiInputs)
+            midiInputs->updateDevices();
+        updateInputSelection();
+        updateOutputSelection();
+#else
         if (jackMidiPorts)
             jackMidiPorts->updatePorts();
 #endif
-
-        updateInputSelection();
-        updateOutputSelection();
 
         resized();
     }

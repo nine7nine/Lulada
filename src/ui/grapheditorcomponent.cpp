@@ -487,12 +487,25 @@ void GraphEditorComponent::mouseDown (const MouseEvent& e)
             menu.addItem (4, "MIDI Output", true, graph.hasMidiOutputNode());
             menu.addSeparator();
 #endif
+#if ! ELEMENT_USE_JACK
+            /* Element-NSPA: per-device MIDI Input/Output submenus
+             * enumerate JUCE-ALSA-seq devices and route through
+             * MidiDeviceProcessor, which doesn't yet know about JACK
+             * MIDI ports.  Hidden on the JACK build: the "MIDI Input"
+             * / "MIDI Output" Graph I/O entries above already wire
+             * the graph's IONode pseudo-nodes to the top-level
+             * MidiBuffer (which carries native JACK MIDI events at
+             * sample-accurate offsets), so the per-device picker is
+             * redundant here.  Re-add as a JACK-port picker in
+             * Phase 3b once MidiDeviceProcessor learns to bind to a
+             * specific midi_in_N / midi_out_N port. */
             PopupMenu submenu;
             addMidiDevicesToMenu (submenu, true, 80000);
             menu.addSubMenu ("MIDI Input Device", submenu);
             submenu.clear();
             addMidiDevicesToMenu (submenu, false, 90000);
             menu.addSubMenu ("MIDI Output Device", submenu);
+#endif
         }
 
         menu.addSeparator();

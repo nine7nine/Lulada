@@ -20,6 +20,17 @@ using juce::XmlElement;
 //==============================================================================
 void MidiEngine::applySettings (Settings& settings)
 {
+#if ELEMENT_USE_JACK
+    /* Element-NSPA: ALSA-seq MIDI is disabled on this fork.  Native JACK
+     * MIDI is the only input path (sample-accurate, RT-inline; see
+     * JackAudioIODevice + the MIDI preferences "JACK MIDI Ports"
+     * section).  No JUCE MidiInputHolders are opened, no ALSA-seq
+     * enumeration happens, and the MIDI XML state from any prior
+     * (ALSA-enabled) install is ignored.  Orphaned XML entries persist
+     * but are harmless; they can be cleared by saving prefs once. */
+    juce::ignoreUnused (settings);
+    midiInsFromXml.clear();
+#else
     // Refresh MIDI device list before applying settings
     const auto midiInputs = MidiInput::getAvailableDevices();
     const auto midiOutputs = MidiOutput::getAvailableDevices();
@@ -52,6 +63,7 @@ void MidiEngine::applySettings (Settings& settings)
         info.identifier = data["defaultMidiOutputID"].toString();
         setDefaultMidiOutput (info);
     }
+#endif
 }
 
 void MidiEngine::writeSettings (Settings& settings)

@@ -623,6 +623,11 @@ void Settings::addItemsToMenu (Context& world, PopupMenu& menu)
     menu.addSeparator();
 
     int index = 0;
+#if ! ELEMENT_USE_JACK
+    /* Element-NSPA: ALSA-seq MIDI device submenus are dropped on the
+     * JACK build.  Native JACK MIDI ports are configured via the Audio
+     * preferences port-count selector and toggled on/off via the MIDI
+     * preferences "JACK MIDI Ports" section. */
     sub.clear();
     for (const auto& device : MidiInput::getAvailableDevices())
         sub.addItem (MidiInputDevice + index++, device.name, true, midi.isMidiInputEnabled (device));
@@ -633,6 +638,9 @@ void Settings::addItemsToMenu (Context& world, PopupMenu& menu)
     for (const auto& device : MidiOutput::getAvailableDevices())
         sub.addItem (MidiOutputDevice + index++, device.name, true, device.identifier == midi.getDefaultMidiOutputID());
     menu.addSubMenu ("MIDI Output Device", sub);
+#else
+    juce::ignoreUnused (midi);
+#endif
 
     if (auto* type = devices.getCurrentDeviceTypeObject())
     {
