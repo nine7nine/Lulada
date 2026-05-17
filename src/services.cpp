@@ -315,6 +315,10 @@ void Services::handleMessage (const Message& msg)
     {
         ec->addJackMidiInputNode (jmim->portIndex);
     }
+    else if (const auto* jmom = dynamic_cast<const AddJackMidiOutputMessage*> (&msg))
+    {
+        ec->addJackMidiOutputNode (jmom->portIndex);
+    }
 #endif
     else if (const auto* removeControllerMessage = dynamic_cast<const RemoveControllerMessage*> (&msg))
     {

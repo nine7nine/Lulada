@@ -12,6 +12,7 @@
 #include "nodes/mididevice.hpp"
 #if ELEMENT_USE_JACK
 #include "nodes/jackmidiinputnode.hpp"
+#include "nodes/jackmidioutputnode.hpp"
 #endif
 #include "nodes/placeholder.hpp"
 #include "engine/rootgraph.hpp"
@@ -194,10 +195,18 @@ bool Processor::isMidiDeviceNode() const
         return true;
 #if ELEMENT_USE_JACK
     /* Element-NSPA: JackMidiInputNode is a MIDI source node with no
-     * input ports (it pulls events directly from a JACK port). Treat
+     * input ports (it pulls events directly from a JACK port).  Treat
      * it like a MidiDeviceProcessor so Processor::setPorts does not
      * force-add a MIDI input port to it. */
     if (nullptr != dynamic_cast<JackMidiInputNode*> (getAudioProcessor()))
+        return true;
+    /* Symmetric: JackMidiOutputNode is a MIDI sink node — its single
+     * MIDI input port is created by the standard JUCE plugin port
+     * enumeration (acceptsMidi == true), so the auto-add wouldn't fire
+     * anyway, but recognising it here keeps the policy uniform with
+     * other MIDI device nodes and gives downstream UI checks a single
+     * predicate to match on. */
+    if (nullptr != dynamic_cast<JackMidiOutputNode*> (getAudioProcessor()))
         return true;
 #endif
     return false;

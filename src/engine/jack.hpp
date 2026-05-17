@@ -69,6 +69,33 @@ public:
     virtual int getNumJackMidiInputPorts() const noexcept = 0;
 };
 
+/** Element-NSPA: outbound JACK MIDI sink — symmetric counterpart of
+ *  JackMidiInputProvider.  Implemented by JackAudioIODevice, queried
+ *  via dynamic_cast from JackMidiOutputNode.
+ *
+ *  Calls land on the same RT thread as the JACK process callback
+ *  (Element's audio callback IS the JACK process callback in the
+ *  middle of its work).  pushMidiEvent writes to a lock-free
+ *  jack_ringbuffer (mlocked) — the JACK process callback drains it
+ *  into the actual midi_out_N port buffers at the start of the next
+ *  period.  That's a one-period delay; acceptable for outbound MIDI
+ *  (Wine drivers + most DAWs run the same shape). */
+class JackMidiOutputSink
+{
+public:
+    virtual ~JackMidiOutputSink() = default;
+
+    /** Queue a MIDI event for delivery on element:midi_out_<portIndex+1>.
+        Returns true if the event was queued (ringbuffer had room); false
+        on full ring or out-of-range port index.  The data buffer is
+        copied; caller does not need to keep it alive. */
+    virtual bool pushJackMidiOutput (int portIndex, const juce::uint8* data, int size) noexcept = 0;
+
+    /** Number of configured JACK MIDI output ports.  Bounds the valid
+        range for pushJackMidiOutput. */
+    virtual int getNumJackMidiOutputPorts() const noexcept = 0;
+};
+
 class JackPort final : public juce::ReferenceCountedObject
 {
 public:

@@ -29,6 +29,10 @@ extern "C" {
 /* Element-NSPA: native JACK MIDI input node — receives events from one
  * specific element:midi_in_N JACK port, sample-accurate, RT-inline. */
 #define EL_NODE_ID_JACK_MIDI_INPUT    "element.jackMidiInput"
+/* Element-NSPA: native JACK MIDI output node — sends events to one
+ * specific element:midi_out_N JACK port via outMidiRb (one-period
+ * delivery delay, symmetric to wine-nspa's WinMM JACK driver). */
+#define EL_NODE_ID_JACK_MIDI_OUTPUT   "element.jackMidiOutput"
 #define EL_NODE_ID_PLACEHOLDER        "element.placeholder"
 #define EL_NODE_ID_REVERB             "element.reverb"
 #define EL_NODE_ID_WET_DRY            "element.wetDry"
@@ -78,6 +82,7 @@ extern "C" {
 #define EL_NODE_UID_MCU                   1027
 #define EL_NODE_UID_MIDI_SET_LIST         1028
 #define EL_NODE_UID_JACK_MIDI_INPUT       1029
+#define EL_NODE_UID_JACK_MIDI_OUTPUT      1030
 
 #ifdef __cplusplus
 }

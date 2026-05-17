@@ -61,6 +61,10 @@ public:
         port (element:midi_in_<portIndex+1>) to the current root graph. */
     Node addJackMidiInputNode (int portIndex);
 
+    /** Element-NSPA: symmetric counterpart — adds a JACK MIDI output
+        sink node bound to element:midi_out_<portIndex+1>. */
+    Node addJackMidiOutputNode (int portIndex);
+
     /** Removes a node from the current graph */
     void removeNode (const uint32);
 

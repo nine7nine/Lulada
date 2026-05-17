@@ -499,12 +499,11 @@ void GraphEditorComponent::mouseDown (const MouseEvent& e)
             addMidiDevicesToMenu (submenu, false, 90000);
             menu.addSubMenu ("MIDI Output Device", submenu);
 #else
-            /* Element-NSPA: native JACK MIDI input source picker.
-             * One menu entry per configured midi_in_N port — clicking
-             * adds a JackMidiInputNode bound to that port, giving
-             * per-source routing (controller A → midi_in_1 → synth A;
-             * controller B → midi_in_2 → synth B).  Item IDs 80000..
-             * 80031 are reserved (one slot per supported port). */
+            /* Element-NSPA: native JACK MIDI source / sink pickers.
+             * One menu entry per configured midi_in_N / midi_out_N
+             * port — clicking adds the corresponding node bound to
+             * that port, giving per-source/per-destination routing.
+             * Item IDs 80000..80031 = inputs; 81000..81031 = outputs. */
             if (auto* world = ViewHelpers::getGlobals (this))
             {
                 auto& jack = world->devices().getJackClient();
@@ -523,6 +522,23 @@ void GraphEditorComponent::mouseDown (const MouseEvent& e)
                         submenu.addItem (80000 + i, label);
                     }
                     menu.addSubMenu ("JACK MIDI Input", submenu);
+                }
+
+                const int nout = jack.getNumMidiOutputs();
+                if (nout > 0)
+                {
+                    PopupMenu submenu;
+                    for (int i = 0; i < nout && i < 32; ++i)
+                    {
+                        juce::String label;
+                        label << "midi_out_" << (i + 1);
+                        auto conns = jack.getMidiPortConnections (i, false);
+                        if (! conns.isEmpty())
+                            label << "  " << juce::String (juce::CharPointer_UTF8 ("\xe2\x86\x92"))
+                                  << " " << conns[0];
+                        submenu.addItem (81000 + i, label);
+                    }
+                    menu.addSubMenu ("JACK MIDI Output", submenu);
                 }
             }
 #endif
@@ -547,11 +563,21 @@ void GraphEditorComponent::mouseDown (const MouseEvent& e)
         else if (result >= 80000 && result < 90000)
         {
 #if ELEMENT_USE_JACK
-            /* Element-NSPA: JACK MIDI input — result encodes port
-             * index (result - 80000).  Reserved range 80000..80031. */
-            const int portIndex = result - 80000;
-            ViewHelpers::postMessageFor (this,
-                                         new AddJackMidiInputMessage (portIndex));
+            /* Element-NSPA: JACK MIDI nodes — result encodes port
+             * index.  Input range 80000..80031; output range
+             * 81000..81031.  Anything else in 80000..89999 is unused. */
+            if (result >= 81000 && result < 81000 + 32)
+            {
+                const int portIndex = result - 81000;
+                ViewHelpers::postMessageFor (this,
+                                             new AddJackMidiOutputMessage (portIndex));
+            }
+            else if (result < 80000 + 32)
+            {
+                const int portIndex = result - 80000;
+                ViewHelpers::postMessageFor (this,
+                                             new AddJackMidiInputMessage (portIndex));
+            }
 #else
             ViewHelpers::postMessageFor (this,
                                          new AddMidiDeviceMessage (getMidiDeviceForMenuResult (result, true), true));

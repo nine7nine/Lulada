@@ -22,6 +22,7 @@
 #include "nodes/mididevice.hpp"
 #if ELEMENT_USE_JACK
 #include "nodes/jackmidiinputnode.hpp"
+#include "nodes/jackmidioutputnode.hpp"
 #endif
 #include "nodes/midisetlist.hpp"
 #include "nodes/placeholder.hpp"
@@ -173,6 +174,11 @@ void ElementAudioPluginFormat::findAllTypesForFile (OwnedArray<PluginDescription
         auto* const desc = ds.add (new PluginDescription());
         JackMidiInputNode (_context.devices()).fillInPluginDescription (*desc);
     }
+    else if (fileOrId == EL_NODE_ID_JACK_MIDI_OUTPUT)
+    {
+        auto* const desc = ds.add (new PluginDescription());
+        JackMidiOutputNode (_context.devices()).fillInPluginDescription (*desc);
+    }
 #endif
 }
 
@@ -197,6 +203,7 @@ StringArray ElementAudioPluginFormat::searchPathsForPlugins (const FileSearchPat
     results.add (EL_NODE_ID_MIDI_OUTPUT_DEVICE);
 #if ELEMENT_USE_JACK
     results.add (EL_NODE_ID_JACK_MIDI_INPUT);
+    results.add (EL_NODE_ID_JACK_MIDI_OUTPUT);
 #endif
     return results;
 }
@@ -251,6 +258,8 @@ AudioPluginInstance* ElementAudioPluginFormat::instantiatePlugin (const PluginDe
 #if ELEMENT_USE_JACK
     else if (desc.fileOrIdentifier == EL_NODE_ID_JACK_MIDI_INPUT)
         base = std::make_unique<JackMidiInputNode> (_context.devices());
+    else if (desc.fileOrIdentifier == EL_NODE_ID_JACK_MIDI_OUTPUT)
+        base = std::make_unique<JackMidiOutputNode> (_context.devices());
 #endif
 
     return base != nullptr ? base.release() : nullptr;

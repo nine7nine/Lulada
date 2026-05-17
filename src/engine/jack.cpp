@@ -453,7 +453,8 @@ static constexpr size_t NSPA_MIDI_HDR_BYTES = 3;
 
 //==============================================================================
 class JackAudioIODevice : public AudioIODevice,
-                          public JackMidiInputProvider
+                          public JackMidiInputProvider,
+                          public JackMidiOutputSink
 {
 public:
     JackAudioIODevice (JackClient& _client,
@@ -817,6 +818,42 @@ public:
     int getNumJackMidiInputPorts() const noexcept override
     {
         return currentPeriodMidiInputPerPort.size();
+    }
+
+    /* Element-NSPA: JackMidiOutputSink overrides.  pushJackMidiOutput
+     * is invoked from a graph node's processBlock — which on Element's
+     * JACK setup runs on the same RT thread as the JACK process
+     * callback.  Same-thread writer + reader on outMidiRb means the
+     * ringbuffer's lock-free semantics are overkill (no contention)
+     * but harmless; events queued mid-callback are picked up by the
+     * NEXT period's drain (one-period output delay, matching the
+     * established pattern in wine-nspa/dlls/winejack.drv/jackmidi.c). */
+    bool pushJackMidiOutput (int portIndex, const juce::uint8* data, int size) noexcept override
+    {
+        if (outMidiRb == nullptr || data == nullptr)
+            return false;
+        if (portIndex < 0 || portIndex >= outputMidiPorts.size())
+            return false;
+        if (size <= 0 || size > static_cast<int> (NSPA_MIDI_EVENT_MAX))
+            return false;
+
+        unsigned char hdr[NSPA_MIDI_HDR_BYTES];
+        hdr[0] = static_cast<unsigned char> (portIndex);
+        hdr[1] = static_cast<unsigned char> (size & 0xFFu);
+        hdr[2] = static_cast<unsigned char> ((size >> 8) & 0xFFu);
+
+        const size_t needed = NSPA_MIDI_HDR_BYTES + static_cast<size_t> (size);
+        if (element::jack_ringbuffer_write_space (outMidiRb) < needed)
+            return false;
+
+        element::jack_ringbuffer_write (outMidiRb, reinterpret_cast<const char*> (hdr), NSPA_MIDI_HDR_BYTES);
+        element::jack_ringbuffer_write (outMidiRb, reinterpret_cast<const char*> (data), static_cast<size_t> (size));
+        return true;
+    }
+
+    int getNumJackMidiOutputPorts() const noexcept override
+    {
+        return outputMidiPorts.size();
     }
 
     int getOutputLatencyInSamples() override

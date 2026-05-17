@@ -52,6 +52,14 @@ struct AddJackMidiInputMessage : public AppMessage
     const int portIndex;
 };
 
+/* Element-NSPA: symmetric counterpart — add a JACK MIDI output sink
+ * node bound to element:midi_out_<portIndex+1>. */
+struct AddJackMidiOutputMessage : public AppMessage
+{
+    explicit AddJackMidiOutputMessage (int port) : portIndex (port) {}
+    const int portIndex;
+};
+
 /** Send this to add a preset for a node */
 struct AddPresetMessage : public AppMessage
 {
