@@ -56,6 +56,12 @@ const char* Settings::audioJackOutputPortCountKey = "audioJackOutputPortCount";
 const char* Settings::audioJackInputMidiPortCountKey  = "audioJackInputMidiPortCount";
 const char* Settings::audioJackOutputMidiPortCountKey = "audioJackOutputMidiPortCount";
 
+/* Element-NSPA: per-port enable bitmasks for native JACK MIDI ports.
+ * Default = ~0u (all configured ports enabled).  See JackClient atomic
+ * mask + MIDI preferences panel "JACK MIDI Inputs/Outputs" section. */
+const char* Settings::audioJackInputMidiPortEnableMaskKey  = "audioJackInputMidiPortEnableMask";
+const char* Settings::audioJackOutputMidiPortEnableMaskKey = "audioJackOutputMidiPortEnableMask";
+
 //=============================================================================
 enum OptionsMenuItemId
 {

@@ -16,6 +16,9 @@
 
 #include "engine/midiengine.hpp"
 #include "engine/midipanic.hpp"
+#if ELEMENT_USE_JACK
+#include "engine/jack.hpp"
+#endif
 #include "messages.hpp"
 #include "auth.hpp"
 #include "ui/audiodeviceselector.hpp"
@@ -800,15 +803,30 @@ public:
                                       dontSendNotification);
         startStopCont.addListener (this);
 
+#if ELEMENT_USE_JACK
+        /* Element-NSPA: JACK MIDI port section.  Appears above the
+         * legacy ALSA-seq "Active MIDI Inputs" list so users see the
+         * sample-accurate path first.  Header text reflects the
+         * configured port counts; the per-port list is populated by
+         * JackMidiPorts::updatePorts(). */
+        addAndMakeVisible (jackMidiHeader);
+        jackMidiHeader.setText ("JACK MIDI Ports", dontSendNotification);
+        jackMidiHeader.setFont (Font (FontOptions (12.0f).withStyle ("Bold")));
+
+        jackMidiPorts = std::make_unique<JackMidiPorts> (*this);
+        jackMidiView.setViewedComponent (jackMidiPorts.get(), false);
+        addAndMakeVisible (jackMidiView);
+#endif
+
         addAndMakeVisible (midiInputHeader);
-        midiInputHeader.setText ("Active MIDI Inputs", dontSendNotification);
+        midiInputHeader.setText ("Active MIDI Inputs (ALSA-seq)", dontSendNotification);
         midiInputHeader.setFont (Font (FontOptions (12.0f).withStyle ("Bold")));
 
         midiInputs = std::make_unique<MidiInputs> (*this);
         midiInputView.setViewedComponent (midiInputs.get(), false);
         addAndMakeVisible (midiInputView);
 
-        setSize (300, 400);
+        setSize (300, 460);
 
         devices.addChangeListener (this);
         updateDevices();
@@ -829,6 +847,21 @@ public:
         {
             updateDevices();
         }
+#if ELEMENT_USE_JACK
+        /* Element-NSPA: rebuild the JACK port list when the configured
+         * port count changes (user moved the Audio prefs slider) or
+         * just refresh the connection labels otherwise. */
+        if (jackMidiPorts)
+        {
+            auto& jack = world.devices().getJackClient();
+            const int wantInputs  = jack.getNumMidiInputs();
+            const int wantOutputs = jack.getNumMidiOutputs();
+            if (wantInputs != jackMidiPorts->numInputs || wantOutputs != jackMidiPorts->numOutputs)
+                jackMidiPorts->updatePorts();
+            else
+                jackMidiPorts->refreshConnections();
+        }
+#endif
     }
 
     void resized() override
@@ -847,6 +880,28 @@ public:
         layoutSetting (r, panicLabel, panic, getWidth() / 2);
 
         r.removeFromTop (roundToInt ((double) spacingBetweenSections * 1.5));
+
+#if ELEMENT_USE_JACK
+        /* Element-NSPA: JACK MIDI section.  Allocate the upper third
+         * of the remaining region to the JACK port list; the legacy
+         * ALSA-seq list keeps the lower portion.  When no JACK MIDI
+         * ports are configured the section collapses to just the
+         * header so it stays informative without wasting space. */
+        jackMidiHeader.setBounds (r.removeFromTop (24));
+
+        int jackHeight = 0;
+        if (jackMidiPorts && (jackMidiPorts->numInputs > 0 || jackMidiPorts->numOutputs > 0))
+        {
+            const int desired = jackMidiPorts->computeHeight();
+            jackHeight = jmin (desired, r.getHeight() / 2);
+        }
+        jackMidiView.setBounds (r.removeFromTop (jackHeight));
+        if (jackMidiPorts)
+            jackMidiPorts->updateSize();
+
+        r.removeFromTop (spacingBetweenSections);
+#endif
+
         midiInputHeader.setBounds (r.removeFromTop (24));
 
         midiInputView.setBounds (r);
@@ -1107,6 +1162,221 @@ private:
 
     friend class MidiInputs;
     std::unique_ptr<MidiInputs> midiInputs;
+
+#if ELEMENT_USE_JACK
+    /* Element-NSPA: JACK MIDI port section.  Mirrors the MidiInputs
+     * inner class above but enumerates Element's own native JACK MIDI
+     * ports (midi_in_1..N / midi_out_1..N) instead of JUCE's ALSA-seq
+     * MidiInput devices.  Per-port toggles flip both a Settings
+     * bitmask and the live JackClient atomic mask, so the change
+     * takes effect on the next JACK period without a device restart.
+     * Per-port "connected to: …" label refreshes via the page's 1 Hz
+     * timer. */
+    class JackMidiPorts : public Component,
+                          public Button::Listener
+    {
+    public:
+        JackMidiPorts (MidiSettingsPage& o) : owner (o)
+        {
+            inputSectionLabel.setText ("Inputs", dontSendNotification);
+            inputSectionLabel.setFont (Font (FontOptions (11.0f).withStyle ("Bold")));
+            addAndMakeVisible (inputSectionLabel);
+
+            outputSectionLabel.setText ("Outputs", dontSendNotification);
+            outputSectionLabel.setFont (Font (FontOptions (11.0f).withStyle ("Bold")));
+            addAndMakeVisible (outputSectionLabel);
+        }
+
+        int getNumRows() const { return rowCount; }
+
+        void updatePorts()
+        {
+            inputLabels.clearQuick (true);
+            inputToggles.clearQuick (true);
+            outputLabels.clearQuick (true);
+            outputToggles.clearQuick (true);
+
+            auto& jack = owner.world.devices().getJackClient();
+            numInputs  = jack.getNumMidiInputs();
+            numOutputs = jack.getNumMidiOutputs();
+
+            for (int i = 0; i < numInputs; ++i)
+            {
+                auto* lbl = inputLabels.add (new Label());
+                lbl->setFont (Font (FontOptions (12.0f)));
+                lbl->setText (formatPortLabel (jack, i, true), dontSendNotification);
+                addAndMakeVisible (lbl);
+
+                auto* btn = inputToggles.add (new SettingButton());
+                btn->setClickingTogglesState (true);
+                btn->setYesNoText ("On", "Off");
+                btn->setToggleState (jack.isMidiInputPortEnabled (i), dontSendNotification);
+                btn->addListener (this);
+                addAndMakeVisible (btn);
+            }
+
+            for (int i = 0; i < numOutputs; ++i)
+            {
+                auto* lbl = outputLabels.add (new Label());
+                lbl->setFont (Font (FontOptions (12.0f)));
+                lbl->setText (formatPortLabel (jack, i, false), dontSendNotification);
+                addAndMakeVisible (lbl);
+
+                auto* btn = outputToggles.add (new SettingButton());
+                btn->setClickingTogglesState (true);
+                btn->setYesNoText ("On", "Off");
+                btn->setToggleState (jack.isMidiOutputPortEnabled (i), dontSendNotification);
+                btn->addListener (this);
+                addAndMakeVisible (btn);
+            }
+
+            rowCount = numInputs + numOutputs;
+            updateSize();
+        }
+
+        /** Refresh just the "connected to:" labels without rebuilding
+            the whole list.  Called by the page's 1 Hz timer. */
+        void refreshConnections()
+        {
+            auto& jack = owner.world.devices().getJackClient();
+            for (int i = 0; i < numInputs && i < inputLabels.size(); ++i)
+                inputLabels.getUnchecked (i)->setText (formatPortLabel (jack, i, true), dontSendNotification);
+            for (int i = 0; i < numOutputs && i < outputLabels.size(); ++i)
+                outputLabels.getUnchecked (i)->setText (formatPortLabel (jack, i, false), dontSendNotification);
+        }
+
+        void updateSize()
+        {
+            const int widthOfView = owner.jackMidiView.getWidth() - owner.jackMidiView.getScrollBarThickness();
+            setSize (jmax (200, widthOfView), computeHeight());
+        }
+
+        int computeHeight()
+        {
+            static int tick = 0;
+            const int spacing = 6;
+            const int row     = 22;
+            const int section = 18;
+
+            int h = 1;
+            if (numInputs > 0)
+            {
+                h += section;
+                for (int i = 0; i < numInputs; ++i)
+                    h += spacing + row;
+            }
+            if (numOutputs > 0)
+            {
+                h += spacing + section;
+                for (int i = 0; i < numOutputs; ++i)
+                    h += spacing + row;
+            }
+
+            tick = tick == 0 ? 1 : 0;
+            return h + tick;
+        }
+
+        void resized() override
+        {
+            const int spacing     = 6;
+            const int row         = 22;
+            const int section     = 18;
+            const int toggleW     = 40;
+            const int toggleH     = 18;
+
+            auto r = getLocalBounds();
+            if (numInputs > 0)
+            {
+                auto hdr = r.removeFromTop (section);
+                inputSectionLabel.setBounds (hdr);
+                for (int i = 0; i < numInputs; ++i)
+                {
+                    r.removeFromTop (spacing);
+                    auto rr = r.removeFromTop (row);
+                    inputLabels.getUnchecked (i)->setBounds (rr.removeFromLeft (getWidth() - toggleW - 8));
+                    inputToggles.getUnchecked (i)->setBounds (rr.withSizeKeepingCentre (toggleW, toggleH));
+                }
+            }
+            if (numOutputs > 0)
+            {
+                r.removeFromTop (spacing);
+                auto hdr = r.removeFromTop (section);
+                outputSectionLabel.setBounds (hdr);
+                for (int i = 0; i < numOutputs; ++i)
+                {
+                    r.removeFromTop (spacing);
+                    auto rr = r.removeFromTop (row);
+                    outputLabels.getUnchecked (i)->setBounds (rr.removeFromLeft (getWidth() - toggleW - 8));
+                    outputToggles.getUnchecked (i)->setBounds (rr.withSizeKeepingCentre (toggleW, toggleH));
+                }
+            }
+        }
+
+        void buttonClicked (Button* btn) override
+        {
+            auto* sb = dynamic_cast<SettingButton*> (btn);
+            if (sb == nullptr) return;
+
+            auto& jack = owner.world.devices().getJackClient();
+            int  idx   = inputToggles.indexOf (sb);
+            bool isInput = idx >= 0;
+            if (! isInput)
+                idx = outputToggles.indexOf (sb);
+            if (idx < 0) return;
+
+            const bool on = btn->getToggleState();
+            if (isInput)
+                jack.setMidiInputPortEnabled (idx, on);
+            else
+                jack.setMidiOutputPortEnabled (idx, on);
+
+            /* Persist.  Settings stores int; cast to int round-trips
+             * the bitmask without loss for our 32-bit width. */
+            const uint32_t mask = isInput ? jack.getMidiInputEnableMask()
+                                          : jack.getMidiOutputEnableMask();
+            owner.settings.set (isInput ? Settings::audioJackInputMidiPortEnableMaskKey
+                                        : Settings::audioJackOutputMidiPortEnableMaskKey,
+                                static_cast<int> (mask));
+        }
+
+        Label inputSectionLabel { {}, "Inputs" };
+        Label outputSectionLabel { {}, "Outputs" };
+
+    private:
+        static juce::String formatPortLabel (JackClient& jack, int portIndex, bool isInput)
+        {
+            juce::String text;
+            text << (isInput ? "midi_in_" : "midi_out_") << (portIndex + 1);
+            auto conns = jack.getMidiPortConnections (portIndex, isInput);
+            if (! conns.isEmpty())
+            {
+                text << "  " << (isInput ? juce::String (CharPointer_UTF8 ("\xe2\x86\x90"))   // ←
+                                         : juce::String (CharPointer_UTF8 ("\xe2\x86\x92"))); // →
+                text << " " << conns[0];
+                if (conns.size() > 1)
+                    text << "  (+" << (conns.size() - 1) << ")";
+            }
+            else
+            {
+                text << "  (not connected)";
+            }
+            return text;
+        }
+
+        friend class MidiSettingsPage;
+        MidiSettingsPage& owner;
+        int numInputs  = 0;
+        int numOutputs = 0;
+        int rowCount   = 0;
+        OwnedArray<Label>         inputLabels,  outputLabels;
+        OwnedArray<SettingButton> inputToggles, outputToggles;
+    };
+
+    friend class JackMidiPorts;
+    std::unique_ptr<JackMidiPorts> jackMidiPorts;
+    Label jackMidiHeader;
+    Viewport jackMidiView;
+#endif
     Viewport midiInputView;
 
     void updateDevices()
@@ -1125,6 +1395,10 @@ private:
         }
 
         midiInputs->updateDevices();
+#if ELEMENT_USE_JACK
+        if (jackMidiPorts)
+            jackMidiPorts->updatePorts();
+#endif
 
         updateInputSelection();
         updateOutputSelection();

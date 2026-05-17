@@ -69,6 +69,14 @@ public:
     static const char* audioJackInputMidiPortCountKey;
     static const char* audioJackOutputMidiPortCountKey;
 
+    /* Element-NSPA: per-port enable bitmask for native JACK MIDI ports.
+     * Stored as a uint32 (bit N = port N+1 enabled).  Default = ~0u
+     * (all configured ports enabled).  Read by JackAudioIODevice at
+     * RT drain time via JackClient's atomic mask; UI toggles in the
+     * MIDI preferences panel write both Settings and the live mask. */
+    static const char* audioJackInputMidiPortEnableMaskKey;
+    static const char* audioJackOutputMidiPortEnableMaskKey;
+
     bool getBool (std::string_view key, bool fallback = false) const noexcept;
     int  getInt  (std::string_view key, int  fallback = 0) const noexcept;
 

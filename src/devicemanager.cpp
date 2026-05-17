@@ -128,6 +128,18 @@ void DeviceManager::applyJackPortCountsFromSettings (Settings& settings)
     const int midiOutCount = settings.getInt (Settings::audioJackOutputMidiPortCountKey, 0);
     impl->jack.setNumMidiInputs  (midiInCount);
     impl->jack.setNumMidiOutputs (midiOutCount);
+
+    /* Element-NSPA: per-port enable masks.  Default = ~0u (all enabled)
+     * preserves "everything works" behaviour for users who haven't
+     * touched the MIDI preferences toggles.  Setting::getInt returns a
+     * signed int so the cast normalises -1 / ~0 to the same all-ones
+     * bitmask. */
+    const uint32_t midiInMask  = static_cast<uint32_t> (
+        settings.getInt (Settings::audioJackInputMidiPortEnableMaskKey,  static_cast<int> (~0u)));
+    const uint32_t midiOutMask = static_cast<uint32_t> (
+        settings.getInt (Settings::audioJackOutputMidiPortEnableMaskKey, static_cast<int> (~0u)));
+    impl->jack.setMidiInputEnableMask  (midiInMask);
+    impl->jack.setMidiOutputEnableMask (midiOutMask);
    #else
     juce::ignoreUnused (settings);
    #endif

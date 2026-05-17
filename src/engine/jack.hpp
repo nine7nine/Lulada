@@ -5,6 +5,8 @@
 
 #if ELEMENT_USE_JACK
 
+#include <atomic>
+
 #include <jack/jack.h>
 
 #include <element/juce/audio_devices.hpp>
@@ -22,6 +24,32 @@ struct Jack
     static juce::AudioIODeviceType* createAudioIODeviceType (JackClient&);
     static int getClientNameSize();
     static int getPortNameSize();
+};
+
+/** Element-NSPA: sample-accurate JACK MIDI input handoff.
+ *
+ *  JUCE's AudioIODeviceCallback API has no MIDI parameter, so the JACK
+ *  driver exposes per-period MIDI events through this side-channel:
+ *
+ *    1. The JACK process callback (RT) drains native JACK MIDI events
+ *       directly into a per-device juce::MidiBuffer with each event's
+ *       jack_midi_event_t::time preserved as the sample offset within
+ *       the current period.
+ *    2. AudioEngine's audio callback runs on the same RT thread,
+ *       synchronously dispatched from the JACK process callback.
+ *    3. AudioEngine queries getCurrentJackMidiInput() at the start of
+ *       graph processing and merges those events into the MidiBuffer
+ *       handed to the plugin graph — same period, same sample offsets.
+ *
+ *  Result: zero added latency, sample-accurate, no consumer-thread
+ *  jitter.  The buffer reference is valid only for the duration of the
+ *  audio callback that dispatched it; it is cleared at the start of
+ *  each new JACK process callback. */
+class JackMidiInputProvider
+{
+public:
+    virtual ~JackMidiInputProvider() = default;
+    virtual const juce::MidiBuffer& getCurrentJackMidiInput() const noexcept = 0;
 };
 
 class JackPort final : public juce::ReferenceCountedObject
@@ -99,6 +127,56 @@ public:
     void setNumMidiInputs  (int n) noexcept { numMidiIns  = n > 0 ? n : 0; }
     void setNumMidiOutputs (int n) noexcept { numMidiOuts = n > 0 ? n : 0; }
 
+    /** Element-NSPA: per-port enable bitmasks for native JACK MIDI.
+        Bit N (0-indexed) controls whether events from / to midi_in_N+1
+        / midi_out_N+1 are routed through the JACK driver's RT drain/
+        fill paths.  Read with relaxed atomics from the RT JACK process
+        callback once per period — single load, negligible cost.  UI
+        toggles in the MIDI preferences panel write through these
+        setters; changes take effect on the next JACK period without a
+        device restart. */
+    uint32_t getMidiInputEnableMask()  const noexcept { return midiInEnableMask.load (std::memory_order_relaxed); }
+    uint32_t getMidiOutputEnableMask() const noexcept { return midiOutEnableMask.load (std::memory_order_relaxed); }
+    void setMidiInputEnableMask  (uint32_t m) noexcept { midiInEnableMask.store  (m, std::memory_order_relaxed); }
+    void setMidiOutputEnableMask (uint32_t m) noexcept { midiOutEnableMask.store (m, std::memory_order_relaxed); }
+
+    /** Convenience: toggle a single port bit (0-indexed) preserving
+        the other bits.  Loads and stores are relaxed — UI thread
+        writes, RT thread reads; the only requirement is atomicity per
+        access, which std::atomic<uint32_t> guarantees on all our
+        target ISAs. */
+    void setMidiInputPortEnabled  (int portIndex, bool enabled) noexcept
+    {
+        if (portIndex < 0 || portIndex >= 32) return;
+        const uint32_t bit = 1u << static_cast<unsigned> (portIndex);
+        uint32_t cur = midiInEnableMask.load (std::memory_order_relaxed);
+        uint32_t next;
+        do { next = enabled ? (cur | bit) : (cur & ~bit); }
+        while (! midiInEnableMask.compare_exchange_weak (cur, next, std::memory_order_relaxed));
+    }
+
+    void setMidiOutputPortEnabled (int portIndex, bool enabled) noexcept
+    {
+        if (portIndex < 0 || portIndex >= 32) return;
+        const uint32_t bit = 1u << static_cast<unsigned> (portIndex);
+        uint32_t cur = midiOutEnableMask.load (std::memory_order_relaxed);
+        uint32_t next;
+        do { next = enabled ? (cur | bit) : (cur & ~bit); }
+        while (! midiOutEnableMask.compare_exchange_weak (cur, next, std::memory_order_relaxed));
+    }
+
+    bool isMidiInputPortEnabled  (int portIndex) const noexcept
+    {
+        if (portIndex < 0 || portIndex >= 32) return false;
+        return (getMidiInputEnableMask()  & (1u << static_cast<unsigned> (portIndex))) != 0u;
+    }
+
+    bool isMidiOutputPortEnabled (int portIndex) const noexcept
+    {
+        if (portIndex < 0 || portIndex >= 32) return false;
+        return (getMidiOutputEnableMask() & (1u << static_cast<unsigned> (portIndex))) != 0u;
+    }
+
     const juce::String& getMainOutputPrefix() const { return mainOutPrefix; }
     const juce::String& getMainInputPrefix() const { return mainInPrefix; }
 
@@ -135,6 +213,15 @@ public:
     /** Query for ports */
     void getPorts (juce::StringArray& dest, juce::String nameRegex = {}, juce::String typeRegex = {}, uint64_t flags = 0);
 
+    /** Element-NSPA: return the list of remote ports currently connected
+        to one of Element's own JACK MIDI ports.  portIndex is 0-based
+        and resolved against the configured port count + naming scheme
+        ("<client>:midi_in_<N+1>" / "<client>:midi_out_<N+1>").  Used by
+        the MIDI preferences panel to show a live "connected to: …"
+        label per port.  Empty result if the client isn't open or the
+        port hasn't been registered yet. */
+    juce::StringArray getMidiPortConnections (int portIndex, bool isInput);
+
     operator jack_client_t*() const { return client; }
 
 private:
@@ -151,6 +238,11 @@ private:
      * to the audio process callback. */
     int numMidiIns  = 0;
     int numMidiOuts = 0;
+    /* Element-NSPA: per-port enable bitmasks (bit N = port N+1).
+     * Default = all enabled.  Live-readable from the RT JACK process
+     * callback via relaxed atomics; UI mutates via the setters above. */
+    std::atomic<uint32_t> midiInEnableMask  { ~0u };
+    std::atomic<uint32_t> midiOutEnableMask { ~0u };
     juce::Array<JackPort::Ptr> ports;
 };
 

@@ -15,6 +15,10 @@
 #include "engine/midipanic.hpp"
 #include "engine/trace.hpp"
 
+#if ELEMENT_USE_JACK
+#include "engine/jack.hpp"
+#endif
+
 #include "tempo.hpp"
 
 namespace element {
@@ -455,6 +459,39 @@ public:
         const int numSamples = buffer.getNumSamples();
         messageCollector.removeNextBlockOfMessages (midi, numSamples);
 
+#if ELEMENT_USE_JACK
+        /* Element-NSPA: merge sample-accurate JACK MIDI input into the
+         * top-level graph buffer.  The provider owns the buffer for the
+         * lifetime of this audio callback (same RT thread, same period).
+         * Events arrive with their original jack_midi_event_t::time as
+         * the sample offset, so addEvents preserves sub-period timing.
+         * No locking: same-thread synchronous handoff from
+         * JackAudioIODevice::process() into the audio callback. */
+        if (jackMidiInputProvider != nullptr)
+        {
+            const auto& jackMidi = jackMidiInputProvider->getCurrentJackMidiInput();
+            if (! jackMidi.isEmpty())
+            {
+                midi.addEvents (jackMidi, 0, numSamples, 0);
+
+                /* Light the existing UI MIDI activity indicator for any
+                 * non-keep-alive event coming via JACK so the user can
+                 * tell at a glance that the JACK path (not legacy ALSA-
+                 * seq) is firing.  Same tap point as the legacy
+                 * handleIncomingMidiMessage path. */
+                for (const auto m : jackMidi)
+                {
+                    const auto& msg = m.getMessage();
+                    if (! msg.isActiveSense() && ! msg.isMidiClock())
+                    {
+                        midiIOMonitor->received();
+                        break; /* one tick per period is plenty */
+                    }
+                }
+            }
+        }
+#endif
+
         extraMidi.clear();
 
         if (MidiPanic::processCC (midi, extraMidi, panicCC.get(), panicChannel.get()))
@@ -544,6 +581,16 @@ public:
         const int newBlockSize = device->getCurrentBufferSizeSamples();
         const int numChansIn = device->getActiveInputChannels().countNumberOfSetBits();
         const int numChansOut = device->getActiveOutputChannels().countNumberOfSetBits();
+
+#if ELEMENT_USE_JACK
+        /* Element-NSPA: capture the device's JACK MIDI input provider
+         * (if any) before audio starts.  Single dynamic_cast at start;
+         * the RT path just dereferences the cached pointer.  Non-JACK
+         * device types return nullptr — MIDI delivery falls back to
+         * the legacy MidiMessageCollector path. */
+        jackMidiInputProvider = dynamic_cast<JackMidiInputProvider*> (device);
+#endif
+
         audioAboutToStart (newSampleRate, newBlockSize, numChansIn, numChansOut);
     }
 
@@ -594,6 +641,9 @@ public:
         audioStarted.store (false, std::memory_order_release);
         tempBuffer.setSize (1, 1);
         graphs.releaseBuffers();
+#if ELEMENT_USE_JACK
+        jackMidiInputProvider = nullptr;
+#endif
     }
 
     void handleIncomingMidiMessage (MidiInput*, const MidiMessage& message) override
@@ -770,6 +820,17 @@ private:
 
     Atomic<double> midiOutLatency { 0.0 };
     std::atomic<bool> audioStarted { false };
+
+#if ELEMENT_USE_JACK
+    /* Element-NSPA: pointer to the active JACK driver's RT-inline MIDI
+     * input buffer, captured via dynamic_cast in audioDeviceAboutToStart.
+     * Used by processCurrentGraph to merge sample-accurate JACK MIDI
+     * events into the top-level MidiBuffer that flows into the root
+     * graph.  Lifetime is bounded by the audio callback start/stop
+     * pair — JackAudioIODevice cannot be destroyed while the callback
+     * is live. */
+    JackMidiInputProvider* jackMidiInputProvider = nullptr;
+#endif
 
     ReferenceCountedArray<AudioEngine::LevelMeter> inMeters, outMeters;
 
