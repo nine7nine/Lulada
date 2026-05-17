@@ -11,6 +11,9 @@
 
 #include "engine/graphmanager.hpp"
 #include "nodes/mididevice.hpp"
+#if ELEMENT_USE_JACK
+#include "nodes/jackmidiinputnode.hpp"
+#endif
 #include "engine/rootgraph.hpp"
 #include <element/engine.hpp>
 #include <element/ui.hpp>
@@ -980,6 +983,45 @@ Node EngineService::addPlugin (GraphManager& c, const PluginDescription& desc)
 
     return Node();
 }
+
+#if ELEMENT_USE_JACK
+Node EngineService::addJackMidiInputNode (int portIndex)
+{
+    ProcessorPtr ptr;
+    Node graph;
+    if (auto s = context().session())
+        graph = s->getActiveGraph();
+    if (auto* const root = graphs->findActiveRootGraphManager())
+    {
+        PluginDescription desc;
+        desc.pluginFormatName = EL_NODE_FORMAT_NAME;
+        desc.fileOrIdentifier = EL_NODE_ID_JACK_MIDI_INPUT;
+        ptr = root->getNodeForId (root->addNode (&desc, 0.5, 0.5));
+    }
+
+    auto* const proc = (ptr == nullptr) ? nullptr
+                                        : dynamic_cast<JackMidiInputNode*> (ptr->getAudioProcessor());
+
+    Node deviceNode;
+    if (proc != nullptr)
+    {
+        proc->setPortIndex (portIndex);
+
+        for (int i = 0; i < graph.getNumNodes(); ++i)
+        {
+            auto node (graph.getNode (i));
+            if (node.getObject() == ptr.get())
+            {
+                node.setProperty (tags::name, proc->getName());
+                node.resetPorts();
+                deviceNode = node;
+                break;
+            }
+        }
+    }
+    return deviceNode;
+}
+#endif
 
 Node EngineService::addMidiDeviceNode (const MidiDeviceInfo& device, const bool isInput)
 {

@@ -42,6 +42,16 @@ struct AddMidiDeviceMessage : public AppMessage
     const bool inputDevice;
 };
 
+/* Element-NSPA: add a JACK MIDI input source node bound to a specific
+ * element:midi_in_<portIndex+1> port.  Dispatched from the graph
+ * right-click menu's "JACK MIDI Input" submenu to
+ * EngineService::addJackMidiInputNode. */
+struct AddJackMidiInputMessage : public AppMessage
+{
+    explicit AddJackMidiInputMessage (int port) : portIndex (port) {}
+    const int portIndex;
+};
+
 /** Send this to add a preset for a node */
 struct AddPresetMessage : public AppMessage
 {

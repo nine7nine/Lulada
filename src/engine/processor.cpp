@@ -10,6 +10,9 @@
 
 #include "nodes/audioprocessor.hpp"
 #include "nodes/mididevice.hpp"
+#if ELEMENT_USE_JACK
+#include "nodes/jackmidiinputnode.hpp"
+#endif
 #include "nodes/placeholder.hpp"
 #include "engine/rootgraph.hpp"
 
@@ -187,7 +190,17 @@ bool Processor::isMidiIONode() const
 
 bool Processor::isMidiDeviceNode() const
 {
-    return nullptr != dynamic_cast<MidiDeviceProcessor*> (getAudioProcessor());
+    if (nullptr != dynamic_cast<MidiDeviceProcessor*> (getAudioProcessor()))
+        return true;
+#if ELEMENT_USE_JACK
+    /* Element-NSPA: JackMidiInputNode is a MIDI source node with no
+     * input ports (it pulls events directly from a JACK port). Treat
+     * it like a MidiDeviceProcessor so Processor::setPorts does not
+     * force-add a MIDI input port to it. */
+    if (nullptr != dynamic_cast<JackMidiInputNode*> (getAudioProcessor()))
+        return true;
+#endif
+    return false;
 }
 
 int Processor::getNumAudioInputs() const { return ports.size (PortType::Audio, true); }

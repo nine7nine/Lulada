@@ -310,6 +310,12 @@ void Services::handleMessage (const Message& msg)
     {
         ec->addMidiDeviceNode (mdm->device, mdm->inputDevice);
     }
+#if ELEMENT_USE_JACK
+    else if (const auto* jmim = dynamic_cast<const AddJackMidiInputMessage*> (&msg))
+    {
+        ec->addJackMidiInputNode (jmim->portIndex);
+    }
+#endif
     else if (const auto* removeControllerMessage = dynamic_cast<const RemoveControllerMessage*> (&msg))
     {
         const auto device = removeControllerMessage->device;

@@ -57,6 +57,10 @@ public:
     /** Adds a midi device node to the current root graph */
     Node addMidiDeviceNode (const juce::MidiDeviceInfo& device, const bool isInput);
 
+    /** Element-NSPA: adds a JACK MIDI input node bound to a specific
+        port (element:midi_in_<portIndex+1>) to the current root graph. */
+    Node addJackMidiInputNode (int portIndex);
+
     /** Removes a node from the current graph */
     void removeNode (const uint32);
 
