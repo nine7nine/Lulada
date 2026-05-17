@@ -938,7 +938,7 @@ private:
 
 //==============================================================================
 
-#if KV_JACK_AUDIO
+#if ELEMENT_USE_JACK
 /* Element-NSPA: JACK-specific extension panel that surfaces the
  * forced-port-count controls atop the standard AudioDeviceSettingsPanel.
  *
@@ -1294,7 +1294,7 @@ void AudioDeviceSelectorComponent::updateAllControls()
                 sp->updateAllControls();
             }
 
-           #if KV_JACK_AUDIO
+           #if ELEMENT_USE_JACK
             /* Element-NSPA: when the selected audio driver is JACK,
              * surface the extra port-count controls beneath the
              * standard panel. */

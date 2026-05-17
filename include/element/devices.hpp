@@ -9,6 +9,7 @@
 namespace element {
 
 class Settings;
+class JackClient;
 
 class DeviceManager : public juce::AudioDeviceManager {
 public:
@@ -30,8 +31,8 @@ public:
      *  restartLastAudioDevice) so the new counts take effect. */
     void applyJackPortCountsFromSettings (Settings& settings);
 
-#if KV_JACK_AUDIO
-    kv::JackClient& getJackClient();
+#if ELEMENT_USE_JACK
+    JackClient& getJackClient();
 #endif
 
     void createAudioDeviceTypes (juce::OwnedArray<juce::AudioIODeviceType>& list) override;

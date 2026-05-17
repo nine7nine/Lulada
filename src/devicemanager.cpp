@@ -101,8 +101,8 @@ void DeviceManager::selectAudioDriver (const String& name)
     setCurrentAudioDeviceType (name, true);
 }
 
-#if KV_JACK_AUDIO
-kv::JackClient& DeviceManager::getJackClient()
+#if ELEMENT_USE_JACK
+JackClient& DeviceManager::getJackClient()
 {
     return impl->jack;
 }
