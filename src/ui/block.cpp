@@ -223,16 +223,29 @@ BlockComponent::BlockComponent (const Node& graph_, const Node& node_, const boo
 
     // setup a fallback alignment.
     String portAlignStr = "middle";
-    switch (getDisplayMode())
+
+    /* Element: audio I/O nodes always default to middle port alignment.
+     * The legacy display-mode-based fallback below puts ports flush to
+     * the leading edge in Normal/Embed (and vertical Compact/Small),
+     * which looks lopsided on wide multi-channel I/O blocks — a stereo
+     * Audio In with 2 dots clustered on the left edge of an 8-channel-
+     * wide block reads as misaligned.  MIDI blocks keep the existing
+     * defaults (their single port + "before" alignment already reads
+     * well). */
+    const bool isAudioIONode = node.isAudioInputNode() || node.isAudioOutputNode();
+    if (! isAudioIONode)
     {
-        case Normal:
-        case Embed:
-            portAlignStr = "before";
-            break;
-        case Small:
-        case Compact:
-            portAlignStr = vertical_ ? "before" : "middle";
-            break;
+        switch (getDisplayMode())
+        {
+            case Normal:
+            case Embed:
+                portAlignStr = "before";
+                break;
+            case Small:
+            case Compact:
+                portAlignStr = vertical_ ? "before" : "middle";
+                break;
+        }
     }
 
     _portAlign = portAlignmentFromKey (blockData.getProperty (tags::portAlignment, portAlignStr));

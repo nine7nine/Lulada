@@ -5,6 +5,11 @@
 #include <element/ui.hpp>
 #include <element/ui/style.hpp>
 
+#include <element/context.hpp>
+#include <element/devices.hpp>
+
+#include "nodes/ionodeeditor.hpp"
+#include "nodes/midiionodeinfopanel.hpp"
 #include "services/sessionservice.hpp"
 #include "ui/nodeproperties.hpp"
 #include "ui/nodepropertiesview.hpp"
@@ -167,7 +172,10 @@ void NodePropertiesView::paint (Graphics& g)
 
 void NodePropertiesView::paintOverChildren (Graphics& g)
 {
-    if (! _node.isIONode())
+    /* Element: IONodes now render their own inline editor (see
+     * updateProperties); only fall back to the upstream
+     * "see preferences..." overlay when no editor was attached. */
+    if (! _node.isIONode() || ioEditor != nullptr)
         return;
     g.setFont (Font (FontOptions (20.f)));
     g.setColour (findColour (Label::textColourId));
@@ -185,7 +193,10 @@ void NodePropertiesView::resized()
     combo.setBounds (r2.removeFromLeft (std::max (100, r2.getWidth() - 24)));
     menuButton.setBounds (r2.withWidth (22).withX (r2.getX() + 2));
     r1.removeFromTop (2);
-    props.setBounds (r1);
+    if (ioEditor != nullptr)
+        ioEditor->setBounds (r1);
+    else
+        props.setBounds (r1);
 }
 
 void NodePropertiesView::setNode (const Node& newNode)
@@ -334,11 +345,37 @@ void NodePropertiesView::nodeMenuCallback (int result, NodePropertiesView* view)
 void NodePropertiesView::updateProperties()
 {
     props.clear();
+    if (ioEditor != nullptr)
+    {
+        removeChildComponent (ioEditor.get());
+        ioEditor.reset();
+    }
+
     if (_node.isValid())
     {
         if (_node.isIONode())
         {
             props.setMessageWhenEmpty ("");
+            /* Element: render an inline editor instead of the
+             * upstream "see preferences..." overlay.  Audio I/O nodes
+             * get the channel-list + port-count picker; MIDI I/O
+             * pseudo-nodes get an info panel explaining what carries
+             * what (since there is no per-device picker — JACK MIDI
+             * is routed via the dedicated JACK MIDI graph nodes). */
+            if (_node.isAudioInputNode() || _node.isAudioOutputNode())
+            {
+                if (auto* world = ViewHelpers::getGlobals (this))
+                {
+                    const bool isIn = _node.isAudioInputNode();
+                    ioEditor = std::make_unique<AudioIONodeEditor> (_node, world->devices(), isIn, ! isIn);
+                    addAndMakeVisible (ioEditor.get());
+                }
+            }
+            else if (_node.isMidiInputNode() || _node.isMidiOutputNode())
+            {
+                ioEditor = std::make_unique<MidiIONodeInfoPanel> (_node.isMidiInputNode());
+                addAndMakeVisible (ioEditor.get());
+            }
         }
         else
         {
@@ -350,6 +387,11 @@ void NodePropertiesView::updateProperties()
             props.setMessageWhenEmpty ("");
         }
     }
+
+    /* Show the props panel only when there's no IO editor — otherwise
+     * the editor needs the full content area to render its list. */
+    props.setVisible (ioEditor == nullptr);
+
     resized();
     repaint();
 }

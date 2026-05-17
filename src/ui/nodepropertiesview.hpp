@@ -57,6 +57,12 @@ private:
     PropertyPanel props;
     NodeObjectSync nodeSync;
     IconButton menuButton;
+    /* Element: inline editor shown for Audio I/O IONodes — replaces
+     * upstream's "see preferences..." overlay with a live channel
+     * list + port-count picker that syncs to the same Settings keys
+     * the Audio preferences panel writes.  Null for any other node
+     * type. */
+    std::unique_ptr<Component> ioEditor;
     bool sticky = false;
 
     static void nodeMenuCallback (int, NodePropertiesView*);
