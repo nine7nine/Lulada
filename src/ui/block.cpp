@@ -98,8 +98,14 @@ void PortComponent::paint (Graphics& g)
 {
     if (true)
     {
+        const auto bounds = juce::Rectangle<float> (0.f, 0.f, (float) getWidth(), (float) getHeight());
         g.setColour (getColor());
-        g.fillRoundedRectangle (0.f, 0.f, (float) getWidth(), (float) getHeight(), 2.f);
+        g.fillRoundedRectangle (bounds, 2.f);
+
+        /* Element: dark 1px outline around the port dot so the colored
+         * fill reads cleanly against any block-fill or canvas color. */
+        g.setColour (Colours::black.withAlpha (0.75f));
+        g.drawRoundedRectangle (bounds.reduced (0.5f), 1.5f, 1.0f);
     }
     else
     {
@@ -849,6 +855,68 @@ void BlockComponent::paint (Graphics& g)
     {
         g.setColour (bgc.darker (0.6f));
         g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.3f);
+    }
+    else
+    {
+        /* Element: per-block-type colored border + dark inset separator.
+         * Visual cue so users can tell at a glance whether a block is
+         * Audio I/O, JACK MIDI, a VST2 / VST3 / CLAP / LV2 plugin, or
+         * an Element internal utility — independent of the user-set
+         * "color" property (which still drives the fill / title-bar as
+         * before).  Selection is already conveyed by the brightened
+         * background, so the border stays at a single bright weight
+         * regardless of selection state.
+         *
+         * The dark 1px stroke sits just inside the colored stroke to
+         * keep the color from bleeding into the block contents when
+         * the colorize fill (or a brightened-selection bg) is the same
+         * family of hue as the type. */
+        const auto typeColor = [this]() -> Colour {
+            /* Per-block-type color — for blocks that carry a single
+             * port type the border matches the wire color so the graph
+             * reads with consistent type cues (audio block → green
+             * border + green wires; MIDI block → orange border +
+             * orange wires).  For plugin formats and mixed-type
+             * Element internals the color identifies the FORMAT
+             * instead.
+             *
+             * Check node-type predicates before the format string —
+             * IONode pseudo-nodes have pluginFormatName="Internal",
+             * not the Element format, so a format-first check would
+             * miss them and land on the gray fallback. */
+            if (node.isAudioInputNode() || node.isAudioOutputNode())
+                return Colour (0xff1de9b6);      // teal A400 — matches audio wire (brighter tone than the prior forest green)
+            if (node.isMidiInputNode() || node.isMidiOutputNode())
+                return Colour (0xffffa726);      // orange 400 — matches MIDI wire
+
+            const auto format = node.getFormat().toString();
+            const auto id     = node.getIdentifier().toString();
+
+            if (format == EL_NODE_FORMAT_NAME)
+            {
+                if (id == EL_NODE_ID_JACK_MIDI_INPUT
+                 || id == EL_NODE_ID_JACK_MIDI_OUTPUT
+                 || id == EL_NODE_ID_JACK_MIDI_INPUT_ALL
+                 || id == EL_NODE_ID_JACK_MIDI_OUTPUT_ALL)
+                    return Colour (0xffffa726);  // orange 400 — JACK MIDI nodes (match MIDI wire)
+                return Colour (0xffff4081);      // pink A400  — Element internal utility (distinct from any wire color or other block format)
+            }
+
+            if (format == "VST")       return Colour (0xff3d5afe);  // indigo A400 — VST2
+            if (format == "VST3")      return Colour (0xffd500f9);  // purple A400 — VST3
+            if (format == "CLAP")      return Colour (0xff00e5ff);  // cyan   A400 — CLAP
+            if (format == "LV2")       return Colour (0xffff1744);  // red    A400 — LV2
+            if (format == "AudioUnit") return Colour (0xffff9100);  // orange A400 — AudioUnit
+            return Colour (0xffbdbdbd);                              // gray 400 fallback
+        }();
+
+        g.setColour (typeColor);
+        g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.5f);
+
+        g.setColour (Colours::black.withAlpha (0.6f));
+        g.drawRoundedRectangle (box.toFloat().reduced (1.5f, 1.5f),
+                                juce::jmax (0.5f, cornerSize - 1.5f),
+                                1.0f);
     }
 
     auto displayName = node.getDisplayName();

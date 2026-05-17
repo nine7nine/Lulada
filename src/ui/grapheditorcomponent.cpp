@@ -218,9 +218,51 @@ public:
 
     void paint (Graphics& g) override
     {
-        auto c = Colours::black.brighter();
+        /* Element: tint the connection wire by its source port type so
+         * the graph reads at a glance — audio = green, MIDI = amber,
+         * CV/Control = blue, etc.  Kept slightly desaturated so wires
+         * still recede behind the colored block borders + port dots
+         * but stay readable against the dark canvas.  Hover / drag
+         * lifts brightness to make the active wire pop. */
+        Colour wireColor = Colours::black.brighter();
+        /* Look up the port type on whichever end of the wire has a
+         * resolved node — during a fresh drag one end is still 0
+         * (the "loose" end the user is dragging toward).  For
+         * input → output drags sourceFilterID is the placeholder,
+         * for output → input drags destFilterID is.  Either side's
+         * port type is fine for picking the wire color since a
+         * legal connection must agree on type at both ends. */
+        Node typeNode;
+        int  typeChannel = 0;
+        if (sourceFilterID != 0)
+        {
+            typeNode    = graph.getNodeById (sourceFilterID);
+            typeChannel = sourceFilterChannel;
+        }
+        else if (destFilterID != 0)
+        {
+            typeNode    = graph.getNodeById (destFilterID);
+            typeChannel = destFilterChannel;
+        }
+
+        if (typeNode.isValid())
+        {
+            const Port port (typeNode.getPort (typeChannel));
+            switch (port.getType().id())
+            {
+                case PortType::Audio:   wireColor = Colour (0xff1de9b6); break; // teal    A400 (matches audio block + port hue family)
+                case PortType::Midi:    wireColor = Colour (0xffffa726); break; // orange  400
+                case PortType::Control: wireColor = Colour (0xff64b5f6); break; // blue    300
+                case PortType::CV:      wireColor = Colour (0xffba68c8); break; // purple  300
+                case PortType::Atom:    wireColor = Colour (0xff4dd0e1); break; // cyan    300
+                case PortType::Event:   wireColor = Colour (0xffffd54f); break; // amber   300
+                default:                wireColor = Colours::black.brighter(); break;
+            }
+        }
+
+        auto c = wireColor.withAlpha (0.78f);
         if (hover || dragging)
-            c = c.brighter (0.2f);
+            c = c.brighter (0.25f).withAlpha (1.0f);
         g.setColour (c);
         g.fillPath (linePath);
     }
