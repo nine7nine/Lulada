@@ -543,14 +543,22 @@ public:
                 if (outMidiRb) element::jack_ringbuffer_mlock (outMidiRb);
             }
 
-            /* Element-NSPA: preallocate the inbound MidiBuffer so the
-             * RT drain into it does not allocate.  ensureSize() reserves
-             * storage for `numBytes` event bytes (events + headers); a
-             * single 4-byte note message costs ~16 bytes after metadata,
-             * so 4 KB covers ~250 events per period which is comfortably
-             * above any plausible inbound burst at typical period
-             * sizes. */
+            /* Element-NSPA: preallocate the inbound MidiBuffers so the
+             * RT drain into them does not allocate.  ensureSize reserves
+             * `numBytes` event bytes (events + headers); a single 4-byte
+             * note costs ~16 bytes after metadata, so 4 KB per buffer
+             * covers ~250 events/period — well above any plausible
+             * inbound burst at typical period sizes.  Per-port buffers
+             * track the configured input port count so JackMidiInputNode
+             * can read a specific port's events; the combined buffer
+             * carries the union for the graph's top-level MidiBuffer. */
             currentPeriodMidiInput.ensureSize (4096);
+            currentPeriodMidiInputPerPort.clearQuick();
+            for (int i = 0; i < midiInsToCreate; ++i)
+            {
+                currentPeriodMidiInputPerPort.add (juce::MidiBuffer());
+                currentPeriodMidiInputPerPort.getReference (i).ensureSize (4096);
+            }
 
             for (int i = 0; i < midiInsToCreate; ++i)
             {
@@ -786,15 +794,29 @@ public:
     BigInteger getActiveOutputChannels() const override { return activeOutputChannels; }
     BigInteger getActiveInputChannels() const override { return activeInputChannels; }
 
-    /* Element-NSPA: JackMidiInputProvider override.  AudioEngine reads
-     * this once per audio callback from the same RT thread that the
-     * JACK process callback populated the buffer on — same-thread,
-     * synchronous, no locking needed.  Returned reference is valid for
-     * the lifetime of the audio callback that dispatched it (the
-     * buffer is cleared at the start of the next period). */
+    /* Element-NSPA: JackMidiInputProvider overrides.  AudioEngine reads
+     * the combined buffer once per audio callback from the same RT
+     * thread that the JACK process callback populated it on —
+     * same-thread, synchronous, no locking needed.  JackMidiInputNode
+     * reads its bound port's per-port buffer the same way.  Returned
+     * references are valid for the lifetime of the audio callback
+     * that dispatched them (both buffers are cleared at the start of
+     * the next period). */
     const juce::MidiBuffer& getCurrentJackMidiInput() const noexcept override
     {
         return currentPeriodMidiInput;
+    }
+
+    const juce::MidiBuffer& getCurrentJackMidiInputForPort (int portIndex) const noexcept override
+    {
+        if (portIndex < 0 || portIndex >= currentPeriodMidiInputPerPort.size())
+            return emptyMidiBuffer;
+        return currentPeriodMidiInputPerPort.getReference (portIndex);
+    }
+
+    int getNumJackMidiInputPorts() const noexcept override
+    {
+        return currentPeriodMidiInputPerPort.size();
     }
 
     int getOutputLatencyInSamples() override
@@ -878,6 +900,8 @@ private:
          * is null because the device hasn't been started yet) are
          * dropped at the next clear, which is the right behaviour. */
         currentPeriodMidiInput.clear();
+        for (int i = 0; i < currentPeriodMidiInputPerPort.size(); ++i)
+            currentPeriodMidiInputPerPort.getReference (i).clear();
 
         if (! inputMidiPorts.isEmpty())
         {
@@ -906,11 +930,20 @@ private:
                     /* Sample-accurate offset: ev.time is the JACK frame
                      * within [0, numSamples) for this period.  The
                      * audio callback consumes the buffer with the same
-                     * numSamples, so the offset is correct as-is. */
+                     * numSamples, so the offset is correct as-is.
+                     * Write into both the combined buffer (consumed by
+                     * AudioEngine for the graph's top-level MidiBuffer)
+                     * and this port's per-port buffer (consumed by any
+                     * JackMidiInputNode bound to this port). */
                     currentPeriodMidiInput.addEvent (
                         reinterpret_cast<const uint8_t*> (ev.buffer),
                         static_cast<int> (ev.size),
                         static_cast<int> (ev.time));
+                    if (p < currentPeriodMidiInputPerPort.size())
+                        currentPeriodMidiInputPerPort.getReference (p).addEvent (
+                            reinterpret_cast<const uint8_t*> (ev.buffer),
+                            static_cast<int> (ev.size),
+                            static_cast<int> (ev.time));
                 }
             }
         }
@@ -1099,13 +1132,21 @@ private:
     Array<jack_port_t*> inputMidiPorts, outputMidiPorts;
     jack_ringbuffer_t*  outMidiRb = nullptr;
 
-    /* Element-NSPA: per-period inbound JACK MIDI staging buffer.
+    /* Element-NSPA: per-period inbound JACK MIDI staging buffers.
      * Populated by the JACK process callback (RT) at sample-accurate
-     * offsets, read by AudioEngine via getCurrentJackMidiInput() in
+     * offsets, read by AudioEngine via getCurrentJackMidiInput() and
+     * by JackMidiInputNode via getCurrentJackMidiInputForPort() in
      * the audio callback that runs on the SAME thread immediately
-     * after the drain.  ensureSize() is called at construction so the
-     * RT writer never needs to allocate. */
+     * after the drain.  ensureSize is called at construction so the
+     * RT writer never needs to allocate.
+     *
+     *   currentPeriodMidiInput          — combined (all enabled ports)
+     *   currentPeriodMidiInputPerPort   — per-port slot (index = port)
+     *   emptyMidiBuffer                 — fallback for out-of-range or
+     *                                     unconfigured port queries */
     juce::MidiBuffer currentPeriodMidiInput;
+    juce::Array<juce::MidiBuffer> currentPeriodMidiInputPerPort;
+    juce::MidiBuffer emptyMidiBuffer;
 
     std::atomic<int> xruns { 0 };
 

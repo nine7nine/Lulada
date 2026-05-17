@@ -414,7 +414,11 @@ private:
                 ret = 32.0;
                 break;
             case PortType::Midi:
-                ret = 1.0;
+                /* Element-NSPA: native JACK MIDI supports up to 32 ports
+                 * per direction (see JackClient bitmasks); matching the
+                 * audio cap lets the graph's MIDI IONodes scale to the
+                 * configured JACK MIDI port count. */
+                ret = 32.0;
                 break;
             default:
                 ret = 0.0;

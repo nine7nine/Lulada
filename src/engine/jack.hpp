@@ -49,7 +49,24 @@ class JackMidiInputProvider
 {
 public:
     virtual ~JackMidiInputProvider() = default;
+
+    /** Combined buffer carrying events from every configured JACK MIDI
+        input port for the current period.  Consumed by AudioEngine to
+        feed the graph's top-level MidiBuffer (the route used by the
+        Graph I/O "MIDI Input" pseudo-node). */
     virtual const juce::MidiBuffer& getCurrentJackMidiInput() const noexcept = 0;
+
+    /** Per-port buffer for selective routing.  Index N corresponds to
+        the JACK port "midi_in_<N+1>".  Empty for out-of-range indices
+        or disabled ports.  Used by JackMidiInputNode to feed events
+        from a specific port into a downstream node chain (per-source
+        routing — e.g. controller A → synth A, controller B → synth B). */
+    virtual const juce::MidiBuffer& getCurrentJackMidiInputForPort (int portIndex) const noexcept = 0;
+
+    /** Number of configured JACK MIDI input ports (matches the value
+        last set on JackClient via setNumMidiInputs).  Bounds the valid
+        range for getCurrentJackMidiInputForPort. */
+    virtual int getNumJackMidiInputPorts() const noexcept = 0;
 };
 
 class JackPort final : public juce::ReferenceCountedObject
