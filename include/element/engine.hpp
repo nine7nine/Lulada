@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <element/juce/audio_devices.hpp>
 #include <element/services.hpp>
 #include <element/node.hpp>
@@ -46,6 +48,33 @@ public:
 
     /** Adds a plugin by description to the current graph */
     Node addPlugin (const juce::PluginDescription& desc, const bool verified = true, const float rx = 0.5f, const float ry = 0.5f, bool dontShowUI = false);
+
+    /** Element: async equivalent of addPlugin.  Routes the heavy
+        createPluginInstance call through a JUCE worker thread; the
+        callback is invoked on the message thread once the plugin is
+        loaded (or with an empty Node on failure).  Use this from any
+        user-interactive code path so the GUI stays responsive while
+        the plugin loads — particularly important on this build where
+        the wineserver RPC traffic from a sync LoadLibrary blocks
+        the message thread AND competes with running plugins' audio-
+        thread Wine calls, which can push the engine into xruns. */
+    void addPluginAsync (const juce::PluginDescription& desc,
+                         bool verified,
+                         float rx,
+                         float ry,
+                         bool dontShowUI,
+                         std::function<void (const Node&)> callback);
+
+    /** Element: async variant of addPlugin(graph, desc, builder,
+        verified).  Same shape, routes through the same worker thread
+        plumbing.  Used by AddPluginAction (the UndoableAction that
+        handles the right-click Plugins-submenu add) so the message
+        thread isn't held for the full LoadLibrary + dispatcher init. */
+    void addPluginAsync (const Node& graph,
+                         const juce::PluginDescription& desc,
+                         const ConnectionBuilder& builder,
+                         bool verified,
+                         std::function<void (const Node&)> callback);
 
     /** Adds a plugin to a specific graph */
     Node addPlugin (const Node& graph, const juce::PluginDescription& desc);

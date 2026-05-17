@@ -51,6 +51,17 @@ public:
     /** Adss a node with a plugin description */
     uint32 addNode (const juce::PluginDescription* desc, double x = 0.0f, double y = 0.0f, uint32 nodeId = 0);
 
+    /** Element: async variant of addNode(PluginDescription*, ...).
+        Routes the heavy createPluginInstance call through JUCE's
+        async loader on a worker thread; once the plugin instance
+        is ready, the rest of the addNode body runs synchronously on
+        the message thread.  Callback fires with EL_INVALID_NODE on
+        failure (and an error message has already been logged /
+        surfaced by the underlying loader). */
+    void addNodeAsync (const juce::PluginDescription* desc,
+                       double x, double y, juce::uint32 nodeId,
+                       std::function<void (juce::uint32 nodeId)> callback);
+
     /** Remove a node by ID */
     void removeNode (const uint32 nodeId);
 
@@ -109,9 +120,41 @@ private:
     Processor* createFilter (const PluginDescription* desc, double x = 0.0f, double y = 0.0f, uint32 nodeId = 0);
     Processor* createPlaceholder (const Node& node);
 
+    /* Element: post-load finalization shared between addNode (sync)
+     * and addNodeAsync.  Strictly message-thread; mutates the graph
+     * model, registers the node in the processor's value tree, and
+     * negotiates a default stereo bus layout for AudioProcessor-
+     * backed nodes. */
+    juce::uint32 finalizeAddedNode (Processor* object,
+                                    const juce::PluginDescription* desc,
+                                    double rx, double ry);
+
+    /* Element: async finalize for the addNodeAsync path.  Splits the
+     * work across threads — Part A (metadata + resetPorts) on the
+     * message thread for VST3 MMLock safety, the hidePorts loop on a
+     * worker thread (pure ValueTree writes on a not-yet-attached
+     * tree), then Part B (stereo bus + addChild + changed) back on
+     * the message thread via callAsync.  Callback fires on the
+     * message thread once Part B completes.  No-op if either input is
+     * null. */
+    void finalizeAddedNodeAsync (Processor* object,
+                                 std::shared_ptr<juce::PluginDescription> desc,
+                                 double rx, double ry,
+                                 std::function<void (juce::uint32)> callback);
+
     void setupNode (const ValueTree& data, ProcessorPtr object);
 
     void processorArcsChanged();
+
+    /* Element: WeakReference master for the async plugin-load path.
+     * addNodeAsync captures a WeakReference into the lambda dispatched
+     * back from JUCE's worker thread; if the GraphManager is destroyed
+     * (session close, app quit) before the worker completes, the
+     * reference is invalidated and the callback no-ops instead of
+     * touching freed memory.  No audio-thread involvement — the
+     * weak ref is consulted only on the message thread inside the
+     * async completion. */
+    JUCE_DECLARE_WEAK_REFERENCEABLE (GraphManager)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GraphManager)
 };

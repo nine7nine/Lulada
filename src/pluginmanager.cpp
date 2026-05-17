@@ -883,6 +883,33 @@ AudioPluginInstance* PluginManager::createAudioPlugin (const PluginDescription& 
         .release();
 }
 
+void PluginManager::createAudioPluginAsync (const PluginDescription& desc,
+                                            std::function<void (AudioPluginInstance*, const String&)> callback)
+{
+    /* Element-NSPA: route directly through JUCE-NSPA's async entry.
+     * The fork's AudioPluginFormat::createPluginInstanceAsync spawns
+     * the load on a Win32-registered worker thread (via Wine's
+     * CreateThread, since plain pthreads can't safely call
+     * LoadLibraryW + SEH on this build) and delivers the result back
+     * onto the message thread via MessageManager::callAsync.
+     *
+     * Upstream JUCE's implementation does NOT do this — it
+     * postMessage's to the format's MessageListener queue and runs
+     * the load on the message thread, freezing the GUI for the
+     * duration.  See the JUCE-NSPA winelib patch in
+     * modules/juce_audio_processors_headless/format/juce_AudioPluginFormat.cpp. */
+
+    getAudioPluginFormats().createPluginInstanceAsync (
+        desc,
+        priv->sampleRate,
+        priv->blockSize,
+        [cb = std::move (callback)] (std::unique_ptr<AudioPluginInstance> instance,
+                                      const String& errorMsg) mutable
+        {
+            cb (instance.release(), errorMsg);
+        });
+}
+
 Processor* PluginManager::createGraphNode (const PluginDescription& desc, String& errorMsg)
 {
     errorMsg.clear();
@@ -926,6 +953,69 @@ Processor* PluginManager::createGraphNode (const PluginDescription& desc, String
     errorMsg = desc.name;
     errorMsg << " not found.";
     return nullptr;
+}
+
+void PluginManager::createGraphNodeAsync (const PluginDescription& desc,
+                                          std::function<void (Processor*, const String&)> callback)
+{
+    /* Mirror createGraphNode's logic but route the heavy path
+     * through createAudioPluginAsync.  Internal / Element-format
+     * shortcuts (IONode pseudo-nodes + the internal NodeFactory
+     * processors) are cheap to construct so they complete
+     * synchronously and the callback is dispatched immediately. */
+    String errorMsg;
+
+    if (desc.pluginFormatName == "Internal")
+    {
+        Processor* node = nullptr;
+        if (desc.fileOrIdentifier == "audio.input")
+            node = new IONode (IONode::audioInputNode);
+        else if (desc.fileOrIdentifier == "audio.output")
+            node = new IONode (IONode::audioOutputNode);
+        else if (desc.fileOrIdentifier == "midi.input")
+            node = new IONode (IONode::midiInputNode);
+        else if (desc.fileOrIdentifier == "midi.output")
+            node = new IONode (IONode::midiOutputNode);
+        else
+        {
+            errorMsg = "Could not create internal node: ";
+            errorMsg << desc.fileOrIdentifier;
+        }
+        callback (node, errorMsg);
+        return;
+    }
+
+    if (! isAudioPluginFormatSupported (desc.pluginFormatName))
+    {
+        errorMsg = desc.name;
+        errorMsg << ": invalid format: " << desc.pluginFormatName;
+        callback (nullptr, errorMsg);
+        return;
+    }
+
+    /* NodeFactory holds the Element-format internal builders
+     * (mixer, channelize, midi*, jackMidi*, etc.).  These don't go
+     * through the AudioPluginFormat layer; instantiating them is
+     * fast + synchronous, so handle here before falling through
+     * to the async load. */
+    if (auto* node = getNodeFactory().instantiate (desc))
+    {
+        callback (node, {});
+        return;
+    }
+
+    createAudioPluginAsync (
+        desc,
+        [cb = std::move (callback)] (AudioPluginInstance* plugin, const String& err) mutable
+        {
+            if (plugin == nullptr)
+            {
+                cb (nullptr, err);
+                return;
+            }
+            plugin->enableAllBuses();
+            cb (NodeFactory::wrap (plugin), {});
+        });
 }
 
 AudioPluginFormatManager& PluginManager::getAudioPluginFormats()

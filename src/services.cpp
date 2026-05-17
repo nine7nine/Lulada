@@ -225,7 +225,14 @@ void Services::handleMessage (const Message& msg)
     handled = true; // final else condition will set false
     if (const auto* lpm = dynamic_cast<const LoadPluginMessage*> (&msg))
     {
-        ec->addPlugin (lpm->description, lpm->verified, lpm->relativeX, lpm->relativeY);
+        /* Element: route through the async add path so the message
+         * thread isn't held for the full duration of LoadLibrary +
+         * the plugin's dispatcher init.  The callback fires on the
+         * message thread once the plugin is loaded — no-op for the
+         * default add (the GuiService side handles plugin-window
+         * presentation inside addPluginAsync). */
+        ec->addPluginAsync (lpm->description, lpm->verified, lpm->relativeX, lpm->relativeY, false,
+                            [] (const Node&) {});
     }
     else if (const auto* dnm = dynamic_cast<const DuplicateNodeMessage*> (&msg))
     {

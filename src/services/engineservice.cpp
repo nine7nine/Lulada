@@ -609,6 +609,73 @@ void EngineService::addNode (const Node& _node)
     }
 }
 
+void EngineService::addPluginAsync (const PluginDescription& desc,
+                                    bool verified,
+                                    float rx,
+                                    float ry,
+                                    bool dontShowUI,
+                                    std::function<void (const Node&)> userCallback)
+{
+    /* Element: async equivalent of addPlugin.  The cheap parts
+     * (verify / scan / fallback resolution) run synchronously on
+     * the message thread; the heavy createPluginInstance step is
+     * dispatched to a worker via GraphManager::addNodeAsync.  Once
+     * the worker callback lands back on the message thread we look
+     * up the resulting Node, present the plugin window (matching
+     * the sync addPlugin behaviour), and invoke the user callback. */
+    auto* root = graphs->findActiveRootGraphManager();
+    if (! root)
+    {
+        if (userCallback) userCallback ({});
+        return;
+    }
+
+    auto descCopy = std::make_shared<PluginDescription> (desc);
+
+    if (! verified)
+    {
+        auto* format = context().plugins().getAudioPluginFormat (descCopy->pluginFormatName);
+        jassert (format != nullptr);
+        auto& list (context().plugins().getKnownPlugins());
+        list.removeFromBlacklist (descCopy->fileOrIdentifier);
+        list.removeType (*descCopy);
+        OwnedArray<PluginDescription> plugs;
+        if (list.scanAndAddFile (descCopy->fileOrIdentifier, false, plugs, *format))
+        {
+            context().plugins().saveUserPlugins (context().settings());
+        }
+        if (plugs.size() == 0)
+        {
+            AlertWindow::showMessageBoxAsync (AlertWindow::NoIcon, "Add Plugin",
+                String ("Could not add ") + descCopy->name + " for an unknown reason");
+            if (userCallback) userCallback ({});
+            return;
+        }
+        descCopy = std::make_shared<PluginDescription> (*plugs.getFirst());
+    }
+
+    /* Capture the GuiService raw — Services live as long as Context,
+     * so by the time the async callback fires they're still valid.
+     * RootGraphManager itself is guarded by addNodeAsync's
+     * WeakReference; if the manager dies we get EL_INVALID_NODE back
+     * and short-circuit cleanly. */
+    auto* gui = sibling<GuiService>();
+    bool showWindow = ! dontShowUI && context().settings().showPluginWindowsWhenAdded();
+
+    root->addNodeAsync (descCopy.get(), rx, ry, 0,
+        [this, root, descCopy, showWindow, gui, cb = std::move (userCallback)] (uint32 nodeId)
+        {
+            Node node;
+            if (nodeId != EL_INVALID_NODE)
+            {
+                node = root->getNodeModelForId (nodeId);
+                if (showWindow && gui != nullptr && node.isValid())
+                    gui->presentPluginWindow (node);
+            }
+            if (cb) cb (node);
+        });
+}
+
 Node EngineService::addPlugin (const PluginDescription& desc, const bool verified, const float rx, const float ry, bool dontShowUI)
 {
     auto* root = graphs->findActiveRootGraphManager();
@@ -876,6 +943,83 @@ Node EngineService::addPlugin (const Node& graph, const PluginDescription& desc)
         node = addPlugin (*controller, desc);
 
     return node;
+}
+
+void EngineService::addPluginAsync (const Node& graph,
+                                    const PluginDescription& desc,
+                                    const ConnectionBuilder& builder,
+                                    bool verified,
+                                    std::function<void (const Node&)> userCallback)
+{
+    /* Element: async variant of addPlugin(graph, desc, builder,
+     * verified).  See PluginManager::createAudioPluginAsync for the
+     * worker-thread mechanics.  Verify/scan prework happens
+     * synchronously on the message thread, the heavy load + post-
+     * load setup runs through GraphManager::addNodeAsync, then the
+     * builder applies any auto-connections back on the message
+     * thread inside our completion callback. */
+    if (! graph.isGraph())
+    {
+        if (userCallback) userCallback ({});
+        return;
+    }
+
+    auto* controller = graphs->findGraphManagerFor (graph);
+    if (controller == nullptr)
+    {
+        if (userCallback) userCallback ({});
+        return;
+    }
+
+    auto& list (context().plugins().getKnownPlugins());
+    PluginDescription descToLoad = desc;
+
+    if (! verified)
+    {
+        if (desc.pluginFormatName == "LV2")
+        {
+            if (auto lv2 = context().plugins().getProvider ("LV2"))
+            {
+                juce::ignoreUnused (lv2);
+                list.removeFromBlacklist (desc.fileOrIdentifier);
+                list.addType (desc);
+            }
+        }
+        else
+        {
+            auto* format = context().plugins().getAudioPluginFormat (desc.pluginFormatName);
+            jassert (format != nullptr);
+            list.removeFromBlacklist (desc.fileOrIdentifier);
+            OwnedArray<PluginDescription> plugs;
+            if (list.scanAndAddFile (desc.fileOrIdentifier, false, plugs, *format))
+            {
+                context().plugins().saveUserPlugins (context().settings());
+            }
+            if (plugs.size() > 0)
+                descToLoad = *plugs.getFirst();
+        }
+    }
+
+    /* Capture by value where possible — descToLoad is a struct, the
+     * builder doesn't survive easily through an async hop so we copy
+     * it.  controller pointer is fine since the GraphManager outlives
+     * the async hop (and addNodeAsync itself uses a WeakReference). */
+    auto builderCopy = std::make_shared<ConnectionBuilder> (builder);
+    controller->addNodeAsync (&descToLoad, 0.5, 0.5, 0,
+        [controller, builderCopy, cb = std::move (userCallback)] (uint32 nodeId) mutable
+        {
+            Node node;
+            if (nodeId != EL_INVALID_NODE)
+            {
+                node = controller->getNodeModelForId (nodeId);
+                if (node.isValid())
+                {
+                    builderCopy->addConnections (*controller, nodeId);
+                    jassert (! node.getUuid().isNull());
+                }
+            }
+            if (cb) cb (node);
+        });
 }
 
 Node EngineService::addPlugin (const Node& graph, const PluginDescription& desc, const ConnectionBuilder& builder, const bool verified)

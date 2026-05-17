@@ -21,11 +21,37 @@ public:
 
     bool perform() override
     {
+        /* Element: route through addPluginAsync so the message thread
+         * isn't held for the full LoadLibrary + dispatcher init.  The
+         * action returns true immediately and addedNode is populated
+         * when the worker thread's callback lands back on the message
+         * thread.  Undo before the load completes is a no-op (the
+         * undo handler sees addedNode invalid and bails) — the load
+         * will still finalize and the plugin will appear on the
+         * canvas, but it won't be on the undo stack.  Acceptable
+         * trade-off vs holding the message thread for seconds. */
         addedNode = Node();
         if (auto* ec = app.find<EngineService>())
+        {
             if (graph.isGraph())
-                addedNode = addPlugin (*ec);
-        return addedNode.isValid();
+            {
+                auto node = app.context().plugins().getDefaultNode (description);
+                if (node.isValid())
+                {
+                    /* Preset / default-node path is sync + cheap. */
+                    addedNode = ec->addNode (node, graph, builder);
+                }
+                else
+                {
+                    /* Plugin load — async.  UndoManager owns this
+                     * action so capturing `this` is safe as long as
+                     * the action stays in the undo history. */
+                    ec->addPluginAsync (graph, description, builder, verified,
+                        [this] (const Node& result) { this->addedNode = result; });
+                }
+            }
+        }
+        return true;
     }
 
     bool undo() override

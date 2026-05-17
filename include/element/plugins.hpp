@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <element/juce/audio_processors.hpp>
 
 #define EL_PLUGIN_SCANNER_PROCESS_ID "pspelbg"
@@ -99,6 +101,31 @@ public:
 
     juce::AudioPluginInstance* createAudioPlugin (const juce::PluginDescription& desc, juce::String& errorMsg);
     Processor* createGraphNode (const juce::PluginDescription& desc, juce::String& errorMsg);
+
+    /** Element: async equivalents.  The blocking variants above hold
+        the message thread for the duration of LoadLibrary + the
+        plugin's dispatcher initialization — anywhere from ~200ms for
+        a small effect to multiple seconds for a heavy sampler.  On
+        the winelib build the same call is doubly painful because the
+        wineserver RPC traffic the loader emits competes with any
+        already-running plugins' audio-thread Wine calls, which can
+        push the audio engine into xruns while the UI freezes.
+
+        These run JUCE's underlying createPluginInstanceAsync on a
+        worker thread and dispatch the callback back on the message
+        thread once the instance is ready.  Element-internal plugins
+        (audio.input/output, etc.) are cheap to construct and complete
+        synchronously inside the call to the callback. */
+    void createAudioPluginAsync (const juce::PluginDescription& desc,
+                                 std::function<void (juce::AudioPluginInstance*, const juce::String& errorMsg)> callback);
+
+    /** Equivalent of createGraphNode but async.  Wraps the resulting
+        AudioPluginInstance in a Processor via NodeFactory::wrap and
+        invokes the callback on the message thread.  Internal formats
+        (Element + Internal IONodes) complete synchronously inside
+        this call. */
+    void createGraphNodeAsync (const juce::PluginDescription& desc,
+                               std::function<void (Processor*, const juce::String& errorMsg)> callback);
 
     /** Set the play config used when instantiating plugins */
     void setPlayConfig (double sampleRate, int blockSize);
