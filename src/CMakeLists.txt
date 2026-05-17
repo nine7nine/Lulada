@@ -81,6 +81,7 @@ target_link_libraries(element
         juce::juce_core
         juce::juce_gui_basics
         juce::juce_gui_extra
+        juce::juce_opengl
         juce::juce_osc
         juce::juce_dsp
         juce::juce_data_structures

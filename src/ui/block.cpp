@@ -187,14 +187,20 @@ BlockComponent::BlockComponent (const Node& graph_, const Node& node_, const boo
     jassert (obj != nullptr);
     nodeObject.addListener (this);
 
-    setBufferedToImage (true);
+    /* Element: dropped setBufferedToImage(true) + the DropShadow
+     * effect.  Both made sense when each block redraw was a costly
+     * software-rasterized paint pushed through the X11 socket — the
+     * offscreen image cached the result so subsequent paints were
+     * cheap.  With the GL renderer attached to the main window, all
+     * drawing goes through the GPU and the per-component offscreen
+     * actually hurts: every resize / move invalidates the image and
+     * forces a full regeneration, and the Gaussian-blurred shadow
+     * effect runs on the CPU regardless of renderer.  Stripping
+     * both removed the resize choppiness on dense graphs. */
     nodeEnabled = node.getPropertyAsValue (tags::enabled);
     nodeEnabled.addListener (this);
     nodeName = node.getPropertyAsValue (tags::name);
     nodeName.addListener (this);
-
-    shadow.setShadowProperties (DropShadow (Colours::black.withAlpha (0.5f), 3, Point<int> (0, 1)));
-    setComponentEffect (&shadow);
 
     addAndMakeVisible (configButton);
     configButton.setPath (getIcons().fasCog);

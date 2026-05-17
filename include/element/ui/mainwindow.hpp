@@ -6,6 +6,8 @@
 #include <element/juce/gui_basics.hpp>
 #include <element/session.hpp>
 
+#include <juce_opengl/juce_opengl.h>
+
 namespace element {
 
 class Services;
@@ -39,6 +41,15 @@ private:
 
     void nameChanged();
     void nameChangedSession();
+
+    /* Element: GPU-backed rendering for the main window.  The JUCE
+     * software renderer on X11 is CPU-only — every paint blits via
+     * the X11 socket on the message thread, which makes window /
+     * mixer resize feel choppy on dense graphs.  Attaching an
+     * OpenGLContext lifts the whole window's render tree onto the
+     * GPU.  Plugin embedding lives in separate native windows and
+     * is unaffected. */
+    juce::OpenGLContext openGLContext;
 };
 
 } // namespace element

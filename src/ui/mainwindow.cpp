@@ -33,10 +33,21 @@ MainWindow::MainWindow (Context& g)
 
     g.session()->addChangeListener (this);
     addKeyListener (gui.commands().getKeyMappings());
+
+    /* Element: GPU renderer for the main window.  Attaching to the
+     * DocumentWindow itself wraps everything inside (content panel +
+     * any embedded views) in a single GL context.  Continuous repaint
+     * stays off — JUCE invalidates regions on resize / drag and the
+     * GL renderer handles the upload, which is what we want on a
+     * desktop UI.  Embedded plugin windows live in separate native
+     * peers and aren't affected by this context. */
+    openGLContext.setContinuousRepainting (false);
+    openGLContext.attachTo (*this);
 }
 
 MainWindow::~MainWindow()
 {
+    openGLContext.detach();
     setMenuBar (nullptr);
     world.session()->removeChangeListener (this);
     mainMenu.reset();

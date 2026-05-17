@@ -304,7 +304,6 @@ private:
 
     juce::OptionalScopedPointer<CallOutBox> ioBox;
 
-    DropShadowEffect shadow;
     std::unique_ptr<Component> embedded;
 
     Value nodeObject;

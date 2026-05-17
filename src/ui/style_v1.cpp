@@ -255,12 +255,16 @@ LookAndFeel_E1::LookAndFeel_E1()
     setColour (TextButton::textColourOffId, Colours::white);
     setColour (TextButton::textColourOnId, Colours::white);
 
-    // PopupMenu Styling
-    setColour (PopupMenu::backgroundColourId, Colour (0xfff0f0f0));
-    setColour (PopupMenu::textColourId, Colour (0xff1d1d1e));
-    setColour (PopupMenu::headerTextColourId, Colour (0xff1d1d1e));
+    // Element: dark-themed PopupMenu so it matches the rest of the
+    // app's dark palette (light dropdowns next to a dark menu bar
+    // looked very Windows-90s).  Background follows the same
+    // widgetBackground gray used by the toolbar / properties panel
+    // just below the menu bar.
+    setColour (PopupMenu::backgroundColourId, Colors::widgetBackgroundColor);
+    setColour (PopupMenu::textColourId, Colour (0xffe0e0e0));
+    setColour (PopupMenu::headerTextColourId, Colour (0xffbdbdbd));
     setColour (PopupMenu::highlightedBackgroundColourId, Colors::elemental);
-    setColour (PopupMenu::highlightedTextColourId, Colour (0xfff0f0f0));
+    setColour (PopupMenu::highlightedTextColourId, Colour (0xffffffff));
 
     // ComboBox Styling
     setColour (ComboBox::backgroundColourId, Colours::black);
@@ -1054,14 +1058,43 @@ Font LookAndFeel_E1::getMenuBarFont (MenuBarComponent&, int, const String&)
     return Font (FontOptions (16.f));
 }
 
-void LookAndFeel_E1::drawMenuBarBackground (Graphics& g, int width, int height, bool isMouseOverBar, MenuBarComponent& mbc)
+void LookAndFeel_E1::drawMenuBarBackground (Graphics& g, int width, int height, bool /*isMouseOverBar*/, MenuBarComponent& /*mbc*/)
 {
-    LookAndFeel_V3::drawMenuBarBackground (g, width, height, isMouseOverBar, mbc);
+    /* Element: flat fill that matches the transport / toolbar strip
+     * directly below the menu bar (see Content's inner toolbar paint
+     * — same Colors::contentBackgroundColor.brighter(0.1f)).  Using
+     * a different shade made the menu bar read as a separate widget;
+     * matching them gives one continuous header strip.  No gradient,
+     * no 1px separator line. */
+    g.fillAll (Colors::contentBackgroundColor.brighter (0.1f));
 }
 
-void LookAndFeel_E1::drawMenuBarItem (Graphics& g, int width, int height, int itemIndex, const String& itemText, bool isMouseOverItem, bool isMenuOpen, bool isMouseOverBar, MenuBarComponent& bar)
+void LookAndFeel_E1::drawMenuBarItem (Graphics& g, int width, int height, int /*itemIndex*/, const String& itemText, bool isMouseOverItem, bool isMenuOpen, bool /*isMouseOverBar*/, MenuBarComponent& bar)
 {
-    LookAndFeel_V3::drawMenuBarItem (g, width, height, itemIndex, itemText, isMouseOverItem, isMenuOpen, isMouseOverBar, bar);
+    if (! itemText.isEmpty())
+    {
+        if (isMenuOpen)
+        {
+            g.setColour (Colors::elemental);
+            g.fillRect (0, 0, width, height);
+            g.setColour (Colours::white);
+        }
+        else if (isMouseOverItem)
+        {
+            g.setColour (Colors::widgetBackgroundColor.brighter (0.25f));
+            g.fillRect (0, 0, width, height);
+            g.setColour (Colours::white);
+        }
+        else
+        {
+            /* Light gray matching the active toolbar text below — flat
+             * against the dark menu bar, no Windows-style embossing. */
+            g.setColour (Colour (0xffe0e0e0));
+        }
+
+        g.setFont (getMenuBarFont (bar, 0, itemText));
+        g.drawFittedText (itemText, 0, 0, width, height, Justification::centred, 1);
+    }
 }
 
 void LookAndFeel_E1::drawKeymapChangeButton (Graphics& g, int width, int height, Button& button, const String& keyDescription)
