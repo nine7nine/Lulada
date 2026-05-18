@@ -961,7 +961,19 @@ bool GuiService::perform (const InvocationInfo& info)
         }
         //======================================================================
         case Commands::sessionOpen: {
-            FileChooser chooser ("Open Session", impl->lastSavedFile, "*.els", true, false);
+            // useOSNativeDialogBox = false — Wine's IFileDialog never
+            // surfaces under winelib Element (no zenity / KDE bridge
+            // fires either), so use JUCE's internal portable chooser
+            // for every file dialog in this binary.  Same workaround
+            // we use for the VST plugin-path picker.
+            //
+            // parentComponent = content() — anchors the chooser as a
+            // child of the main window instead of a separate top-
+            // level X11 window.  Top-level non-native dialogs come up
+            // with no decoration under winelib (no titlebar / close
+            // button), so embed centred on the parent for visual
+            // consistency with the VST-path AlertWindow.
+            FileChooser chooser ("Open Session", impl->lastSavedFile, "*.els", false, false, content());
             if (chooser.browseForFileToOpen())
             {
                 sibling<SessionService>()->openFile (chooser.getResult());
@@ -997,7 +1009,9 @@ bool GuiService::perform (const InvocationInfo& info)
             break;
         //======================================================================
         case Commands::importGraph: {
-            FileChooser chooser ("Import Graph", impl->lastExportedGraph, "*.elg");
+            // JUCE-internal chooser, embedded on main window — see
+            // sessionOpen above for why.
+            FileChooser chooser ("Import Graph", impl->lastExportedGraph, "*.elg", false, false, content());
             if (chooser.browseForFileToOpen())
                 sibling<SessionService>()->importGraph (chooser.getResult());
             break;
@@ -1016,7 +1030,9 @@ bool GuiService::perform (const InvocationInfo& info)
             }
 
             {
-                FileChooser chooser (TRANS ("Export Graph"), impl->lastExportedGraph, "*.elg");
+                // JUCE-internal chooser, embedded on main window — see
+                // sessionOpen above for why.
+                FileChooser chooser (TRANS ("Export Graph"), impl->lastExportedGraph, "*.elg", false, false, content());
                 if (chooser.browseForFileToSave (true))
                     sibling<SessionService>()->exportGraph (node, chooser.getResult());
                 if (auto* gui = sibling<GuiService>())
