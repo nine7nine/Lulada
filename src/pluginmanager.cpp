@@ -313,7 +313,12 @@ public:
 
         logger->logMessage ("[scanner] setting up formats");
         auto& nf = plugins->getNodeFactory();
+       #if ! defined (__WINE__)
+        // Native Linux CLAP path — same gate as context.cpp's main-process
+        // setup.  Under winelib, JUCE-NSPA's CLAPPluginFormat (registered
+        // by addDefaultFormats below) handles Windows .clap PE DLLs.
         nf.add (new CLAPProvider());
+       #endif
         plugins->addDefaultFormats();
         plugins->setPlayConfig (48000.0, 1024);
     }
@@ -358,6 +363,27 @@ bool PluginScanner::retrieveDescriptions (const String& formatName,
                                           const String& fileOrIdentifier,
                                           OwnedArray<PluginDescription>& result)
 {
+   #if defined (__WINE__)
+    // Winelib bypass for CLAP: the ChildProcessCoordinator → Worker IPC
+    // handshake is broken under winegcc (worker writes its FileLogger
+    // header then dies/hangs before initialiseFromCommandLine completes).
+    // Scan happens in-process for CLAP — same risk profile as JUCE's
+    // built-in scanAndAddDragAndDroppedFiles in-process path that VST3
+    // and VST2 winelib also use.  When the worker IPC is fixed, this
+    // gate flips back open.  See JUCE-NSPA juce_CLAPPluginFormatImpl.h
+    // for the load + factory enumeration path that runs here.
+    if (formatName == "CLAP")
+    {
+        if (auto* format = _manager.getAudioPluginFormat (formatName))
+        {
+            Logger::writeToLog ("[in-process scan] " + formatName + ": " + fileOrIdentifier);
+            format->findAllTypesForFile (result, fileOrIdentifier);
+            return result.size() > 0;
+        }
+        return false;
+    }
+   #endif
+
     if (superprocess == nullptr)
         superprocess = std::make_unique<PluginScannerCoordinator> (*this);
 
@@ -772,6 +798,16 @@ void PluginManager::addDefaultFormats()
 #if JUCE_PLUGINHOST_VST3
         else if (fmt == "VST3")
             audioPlugs.addFormat (std::make_unique<VST3PluginFormat>());
+#endif
+
+#if JUCE_PLUGINHOST_CLAP && defined (__WINE__)
+        // CLAP host support is winelib-only on this fork — loads Windows
+        // .clap PE DLLs via Wine's LoadLibraryW.  Native Linux .clap files
+        // are handled by Element's own CLAPProvider (engine/clapprovider.cpp),
+        // which context.cpp gates off under __WINE__ so we don't double-
+        // register.  See juce_CLAPPluginFormatImpl.h on the JUCE-NSPA side.
+        else if (fmt == "CLAP")
+            audioPlugs.addFormat (std::make_unique<CLAPPluginFormat>());
 #endif
 
 #if JUCE_PLUGINHOST_LV2 && ! defined (__WINE__)

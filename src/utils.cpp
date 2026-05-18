@@ -104,6 +104,16 @@ void addWinePluginPaths (juce::FileSearchPath& path, const juce::String& formatN
     {
         addIfExists (prefix + "/drive_c/Program Files/Common Files/VST3");
     }
+    else if (formatName == "CLAP")
+    {
+        // CLAP spec (entry.h) Windows search dirs:
+        //   %COMMONPROGRAMFILES%\CLAP                         → Program Files/Common Files/CLAP
+        //   %LOCALAPPDATA%\Programs\Common\CLAP               → users/<user>/AppData/Local/Programs/Common/CLAP
+        addIfExists (prefix + "/drive_c/Program Files/Common Files/CLAP");
+        const juce::String user = juce::SystemStats::getEnvironmentVariable ("USER", {});
+        if (! user.isEmpty())
+            addIfExists (prefix + "/drive_c/users/" + user + "/AppData/Local/Programs/Common/CLAP");
+    }
 #else
     juce::ignoreUnused (path, formatName);
 #endif

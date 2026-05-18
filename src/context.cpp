@@ -93,7 +93,16 @@ private:
         auto& nf = plugins->getNodeFactory();
         nf.add (new InternalNodes (owner));
         nf.add (new AudioProcessorFactory (owner));
+       #if ! defined (__WINE__)
+        // Native Linux CLAP path — Element's own NodeProvider-based host.
+        // Under winelib, CLAP hosting flows through JUCE-NSPA's
+        // CLAPPluginFormat (registered via addDefaultFormats below); having
+        // both paths active would double-scan + double-instantiate.  The
+        // winelib variant is the only useful one under Wine since native
+        // Linux .clap files have a different ABI than the Windows .clap
+        // PE DLLs we're targeting.
         nf.add (new CLAPProvider());
+       #endif
         plugins->addDefaultFormats();
     }
 

@@ -134,6 +134,16 @@ if(CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
     target_compile_definitions(element PUBLIC JUCE_ASIO=1)
 endif()
 
+# CLAP host support — only enabled under winelib, where JUCE-NSPA's
+# CLAPPluginFormat loads Windows .clap PE DLLs via Wine's LoadLibraryW.
+# Native Linux CLAP hosting is handled by Element's own CLAPProvider
+# (engine/clapprovider.cpp), which the context.cpp wire-up gates off
+# under __WINE__ so we don't double-register the format.
+if(CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
+    message(STATUS "Winelib CLAP host support enabled (JUCE-NSPA CLAPPluginFormat)")
+    target_compile_definitions(element PUBLIC JUCE_PLUGINHOST_CLAP=1)
+endif()
+
 # VST2 enable host support
 #
 # Under winelib, always enable VST2 host support and point at the
