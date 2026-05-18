@@ -250,7 +250,7 @@ public:
             const Port port (typeNode.getPort (typeChannel));
             switch (port.getType().id())
             {
-                case PortType::Audio:   wireColor = Colour (0xff1de9b6); break; // teal    A400 (matches audio block + port hue family)
+                case PortType::Audio:   wireColor = Colour (0xff00e676); break; // green   A400 (matches audio block + port hue family)
                 case PortType::Midi:    wireColor = Colour (0xffffa726); break; // orange  400
                 case PortType::Control: wireColor = Colour (0xff64b5f6); break; // blue    300
                 case PortType::CV:      wireColor = Colour (0xffba68c8); break; // purple  300
@@ -503,7 +503,12 @@ void GraphEditorComponent::setVerticalLayout (const bool isVertical)
 
 void GraphEditorComponent::paint (Graphics& g)
 {
-    g.fillAll (findColour (Style::contentBackgroundColorId));
+    // Use the named Colors::contentBackgroundColor (the deep theme
+    // base) directly — the LookAndFeel's Style::contentBackgroundColorId
+    // is a lighter intermediate gray and visibly stands apart from the
+    // window's own dark base.  Matching the same near-black across the
+    // window content + table + graph keeps the whole app one piece.
+    g.fillAll (Colors::contentBackgroundColor);
 }
 
 void GraphEditorComponent::mouseDown (const MouseEvent& e)

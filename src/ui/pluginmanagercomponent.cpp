@@ -299,7 +299,36 @@ public:
 
     void paintRowBackground (Graphics& g, int rowNumber, int width, int height, bool rowIsSelected) override
     {
-        ViewHelpers::drawBasicTextRow (String(), g, width, height, rowIsSelected);
+        // Per-row type tint — same recipe as the mixer / strip dock:
+        // darkened gray base interpolated a low % toward the format
+        // accent so the row carries a subtle visual cue without
+        // turning the table into stripes.  Selection is signalled by
+        // a stronger tint of the same accent so the highlight still
+        // matches the row's type.
+        const juce::String format = (! isPositiveAndBelow (rowNumber, list.getNumTypes()))
+                                        ? juce::String()
+                                        : list.getTypes().getReference (rowNumber).pluginFormatName;
+
+        const auto accent = formatAccent (format);
+        const auto base   = Colors::contentBackgroundColor;
+        g.setColour (base.interpolatedWith (accent, rowIsSelected ? 0.20f : 0.05f));
+        g.fillRect (0, 0, width, height);
+    }
+
+    /* Plugin-format → accent colour.  Mirrors the block / strip
+     * palette in nodechannelstrip.hpp + block.cpp; kept duplicated
+     * here because this site works on raw format strings (no Node)
+     * and has no Audio / MIDI / JACK-MIDI cases (those aren't
+     * loadable plugin formats). */
+    static juce::Colour formatAccent (const juce::String& f) noexcept
+    {
+        if (f == "VST")       return juce::Colour (0xff3d5afe);  // indigo A400 — VST2
+        if (f == "VST3")      return juce::Colour (0xffd500f9);  // purple A400 — VST3
+        if (f == "CLAP")      return juce::Colour (0xff00e5ff);  // cyan   A400 — CLAP
+        if (f == "LV2")       return juce::Colour (0xffff1744);  // red    A400 — LV2
+        if (f == "AudioUnit") return juce::Colour (0xffff9100);  // orange A400 — AU
+        if (f == "Element")   return juce::Colour (0xffff4081);  // pink   A400 — Element internal
+        return juce::Colour (0xffbdbdbd);                         // gray 400 fallback
     }
 
     enum
@@ -363,9 +392,11 @@ public:
 
         if (text.isNotEmpty())
         {
-            g.setColour (isBlacklisted         ? Colours::red
-                         : columnId == nameCol ? Colors::textColor
-                                               : Colours::grey);
+            // Cells render in white against the type-tinted row bg
+            // (see paintRowBackground) so every column reads cleanly
+            // — type cue is in the row, not the text.  Blacklisted
+            // rows keep their red so dead entries stay obvious.
+            g.setColour (isBlacklisted ? Colours::red : Colours::white);
             g.setFont (Font (FontOptions (height * 0.7f)));
             g.drawFittedText (text, 4, 0, width - 6, height, Justification::centredLeft, 1, 0.9f);
         }
@@ -467,12 +498,23 @@ PluginListComponent::PluginListComponent (PluginManager& p, PropertiesFile* prop
 
     TableHeaderComponent& header = table.getHeader();
 
+    // Drop the LookAndFeel's light header bg — match the dark app
+    // theme so the column titles stop sticking out against the
+    // tinted rows below.  Text goes pure white for legibility.
+    header.setColour (TableHeaderComponent::backgroundColourId, Colors::contentBackgroundColor);
+    header.setColour (TableHeaderComponent::textColourId,       Colours::white);
+    header.setColour (TableHeaderComponent::outlineColourId,    Colors::contentBackgroundColor.brighter (0.1f));
+    header.setColour (TableHeaderComponent::highlightColourId,  Colors::widgetBackgroundColor);
+
     header.addColumn (TRANS ("Name"), TableModel::nameCol, 200, 100, 700, TableHeaderComponent::defaultFlags | TableHeaderComponent::sortedForwards);
     header.addColumn (TRANS ("Format"), TableModel::typeCol, 80, 80, 80, TableHeaderComponent::notResizable);
     header.addColumn (TRANS ("Category"), TableModel::categoryCol, 100, 100, 200);
     header.addColumn (TRANS ("Manufacturer"), TableModel::manufacturerCol, 200, 100, 300);
     header.addColumn (TRANS ("Description"), TableModel::descCol, 300, 100, 500, TableHeaderComponent::notSortable);
     header.addColumn (TRANS ("IO"), TableModel::ioCol, 80, 80, 80, TableHeaderComponent::notSortable);
+    // Table outer bg (uncovered area below rows + sides) matches the
+    // dark theme base so the rows don't sit on a lighter island.
+    table.setColour (ListBox::backgroundColourId, Colors::contentBackgroundColor);
     table.setHeaderHeight (22);
     table.setRowHeight (20);
     table.setModel (tableModel.get());

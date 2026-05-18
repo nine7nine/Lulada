@@ -23,9 +23,14 @@ const Colour Colors::toggleRed = Colour (0xffff0000);
 
 const Colour Colors::elementBlue = Colors::elemental;
 const Colour Colors::backgroundColor = Colour ((uint32) LookAndFeel_E1::defaultBackgroundColor);
-const Colour Colors::widgetBackgroundColor = Colour (0xff3b3b3b);
-const Colour Colors::contentBackgroundColor = Colors::widgetBackgroundColor.darker().darker();
-// const Colour Colors::contentBackgroundColor = Colour (0xff212125);
+// NSPA: app-wide dark-theme baseline.  Two coordinated tones rather
+// than one — chrome (panels, popups, toolbars, ContentView headers)
+// stays on widgetBackgroundColor; the deep canvas surfaces (graph,
+// plugin scan table, etc.) sit on contentBackgroundColor.  Both are
+// hardcoded so darkening the widget tone doesn't cascade content to
+// near-black through .darker().darker() math.
+const Colour Colors::widgetBackgroundColor  = Colour (0xff262626);
+const Colour Colors::contentBackgroundColor = Colour (0xff141414);
 
 const Colour Colors::textColor = Colour ((uint32) LookAndFeel_E1::defaultTextColor);
 const Colour Colors::textActiveColor = Colour ((uint32) LookAndFeel_E1::defaultTextActiveColor);
@@ -359,8 +364,19 @@ LookAndFeel_E1::LookAndFeel_E1()
     setColour (Style::backgroundColorId, Colour (0xff16191a));
     setColour (Style::backgroundHighlightColorId, Colour (0xffcccccc).darker (0.6000006f).withAlpha (0.6f));
 
-    setColour (Style::widgetBackgroundColorId, Colour (0xff3b3b3b));
-    setColour (Style::contentBackgroundColorId, Colour (0xff3b3b3b).darker (0.6f));
+    // Keep the LAF IDs in lock-step with the namespace-scope Colors:: —
+    // some consumers reach for findColour(Style::...), others use the
+    // static const directly, and they need to agree.
+    setColour (Style::widgetBackgroundColorId,  Colors::widgetBackgroundColor);
+    setColour (Style::contentBackgroundColorId, Colors::contentBackgroundColor);
+
+    // Default table headers across the app match the dark theme base so
+    // they stop reading as a stamped-on light bar.  Text + outline tuned
+    // for legibility against the dark fill.
+    setColour (TableHeaderComponent::backgroundColourId, Colors::contentBackgroundColor);
+    setColour (TableHeaderComponent::textColourId,       Colours::white);
+    setColour (TableHeaderComponent::outlineColourId,    Colors::contentBackgroundColor.brighter (0.1f));
+    setColour (TableHeaderComponent::highlightColourId,  Colors::widgetBackgroundColor);
 
     setColour (Style::textColorId, Colour (0xffcccccc));
     setColour (Style::textActiveColorId, Colour (0xffe5e5e5));
@@ -832,10 +848,14 @@ void LookAndFeel_E1::drawTableHeaderBackground (Graphics& g, TableHeaderComponen
 {
     Rectangle<int> r (header.getLocalBounds());
 
-    g.setColour (Colours::black.withAlpha (0.5f));
+    g.setColour (Colours::black);
     g.fillRect (r.removeFromBottom (1));
 
-    g.setColour (Colours::white.withAlpha (0.6f));
+    // Honour the per-header colour ID so tables can theme themselves;
+    // fall back to the dark theme base so default headers stop looking
+    // like a light bar pasted on top of dark content.
+    g.setColour (header.findColour (TableHeaderComponent::backgroundColourId,
+                                    /* inheritFromParent */ true));
     g.fillRect (r);
 
     g.setColour (Colours::black.withAlpha (0.5f));

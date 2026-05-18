@@ -19,6 +19,9 @@ public:
     Content (GuiService& g)
         : NodeChannelStripComponent (g)
     {
+        // Channel-name label pops in white so it stays legible against
+        // the type-tinted strip background regardless of node format.
+        setNodeNameColour (Colours::white);
         bindSignals();
         _conns.push_back (g.sibling<SessionService>()->sigSessionLoaded.connect ([this, &g]() {
             auto graph = g.session()->getActiveGraph();
@@ -37,7 +40,13 @@ public:
 
     void paint (Graphics& g) override
     {
-        NodeChannelStripComponent::paint (g);
+        // Match the mixer strip — subdued bg with a low-alpha tint of
+        // the node-type accent.  This view always shows the active
+        // node, so no selection state is layered on top.
+        const auto accent = nodeTypeColour (getNode());
+        const auto base   = Colors::widgetBackgroundColor.darker (0.45f);
+        g.setColour (base.interpolatedWith (accent, 0.07f));
+        g.fillAll();
         g.setColour (Colors::contentBackgroundColor);
         g.drawLine (0.0, 0.0, 0.0, getHeight());
     }

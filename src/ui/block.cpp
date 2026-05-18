@@ -891,7 +891,7 @@ void BlockComponent::paint (Graphics& g)
              * not the Element format, so a format-first check would
              * miss them and land on the gray fallback. */
             if (node.isAudioInputNode() || node.isAudioOutputNode())
-                return Colour (0xff1de9b6);      // teal A400 — matches audio wire (brighter tone than the prior forest green)
+                return Colour (0xff00e676);      // green A400 — matches audio wire
             if (node.isMidiInputNode() || node.isMidiOutputNode())
                 return Colour (0xffffa726);      // orange 400 — matches MIDI wire
 

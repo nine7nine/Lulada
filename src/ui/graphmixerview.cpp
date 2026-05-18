@@ -22,7 +22,13 @@ public:
 
     GraphMixerChannelStrip (GuiService& gui) : NodeChannelStripComponent (gui, false)
     {
-        onNodeChanged = [this]() { setNodeNameEditable (! (getNode().isIONode())); };
+        onNodeChanged = [this]() {
+            setNodeNameEditable (! (getNode().isIONode()));
+            repaint();
+        };
+        // Channel-name label pops in white so it stays legible against
+        // the type-tinted strip background regardless of node format.
+        setNodeNameColour (Colours::white);
         listener.reset (new ChildListener (*this));
         addMouseListener (listener.get(), true);
     }
@@ -92,21 +98,26 @@ public:
 
     void paint (Graphics& g) override
     {
-        NodeChannelStripComponent::paint (g);
-        if (selected)
-        {
-            g.setColour (Colours::white);
-            g.setOpacity (0.09f);
-            g.fillAll();
-        }
+        // Background stays subdued in every state — the type colour is
+        // mixed in at low strength so the strip carries the cue without
+        // shouting.  Selection is signalled by the saturated border in
+        // paintOverChildren, not by flooding the bg.
+        const auto accent = nodeTypeColour (getNode());
+        const auto base   = Colors::widgetBackgroundColor.darker (0.45f);
+        g.setColour (base.interpolatedWith (accent, 0.07f));
+        g.fillAll();
+        // Preserve the 1px right-edge separator from the parent paint.
+        g.setColour (Colors::contentBackgroundColor);
+        g.drawLine (getWidth() - 1.f, 0.0, getWidth() - 1.f, getHeight());
     }
 
     void paintOverChildren (Graphics& g) override
     {
         if (selected || (hover && ! dragging && ! down))
         {
-            g.setColour (Colors::toggleBlue);
-            g.drawRect (0.f, 0.f, (float) getWidth(), (float) getHeight(), selected ? 1.4 : 1.0);
+            const auto accent = nodeTypeColour (getNode());
+            g.setColour (selected ? accent : accent.withAlpha (0.6f));
+            g.drawRect (0.f, 0.f, (float) getWidth(), (float) getHeight(), selected ? 1.4f : 1.0f);
         }
     }
 
@@ -294,6 +305,12 @@ public:
     void onNodeSelected()
     {
         model->setNode (ui.getSelectedNode());
+        // setNode() bails when the parent graph hasn't changed, so a
+        // node added to the current graph (which fires nodeSelected on
+        // the newly-added node) wouldn't be picked up otherwise — re-
+        // walk the graph here so newly-added nodes appear immediately
+        // instead of waiting for the user to click another strip.
+        model->refreshNodes();
         box.updateContent();
     }
 

@@ -13,6 +13,44 @@
 
 namespace element {
 
+/* Per-node-type accent colour shared by the channel-strip family
+ * (graph mixer strips, the standalone node-strip dock).  Mirrors the
+ * block-border palette in block.cpp — duplicated there because block
+ * coloring layers selection state into its own logic; here the strip
+ * paint paths only need the raw type → colour mapping.  If a fourth
+ * consumer turns up, fold block.cpp's local copy into this header. */
+inline juce::Colour nodeTypeColour (const Node& n)
+{
+    using juce::Colour;
+    if (! n.isValid())
+        return Colour (0xffbdbdbd); // gray 400 fallback
+
+    if (n.isAudioInputNode() || n.isAudioOutputNode())
+        return Colour (0xff00e676);      // green A400 — Audio I/O
+    if (n.isMidiInputNode() || n.isMidiOutputNode())
+        return Colour (0xffffa726);      // orange 400 — MIDI I/O
+
+    const auto format = n.getFormat().toString();
+    const auto id     = n.getIdentifier().toString();
+
+    if (format == EL_NODE_FORMAT_NAME)
+    {
+        if (id == EL_NODE_ID_JACK_MIDI_INPUT
+         || id == EL_NODE_ID_JACK_MIDI_OUTPUT
+         || id == EL_NODE_ID_JACK_MIDI_INPUT_ALL
+         || id == EL_NODE_ID_JACK_MIDI_OUTPUT_ALL)
+            return Colour (0xffffa726);  // orange 400 — JACK MIDI
+        return Colour (0xffff4081);      // pink A400  — Element internal
+    }
+
+    if (format == "VST")       return Colour (0xff3d5afe);  // indigo A400 — VST2
+    if (format == "VST3")      return Colour (0xffd500f9);  // purple A400 — VST3
+    if (format == "CLAP")      return Colour (0xff00e5ff);  // cyan   A400 — CLAP
+    if (format == "LV2")       return Colour (0xffff1744);  // red    A400 — LV2
+    if (format == "AudioUnit") return Colour (0xffff9100);  // orange A400 — AudioUnit
+    return Colour (0xffbdbdbd);                              // gray 400 fallback
+}
+
 class NodeChannelStripComponent : public Component,
                                   public Timer,
                                   public ComboBox::Listener,
@@ -183,6 +221,14 @@ public:
         nodeName.setEditable (false, isEditable, false);
     }
 
+    /* Element: override the channel-name label's text colour.  Used by
+     * the graph mixer strip to push the name to pure white so it pops
+     * against the type-tinted background. */
+    inline void setNodeNameColour (Colour c)
+    {
+        nodeName.setColour (Label::textColourId, c);
+    }
+
     inline void setNode (const Node& newNode)
     {
         stopTimer();
@@ -195,6 +241,11 @@ public:
         displayName.referTo (node.getPropertyAsValue (tags::name));
         stabilizeContent();
         startTimerHz (meterSpeedHz);
+
+        // Strip bg is type-dependent (see nodeTypeColour) — a node
+        // swap has to repaint the strip itself, not just refresh the
+        // children that listen to model values.
+        repaint();
 
         if (onNodeChanged)
             onNodeChanged();
