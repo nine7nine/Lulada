@@ -68,7 +68,7 @@ class SamplerInstrument : public ReferenceCountedObject
 {
 public:
     using Ptr = ReferenceCountedObjectPtr<SamplerInstrument>;
-    static constexpr int kNumSlots = 16;
+    static constexpr int kNumSlots = 32;
 
     SamplerInstrument();
 

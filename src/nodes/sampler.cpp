@@ -56,6 +56,16 @@ void ensureMixerInterpolationTablesReady()
     std::call_once (flag, [] { setupMixerInterpolationTables(); });
 }
 
+/* Shared slot palette so the keymap + bank slot-list + Disk Op sample
+ * bank all colour matching slots identically.  32 distinct hues; slot
+ * -1 / unloaded → neutral gray. */
+inline juce::Colour slotPaletteColour (int slot, float sat = 0.55f, float val = 0.85f)
+{
+    if (slot < 0) return juce::Colour { 0xff'30'30'30 };
+    const float h = (slot % 32) / 32.0f;
+    return juce::Colour::fromHSV (h, sat, val, 1.0f);
+}
+
 /* FT2 auto-vibrato sine table (256 entries, -64..+64).  Sourced from
  * ft2_tables.c::autoVibSineTab.  Used by AutoVibrato pitch modulation. */
 static const int8_t kAutoVibSineTab[256] = {
@@ -787,6 +797,7 @@ public:
             g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
             g.drawText ("(load a sample to set loop points)",
                         bounds.toFloat(), Justification::centred);
+            lastSeenN_ = 0;
             return;
         }
 
@@ -798,13 +809,24 @@ public:
         const auto* d = slot->data16L.get();
         if (n <= 0 || w <= 0 || d == nullptr) return;
 
+        /* (Re-)init the viewport to full sample when the slot changes
+         * (different numSamples). */
+        if (lastSeenN_ != n || viewEnd_ <= viewStart_ || viewEnd_ > n)
+        {
+            viewStart_ = 0;
+            viewEnd_   = n;
+            lastSeenN_ = n;
+        }
+        const int vRange = viewEnd_ - viewStart_;
+
         g.setColour (Colour { 0xff'5a'a5'd0 });
         for (int x = 0; x < w; ++x)
         {
-            const int s0 = (int) ((int64_t) x * n / w);
-            const int s1 = (int) std::max ((int64_t) s0 + 1, (int64_t) (x + 1) * n / w);
+            const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
+            const int64_t s1 = juce::jmax (s0 + 1,
+                                            (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
             int mn = INT16_MAX, mx = INT16_MIN;
-            for (int i = s0; i < s1 && i < n; ++i)
+            for (int64_t i = s0; i < s1 && i < n; ++i)
             {
                 const int v = d[i];
                 if (v < mn) mn = v;
@@ -817,8 +839,8 @@ public:
 
         if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
         {
-            const float x0 = bounds.getX() + (float) bounds.getWidth() * slot->loopStart / (float) n;
-            const float x1 = bounds.getX() + (float) bounds.getWidth() * (slot->loopStart + slot->loopLength) / (float) n;
+            const float x0 = bounds.getX() + sampleToPixelF (slot->loopStart, w);
+            const float x1 = bounds.getX() + sampleToPixelF (slot->loopStart + slot->loopLength, w);
             g.setColour (Colour { 0x33'ff'a0'40 });
             g.fillRect (x0, bounds.getY(), x1 - x0, bounds.getHeight());
             g.setColour (Colour { 0xff'ff'a0'40 });
@@ -834,10 +856,25 @@ public:
             g.setColour (Colour { 0xff'40'ff'80 });
             for (int pos : positions)
             {
-                if (pos < 0 || pos >= n) continue;
-                const float x = bounds.getX() + (float) bounds.getWidth() * pos / (float) n;
+                if (pos < viewStart_ || pos >= viewEnd_) continue;
+                const float x = bounds.getX() + sampleToPixelF (pos, w);
                 g.fillRect (x - 0.5f, bounds.getY(), 1.5f, bounds.getHeight());
             }
+        }
+
+        /* Tiny zoom indicator (e.g. "1.0x" / "12.3x") top-right. */
+        if (vRange > 0 && n > 0)
+        {
+            const float zoomX = (float) n / (float) vRange;
+            g.setColour (Colour { 0xff'7a'7a'7a });
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 10.0f, Font::plain));
+            const String label = (zoomX < 9.99f)
+                                 ? String::formatted ("%.2fx", zoomX)
+                                 : String::formatted ("%.1fx", zoomX);
+            g.drawText (label,
+                        Rectangle<float> (bounds.getRight() - 48, bounds.getY() + 2,
+                                          44, 12),
+                        Justification::right);
         }
     }
 
@@ -848,14 +885,14 @@ public:
         if (slot->loopMode == SamplerLoopMode::kNone || slot->loopLength <= 0)
         {
             slot->loopMode   = SamplerLoopMode::kForward;
-            slot->loopStart  = pixelToSample (e.x, slot->numSamples);
+            slot->loopStart  = pixelToSample (e.x);
             slot->loopLength = juce::jmax (1, slot->numSamples - slot->loopStart);
             draggingMarker   = 1;
             repaint();
             return;
         }
-        const int x0 = sampleToPixel (slot->loopStart, slot->numSamples);
-        const int x1 = sampleToPixel (slot->loopStart + slot->loopLength, slot->numSamples);
+        const int x0 = sampleToPixel (slot->loopStart);
+        const int x1 = sampleToPixel (slot->loopStart + slot->loopLength);
         draggingMarker = (std::abs (e.x - x0) < std::abs (e.x - x1)) ? 0 : 1;
     }
 
@@ -865,7 +902,7 @@ public:
         auto* slot = getSlot ? getSlot() : nullptr;
         if (slot == nullptr || ! slot->isLoaded()) return;
 
-        const int newPos = pixelToSample (e.x, slot->numSamples);
+        const int newPos = pixelToSample (e.x);
         if (draggingMarker == 0)
         {
             const int oldEnd = slot->loopStart + slot->loopLength;
@@ -882,6 +919,68 @@ public:
 
     void mouseUp (const MouseEvent&) override { draggingMarker = -1; }
 
+    /** Trackpad pinch — primary zoom gesture, anchored at the cursor. */
+    void mouseMagnify (const MouseEvent& e, float scaleFactor) override
+    {
+        applyZoom (e.x, (double) scaleFactor);
+    }
+
+    /** Trackpad 2-finger scroll.  deltaX → pan, deltaY → zoom (fallback
+     *  for users without a pinch-capable trackpad). */
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+
+        if (std::abs (w.deltaX) > std::abs (w.deltaY))
+        {
+            const int range = viewEnd_ - viewStart_;
+            const int shift = (int) std::lround (range * -w.deltaX * 0.5);
+            const int n = slot->numSamples;
+            int newStart = juce::jlimit (0, juce::jmax (0, n - range),
+                                          viewStart_ + shift);
+            viewStart_ = newStart;
+            viewEnd_   = newStart + range;
+            repaint();
+        }
+        else if (std::abs (w.deltaY) > 0.001f)
+        {
+            const double factor = (w.deltaY > 0) ? (1.0 / 1.20) : 1.20;
+            applyZoom (e.x, factor);
+        }
+    }
+
+    void mouseDoubleClick (const MouseEvent&) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot != nullptr && slot->isLoaded())
+        {
+            viewStart_ = 0;
+            viewEnd_   = slot->numSamples;
+            repaint();
+        }
+    }
+
+private:
+    void applyZoom (int anchorPx, double factor)
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        if (viewEnd_ <= viewStart_) { viewStart_ = 0; viewEnd_ = n; }
+        const int anchorSamp = pixelToSample (anchorPx);
+        int newRange = juce::jmax (4, (int) std::lround ((viewEnd_ - viewStart_) / factor));
+        newRange = juce::jmin (n, newRange);
+        const double tRel = double (anchorSamp - viewStart_)
+                          / juce::jmax (1, viewEnd_ - viewStart_);
+        int newStart = (int) std::lround (anchorSamp - tRel * newRange);
+        newStart = juce::jlimit (0, juce::jmax (0, n - newRange), newStart);
+        viewStart_ = newStart;
+        viewEnd_   = newStart + newRange;
+        repaint();
+    }
+public:
+
 private:
     void timerCallback() override
     {
@@ -893,25 +992,38 @@ private:
         repaint();
     }
 
-    int pixelToSample (int x, int n) const
+    int pixelToSample (int x) const
     {
         const auto bounds = getLocalBounds().reduced (2);
         const int w = bounds.getWidth();
-        if (w <= 0) return 0;
-        return (int) juce::jlimit ((int64_t) 0, (int64_t) n,
-                                    (int64_t) (x - bounds.getX()) * n / w);
+        if (w <= 0) return viewStart_;
+        const int range = juce::jmax (1, viewEnd_ - viewStart_);
+        return (int) juce::jlimit ((int64_t) viewStart_, (int64_t) viewEnd_,
+                                    (int64_t) viewStart_
+                                       + (int64_t) (x - bounds.getX()) * range / w);
     }
-    int sampleToPixel (int s, int n) const
+    int sampleToPixel (int s) const
     {
         const auto bounds = getLocalBounds().reduced (2);
-        if (n <= 0) return bounds.getX();
-        return bounds.getX() + (int) ((int64_t) bounds.getWidth() * s / n);
+        if (viewEnd_ <= viewStart_) return bounds.getX();
+        return bounds.getX() + (int) ((int64_t) (s - viewStart_) * bounds.getWidth()
+                                         / juce::jmax (1, viewEnd_ - viewStart_));
+    }
+    float sampleToPixelF (int s, int w) const
+    {
+        if (viewEnd_ <= viewStart_ || w <= 0) return 0.0f;
+        return (float) ((int64_t) (s - viewStart_) * w
+                         / juce::jmax (1, viewEnd_ - viewStart_));
     }
 
     std::function<SamplerSampleSlot*()> getSlot;
     PlayheadQuery playheadsFor;
     std::vector<int> lastPlayheads_;
     int draggingMarker = -1;
+
+    /* Viewport state — defaults reset whenever slot length changes. */
+    int viewStart_ = 0, viewEnd_ = 0;
+    int lastSeenN_ = 0;
 };
 
 
@@ -1191,7 +1303,10 @@ public:
                                           true,false,true,false,true };
         static const int blackOffsetPC[12] = { -1, 0, -1, 1, -1, -1, 3, -1, 4, -1, 5, -1 };
 
-        /* Pass 1: whites — gray-white base + slot-color accent strip. */
+        /* Pass 1: whites — gray base, slot-color tint over the whole
+         * key when assigned, big bold white slot number. */
+        const Colour grayWhite  { 0xff'6a'6a'6a };   /* theme-fit gray */
+        const Colour grayBlack  { 0xff'1a'1a'1a };
         int whiteIdx = 0;
         for (int n = 0; n < 24; ++n)
         {
@@ -1204,35 +1319,43 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            g.setColour (Colour { 0xff'b8'b8'b8 });   /* light gray base */
+            /* Base gray, then overlay slot tint at ~55% if assigned. */
+            const Colour base = hasAssign
+                              ? grayWhite.interpolatedWith (
+                                    slotPaletteColour (assignedSlot, 0.65f, 0.75f),
+                                    0.55f)
+                              : grayWhite;
+            g.setColour (base);
             g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
             g.setColour (Colour { 0xff'2a'2a'2a });
             g.drawRect (x, bounds.getY(), whiteW, whiteH, 1.0f);
 
-            /* Slot-color accent — top stripe only, not the whole key. */
+            /* Slot # — big bold white centred. */
             if (hasAssign)
             {
-                const auto accent = slotColour (assignedSlot);
-                g.setColour (accent);
-                g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 10.0f);
-                g.setColour (Colour { 0xff'30'30'30 });
-                g.drawHorizontalLine (juce::roundToInt (bounds.getY() + 10),
-                                      x + 1.0f, x + whiteW);
+                g.setColour (Colours::white);
+                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        16.0f, Font::bold));
+                g.drawText (String (assignedSlot + 1),
+                            Rectangle<float> (x, bounds.getCentreY() - 8,
+                                              whiteW, 24),
+                            Justification::centred);
             }
-
-            /* Slot # — large, centred on the lower half of the key. */
-            g.setColour (hasAssign ? Colours::black : Colour { 0xff'70'70'70 });
-            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
-                                    13.0f, Font::bold));
-            const String s = hasAssign ? String (assignedSlot + 1)
-                                       : String (CharPointer_UTF8 ("\xe2\x80\x94"));
-            g.drawText (s, Rectangle<float> (x, bounds.getBottom() - 22,
-                                              whiteW, 18),
-                        Justification::centred);
+            else
+            {
+                g.setColour (Colour { 0xff'40'40'40 });
+                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        13.0f, Font::bold));
+                g.drawText (String (CharPointer_UTF8 ("\xe2\x80\x94")),
+                            Rectangle<float> (x, bounds.getCentreY() - 8,
+                                              whiteW, 16),
+                            Justification::centred);
+            }
             ++whiteIdx;
         }
 
-        /* Pass 2: blacks — dark base + slot-color accent top stripe. */
+        /* Pass 2: blacks — darker gray base, slot tint when assigned,
+         * bold white slot number centred. */
         for (int n = 0; n < 24; ++n)
         {
             const int note = baseNote + n;
@@ -1248,26 +1371,24 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            g.setColour (Colour { 0xff'1c'1c'1c });
+            const Colour base = hasAssign
+                              ? grayBlack.interpolatedWith (
+                                    slotPaletteColour (assignedSlot, 0.7f, 0.55f),
+                                    0.7f)
+                              : grayBlack;
+            g.setColour (base);
             g.fillRect (x, bounds.getY(), blackW, blackH);
-            if (hasAssign)
-            {
-                const auto accent = slotColour (assignedSlot).withMultipliedBrightness (0.85f);
-                g.setColour (accent);
-                g.fillRect (x, bounds.getY(), blackW, 6.0f);
-            }
-            g.setColour (Colour { 0xff'1a'1a'1a });
+            g.setColour (Colour { 0xff'10'10'10 });
             g.drawRect (x, bounds.getY(), blackW, blackH, 1.0f);
 
-            /* Slot # in white on black key. */
             if (hasAssign)
             {
-                g.setColour (Colour { 0xff'e8'e8'e8 });
+                g.setColour (Colours::white);
                 g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
-                                        10.0f, Font::bold));
+                                        12.0f, Font::bold));
                 g.drawText (String (assignedSlot + 1),
-                            Rectangle<float> (x, bounds.getY() + blackH - 16,
-                                              blackW, 14),
+                            Rectangle<float> (x, bounds.getY() + blackH * 0.5f - 8,
+                                              blackW, 16),
                             Justification::centred);
             }
         }
@@ -1396,13 +1517,8 @@ private:
         return -1;
     }
 
-    /** Colour for slot index in the 16-step palette. */
-    static Colour slotColour (int slot)
-    {
-        if (slot < 0) return Colour { 0xff'30'30'30 };
-        const float h = (slot % 16) / 16.0f;
-        return Colour::fromHSV (h, 0.55f, 0.85f, 1.0f);
-    }
+    /** Shim — old in-class palette is now the shared free function. */
+    static Colour slotColour (int slot) { return slotPaletteColour (slot); }
 
     GetInstrument getInst;
     GetActiveSlot getSlot;
@@ -2064,7 +2180,51 @@ public:
         setSelection (0, slot->numSamples);
     }
 
+    /** Trackpad pinch — primary zoom gesture, anchored at cursor. */
+    void mouseMagnify (const MouseEvent& e, float scaleFactor) override
+    {
+        applyZoom (e.x, (double) scaleFactor);
+    }
+
+    /** Trackpad 2-finger scroll: deltaX = pan, deltaY = zoom (fallback). */
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+
+        if (std::abs (w.deltaX) > std::abs (w.deltaY))
+        {
+            const int range = viewEnd_ - viewStart_;
+            const int shift = (int) std::lround (range * -w.deltaX * 0.5);
+            int newStart = juce::jlimit (0, juce::jmax (0, n - range),
+                                          viewStart_ + shift);
+            setViewport (newStart, newStart + range);
+        }
+        else if (std::abs (w.deltaY) > 0.001f)
+        {
+            const double factor = (w.deltaY > 0) ? (1.0 / 1.20) : 1.20;
+            applyZoom (e.x, factor);
+        }
+    }
+
 private:
+    void applyZoom (int anchorPx, double factor)
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        if (viewEnd_ <= viewStart_) { viewStart_ = 0; viewEnd_ = n; }
+        const int anchorSamp = pixelToSample (anchorPx);
+        int newRange = juce::jmax (4, (int) std::lround ((viewEnd_ - viewStart_) / factor));
+        newRange = juce::jmin (n, newRange);
+        const double tRel = double (anchorSamp - viewStart_)
+                          / juce::jmax (1, viewEnd_ - viewStart_);
+        int newStart = (int) std::lround (anchorSamp - tRel * newRange);
+        newStart = juce::jlimit (0, juce::jmax (0, n - newRange), newStart);
+        setViewport (newStart, newStart + newRange);
+    }
+
     int pixelToSample (int x) const
     {
         const auto bounds = getLocalBounds().reduced (2);
@@ -3170,11 +3330,18 @@ public:
 
         auto inst = node.getInstrument (activeInstrument);
         const auto* slot = inst ? inst->getSlot (row) : nullptr;
+        const bool hasSample = slot && slot->isLoaded();
+
+        /* Slot-color stripe down the left edge — matches keymap palette
+         * so the eye can connect bank row ↔ tinted keys. */
+        g.setColour (hasSample ? slotPaletteColour (row, 0.65f, 0.85f)
+                               : Colour { 0xff'2a'2a'2a });
+        g.fillRect (0, 0, 6, height);
 
         g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 12.0f, Font::plain));
 
         g.setColour (slot != nullptr ? Colour { 0xff'd4'd4'd4 } : Colour { 0xff'5a'5a'5a });
-        g.drawText (String::formatted ("%02d", row + 1), 6, 0, 28, height,
+        g.drawText (String::formatted ("%02d", row + 1), 12, 0, 28, height,
                     Justification::centredLeft);
 
         int lo = -1, hi = -1;
@@ -3193,11 +3360,11 @@ public:
                               ? (midiNoteName (lo) + "  " + midiNoteName (hi))
                               : String ("        ");
         g.setColour (Colour { 0xff'd0'80'40 });
-        g.drawText (rng, 38, 0, 80, height, Justification::centredLeft);
+        g.drawText (rng, 44, 0, 80, height, Justification::centredLeft);
 
         g.setColour (slot != nullptr ? Colour { 0xff'b0'b0'b0 } : Colour { 0xff'40'40'40 });
         g.drawText (slot != nullptr ? slot->name : String (juce::CharPointer_UTF8 ("\xe2\x80\x94")),
-                    124, 0, width - 130, height, Justification::centredLeft);
+                    130, 0, width - 136, height, Justification::centredLeft);
     }
 
     void selectedRowsChanged (int lastRowSelected) override
