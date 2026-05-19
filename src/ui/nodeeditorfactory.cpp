@@ -12,6 +12,7 @@
 #include "nodes/midimonitoredtor.hpp"
 #include "nodes/midiprogrammapeditor.hpp"
 #include "nodes/midiroutereditor.hpp"
+#include "nodes/trackereditor.hpp"
 #include "nodes/oscreceivereditor.hpp"
 #include "nodes/oscsendereditor.hpp"
 #include "nodes/volumeeditor.hpp"
@@ -103,6 +104,10 @@ private:
                 pgced->setSize (object->getWidth(), object->getHeight());
 
             return pgced;
+        }
+        else if (NID == EL_NODE_ID_MIDI_SEQUENCER)
+        {
+            return new TrackerEditor (node);
         }
         else if (NID == EL_NODE_ID_MIDI_SET_LIST)
         {
