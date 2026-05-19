@@ -18,7 +18,9 @@
 #include "services/sessionservice.hpp"
 #include "ui/audioiopanelview.hpp"
 #include "ui/connectiongrid.hpp"
+#include "ui/arrangementview.hpp"
 #include "ui/controllersview.hpp"
+#include "ui/trackerhostview.hpp"
 #include "ui/datapathbrowser.hpp"
 #include "ui/emptyview.hpp"
 #include "ui/grapheditorview.hpp"
@@ -584,6 +586,14 @@ void StandardContent::setMainView (const String& name)
     {
         setContentView (new ControllersView());
     }
+    else if (name == EL_VIEW_ARRANGEMENT)
+    {
+        setContentView (new ArrangementView());
+    }
+    else if (name == EL_VIEW_TRACKER_HOST)
+    {
+        setContentView (new TrackerHostView());
+    }
     else
     {
         if (auto s = context().session())
@@ -981,6 +991,8 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::showGraphEditor,
         Commands::showGraphMixer,
         Commands::showConsole,
+        Commands::showArrangement,
+        Commands::showTrackerHost,
         Commands::toggleVirtualKeyboard,
         Commands::toggleMeterBridge,
         Commands::toggleChannelStrip,
@@ -1066,6 +1078,22 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
                             ? Info::isTicked
                             : 0;
             result.setInfo ("Console", "Show the scripting console", "UI", flags);
+            break;
+        }
+        case Commands::showArrangement: {
+            int flags = 0;
+            if (getMainViewName() == EL_VIEW_ARRANGEMENT)
+                flags |= Info::isTicked;
+            result.addDefaultKeypress (KeyPress::F3Key, 0);
+            result.setInfo ("Arrangement", "Show the arrangement view", "UI", flags);
+            break;
+        }
+        case Commands::showTrackerHost: {
+            int flags = 0;
+            if (getMainViewName() == EL_VIEW_TRACKER_HOST)
+                flags |= Info::isTicked;
+            result.addDefaultKeypress (KeyPress::F4Key, 0);
+            result.setInfo ("Trackers", "Show the tabbed tracker editors", "UI", flags);
             break;
         }
         //======================================================================
@@ -1162,6 +1190,12 @@ bool StandardContent::perform (const InvocationInfo& info)
             }
             break;
         }
+        case Commands::showArrangement:
+            setMainView (EL_VIEW_ARRANGEMENT);
+            break;
+        case Commands::showTrackerHost:
+            setMainView (EL_VIEW_TRACKER_HOST);
+            break;
 
         case Commands::toggleVirtualKeyboard:
             toggleVirtualKeyboard();
