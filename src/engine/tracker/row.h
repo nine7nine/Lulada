@@ -34,6 +34,11 @@ typedef struct row_t {
 	int delay_range;
 	int delay_next;
 	void *clt;
+	/* Element-NSPA FX columns (2 per cell).
+	 *   fx[i]       = effect type code (FT2 letters/digits, ASCII; 0 = no effect)
+	 *   fxParam[i]  = 0..255 (split as two hex nybbles xy) */
+	int fx[2];
+	int fxParam[2];
 } row;
 
 int row_get_type(row *rw);

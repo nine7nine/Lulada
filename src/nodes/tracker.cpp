@@ -309,6 +309,12 @@ void TrackerNode::getState (juce::MemoryBlock& block)
                             rowNode.setProperty ("t", row.type,      nullptr);
                             rowNode.setProperty ("n", row.note,      nullptr);
                             rowNode.setProperty ("v", row.velocity,  nullptr);
+                            if (row.fx[0] != 0)
+                                { rowNode.setProperty ("f0", row.fx[0],      nullptr);
+                                  rowNode.setProperty ("p0", row.fxParam[0], nullptr); }
+                            if (row.fx[1] != 0)
+                                { rowNode.setProperty ("f1", row.fx[1],      nullptr);
+                                  rowNode.setProperty ("p1", row.fxParam[1], nullptr); }
                             tt.appendChild (rowNode, nullptr);
                         }
                     }
@@ -442,7 +448,13 @@ void TrackerNode::setState (const void* data, int size)
                 const int vel   = (int) rowNode.getProperty ("v", 100);
 
                 if (r >= 0 && r < length)
+                {
                     track_set_row (trk, c, r, rtype, note, vel, 0);
+                    trk->rows[c][r].fx[0]      = (int) rowNode.getProperty ("f0", 0);
+                    trk->rows[c][r].fxParam[0] = (int) rowNode.getProperty ("p0", 0);
+                    trk->rows[c][r].fx[1]      = (int) rowNode.getProperty ("f1", 0);
+                    trk->rows[c][r].fxParam[1] = (int) rowNode.getProperty ("p1", 0);
+                }
             }
             if (muted) trk->playing = 0;
             sequence_add_track (seq, trk);

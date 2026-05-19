@@ -404,6 +404,8 @@ void track_clear_rows(track *trk, int c) {
 		trk->rows[c][t].velocity_next = 100;
 		trk->rows[c][t].delay_next = 0;
 		trk->rows[c][t].clt = trk->clt;
+		trk->rows[c][t].fx[0] = trk->rows[c][t].fx[1] = 0;
+		trk->rows[c][t].fxParam[0] = trk->rows[c][t].fxParam[1] = 0;
 	}
 
 	pthread_mutex_unlock(&trk->excl);
