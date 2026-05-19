@@ -28,6 +28,7 @@
 #endif
 #include "nodes/midisetlist.hpp"
 #include "nodes/placeholder.hpp"
+#include "nodes/sampler.hpp"
 #include "nodes/everb.hpp"
 #include "nodes/volume.hpp"
 #include "nodes/wetdry.hpp"
@@ -150,6 +151,11 @@ void ElementAudioPluginFormat::findAllTypesForFile (OwnedArray<PluginDescription
         auto* const desc = ds.add (new PluginDescription());
         AudioFilePlayerNode().fillInPluginDescription (*desc);
     }
+    else if (fileOrId == EL_NODE_ID_SAMPLER)
+    {
+        auto* const desc = ds.add (new PluginDescription());
+        SamplerNode().fillInPluginDescription (*desc);
+    }
     else if (fileOrId == EL_NODE_ID_MEDIA_PLAYER)
     {
         auto* const desc = ds.add (new PluginDescription());
@@ -211,6 +217,7 @@ StringArray ElementAudioPluginFormat::searchPathsForPlugins (const FileSearchPat
     results.add (EL_NODE_ID_MEDIA_PLAYER);
     results.add (EL_NODE_ID_MIDI_CHANNEL_MAP);
     results.add (EL_NODE_ID_AUDIO_FILE_PLAYER);
+    results.add (EL_NODE_ID_SAMPLER);
     results.add (EL_NODE_ID_PLACEHOLDER);
 #if ! ELEMENT_USE_JACK
     results.add (EL_NODE_ID_MIDI_INPUT_DEVICE);
@@ -263,6 +270,8 @@ AudioPluginInstance* ElementAudioPluginFormat::instantiatePlugin (const PluginDe
         base = std::make_unique<MidiChannelMapProcessor>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_AUDIO_FILE_PLAYER)
         base = std::make_unique<AudioFilePlayerNode>();
+    else if (desc.fileOrIdentifier == EL_NODE_ID_SAMPLER)
+        base = std::make_unique<SamplerNode>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_MEDIA_PLAYER)
         base = std::make_unique<MediaPlayerProcessor>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_PLACEHOLDER)

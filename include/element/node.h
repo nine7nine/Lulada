@@ -57,6 +57,7 @@ extern "C" {
 #define EL_NODE_ID_MIDI_SEQUENCER        "element.midiSequencer"
 #define EL_NODE_ID_OSC_RECEIVER          "element.oscReceiver"
 #define EL_NODE_ID_OSC_SENDER            "element.oscSender"
+#define EL_NODE_ID_SAMPLER               "element.sampler"
 #define EL_NODE_ID_SCRIPT                "element.script"
 #define EL_NODE_ID_MCU                   "el.MCU"
 #define EL_NODE_ID_MIDI_SET_LIST         "element.midiSetList"
@@ -88,6 +89,7 @@ extern "C" {
 #define EL_NODE_UID_SCRIPT                1024
 #define EL_NODE_UID_ALLPASS_FILTER        1025
 #define EL_NODE_UID_VOLUME                1026
+#define EL_NODE_UID_SAMPLER               1027
 #define EL_NODE_UID_MCU                   1027
 #define EL_NODE_UID_MIDI_SET_LIST         1028
 #define EL_NODE_UID_JACK_MIDI_INPUT       1029
