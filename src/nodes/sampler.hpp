@@ -8,17 +8,63 @@
 
 namespace element {
 
+/** One sample slot within an Instrument.  Holds the loaded WAV's int16
+ *  data, source sample rate, and per-sample play parameters (root note,
+ *  fine tune, volume, pan).  Mono only for v1; stereo is summed at load. */
+struct SamplerSampleSlot
+{
+    String  name;
+    std::unique_ptr<int16_t[]> data16;
+    int     numSamples = 0;
+    double  sourceSampleRate = 48000.0;
+    int     rootNote = 60;       // MIDI note at which sample plays at native pitch
+    int     finetune = 0;        // -128..127 (cents/2 fine offset)
+    float   volume   = 1.0f;     // 0..1
+    float   panning  = 0.5f;     // 0=L  0.5=centre  1=R
+
+    bool isLoaded() const noexcept { return data16 != nullptr && numSamples > 0; }
+};
+
+/** Instrument = up to 16 sample slots + a 128-entry MIDI keymap that
+ *  maps each MIDI note to a slot index.  Default keymap spreads loaded
+ *  slots evenly across the keyboard.  Renoise / FT2 model. */
+class SamplerInstrument : public ReferenceCountedObject
+{
+public:
+    using Ptr = ReferenceCountedObjectPtr<SamplerInstrument>;
+    static constexpr int kNumSlots = 16;
+
+    SamplerInstrument();
+
+    /** Load a WAV (or AudioFormatManager-supported file) into slot. */
+    bool loadSampleToSlot (int slot, const File& file, AudioFormatManager& fmt);
+    void clearSlot (int slot);
+
+    int  slotForNote (int midiNote) const noexcept;
+    void setSlotForNote (int midiNote, int slot);
+
+    /** Spread currently-loaded slots evenly across the keyboard.
+     *  Called automatically on load when keymap is in default state. */
+    void autoSpreadKeymap();
+
+    SamplerSampleSlot*       getSlot (int slot);
+    const SamplerSampleSlot* getSlot (int slot) const;
+    int firstLoadedSlot() const noexcept;
+    int numLoaded() const noexcept;
+
+    String name;
+
+private:
+    std::array<std::unique_ptr<SamplerSampleSlot>, kNumSlots> slots;
+    uint8_t noteToSlot[128] {};  // default all 0
+    bool keymapUserModified = false;
+};
+
 /** Sample-based instrument node.  MIDI-in / stereo audio-out.
  *
- *  Stage 1: built on top of juce::Synthesiser + juce::SamplerSound +
- *  juce::SamplerVoice (framework code from JUCE's juce_audio_basics
- *  module).  One sample is loaded from disk; pitch-shifts across the
- *  MIDI keyboard via linear interpolation.  Polyphony = numVoices.
- *
- *  Stage 2 (planned): swap juce::SamplerVoice for a custom
- *  juce::SynthesiserVoice subclass whose renderNextBlock() calls into
- *  ft2-clone's mixer (sinc/cubic interp, volume ramp, ping-pong loop).
- *  The juce::Synthesiser voice-pool + MIDI dispatch stay the same. */
+ *  Multi-sample instrument model (up to 16 sample slots + keymap).
+ *  Per-voice DSP via vendored ft2-clone mixer.  ADSR envelope + several
+ *  interpolation modes.  */
 class SamplerNode : public BaseProcessor
 {
 public:
@@ -52,17 +98,30 @@ public:
     AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    /** Load a WAV (or any AudioFormatManager-supported file).  Replaces
-     *  any previously loaded sound.  Returns true on success. Thread-safe. */
-    bool loadSample (const File& file);
+    /** Load a WAV into a specific slot of the active instrument. */
+    bool loadSampleToSlot (int slot, const File& file);
 
-    String getCurrentSamplePath() const;
-
-    int  getRootNote() const noexcept { return rootNote; }
-    void setRootNote (int n);
+    SamplerInstrument::Ptr getInstrument() const { return instrument; }
+    void rebuildInstrument(); /* clear all slots */
 
     int  getNumVoices() const noexcept { return numVoices; }
     void setNumVoices (int n);
+
+    /** Interpolation quality. */
+    enum InterpMode { kInterpNone = 0, kInterpLinear = 1, kInterpCubic = 2, kInterpSinc16 = 3 };
+    InterpMode getInterpMode() const noexcept { return interpMode; }
+    void       setInterpMode (InterpMode m);
+
+    /** Instrument-global ADSR.  Seconds for A/D/R; 0..1 for sustain. */
+    struct AdsrParams { float attack = 0.005f; float decay = 0.05f;
+                        float sustain = 1.0f;  float release = 0.10f; };
+    AdsrParams getAdsr() const { return adsrParams; }
+    void setAdsr (AdsrParams p);
+
+    /** Mix-func index for current interpolation mode.  Used by voices. */
+    int getMixFuncIndexForCurrentMode (bool loop, bool pingpong) const;
+
+    AudioFormatManager& getFormatManager() { return formatManager; }
 
 protected:
     bool isBusesLayoutSupported (const BusesLayout&) const override;
@@ -74,10 +133,11 @@ private:
     AudioFormatManager formatManager;
 
     CriticalSection sampleLock;
-    String currentPath;
-    int rootNote     = 60;   // C4
-    int numVoices    = 16;
+    SamplerInstrument::Ptr instrument;
+    int numVoices = 16;
     double currentSampleRate = 48000.0;
+    InterpMode interpMode = kInterpLinear;
+    AdsrParams adsrParams;
 };
 
 } // namespace element
