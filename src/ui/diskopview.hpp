@@ -31,6 +31,7 @@ public:
     DiskOpContentView();
     ~DiskOpContentView() override;
 
+    void initializeView (Services&) override;
     void paint (juce::Graphics&) override;
     void resized() override;
     void didBecomeActive() override;

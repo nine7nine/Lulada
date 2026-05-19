@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <element/juce.hpp>
 
 namespace element {
@@ -83,6 +84,65 @@ public:
         sendChangeMessage();
     }
 
+    /* --- plugin scan paths (Plugin Paths mode) ------------------------ *
+     * One FileSearchPath per format.  Edits live in this service until
+     * the user clicks Save in the Plugin Paths page — at which point a
+     * registered persist callback writes to PluginManager's props (Stage
+     * 2 wiring). */
+    enum PluginFormat { kCLAP = 0, kVST2, kVST3, kNumPluginFormats };
+
+    static juce::String getPluginFormatName (PluginFormat f)
+    {
+        switch (f)
+        {
+            case kCLAP: return "CLAP";
+            case kVST2: return "VST";
+            case kVST3: return "VST3";
+            default: return "?";
+        }
+    }
+
+    juce::FileSearchPath getPluginPaths (PluginFormat f) const
+    {
+        if (f < 0 || f >= kNumPluginFormats) return {};
+        return pluginPaths_[(size_t) f];
+    }
+    void setPluginPaths (PluginFormat f, const juce::FileSearchPath& p)
+    {
+        if (f < 0 || f >= kNumPluginFormats) return;
+        pluginPaths_[(size_t) f] = p;
+        sendChangeMessage();
+    }
+
+    void addPluginPath (PluginFormat f, const juce::File& dir)
+    {
+        if (f < 0 || f >= kNumPluginFormats || ! dir.isDirectory()) return;
+        pluginPaths_[(size_t) f].add (dir);
+        sendChangeMessage();
+    }
+    void removePluginPath (PluginFormat f, int index)
+    {
+        if (f < 0 || f >= kNumPluginFormats) return;
+        if (index < 0 || index >= pluginPaths_[(size_t) f].getNumPaths()) return;
+        pluginPaths_[(size_t) f].remove (index);
+        sendChangeMessage();
+    }
+    void movePluginPath (PluginFormat f, int from, int delta)
+    {
+        if (f < 0 || f >= kNumPluginFormats) return;
+        auto& p = pluginPaths_[(size_t) f];
+        const int to = from + delta;
+        if (from < 0 || from >= p.getNumPaths()) return;
+        if (to   < 0 || to   >= p.getNumPaths()) return;
+        const juce::File a = p[from];
+        const juce::File b = p[to];
+        p.remove (from);
+        p.add (b, from);
+        p.remove (to);
+        p.add (a, to);
+        sendChangeMessage();
+    }
+
     /* --- file-type filter strings ------------------------------------- */
     static juce::String getWildcardForMode (Mode m)
     {
@@ -147,6 +207,7 @@ private:
     juce::File   cwd_;
     juce::File   selection_;
     juce::String filename_;
+    std::array<juce::FileSearchPath, kNumPluginFormats> pluginPaths_;
 };
 
 } // namespace element

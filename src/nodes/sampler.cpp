@@ -1146,24 +1146,841 @@ private:
 
 
 /* ===========================================================================
- * SamplerNodeEditor
- *   - Top row: instrument selector + add/remove
- *   - Left: slot list + path field + load/clear
- *   - Right: per-slot params + loop combo
- *   - Below: waveform view
- *   - Tabbed: volume envelope / pan envelope / extras (fadeout + autoVib)
+ * SamplerKeymap — FT2-style key-to-slot map editor.  Shows 2 octaves of
+ * piano keys at a time (24 keys), each tinted by its assigned slot
+ * (0..15 → 16-step palette).  Click a key (or drag-paint a range) to
+ * assign the currently active slot to that MIDI note range.
+ *
+ * Octave-shift buttons live in the parent InstPage; this component
+ * just renders the visible window starting at `baseOctave_` and
+ * dispatches mouse events to keymap mutations on the bound instrument.
+ * ========================================================================*/
+class SamplerKeymap : public Component
+{
+public:
+    using GetInstrument = std::function<SamplerInstrument::Ptr()>;
+    using GetActiveSlot = std::function<int()>;
+
+    SamplerKeymap (GetInstrument getInst_, GetActiveSlot getSlot_)
+        : getInst (std::move (getInst_)),
+          getSlot (std::move (getSlot_)) {}
+
+    void setBaseOctave (int oct)
+    {
+        baseOctave_ = juce::jlimit (-1, 8, oct);
+        repaint();
+    }
+    int  getBaseOctave() const noexcept { return baseOctave_; }
+
+    void paint (Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        g.setColour (Colour { 0xff'10'10'10 });
+        g.fillRect (bounds);
+
+        const auto inst = getInst ? getInst() : nullptr;
+        const int  baseNote = (baseOctave_ + 1) * 12;     /* MIDI: C-1 = 0 */
+        constexpr int kWhitePerOct = 7;
+        const int totalWhite = kWhitePerOct * 2;          /* 14 whites in 2 oct */
+        const float whiteW = bounds.getWidth() / (float) totalWhite;
+        const float whiteH = bounds.getHeight();
+        const float blackH = whiteH * 0.62f;
+        const float blackW = whiteW * 0.6f;
+
+        static const bool isWhite[12] = { true,false,true,false,true,true,false,
+                                          true,false,true,false,true };
+        static const int blackOffsetPC[12] = { -1, 0, -1, 1, -1, -1, 3, -1, 4, -1, 5, -1 };
+
+        /* Pass 1: whites — gray-white base + slot-color accent strip. */
+        int whiteIdx = 0;
+        for (int n = 0; n < 24; ++n)
+        {
+            const int note = baseNote + n;
+            const int pc   = note % 12;
+            if (! isWhite[pc]) continue;
+            const float x  = bounds.getX() + whiteIdx * whiteW;
+            const int assignedSlot = inst ? inst->slotForNote (note) : -1;
+            const bool hasAssign   = inst && assignedSlot >= 0
+                                  && inst->getSlot (assignedSlot)
+                                  && inst->getSlot (assignedSlot)->isLoaded();
+
+            g.setColour (Colour { 0xff'b8'b8'b8 });   /* light gray base */
+            g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
+            g.setColour (Colour { 0xff'2a'2a'2a });
+            g.drawRect (x, bounds.getY(), whiteW, whiteH, 1.0f);
+
+            /* Slot-color accent — top stripe only, not the whole key. */
+            if (hasAssign)
+            {
+                const auto accent = slotColour (assignedSlot);
+                g.setColour (accent);
+                g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 10.0f);
+                g.setColour (Colour { 0xff'30'30'30 });
+                g.drawHorizontalLine (juce::roundToInt (bounds.getY() + 10),
+                                      x + 1.0f, x + whiteW);
+            }
+
+            /* Slot # — large, centred on the lower half of the key. */
+            g.setColour (hasAssign ? Colours::black : Colour { 0xff'70'70'70 });
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                    13.0f, Font::bold));
+            const String s = hasAssign ? String (assignedSlot + 1)
+                                       : String (CharPointer_UTF8 ("\xe2\x80\x94"));
+            g.drawText (s, Rectangle<float> (x, bounds.getBottom() - 22,
+                                              whiteW, 18),
+                        Justification::centred);
+            ++whiteIdx;
+        }
+
+        /* Pass 2: blacks — dark base + slot-color accent top stripe. */
+        for (int n = 0; n < 24; ++n)
+        {
+            const int note = baseNote + n;
+            const int pc   = note % 12;
+            if (isWhite[pc]) continue;
+            const int bIdx = blackOffsetPC[pc];
+            const int oct  = n / 12;
+            const float xCentre = bounds.getX()
+                                  + (oct * kWhitePerOct + bIdx + 1) * whiteW;
+            const float x = xCentre - blackW * 0.5f;
+            const int assignedSlot = inst ? inst->slotForNote (note) : -1;
+            const bool hasAssign   = inst && assignedSlot >= 0
+                                  && inst->getSlot (assignedSlot)
+                                  && inst->getSlot (assignedSlot)->isLoaded();
+
+            g.setColour (Colour { 0xff'1c'1c'1c });
+            g.fillRect (x, bounds.getY(), blackW, blackH);
+            if (hasAssign)
+            {
+                const auto accent = slotColour (assignedSlot).withMultipliedBrightness (0.85f);
+                g.setColour (accent);
+                g.fillRect (x, bounds.getY(), blackW, 6.0f);
+            }
+            g.setColour (Colour { 0xff'1a'1a'1a });
+            g.drawRect (x, bounds.getY(), blackW, blackH, 1.0f);
+
+            /* Slot # in white on black key. */
+            if (hasAssign)
+            {
+                g.setColour (Colour { 0xff'e8'e8'e8 });
+                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        10.0f, Font::bold));
+                g.drawText (String (assignedSlot + 1),
+                            Rectangle<float> (x, bounds.getY() + blackH - 16,
+                                              blackW, 14),
+                            Justification::centred);
+            }
+        }
+
+        /* Octave labels. */
+        g.setColour (Colour { 0xff'70'70'70 });
+        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                10.0f, Font::bold));
+        for (int oct = 0; oct < 2; ++oct)
+        {
+            const float x = bounds.getX() + oct * kWhitePerOct * whiteW + 2.0f;
+            g.drawText (String ("C") + String (baseOctave_ + oct),
+                        Rectangle<float> (x, bounds.getY(), 24, 14),
+                        Justification::topLeft);
+        }
+    }
+
+    void mouseDown (const MouseEvent& e) override
+    {
+        const int note = noteAt (e.x, e.y);
+        if (note < 0) return;
+        const auto inst = getInst ? getInst() : nullptr;
+        if (inst == nullptr) return;
+
+        if (e.mods.isPopupMenu())
+        {
+            /* Right-click → pick slot inline (no need to leave Inst page). */
+            PopupMenu m;
+            for (int i = 0; i < SamplerInstrument::kNumSlots; ++i)
+            {
+                const auto* slot = inst->getSlot (i);
+                const String label = String::formatted ("%02d  %s", i + 1,
+                    (slot && slot->isLoaded()) ? slot->name.toRawUTF8() : "(empty)");
+                m.addItem (i + 1, label,
+                           true,
+                           inst->slotForNote (note) == i);
+            }
+            const int chosen = m.showAt (this);
+            if (chosen >= 1 && chosen <= SamplerInstrument::kNumSlots)
+                inst->setSlotForNote (note, chosen - 1);
+            repaint();
+            return;
+        }
+
+        const int slot  = getSlot ? getSlot() : -1;
+        if (slot < 0 || slot >= SamplerInstrument::kNumSlots) return;
+        inst->setSlotForNote (note, slot);
+        dragAnchorNote_ = note;
+        repaint();
+    }
+
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
+    {
+        const int note = noteAt (e.x, e.y);
+        if (note < 0) return;
+        const auto inst = getInst ? getInst() : nullptr;
+        if (inst == nullptr) return;
+        const int cur = inst->slotForNote (note);
+        int next = cur + (w.deltaY > 0 ? +1 : -1);
+        if (next < 0)                                    next = SamplerInstrument::kNumSlots - 1;
+        if (next >= SamplerInstrument::kNumSlots)        next = 0;
+        inst->setSlotForNote (note, next);
+        repaint();
+    }
+    void mouseDrag (const MouseEvent& e) override
+    {
+        const int note = noteAt (e.x, e.y);
+        if (note < 0) return;
+        if (dragAnchorNote_ < 0) return;
+        const auto inst = getInst ? getInst() : nullptr;
+        if (inst == nullptr) return;
+        const int slot  = getSlot ? getSlot() : -1;
+        if (slot < 0 || slot >= SamplerInstrument::kNumSlots) return;
+        const int lo = juce::jmin (dragAnchorNote_, note);
+        const int hi = juce::jmax (dragAnchorNote_, note);
+        for (int n = lo; n <= hi; ++n)
+            inst->setSlotForNote (n, slot);
+        repaint();
+    }
+    void mouseUp (const MouseEvent&) override { dragAnchorNote_ = -1; }
+
+private:
+    int noteAt (int px, int py) const
+    {
+        const auto bounds = getLocalBounds().reduced (2);
+        if (! bounds.contains (px, py)) return -1;
+        const int baseNote = (baseOctave_ + 1) * 12;
+        constexpr int kWhitePerOct = 7;
+        const int totalWhite = kWhitePerOct * 2;
+        const float whiteW = bounds.getWidth() / (float) totalWhite;
+        const float whiteH = bounds.getHeight();
+        const float blackH = whiteH * 0.6f;
+        const float blackW = whiteW * 0.6f;
+
+        /* Test blacks first (they overlap whites). */
+        static const bool isWhite[12] = { true,false,true,false,true,true,false,
+                                          true,false,true,false,true };
+        static const int blackOffsetPC[12] = { -1, 0, -1, 1, -1, -1, 3, -1, 4, -1, 5, -1 };
+        const float relY = py - bounds.getY();
+        if (relY < blackH)
+        {
+            for (int n = 0; n < 24; ++n)
+            {
+                const int note = baseNote + n;
+                const int pc   = note % 12;
+                if (isWhite[pc]) continue;
+                const int bIdx = blackOffsetPC[pc];
+                const int oct  = n / 12;
+                const float xCentre = bounds.getX()
+                                      + (oct * kWhitePerOct + bIdx + 1) * whiteW;
+                const float xL = xCentre - blackW * 0.5f;
+                if (px >= xL && px <= xL + blackW) return note;
+            }
+        }
+        /* Whites. */
+        int whiteIdx = 0;
+        for (int n = 0; n < 24; ++n)
+        {
+            const int note = baseNote + n;
+            const int pc   = note % 12;
+            if (! isWhite[pc]) continue;
+            const float xL = bounds.getX() + whiteIdx * whiteW;
+            if (px >= xL && px <= xL + whiteW) return note;
+            ++whiteIdx;
+        }
+        return -1;
+    }
+
+    /** Colour for slot index in the 16-step palette. */
+    static Colour slotColour (int slot)
+    {
+        if (slot < 0) return Colour { 0xff'30'30'30 };
+        const float h = (slot % 16) / 16.0f;
+        return Colour::fromHSV (h, 0.55f, 0.85f, 1.0f);
+    }
+
+    GetInstrument getInst;
+    GetActiveSlot getSlot;
+    int baseOctave_   = 4;   /* shows C4..B5 by default */
+    int dragAnchorNote_ = -1;
+};
+
+
+/* ===========================================================================
+ * SamplerInstPage — the "Edit instrument" page of the paged Sampler
+ * editor.  Shows two envelope editors (vol+pan) at larger size, sustain
+ * + loop point controls per envelope, fadeout + auto-vib sliders, the
+ * 2-octave keymap with octave-shift navigation, and predef-envelope
+ * preset buttons.
+ * ========================================================================*/
+class SamplerInstPage : public Component
+{
+public:
+    using GetInstrument = std::function<SamplerInstrument::Ptr()>;
+    using GetActiveSlot = std::function<int()>;
+    using SetActiveSlot = std::function<void (int)>;
+
+    SamplerInstPage (GetInstrument gi, GetActiveSlot gs, SetActiveSlot ss)
+        : getInst (std::move (gi)),
+          getActiveSlot (gs),
+          setActiveSlot (std::move (ss)),
+          keymap (getInst, std::move (gs))
+    {
+        addAndMakeVisible (keymap);
+
+        slotPickLbl.setText ("Paint slot:", dontSendNotification);
+        slotPickLbl.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+        slotPickLbl.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                          11.0f, Font::plain));
+        addAndMakeVisible (slotPickLbl);
+
+        slotPickValue.setJustificationType (Justification::centred);
+        slotPickValue.setColour (Label::textColourId, Colour { 0xff'd0'80'40 });
+        slotPickValue.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                            13.0f, Font::bold));
+        addAndMakeVisible (slotPickValue);
+
+        configureNudge (slotDownBtn, "-", [this] {
+            const int s = getActiveSlot();
+            setActiveSlot (juce::jmax (0, s - 1));
+            refresh();
+        });
+        configureNudge (slotUpBtn, "+", [this] {
+            const int s = getActiveSlot();
+            setActiveSlot (juce::jmin (SamplerInstrument::kNumSlots - 1, s + 1));
+            refresh();
+        });
+
+        for (int p = 1; p <= 6; ++p)
+        {
+            auto btn = std::make_unique<TextButton> (String (p));
+            const int preset = p;
+            btn->onClick = [this, preset] { applyPredefinedEnvelope (preset); };
+            btn->setColour (TextButton::buttonColourId, Colour { 0xff'24'24'24 });
+            btn->setColour (TextButton::textColourOffId, Colour { 0xff'd0'd0'd0 });
+            addAndMakeVisible (*btn);
+            predefBtns.add (std::move (btn));
+        }
+
+        configureNudge (volAddBtn, "Add",  [this] { addEnvPoint (true);   });
+        configureNudge (volDelBtn, "Del",  [this] { delLastEnvPoint (true); });
+        configureNudge (panAddBtn, "Add",  [this] { addEnvPoint (false);  });
+        configureNudge (panDelBtn, "Del",  [this] { delLastEnvPoint (false); });
+
+        configureNudge (volSusUp,  "+", [this] { nudgeEnvPoint (true,  +1, false); });
+        configureNudge (volSusDn,  "-", [this] { nudgeEnvPoint (true,  -1, false); });
+        configureNudge (volLoopStartUp, "+", [this] { nudgeEnvLoop (true,  true,  +1); });
+        configureNudge (volLoopStartDn, "-", [this] { nudgeEnvLoop (true,  true,  -1); });
+        configureNudge (volLoopEndUp,   "+", [this] { nudgeEnvLoop (true,  false, +1); });
+        configureNudge (volLoopEndDn,   "-", [this] { nudgeEnvLoop (true,  false, -1); });
+
+        configureNudge (panSusUp,  "+", [this] { nudgeEnvPoint (false, +1, false); });
+        configureNudge (panSusDn,  "-", [this] { nudgeEnvPoint (false, -1, false); });
+        configureNudge (panLoopStartUp, "+", [this] { nudgeEnvLoop (false, true,  +1); });
+        configureNudge (panLoopStartDn, "-", [this] { nudgeEnvLoop (false, true,  -1); });
+        configureNudge (panLoopEndUp,   "+", [this] { nudgeEnvLoop (false, false, +1); });
+        configureNudge (panLoopEndDn,   "-", [this] { nudgeEnvLoop (false, false, -1); });
+
+        for (auto* l : { &volSusLbl, &volLoopLbl, &panSusLbl, &panLoopLbl,
+                         &fadeLbl, &avSpeedLbl, &avDepthLbl, &avSweepLbl,
+                         &predefLbl, &keymapLbl })
+        {
+            l->setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+            addAndMakeVisible (*l);
+        }
+        volSusLbl   .setText ("Sust",    dontSendNotification);
+        volLoopLbl  .setText ("Loop",    dontSendNotification);
+        panSusLbl   .setText ("Sust",    dontSendNotification);
+        panLoopLbl  .setText ("Loop",    dontSendNotification);
+        fadeLbl     .setText ("Fadeout", dontSendNotification);
+        avSpeedLbl  .setText ("Vib rate",dontSendNotification);
+        avDepthLbl  .setText ("Vib depth", dontSendNotification);
+        avSweepLbl  .setText ("Vib sweep", dontSendNotification);
+        predefLbl   .setText ("Predef:", dontSendNotification);
+        keymapLbl   .setText ("Keymap:", dontSendNotification);
+
+        configureSlider (fadeoutSlider, 0.0, 4095.0, 1.0, [this] (double v) {
+            if (auto inst = getInst()) inst->fadeoutRate = (uint16_t) v;
+        });
+        configureSlider (avRateSlider, 0.0, 63.0, 1.0, [this] (double v) {
+            if (auto inst = getInst()) inst->autoVib.rate = (uint8_t) v;
+        });
+        configureSlider (avDepthSlider, 0.0, 15.0, 1.0, [this] (double v) {
+            if (auto inst = getInst()) inst->autoVib.depth = (uint8_t) v;
+        });
+        configureSlider (avSweepSlider, 0.0, 255.0, 1.0, [this] (double v) {
+            if (auto inst = getInst()) inst->autoVib.sweep = (uint8_t) v;
+        });
+
+        avTypeCombo.addItem ("Sine",    1);
+        avTypeCombo.addItem ("Square",  2);
+        avTypeCombo.addItem ("Ramp+",   3);
+        avTypeCombo.addItem ("Ramp-",   4);
+        avTypeCombo.setColour (ComboBox::backgroundColourId, Colour { 0xff'24'24'24 });
+        avTypeCombo.setColour (ComboBox::textColourId,        Colour { 0xff'd0'd0'd0 });
+        avTypeCombo.onChange = [this] {
+            if (auto inst = getInst())
+                inst->autoVib.type = (uint8_t) (avTypeCombo.getSelectedId() - 1);
+        };
+        addAndMakeVisible (avTypeCombo);
+
+        configureFlag (volEnabledBtn,  "Env enabled", [this] (bool v) {
+            toggleFlag (true, FT2Envelope::kEnabled, v);
+        });
+        configureFlag (volSustainBtn,  "Sustain",     [this] (bool v) {
+            toggleFlag (true, FT2Envelope::kSustain, v);
+        });
+        configureFlag (volLoopBtn,     "Loop",        [this] (bool v) {
+            toggleFlag (true, FT2Envelope::kLoop, v);
+        });
+        configureFlag (panEnabledBtn,  "Env enabled", [this] (bool v) {
+            toggleFlag (false, FT2Envelope::kEnabled, v);
+        });
+        configureFlag (panSustainBtn,  "Sustain",     [this] (bool v) {
+            toggleFlag (false, FT2Envelope::kSustain, v);
+        });
+        configureFlag (panLoopBtn,     "Loop",        [this] (bool v) {
+            toggleFlag (false, FT2Envelope::kLoop, v);
+        });
+
+        configureNudge (octDownBtn, "<oct", [this] {
+            keymap.setBaseOctave (keymap.getBaseOctave() - 1);
+        });
+        configureNudge (octUpBtn,   "oct>", [this] {
+            keymap.setBaseOctave (keymap.getBaseOctave() + 1);
+        });
+
+        rebuildEnvViews();
+    }
+
+    /** Re-bind the envelope editors when the active instrument changes. */
+    void rebuildEnvViews()
+    {
+        volEnvView.reset();
+        panEnvView.reset();
+        if (auto inst = getInst())
+        {
+            volEnvView.reset (new FT2EnvelopeView (inst->volumeEnv, "Volume",
+                [this] { repaint(); }));
+            panEnvView.reset (new FT2EnvelopeView (inst->panEnv, "Panning",
+                [this] { repaint(); }));
+            addAndMakeVisible (volEnvView.get());
+            addAndMakeVisible (panEnvView.get());
+        }
+        refreshFlagStates();
+        resized();
+    }
+
+    void refresh()
+    {
+        repaint();
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+        if (auto inst = getInst())
+        {
+            fadeoutSlider.setValue ((double) inst->fadeoutRate, dontSendNotification);
+            avRateSlider .setValue ((double) inst->autoVib.rate,  dontSendNotification);
+            avDepthSlider.setValue ((double) inst->autoVib.depth, dontSendNotification);
+            avSweepSlider.setValue ((double) inst->autoVib.sweep, dontSendNotification);
+            avTypeCombo  .setSelectedId ((int) inst->autoVib.type + 1, dontSendNotification);
+            refreshFlagStates();
+        }
+        slotPickValue.setText (String::formatted ("%02d", getActiveSlot() + 1),
+                               dontSendNotification);
+        keymap.repaint();
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (8);
+
+        /* Top strip: predef preset buttons + active-slot picker. */
+        auto top = r.removeFromTop (24);
+        predefLbl.setBounds (top.removeFromLeft (60));
+        for (auto& b : predefBtns) {
+            b->setBounds (top.removeFromLeft (28));
+            top.removeFromLeft (2);
+        }
+        /* Slot picker right side. */
+        slotUpBtn   .setBounds (top.removeFromRight (24));
+        top.removeFromRight (2);
+        slotPickValue.setBounds (top.removeFromRight (38));
+        top.removeFromRight (2);
+        slotDownBtn .setBounds (top.removeFromRight (24));
+        top.removeFromRight (4);
+        slotPickLbl .setBounds (top.removeFromRight (90));
+        r.removeFromTop (6);
+
+        /* Envelope edit area: 2 horizontal panels, stacked. */
+        const int envH = juce::jmax (90, (r.getHeight() - 230) / 2);
+        layoutEnv (r.removeFromTop (envH), true);
+        r.removeFromTop (4);
+        layoutEnv (r.removeFromTop (envH), false);
+        r.removeFromTop (8);
+
+        /* Per-instrument params row. */
+        auto row = r.removeFromTop (24);
+        fadeLbl    .setBounds (row.removeFromLeft (60));
+        fadeoutSlider.setBounds (row.removeFromLeft (140)); row.removeFromLeft (12);
+        avSpeedLbl .setBounds (row.removeFromLeft (70));
+        avRateSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
+        avDepthLbl .setBounds (row.removeFromLeft (80));
+        avDepthSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
+        avSweepLbl .setBounds (row.removeFromLeft (80));
+        avSweepSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
+        avTypeCombo.setBounds (row.removeFromLeft (90));
+        r.removeFromTop (10);
+
+        /* Keymap header (label + oct controls). */
+        auto kmTop = r.removeFromTop (22);
+        keymapLbl.setBounds (kmTop.removeFromLeft (60));
+        octUpBtn  .setBounds (kmTop.removeFromRight (50));   kmTop.removeFromRight (4);
+        octDownBtn.setBounds (kmTop.removeFromRight (50));
+        r.removeFromTop (2);
+        keymap.setBounds (r.removeFromTop (juce::jmax (60, r.getHeight())));
+    }
+
+private:
+    void layoutEnv (Rectangle<int> area, bool isVol)
+    {
+        auto canvas = area.removeFromLeft (area.getWidth() - 168);
+        if (isVol && volEnvView) volEnvView->setBounds (canvas);
+        if (! isVol && panEnvView) panEnvView->setBounds (canvas);
+
+        area.removeFromLeft (8);
+        /* Right strip: Add/Del row + flag toggles + sustain/loop nudges. */
+        auto& sus  = isVol ? volSusLbl  : panSusLbl;
+        auto& loop = isVol ? volLoopLbl : panLoopLbl;
+        auto& enabledBtn = isVol ? volEnabledBtn : panEnabledBtn;
+        auto& susBtn     = isVol ? volSustainBtn : panSustainBtn;
+        auto& loopBtn    = isVol ? volLoopBtn    : panLoopBtn;
+        auto& addBtn = isVol ? volAddBtn : panAddBtn;
+        auto& delBtn = isVol ? volDelBtn : panDelBtn;
+        auto& susUp  = isVol ? volSusUp  : panSusUp;
+        auto& susDn  = isVol ? volSusDn  : panSusDn;
+        auto& lsUp   = isVol ? volLoopStartUp : panLoopStartUp;
+        auto& lsDn   = isVol ? volLoopStartDn : panLoopStartDn;
+        auto& leUp   = isVol ? volLoopEndUp   : panLoopEndUp;
+        auto& leDn   = isVol ? volLoopEndDn   : panLoopEndDn;
+
+        auto col = area.reduced (0);
+        /* Add / Del envelope points row. */
+        auto adRow = col.removeFromTop (20);
+        addBtn.setBounds (adRow.removeFromLeft (74));
+        adRow.removeFromLeft (4);
+        delBtn.setBounds (adRow.removeFromLeft (74));
+        col.removeFromTop (6);
+
+        enabledBtn.setBounds (col.removeFromTop (20)); col.removeFromTop (3);
+        susBtn    .setBounds (col.removeFromTop (20)); col.removeFromTop (3);
+        loopBtn   .setBounds (col.removeFromTop (20)); col.removeFromTop (6);
+
+        auto susRow = col.removeFromTop (20);
+        sus.setBounds (susRow.removeFromLeft (50));
+        susUp.setBounds (susRow.removeFromRight (22));
+        susRow.removeFromRight (2);
+        susDn.setBounds (susRow.removeFromRight (22));
+        col.removeFromTop (3);
+        auto lsRow = col.removeFromTop (20);
+        loop.setBounds (lsRow.removeFromLeft (50));
+        lsUp.setBounds (lsRow.removeFromRight (22));
+        lsRow.removeFromRight (2);
+        lsDn.setBounds (lsRow.removeFromRight (22));
+        col.removeFromTop (3);
+        auto leRow = col.removeFromTop (20);
+        leRow.removeFromLeft (50);
+        leUp.setBounds (leRow.removeFromRight (22));
+        leRow.removeFromRight (2);
+        leDn.setBounds (leRow.removeFromRight (22));
+    }
+
+    void configureNudge (TextButton& b, const String& t, std::function<void()> on)
+    {
+        b.setButtonText (t);
+        b.onClick = std::move (on);
+        b.setColour (TextButton::buttonColourId, Colour { 0xff'22'22'22 });
+        b.setColour (TextButton::textColourOffId, Colour { 0xff'd0'd0'd0 });
+        addAndMakeVisible (b);
+    }
+    void configureSlider (Slider& s, double lo, double hi, double step,
+                          std::function<void (double)> on)
+    {
+        s.setSliderStyle (Slider::LinearBar);
+        s.setRange (lo, hi, step);
+        s.setColour (Slider::backgroundColourId, Colour { 0xff'24'24'24 });
+        s.setColour (Slider::trackColourId,      Colour { 0xff'4a'7a'b5 });
+        s.onValueChange = [&s, on] { on (s.getValue()); };
+        addAndMakeVisible (s);
+    }
+    void configureFlag (TextButton& b, const String& t,
+                        std::function<void (bool)> on)
+    {
+        b.setButtonText (t);
+        b.setClickingTogglesState (true);
+        b.setColour (TextButton::buttonOnColourId, Colour { 0xff'4a'7a'b5 });
+        b.setColour (TextButton::textColourOffId,  Colour { 0xff'a0'a0'a0 });
+        b.setColour (TextButton::textColourOnId,   Colours::white);
+        b.onClick = [&b, on] { on (b.getToggleState()); };
+        addAndMakeVisible (b);
+    }
+
+    void toggleFlag (bool isVol, uint8_t bit, bool wantOn)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (wantOn) e.flags |=  bit;
+        else        e.flags &= ~bit;
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+    }
+    void refreshFlagStates()
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        const auto& ve = inst->volumeEnv;
+        const auto& pe = inst->panEnv;
+        volEnabledBtn.setToggleState (ve.flags & FT2Envelope::kEnabled, dontSendNotification);
+        volSustainBtn.setToggleState (ve.flags & FT2Envelope::kSustain, dontSendNotification);
+        volLoopBtn   .setToggleState (ve.flags & FT2Envelope::kLoop,    dontSendNotification);
+        panEnabledBtn.setToggleState (pe.flags & FT2Envelope::kEnabled, dontSendNotification);
+        panSustainBtn.setToggleState (pe.flags & FT2Envelope::kSustain, dontSendNotification);
+        panLoopBtn   .setToggleState (pe.flags & FT2Envelope::kLoop,    dontSendNotification);
+    }
+
+    /** Append a sensible new point at xMax+20, y = previous point's y.
+     *  Mirrors FT2's "Add" button — extends the envelope tail. */
+    void addEnvPoint (bool isVol)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length >= 12) return;
+        if (e.length == 0)
+        {
+            e.points[0] = { 0, 64 };
+            e.length = 1;
+        }
+        const int prevX = e.points[e.length - 1].x;
+        const int prevY = e.points[e.length - 1].y;
+        const int newX  = juce::jmin (324, prevX + 20);
+        e.points[e.length] = { (int16_t) newX, (int16_t) prevY };
+        e.length = (uint8_t) (e.length + 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+    }
+    /** Remove the trailing point.  FT2's "Del". */
+    void delLastEnvPoint (bool isVol)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length <= 2) return;     /* keep at least 2 (degenerate avoided) */
+        e.length = (uint8_t) (e.length - 1);
+        if (e.sustainPoint >= e.length) e.sustainPoint = (uint8_t) (e.length - 1);
+        if (e.loopStart   >= e.length) e.loopStart   = (uint8_t) (e.length - 1);
+        if (e.loopEnd     >= e.length) e.loopEnd     = (uint8_t) (e.length - 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+    }
+
+    void nudgeEnvPoint (bool isVol, int delta, bool /*loopMode*/)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        e.sustainPoint = (uint8_t) juce::jlimit (0, juce::jmax (0, (int) e.length - 1),
+                                                   (int) e.sustainPoint + delta);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+    }
+    void nudgeEnvLoop (bool isVol, bool isStart, int delta)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        const int maxIdx = juce::jmax (0, (int) e.length - 1);
+        if (isStart)
+            e.loopStart = (uint8_t) juce::jlimit (0, maxIdx, (int) e.loopStart + delta);
+        else
+            e.loopEnd   = (uint8_t) juce::jlimit ((int) e.loopStart, maxIdx,
+                                                   (int) e.loopEnd + delta);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+    }
+
+    /** FT2-style predef shapes — applied to the volume envelope. */
+    void applyPredefinedEnvelope (int preset)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = inst->volumeEnv;
+        e.flags = FT2Envelope::kEnabled;
+        e.sustainPoint = 0;
+        e.loopStart    = 0;
+        e.loopEnd      = 0;
+        switch (preset)
+        {
+            case 1: /* Pluck: A-D, fast decay */
+                e.length = 3;
+                e.points[0] = {  0,  0 };
+                e.points[1] = {  2, 64 };
+                e.points[2] = { 30,  0 };
+                break;
+            case 2: /* AD-sustain */
+                e.length = 4;
+                e.points[0] = {  0,  0 };
+                e.points[1] = {  4, 64 };
+                e.points[2] = { 30, 50 };
+                e.points[3] = { 50, 50 };
+                e.sustainPoint = 3;
+                e.flags |= FT2Envelope::kSustain;
+                break;
+            case 3: /* Pad: slow attack, sustained */
+                e.length = 4;
+                e.points[0] = {   0,  0 };
+                e.points[1] = {  50, 50 };
+                e.points[2] = { 100, 64 };
+                e.points[3] = { 150, 64 };
+                e.sustainPoint = 3;
+                e.flags |= FT2Envelope::kSustain;
+                break;
+            case 4: /* Tremolo loop */
+                e.length = 4;
+                e.points[0] = {  0,  0 };
+                e.points[1] = {  4, 64 };
+                e.points[2] = { 20, 20 };
+                e.points[3] = { 40, 64 };
+                e.loopStart = 1; e.loopEnd = 3;
+                e.flags |= FT2Envelope::kLoop;
+                break;
+            case 5: /* Sustain — FT2 default. */
+                e.length = 2;
+                e.points[0] = { 0,  64 };
+                e.points[1] = { 50, 64 };
+                break;
+            case 6: /* Decay-only (no sustain) */
+                e.length = 2;
+                e.points[0] = {  0, 64 };
+                e.points[1] = { 80,  0 };
+                break;
+            default: break;
+        }
+        refreshFlagStates();
+        if (volEnvView) volEnvView->repaint();
+    }
+
+    GetInstrument getInst;
+    GetActiveSlot getActiveSlot;
+    SetActiveSlot setActiveSlot;
+    SamplerKeymap keymap;
+    std::unique_ptr<FT2EnvelopeView> volEnvView, panEnvView;
+
+    Label slotPickLbl, slotPickValue;
+    TextButton slotDownBtn, slotUpBtn;
+
+    OwnedArray<TextButton> predefBtns;
+    Label predefLbl, keymapLbl;
+    Label volSusLbl, volLoopLbl, panSusLbl, panLoopLbl;
+    Label fadeLbl, avSpeedLbl, avDepthLbl, avSweepLbl;
+
+    TextButton volEnabledBtn, volSustainBtn, volLoopBtn;
+    TextButton panEnabledBtn, panSustainBtn, panLoopBtn;
+    TextButton volAddBtn, volDelBtn, panAddBtn, panDelBtn;
+    TextButton volSusUp,  volSusDn,  panSusUp,  panSusDn;
+    TextButton volLoopStartUp, volLoopStartDn, volLoopEndUp, volLoopEndDn;
+    TextButton panLoopStartUp, panLoopStartDn, panLoopEndUp, panLoopEndDn;
+
+    Slider fadeoutSlider, avRateSlider, avDepthSlider, avSweepSlider;
+    ComboBox avTypeCombo;
+    TextButton octDownBtn, octUpBtn;
+};
+
+
+/* ===========================================================================
+ * SamplerSamplePage / SamplerFXPage — stubs for F2 / F3.
+ * Each draws a centered placeholder label so the nav tab does something
+ * visible.  Real content lands in subsequent phases.
+ * ========================================================================*/
+class SamplerStubPage : public Component
+{
+public:
+    explicit SamplerStubPage (bool isSample)
+    {
+        label_.setText (isSample
+                          ? "Sample editor — F2 (waveform + range + cut/copy/paste).  Coming next."
+                          : "Effects — F3 (lp/hp filter, resonance, generators, normalize).  Coming next.",
+                        dontSendNotification);
+        label_.setJustificationType (Justification::centred);
+        label_.setColour (Label::textColourId, Colour { 0xff'7a'7a'7a });
+        label_.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 13.0f, Font::plain));
+        addAndMakeVisible (label_);
+    }
+    void resized() override { label_.setBounds (getLocalBounds()); }
+private:
+    Label label_;
+};
+
+
+/* ===========================================================================
+ * SamplerNodeEditor — paged container
+ *   - Top nav: Bank | Inst | Sample | FX  +  instrument selector
+ *   - Body: one of four pages, switched by the nav tabs
+ *
+ *   Bank   — slot list, per-slot params, waveform view (existing).
+ *   Inst   — full envelope editor + keymap + per-instrument extras.
+ *   Sample — sample editor (waveform + range + cut/copy/paste). [F2]
+ *   FX     — sample effects (lp/hp/resonance/generators/normalize). [F3]
  * ========================================================================*/
 class SamplerNodeEditor : public AudioProcessorEditor,
                           private Timer,
                           private ListBoxModel
 {
 public:
+    enum class Page { kBank = 0, kInst, kSample, kFX };
+
     explicit SamplerNodeEditor (SamplerNode& s) : AudioProcessorEditor (s), node (s),
         waveformView ([this] { return currentSlot(); },
                       [this] (const SamplerSampleSlot* slot) {
                           return node.collectPlayheadsForSlot (slot);
-                      })
+                      }),
+        instPage_   ([this] { return node.getInstrument (activeInstrument); },
+                     [this] { return activeSlot; },
+                     [this] (int s) {
+                         activeSlot = juce::jlimit (0, SamplerInstrument::kNumSlots - 1, s);
+                         slotList.selectRow (activeSlot, true, false);
+                         refresh();
+                     }),
+        samplePage_ (true),
+        fxPage_     (false)
     {
+        /* === Nav tabs (Bank / Inst / Sample / FX). === */
+        auto setupNav = [this] (TextButton& b, const String& text, Page p) {
+            b.setButtonText (text);
+            b.setClickingTogglesState (true);
+            b.setRadioGroupId (0xb01);
+            b.setColour (TextButton::buttonColourId,    Colour { 0xff'24'24'24 });
+            b.setColour (TextButton::buttonOnColourId,  Colour { 0xff'4a'7a'b5 });
+            b.setColour (TextButton::textColourOffId,   Colour { 0xff'b0'b0'b0 });
+            b.setColour (TextButton::textColourOnId,    Colours::white);
+            b.onClick = [this, p] { switchPage (p); };
+            addAndMakeVisible (b);
+        };
+        setupNav (bankNavBtn,   "Bank",   Page::kBank);
+        setupNav (instNavBtn,   "Inst",   Page::kInst);
+        setupNav (sampleNavBtn, "Sample", Page::kSample);
+        setupNav (fxNavBtn,     "FX",     Page::kFX);
+        bankNavBtn.setToggleState (true, dontSendNotification);
+
+        addChildComponent (instPage_);
+        addChildComponent (samplePage_);
+        addChildComponent (fxPage_);
         instCombo.onChange = [this] {
             const int sel = instCombo.getSelectedId() - 1;
             if (sel >= 0 && sel < node.getNumInstruments())
@@ -1306,9 +2123,10 @@ public:
         addAndMakeVisible (status);
 
         setOpaque (true);
-        setSize (820, 520);
+        setSize (1040, 600);
         rebuildInstCombo();
         rebuildEnvelopeViews();
+        switchPage (Page::kBank);
         refresh();
         startTimerHz (8);
     }
@@ -1324,42 +2142,95 @@ public:
     {
         auto r = getLocalBounds().reduced (8);
 
-        /* Top row: instrument combo + add/remove. */
-        auto topRow = r.removeFromTop (26);
-        instAddBtn.setBounds (topRow.removeFromRight (24));
-        topRow.removeFromRight (2);
-        instDelBtn.setBounds (topRow.removeFromRight (24));
-        topRow.removeFromRight (4);
-        instCombo .setBounds (topRow);
+        /* === Nav strip: Bank | Inst | Sample | FX + instrument combo. === */
+        auto navRow = r.removeFromTop (26);
+        const int navBtnW = 56;
+        bankNavBtn  .setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (2);
+        instNavBtn  .setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (2);
+        sampleNavBtn.setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (2);
+        fxNavBtn    .setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (12);
+        instAddBtn.setBounds (navRow.removeFromRight (24));
+        navRow.removeFromRight (2);
+        instDelBtn.setBounds (navRow.removeFromRight (24));
+        navRow.removeFromRight (4);
+        instCombo .setBounds (navRow);
         r.removeFromTop (6);
 
-        /* Body: left = slot list + load row.  Right = params + tabbed envelopes. */
-        auto leftCol = r.removeFromLeft (270);
+        /* === Body area for the active page. === */
+        const auto body = r;
+
+        /* Inst / Sample / FX pages fill the body when active. */
+        instPage_  .setBounds (body);
+        samplePage_.setBounds (body);
+        fxPage_    .setBounds (body);
+
+        if (currentPage_ != Page::kBank)
+            return;
+
+        /* === Bank page: existing layout (slot list + per-slot + waveform + tabs). === */
+        auto bankR = body;
+        auto leftCol = bankR.removeFromLeft (270);
         slotList.setBounds (leftCol.removeFromTop (260));
         leftCol.removeFromTop (6);
         auto pathRow = leftCol.removeFromTop (24);
         clearBtn.setBounds (pathRow.removeFromRight (50)); pathRow.removeFromRight (4);
-        loadBtn .setBounds (pathRow);     /* fills remaining row */
+        loadBtn .setBounds (pathRow);
 
-        r.removeFromLeft (12);
+        bankR.removeFromLeft (12);
 
         const int rowH = 22;
-        rootSlider .setBounds (r.removeFromTop (rowH)); r.removeFromTop (2);
-        relSlider  .setBounds (r.removeFromTop (rowH)); r.removeFromTop (2);
-        fineSlider .setBounds (r.removeFromTop (rowH)); r.removeFromTop (2);
-        volSlider  .setBounds (r.removeFromTop (rowH)); r.removeFromTop (2);
-        panSlider  .setBounds (r.removeFromTop (rowH)); r.removeFromTop (4);
+        rootSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
+        relSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
+        fineSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
+        volSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
+        panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (4);
 
-        loopCombo.setBounds (r.removeFromTop (rowH));   r.removeFromTop (4);
-        waveformView.setBounds (r.removeFromTop (80));  r.removeFromTop (6);
+        loopCombo.setBounds (bankR.removeFromTop (rowH));   bankR.removeFromTop (4);
+        waveformView.setBounds (bankR.removeFromTop (80));  bankR.removeFromTop (6);
 
-        tabBar.setBounds (r.removeFromTop (150)); r.removeFromTop (4);
+        tabBar.setBounds (bankR.removeFromTop (150)); bankR.removeFromTop (4);
 
-        auto interpRow = r.removeFromTop (26);
+        auto interpRow = bankR.removeFromTop (26);
         interpCombo.setBounds (interpRow.removeFromLeft (140));
 
-        r.removeFromTop (2);
-        status.setBounds (r.removeFromTop (28));
+        bankR.removeFromTop (2);
+        status.setBounds (bankR.removeFromTop (28));
+    }
+
+    /** Switch the visible body page and update tab toggle state. */
+    void switchPage (Page p)
+    {
+        currentPage_ = p;
+        const bool bank   = p == Page::kBank;
+        const bool inst   = p == Page::kInst;
+        const bool sample = p == Page::kSample;
+        const bool fx     = p == Page::kFX;
+
+        bankNavBtn  .setToggleState (bank,   dontSendNotification);
+        instNavBtn  .setToggleState (inst,   dontSendNotification);
+        sampleNavBtn.setToggleState (sample, dontSendNotification);
+        fxNavBtn    .setToggleState (fx,     dontSendNotification);
+
+        slotList     .setVisible (bank);
+        loadBtn      .setVisible (bank);
+        clearBtn     .setVisible (bank);
+        rootSlider   .setVisible (bank);
+        relSlider    .setVisible (bank);
+        fineSlider   .setVisible (bank);
+        volSlider    .setVisible (bank);
+        panSlider    .setVisible (bank);
+        loopCombo    .setVisible (bank);
+        waveformView .setVisible (bank);
+        tabBar       .setVisible (bank);
+        interpCombo  .setVisible (bank);
+        status       .setVisible (bank);
+
+        instPage_   .setVisible (inst);
+        samplePage_ .setVisible (sample);
+        fxPage_     .setVisible (fx);
+
+        if (inst) instPage_.refresh();
+        resized();
     }
 
     /* === ListBoxModel ================================================= */
@@ -1470,6 +2341,7 @@ private:
 
     void rebuildEnvelopeViews()
     {
+        instPage_.rebuildEnvViews();
         volEnvView.reset();
         panEnvView.reset();
         if (auto inst = node.getInstrument (activeInstrument))
@@ -1620,6 +2492,13 @@ private:
 
     int activeSlot = 0;
     int activeInstrument = 0;
+
+    /* Paged container — nav state + sub-pages. */
+    Page currentPage_ = Page::kBank;
+    TextButton bankNavBtn, instNavBtn, sampleNavBtn, fxNavBtn;
+    SamplerInstPage  instPage_;
+    SamplerStubPage  samplePage_;
+    SamplerStubPage  fxPage_;
 };
 
 AudioProcessorEditor* SamplerNode::createEditor()
