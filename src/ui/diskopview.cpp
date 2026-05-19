@@ -12,6 +12,7 @@
 #include <element/session.hpp>
 #include <element/processor.hpp>
 #include <element/node.h>
+#include <element/engine.hpp>
 
 using namespace juce;
 
@@ -250,17 +251,35 @@ private:
 
 
 /* ===========================================================================
- * SampleBankPane — Sample mode's right-side content.  Enumerates
- * SamplerNodes from the active graph, picks one (combo at top), shows
- * its currently-active instrument's 16 slots as a list.  Click a slot
- * → load DiskOpService's selected file into it.  Refresh button
- * re-walks the graph when the user adds/removes sampler nodes.
+ * SampleBankPane — Sample mode's right-side content.  FT2-style sample
+ * bank: 128 instrument banks displayed paged 8-at-a-time (16 pages),
+ * with page-selector tiles on the right.  Each instrument bank holds 16
+ * sample slots.
+ *
+ *   Header — Sampler picker combo + Add Sampler / Refresh buttons
+ *   Body   — split
+ *     left  = 8 instrument rows (current page),
+ *             format "NNN | name | loaded/16"
+ *     right = 16 page-selector tiles ("001-008", "009-016", ...)
+ *   Slots  — 16 rows of the selected instrument, "NN | sample name"
+ *   Footer — Load (DiskOp selection → slot) + Fill bank (dir)
+ *
+ *   - Click instrument row: activate it (slot list updates).
+ *   - Double-click instrument row: rename the bank (modal AlertWindow).
+ *   - Double-click slot row: load the DiskOp selection into it.
+ *   - Click page tile: jump the instrument list to that page.
+ *   - Instruments are lazily allocated on first write so memory only
+ *     grows when the user actually uses a bank.
  * ========================================================================*/
 class SampleBankPane : public Component,
-                       private ListBoxModel,
                        private Timer
 {
 public:
+    static constexpr int kNumBanks         = SamplerNode::kMaxInstruments;   /* 128 */
+    static constexpr int kNumSlotsPerBank  = SamplerInstrument::kNumSlots;    /* 16  */
+    static constexpr int kBanksPerPage     = 8;
+    static constexpr int kNumPages         = kNumBanks / kBanksPerPage;       /* 16 */
+
     SampleBankPane()
     {
         title_.setText ("Sample Bank", dontSendNotification);
@@ -273,92 +292,243 @@ public:
         samplerCombo_.setColour (ComboBox::textColourId, kTextColour);
         samplerCombo_.onChange = [this] {
             activeSampler_ = samplerCombo_.getSelectedId() - 1;
-            refresh();
+            refreshAll();
         };
         addAndMakeVisible (samplerCombo_);
 
-        configureBtn (refreshBtn_, "Refresh", [this] { rebuildSamplerList(); });
-        configureBtn (loadBtn_, "Load → slot", [this] { loadIntoSelectedSlot(); });
+        configureBtn (addSamplerBtn_, "+ Sampler", [this] { addSamplerToGraph(); });
+        configureBtn (refreshBtn_, "Refresh",     [this] { rebuildSamplerList(); });
+        configureBtn (loadBtn_,    "Load → slot", [this] { loadIntoSelectedSlot(); });
+        configureBtn (loadBankBtn_, "Fill bank (dir)", [this] { fillBankFromDirectory(); });
 
-        slotList_.setModel (this);
-        slotList_.setRowHeight (22);
-        slotList_.setColour (ListBox::backgroundColourId, kBgColour);
-        slotList_.setColour (ListBox::outlineColourId,    kOutlineColour);
-        slotList_.setOutlineThickness (1);
-        addAndMakeVisible (slotList_);
+        instrumentList_.model = this;
+        instrumentList_.list.setModel (&instrumentList_);
+        instrumentList_.list.setRowHeight (20);
+        instrumentList_.list.setColour (ListBox::backgroundColourId, kBgColour);
+        instrumentList_.list.setColour (ListBox::outlineColourId,    kOutlineColour);
+        instrumentList_.list.setOutlineThickness (1);
+        addAndMakeVisible (instrumentList_.list);
 
-        startTimerHz (2);   /* graph changes are rare; cheap poll. */
+        slotList_.model = this;
+        slotList_.list.setModel (&slotList_);
+        slotList_.list.setRowHeight (22);
+        slotList_.list.setColour (ListBox::backgroundColourId, kBgColour);
+        slotList_.list.setColour (ListBox::outlineColourId,    kOutlineColour);
+        slotList_.list.setOutlineThickness (1);
+        addAndMakeVisible (slotList_.list);
+
+        instrumentLabel_.setText ("Instrument bank", dontSendNotification);
+        slotsLabel_     .setText ("Slots",           dontSendNotification);
+        for (auto* l : { &instrumentLabel_, &slotsLabel_ })
+        {
+            l->setColour (Label::textColourId, kMutedText);
+            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                     kFontSize, Font::plain));
+            addAndMakeVisible (*l);
+        }
+
+        /* Page tiles (FT2-style "01-08 / 09-16 / ..." quick-nav). */
+        for (int p = 0; p < kNumPages; ++p)
+        {
+            auto btn = std::make_unique<TextButton>();
+            const int lo = p * kBanksPerPage + 1;
+            const int hi = lo + kBanksPerPage - 1;
+            btn->setButtonText (String::formatted ("%03d-%03d", lo, hi));
+            btn->setColour (TextButton::buttonColourId, kPanelColour);
+            btn->setColour (TextButton::buttonOnColourId,
+                            Colour { 0xff'4a'7a'b5 });
+            btn->setColour (TextButton::textColourOffId, kTextColour);
+            btn->setColour (TextButton::textColourOnId, Colours::white);
+            btn->setClickingTogglesState (false);
+            btn->onClick = [this, p] {
+                currentPage_ = p;
+                refreshPageTiles();
+                instrumentList_.list.updateContent();
+                instrumentList_.list.repaint();
+            };
+            addAndMakeVisible (*btn);
+            pageTiles_.add (std::move (btn));
+        }
+        refreshPageTiles();
+
+        startTimerHz (2);
     }
 
     ~SampleBankPane() override { stopTimer(); }
 
-    /** Pull the active graph from Services so we can enumerate
-     *  SamplerNodes.  Called once from DiskOpContentView. */
     void connect (Services* services)
     {
         services_ = services;
         rebuildSamplerList();
     }
 
+    /* ----- ListBoxModel surrogates ------------------------------------ *
+     * Two ListBoxes per pane; rather than multi-inherit ListBoxModel we
+     * use small adapters that forward into SampleBankPane.            */
+    struct InstAdapter : public ListBoxModel {
+        SampleBankPane* model = nullptr;
+        ListBox list;
+        int getNumRows() override { return model ? kBanksPerPage : 0; }
+        void paintListBoxItem (int row, Graphics& g, int w, int h, bool sel) override
+            { if (model) model->paintInstrumentRow (row, g, w, h, sel); }
+        void selectedRowsChanged (int sel) override
+            { if (model) model->onInstrumentSelected (sel); }
+        void listBoxItemDoubleClicked (int row, const MouseEvent&) override
+            { if (model) model->renameInstrument (model->currentPage_ * kBanksPerPage + row); }
+    } instrumentList_;
+
+    struct SlotAdapter : public ListBoxModel {
+        SampleBankPane* model = nullptr;
+        ListBox list;
+        int getNumRows() override { return model ? kNumSlotsPerBank : 0; }
+        void paintListBoxItem (int row, Graphics& g, int w, int h, bool sel) override
+            { if (model) model->paintSlotRow (row, g, w, h, sel); }
+        void listBoxItemDoubleClicked (int row, const MouseEvent&) override
+            { if (model) { model->slotList_.list.selectRow (row);
+                           model->loadIntoSelectedSlot(); } }
+    } slotList_;
+
     void resized() override
     {
         auto r = getLocalBounds().reduced (4);
+
+        /* Header */
         title_.setBounds (r.removeFromTop (18));
         r.removeFromTop (4);
 
         auto topRow = r.removeFromTop (24);
-        refreshBtn_.setBounds (topRow.removeFromRight (70)); topRow.removeFromRight (4);
-        loadBtn_   .setBounds (topRow.removeFromRight (90)); topRow.removeFromRight (4);
+        refreshBtn_   .setBounds (topRow.removeFromRight (70)); topRow.removeFromRight (4);
+        addSamplerBtn_.setBounds (topRow.removeFromRight (84)); topRow.removeFromRight (4);
         samplerCombo_.setBounds (topRow);
-        r.removeFromTop (4);
+        r.removeFromTop (6);
 
-        slotList_.setBounds (r);
-    }
+        /* Instrument list label */
+        instrumentLabel_.setBounds (r.removeFromTop (16));
+        r.removeFromTop (2);
 
-    /* === ListBoxModel ============================================== */
-    int getNumRows() override
-    {
-        auto inst = activeInstrument();
-        if (inst == nullptr) return 0;
-        return SamplerInstrument::kNumSlots;
-    }
-    void paintListBoxItem (int row, Graphics& g, int width, int height,
-                           bool rowIsSelected) override
-    {
-        if (rowIsSelected)
+        /* Instrument list row + page-tile column on the right (FT2 layout). */
+        const int instH = juce::jmax (170, r.getHeight() * 6 / 10);
+        auto instArea = r.removeFromTop (instH);
+        const int tilesW = 78;
+        auto tilesCol = instArea.removeFromRight (tilesW);
+        instArea.removeFromRight (4);
+        instrumentList_.list.setBounds (instArea);
+
+        /* 16 page-tile buttons stacked vertically in the right column. */
+        const int tileH = juce::jmax (12, tilesCol.getHeight() / kNumPages);
+        for (auto& b : pageTiles_)
         {
-            g.setColour (kAccentBlue.withAlpha (0.3f));
-            g.fillRect (0, 0, width, height);
+            b->setBounds (tilesCol.removeFromTop (tileH));
         }
-        auto inst = activeInstrument();
+        r.removeFromTop (8);
+
+        /* Slot list */
+        slotsLabel_.setBounds (r.removeFromTop (16));
+        r.removeFromTop (2);
+        auto footer = r.removeFromBottom (24);
+        loadBtn_    .setBounds (footer.removeFromLeft (110)); footer.removeFromLeft (6);
+        loadBankBtn_.setBounds (footer.removeFromLeft (130));
+        r.removeFromBottom (4);
+        slotList_.list.setBounds (r);
+    }
+
+    /* ----- row painting ---------------------------------------------- */
+    void paintInstrumentRow (int row, Graphics& g, int w, int h, bool sel)
+    {
+        if (sel) { g.setColour (kAccentBlue.withAlpha (0.3f)); g.fillRect (0, 0, w, h); }
+
+        const int instIndex = currentPage_ * kBanksPerPage + row;
+        auto inst = getInstrumentRaw (instIndex);
+        const int loaded = inst ? inst->numLoaded() : 0;
+        const bool used  = (inst && (loaded > 0 || inst->name.isNotEmpty()));
+        const bool isActive = instIndex == activeInstrument_;
+
+        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                kFontSize, Font::plain));
+        g.setColour (used    ? kTextColour
+                   : isActive ? kAccentBlue
+                   :            kMutedText);
+        g.drawText (String::formatted ("%03d", instIndex + 1),
+                    6, 0, 36, h, Justification::centredLeft);
+
+        g.setColour (used ? kAccentAmber : kEmptyText);
+        const String name = (inst && inst->name.isNotEmpty()) ? inst->name
+                          : String (CharPointer_UTF8 ("\xe2\x80\x94"));
+        g.drawText (name, 50, 0, w - 110, h, Justification::centredLeft);
+
+        if (inst)
+        {
+            g.setColour (loaded > 0 ? kAccentGreen : kMutedText);
+            g.drawText (String::formatted ("%d/%d", loaded, kNumSlotsPerBank),
+                        w - 52, 0, 46, h, Justification::centredRight);
+        }
+    }
+
+    void paintSlotRow (int row, Graphics& g, int w, int h, bool sel)
+    {
+        if (sel) { g.setColour (kAccentBlue.withAlpha (0.3f)); g.fillRect (0, 0, w, h); }
+
+        auto inst = getInstrumentRaw (activeInstrument_);
         const auto* slot = inst ? inst->getSlot (row) : nullptr;
 
         g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
                                 kFontSize, Font::plain));
-
         g.setColour (slot ? kTextColour : kEmptyText);
         g.drawText (String::formatted ("%02d", row + 1),
-                    6, 0, 28, height, Justification::centredLeft);
-
+                    6, 0, 30, h, Justification::centredLeft);
         g.setColour (slot ? kAccentAmber : kEmptyText);
         g.drawText (slot ? slot->name
                          : String (CharPointer_UTF8 ("\xe2\x80\x94")),
-                    38, 0, width - 44, height, Justification::centredLeft);
+                    40, 0, w - 46, h, Justification::centredLeft);
     }
-    void listBoxItemDoubleClicked (int row, const MouseEvent&) override
+
+    void onInstrumentSelected (int row)
     {
-        slotList_.selectRow (row);
-        loadIntoSelectedSlot();
+        if (row < 0) return;
+        activeInstrument_ = currentPage_ * kBanksPerPage + row;
+        slotList_.list.updateContent();
+        slotList_.list.repaint();
+    }
+
+    void refreshPageTiles()
+    {
+        for (int i = 0; i < pageTiles_.size(); ++i)
+            pageTiles_[i]->setToggleState (i == currentPage_, dontSendNotification);
+    }
+
+    void renameInstrument (int row)
+    {
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        ensureInstrumentExists (sn, row);
+        auto inst = sn->getInstrument (row);
+        if (inst == nullptr) return;
+
+        auto* editor = new AlertWindow ("Rename instrument bank",
+            "Name for bank " + String (row + 1), AlertWindow::NoIcon);
+        editor->addTextEditor ("name", inst->name);
+        editor->addButton ("OK",     1, KeyPress (KeyPress::returnKey));
+        editor->addButton ("Cancel", 0, KeyPress (KeyPress::escapeKey));
+        editor->enterModalState (true,
+            ModalCallbackFunction::create ([this, row, editor] (int r) {
+                if (r == 1)
+                {
+                    if (auto* sn2 = getSamplerProcessor (activeSampler_))
+                        if (auto inst2 = sn2->getInstrument (row))
+                            inst2->name = editor->getTextEditorContents ("name");
+                    instrumentList_.list.repaint();
+                }
+                delete editor;
+            }), false);
     }
 
 private:
     void timerCallback() override
     {
-        /* Cheap diff-poll for sampler node count / instrument count
-         * change.  No graph traversal if neither moved. */
         const int curCount = countSamplerNodes();
         if (curCount != lastSamplerCount_) rebuildSamplerList();
-        slotList_.repaint();
+        instrumentList_.list.repaint();
+        slotList_.list.repaint();
     }
 
     void configureBtn (TextButton& b, const String& text,
@@ -403,11 +573,26 @@ private:
         if (! graph.isValid()) return 0;
         int c = 0;
         for (int i = 0; i < graph.getNumNodes(); ++i)
-        {
-            const Node n = graph.getNode (i);
-            if (n.getFileOrIdentifier().toString() == EL_NODE_ID_SAMPLER) ++c;
-        }
+            if (graph.getNode (i).getFileOrIdentifier().toString() == EL_NODE_ID_SAMPLER)
+                ++c;
         return c;
+    }
+
+    SamplerInstrument::Ptr getInstrumentRaw (int row) const
+    {
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return nullptr;
+        return sn->getInstrument (row);
+    }
+
+    /** Lazy allocation — bring instruments[size..targetIndex] into
+     *  existence on first write to a row beyond the current count. */
+    void ensureInstrumentExists (SamplerNode* sn, int targetIndex)
+    {
+        if (sn == nullptr) return;
+        while (sn->getNumInstruments() <= targetIndex
+               && sn->getNumInstruments() < kNumBanks)
+            sn->addInstrument();
     }
 
     void rebuildSamplerList()
@@ -421,7 +606,7 @@ private:
 
         if (n == 0)
         {
-            samplerCombo_.addItem ("(no Sampler in graph)", 1);
+            samplerCombo_.addItem ("(no Sampler — click + Sampler)", 1);
             samplerCombo_.setEnabled (false);
         }
         else
@@ -430,42 +615,84 @@ private:
             if (activeSampler_ >= n) activeSampler_ = 0;
             samplerCombo_.setSelectedId (activeSampler_ + 1, dontSendNotification);
         }
-        refresh();
+        refreshAll();
     }
 
-    SamplerInstrument::Ptr activeInstrument() const
+    void refreshAll()
     {
-        auto* sn = getSamplerProcessor (activeSampler_);
-        if (sn == nullptr) return nullptr;
-        return sn->getInstrument (0);   /* first instrument for now */
+        instrumentList_.list.updateContent();
+        instrumentList_.list.repaint();
+        slotList_.list.updateContent();
+        slotList_.list.repaint();
+    }
+
+    void addSamplerToGraph()
+    {
+        if (services_ == nullptr) return;
+        auto* eng = services_->find<EngineService>();
+        if (eng == nullptr) return;
+        eng->addNode (EL_NODE_ID_SAMPLER, EL_NODE_FORMAT_NAME);
+        /* timerCallback will pick up the count change within ~500ms. */
     }
 
     void loadIntoSelectedSlot()
     {
-        const int row = slotList_.getSelectedRow();
-        if (row < 0) return;
+        const int slotRow = slotList_.list.getSelectedRow();
+        if (slotRow < 0) return;
         auto* sn = getSamplerProcessor (activeSampler_);
         if (sn == nullptr) return;
         const auto sel = DiskOpService::get().getSelectedFile();
         if (! sel.existsAsFile()) return;
-        sn->loadSampleToSlot (0, row, sel);
-        slotList_.repaint();
+
+        ensureInstrumentExists (sn, activeInstrument_);
+        sn->loadSampleToSlot (activeInstrument_, slotRow, sel);
+        instrumentList_.list.repaint();
+        slotList_.list.repaint();
     }
 
-    void refresh()
+    /** Fill the active bank's 16 slots with audio files from the
+     *  DiskOp's current directory.  Picks the first 16 audio files in
+     *  alphabetical order, matching the active mode's wildcard. */
+    void fillBankFromDirectory()
     {
-        slotList_.updateContent();
-        slotList_.repaint();
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        const auto dir = DiskOpService::get().getCurrentDirectory();
+        if (! dir.isDirectory()) return;
+
+        WildcardFileFilter filter (
+            DiskOpService::getWildcardForMode (DiskOpService::Mode::kSample),
+            "*", "audio");
+        Array<File> files;
+        for (const auto& entry : RangedDirectoryIterator (
+                 dir, false, "*", File::findFiles))
+        {
+            const auto f = entry.getFile();
+            if (filter.isFileSuitable (f)) files.add (f);
+        }
+        std::sort (files.begin(), files.end(),
+                   [] (const File& a, const File& b) {
+                       return a.getFileName().compareIgnoreCase (b.getFileName()) < 0;
+                   });
+
+        ensureInstrumentExists (sn, activeInstrument_);
+        const int n = juce::jmin (kNumSlotsPerBank, files.size());
+        for (int i = 0; i < n; ++i)
+            sn->loadSampleToSlot (activeInstrument_, i, files[i]);
+
+        refreshAll();
     }
 
     Services* services_ = nullptr;
-    int activeSampler_ = 0;
+    int activeSampler_    = 0;
+    int activeInstrument_ = 0;
+    int currentPage_      = 0;
     int lastSamplerCount_ = -1;
 
-    Label title_;
+    Label title_, instrumentLabel_, slotsLabel_;
     ComboBox samplerCombo_;
-    TextButton refreshBtn_, loadBtn_;
-    ListBox  slotList_;
+    TextButton addSamplerBtn_, refreshBtn_, loadBtn_, loadBankBtn_;
+    OwnedArray<TextButton> pageTiles_;
 };
 
 
