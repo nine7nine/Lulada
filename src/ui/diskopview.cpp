@@ -251,23 +251,19 @@ private:
 
 
 /* ===========================================================================
- * SampleBankPane — Sample mode's right-side content.  FT2-style sample
- * bank: 128 instrument banks displayed paged 8-at-a-time (16 pages),
- * with page-selector tiles on the right.  Each instrument bank holds 16
- * sample slots.
+ * SampleBankPane — Sample mode's right-side content.  Modern scrolling
+ * sample-bank UI: full 128 instrument banks in one scrollable list,
+ * each with 16 sample slots.  No FT2-style paging — we have the
+ * vertical real estate.
  *
  *   Header — Sampler picker combo + Add Sampler / Refresh buttons
- *   Body   — split
- *     left  = 8 instrument rows (current page),
- *             format "NNN | name | loaded/16"
- *     right = 16 page-selector tiles ("001-008", "009-016", ...)
- *   Slots  — 16 rows of the selected instrument, "NN | sample name"
- *   Footer — Load (DiskOp selection → slot) + Fill bank (dir)
+ *   Instrument list — 128 rows, "NNN | name | loaded/16"
+ *   Slot list       — 16 rows of the selected bank, "NN | sample name"
+ *   Footer          — Load (DiskOp selection → slot) + Fill bank (dir)
  *
  *   - Click instrument row: activate it (slot list updates).
  *   - Double-click instrument row: rename the bank (modal AlertWindow).
  *   - Double-click slot row: load the DiskOp selection into it.
- *   - Click page tile: jump the instrument list to that page.
  *   - Instruments are lazily allocated on first write so memory only
  *     grows when the user actually uses a bank.
  * ========================================================================*/
@@ -277,8 +273,6 @@ class SampleBankPane : public Component,
 public:
     static constexpr int kNumBanks         = SamplerNode::kMaxInstruments;   /* 128 */
     static constexpr int kNumSlotsPerBank  = SamplerInstrument::kNumSlots;    /* 16  */
-    static constexpr int kBanksPerPage     = 8;
-    static constexpr int kNumPages         = kNumBanks / kBanksPerPage;       /* 16 */
 
     SampleBankPane()
     {
@@ -327,30 +321,6 @@ public:
             addAndMakeVisible (*l);
         }
 
-        /* Page tiles (FT2-style "01-08 / 09-16 / ..." quick-nav). */
-        for (int p = 0; p < kNumPages; ++p)
-        {
-            auto btn = std::make_unique<TextButton>();
-            const int lo = p * kBanksPerPage + 1;
-            const int hi = lo + kBanksPerPage - 1;
-            btn->setButtonText (String::formatted ("%03d-%03d", lo, hi));
-            btn->setColour (TextButton::buttonColourId, kPanelColour);
-            btn->setColour (TextButton::buttonOnColourId,
-                            Colour { 0xff'4a'7a'b5 });
-            btn->setColour (TextButton::textColourOffId, kTextColour);
-            btn->setColour (TextButton::textColourOnId, Colours::white);
-            btn->setClickingTogglesState (false);
-            btn->onClick = [this, p] {
-                currentPage_ = p;
-                refreshPageTiles();
-                instrumentList_.list.updateContent();
-                instrumentList_.list.repaint();
-            };
-            addAndMakeVisible (*btn);
-            pageTiles_.add (std::move (btn));
-        }
-        refreshPageTiles();
-
         startTimerHz (2);
     }
 
@@ -368,13 +338,13 @@ public:
     struct InstAdapter : public ListBoxModel {
         SampleBankPane* model = nullptr;
         ListBox list;
-        int getNumRows() override { return model ? kBanksPerPage : 0; }
+        int getNumRows() override { return model ? kNumBanks : 0; }
         void paintListBoxItem (int row, Graphics& g, int w, int h, bool sel) override
             { if (model) model->paintInstrumentRow (row, g, w, h, sel); }
         void selectedRowsChanged (int sel) override
             { if (model) model->onInstrumentSelected (sel); }
         void listBoxItemDoubleClicked (int row, const MouseEvent&) override
-            { if (model) model->renameInstrument (model->currentPage_ * kBanksPerPage + row); }
+            { if (model) model->renameInstrument (row); }
     } instrumentList_;
 
     struct SlotAdapter : public ListBoxModel {
@@ -406,20 +376,9 @@ public:
         instrumentLabel_.setBounds (r.removeFromTop (16));
         r.removeFromTop (2);
 
-        /* Instrument list row + page-tile column on the right (FT2 layout). */
-        const int instH = juce::jmax (170, r.getHeight() * 6 / 10);
-        auto instArea = r.removeFromTop (instH);
-        const int tilesW = 78;
-        auto tilesCol = instArea.removeFromRight (tilesW);
-        instArea.removeFromRight (4);
-        instrumentList_.list.setBounds (instArea);
-
-        /* 16 page-tile buttons stacked vertically in the right column. */
-        const int tileH = juce::jmax (12, tilesCol.getHeight() / kNumPages);
-        for (auto& b : pageTiles_)
-        {
-            b->setBounds (tilesCol.removeFromTop (tileH));
-        }
+        /* Instrument list — full 128 rows scrollable, no paging. */
+        const int instH = juce::jmax (200, r.getHeight() * 6 / 10);
+        instrumentList_.list.setBounds (r.removeFromTop (instH));
         r.removeFromTop (8);
 
         /* Slot list */
@@ -437,18 +396,14 @@ public:
     {
         if (sel) { g.setColour (kAccentBlue.withAlpha (0.3f)); g.fillRect (0, 0, w, h); }
 
-        const int instIndex = currentPage_ * kBanksPerPage + row;
-        auto inst = getInstrumentRaw (instIndex);
+        auto inst = getInstrumentRaw (row);
         const int loaded = inst ? inst->numLoaded() : 0;
         const bool used  = (inst && (loaded > 0 || inst->name.isNotEmpty()));
-        const bool isActive = instIndex == activeInstrument_;
 
         g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
                                 kFontSize, Font::plain));
-        g.setColour (used    ? kTextColour
-                   : isActive ? kAccentBlue
-                   :            kMutedText);
-        g.drawText (String::formatted ("%03d", instIndex + 1),
+        g.setColour (used ? kTextColour : kMutedText);
+        g.drawText (String::formatted ("%03d", row + 1),
                     6, 0, 36, h, Justification::centredLeft);
 
         g.setColour (used ? kAccentAmber : kEmptyText);
@@ -485,15 +440,9 @@ public:
     void onInstrumentSelected (int row)
     {
         if (row < 0) return;
-        activeInstrument_ = currentPage_ * kBanksPerPage + row;
+        activeInstrument_ = row;
         slotList_.list.updateContent();
         slotList_.list.repaint();
-    }
-
-    void refreshPageTiles()
-    {
-        for (int i = 0; i < pageTiles_.size(); ++i)
-            pageTiles_[i]->setToggleState (i == currentPage_, dontSendNotification);
     }
 
     void renameInstrument (int row)
@@ -686,13 +635,11 @@ private:
     Services* services_ = nullptr;
     int activeSampler_    = 0;
     int activeInstrument_ = 0;
-    int currentPage_      = 0;
     int lastSamplerCount_ = -1;
 
     Label title_, instrumentLabel_, slotsLabel_;
     ComboBox samplerCombo_;
     TextButton addSamplerBtn_, refreshBtn_, loadBtn_, loadBankBtn_;
-    OwnedArray<TextButton> pageTiles_;
 };
 
 
