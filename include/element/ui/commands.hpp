@@ -44,6 +44,7 @@ public:
         showConsole,
         showArrangement,
         showTrackerHost,
+        showDiskOp,
         toggleMeterBridge,
 
         sessionClose = 0x0300,
@@ -126,6 +127,7 @@ public:
             showConsole,
             showArrangement,
             showTrackerHost,
+            showDiskOp,
 
             sessionClose,
             sessionOpen,
@@ -235,6 +237,8 @@ public:
                 break;
             case Commands::showTrackerHost:
                 return "showTrackerHost";
+            case Commands::showDiskOp:
+                return "showDiskOp";
                 break;
             case Commands::panic:
                 return "panic";
@@ -310,6 +314,8 @@ public:
             return Commands::showArrangement;
         if (str == "showTrackerHost")
             return Commands::showTrackerHost;
+        if (str == "showDiskOp")
+            return Commands::showDiskOp;
 
         if (str == "panic")
             return Commands::panic;

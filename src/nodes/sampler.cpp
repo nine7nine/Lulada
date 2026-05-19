@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "nodes/sampler.hpp"
+#include "services/diskopservice.hpp"
 
 /* Vendored ft2-clone mixer (BSD-3-Clause). See src/engine/sampler/. */
 extern "C" {
@@ -1203,13 +1204,7 @@ public:
         slotList.setOutlineThickness (1);
         addAndMakeVisible (slotList);
 
-        pathEdit.setTextToShowWhenEmpty ("/path/to/sample.wav", Colours::grey);
-        pathEdit.setMultiLine (false);
-        pathEdit.setReturnKeyStartsNewLine (false);
-        pathEdit.onReturnKey = [this] { onLoad(); };
-        addAndMakeVisible (pathEdit);
-
-        loadBtn.setButtonText ("Load");
+        loadBtn.setButtonText ("Load from Disk Op");
         loadBtn.onClick = [this] { onLoad(); };
         addAndMakeVisible (loadBtn);
 
@@ -1343,9 +1338,8 @@ public:
         slotList.setBounds (leftCol.removeFromTop (260));
         leftCol.removeFromTop (6);
         auto pathRow = leftCol.removeFromTop (24);
-        loadBtn .setBounds (pathRow.removeFromRight (50)); pathRow.removeFromRight (4);
         clearBtn.setBounds (pathRow.removeFromRight (50)); pathRow.removeFromRight (4);
-        pathEdit.setBounds (pathRow);
+        loadBtn .setBounds (pathRow);     /* fills remaining row */
 
         r.removeFromLeft (12);
 
@@ -1426,7 +1420,7 @@ public:
     {
         activeSlot = row;
         slotList.selectRow (row);
-        if (pathEdit.getText().trim().isNotEmpty()) onLoad();
+        onLoad();    /* pulls from DiskOpService selection if any */
     }
 
 private:
@@ -1509,12 +1503,19 @@ private:
 
     void onLoad()
     {
-        const auto text = pathEdit.getText().trim();
-        if (text.isEmpty()) return;
-        const File f (text);
+        /* Pull the currently-selected sample from the app-wide Disk Op
+         * service.  The user picks a file in the Disk Op nav page
+         * (F5 / View → Disk Op), then comes back here and clicks Load.
+         * Mode is forced to Sample so the Disk Op shows the audio-files
+         * filter on the next visit. */
+        auto& svc = DiskOpService::get();
+        svc.setMode (DiskOpService::Mode::kSample);
+
+        const auto f = svc.getSelectedFile();
         if (! f.existsAsFile())
         {
-            status.setText ("Not a file: " + text, dontSendNotification);
+            status.setText ("No sample selected — pick one in Disk Op",
+                            dontSendNotification);
             return;
         }
         if (node.loadSampleToSlot (activeInstrument, activeSlot, f))
@@ -1601,7 +1602,6 @@ private:
     TextButton   instAddBtn, instDelBtn;
 
     ListBox      slotList;
-    TextEditor   pathEdit;
     TextButton   loadBtn, clearBtn;
 
     Slider       rootSlider, relSlider, fineSlider, volSlider, panSlider;
