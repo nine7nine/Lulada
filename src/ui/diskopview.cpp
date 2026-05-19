@@ -32,6 +32,116 @@ constexpr float kHeaderFontSize = 13.0f;
 
 
 /* ===========================================================================
+ * PluginPathsSection — one ListBox + Add/Remove/Up/Down per plugin format.
+ * Add appends the currently-browsed Disk Op directory.
+ * ========================================================================*/
+class PluginPathsSection : public Component,
+                           private ListBoxModel,
+                           private ChangeListener
+{
+public:
+    explicit PluginPathsSection (DiskOpService::PluginFormat fmt) : format_ (fmt)
+    {
+        title_.setText (DiskOpService::getPluginFormatName (fmt) + " paths",
+                        dontSendNotification);
+        title_.setColour (Label::textColourId, kTextColour);
+        title_.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                     kHeaderFontSize, Font::bold));
+        addAndMakeVisible (title_);
+
+        list_.setModel (this);
+        list_.setRowHeight (20);
+        list_.setColour (ListBox::backgroundColourId, kBgColour);
+        list_.setColour (ListBox::outlineColourId,    kOutlineColour);
+        list_.setOutlineThickness (1);
+        addAndMakeVisible (list_);
+
+        configureBtn (addBtn_, "Add cwd", [this] {
+            const auto cwd = DiskOpService::get().getCurrentDirectory();
+            DiskOpService::get().addPluginPath (format_, cwd);
+        });
+        configureBtn (removeBtn_, "Remove", [this] {
+            const int sel = list_.getSelectedRow();
+            if (sel >= 0) DiskOpService::get().removePluginPath (format_, sel);
+        });
+        configureBtn (upBtn_, "Up", [this] {
+            DiskOpService::get().movePluginPath (format_, list_.getSelectedRow(), -1);
+        });
+        configureBtn (downBtn_, "Down", [this] {
+            DiskOpService::get().movePluginPath (format_, list_.getSelectedRow(), +1);
+        });
+
+        DiskOpService::get().addChangeListener (this);
+        refresh();
+    }
+
+    ~PluginPathsSection() override
+    {
+        DiskOpService::get().removeChangeListener (this);
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (4);
+        title_.setBounds (r.removeFromTop (18));
+        r.removeFromTop (2);
+
+        auto btnRow = r.removeFromBottom (22);
+        addBtn_   .setBounds (btnRow.removeFromLeft (74)); btnRow.removeFromLeft (4);
+        removeBtn_.setBounds (btnRow.removeFromLeft (74)); btnRow.removeFromLeft (4);
+        upBtn_    .setBounds (btnRow.removeFromLeft (40)); btnRow.removeFromLeft (4);
+        downBtn_  .setBounds (btnRow.removeFromLeft (40));
+        r.removeFromBottom (4);
+
+        list_.setBounds (r);
+    }
+
+    /* === ListBoxModel ============================================== */
+    int getNumRows() override
+    {
+        return DiskOpService::get().getPluginPaths (format_).getNumPaths();
+    }
+    void paintListBoxItem (int row, Graphics& g, int width, int height,
+                           bool rowIsSelected) override
+    {
+        if (rowIsSelected)
+        {
+            g.setColour (kAccentBlue.withAlpha (0.3f));
+            g.fillRect (0, 0, width, height);
+        }
+        const auto path = DiskOpService::get().getPluginPaths (format_);
+        if (row < 0 || row >= path.getNumPaths()) return;
+        g.setColour (kTextColour);
+        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                kFontSize, Font::plain));
+        g.drawText (path[row].getFullPathName(),
+                    6, 0, width - 12, height, Justification::centredLeft);
+    }
+
+private:
+    void configureBtn (TextButton& b, const String& text, std::function<void()> on)
+    {
+        b.setButtonText (text);
+        b.onClick = std::move (on);
+        b.setColour (TextButton::buttonColourId, kPanelColour);
+        b.setColour (TextButton::textColourOffId, kTextColour);
+        addAndMakeVisible (b);
+    }
+    void changeListenerCallback (ChangeBroadcaster*) override { refresh(); }
+    void refresh()
+    {
+        list_.updateContent();
+        list_.repaint();
+    }
+
+    DiskOpService::PluginFormat format_;
+    Label  title_;
+    ListBox list_;
+    TextButton addBtn_, removeBtn_, upBtn_, downBtn_;
+};
+
+
+/* ===========================================================================
  * DiskOpContentView::Impl
  * ========================================================================*/
 class DiskOpContentView::Impl : public Component,
@@ -105,6 +215,23 @@ public:
 
         configureLabel (modeBadge_, "");
 
+        /* Plugin Paths page sections — created upfront, visibility
+         * toggled by mode in syncFromService(). */
+        for (int i = 0; i < (int) DiskOpService::kNumPluginFormats; ++i)
+        {
+            auto sec = std::make_unique<PluginPathsSection> (
+                (DiskOpService::PluginFormat) i);
+            addChildComponent (*sec);   /* hidden by default */
+            pluginPathsSections_.add (std::move (sec));
+        }
+
+        /* Mode-extras placeholder shown in non-Plugin-Paths modes. */
+        extrasPlaceholder_.setJustificationType (Justification::centred);
+        extrasPlaceholder_.setColour (Label::textColourId, kMutedText);
+        extrasPlaceholder_.setFont (FontOptions (
+            Font::getDefaultMonospacedFontName(), kFontSize, Font::plain));
+        addAndMakeVisible (extrasPlaceholder_);
+
         syncFromService();
     }
 
@@ -129,7 +256,7 @@ public:
     {
         auto r = getLocalBounds().reduced (12);
 
-        /* Sidebar (left): mode selector + Wine drive quick-nav. */
+        /* === Column 1 — Sidebar: mode radio + Wine drive quick-nav. === */
         sidebarBounds_ = r.removeFromLeft (170);
         auto sb = sidebarBounds_.reduced (10);
         modeLabel_.setBounds (sb.removeFromTop (18));
@@ -144,7 +271,6 @@ public:
         modeBadge_.setBounds (sb.removeFromTop (18));
         sb.removeFromTop (6);
 
-        /* Wine-drive quick-nav. */
         for (auto& b : wineBtns_)
         {
             b->setBounds (sb.removeFromTop (22));
@@ -154,10 +280,15 @@ public:
         homeBtn_.setBounds (sb.removeFromTop (22));  sb.removeFromTop (2);
         rootBtn_.setBounds (sb.removeFromTop (22));
 
-        r.removeFromLeft (10);
+        r.removeFromLeft (8);
 
-        /* Right column: toolbar + path/filename + browser. */
-        toolbarBounds_ = r.removeFromTop (36);
+        /* === Column 2 — File browser column.  Narrow per design note:
+         * "file navigation is never going to require full horizontal."
+         * Holds toolbar / path / filename / FileBrowserComponent. === */
+        const int browserColW = juce::jmin (480, r.getWidth() * 5 / 12);
+        auto browserCol = r.removeFromLeft (browserColW);
+
+        toolbarBounds_ = browserCol.removeFromTop (36);
         auto tb = toolbarBounds_.reduced (6);
         refreshBtn_.setBounds (tb.removeFromLeft (70)); tb.removeFromLeft (4);
         setPathBtn_.setBounds (tb.removeFromLeft (70)); tb.removeFromLeft (8);
@@ -165,23 +296,48 @@ public:
         tb.removeFromLeft (8);
         statusLabel_.setBounds (tb);
 
-        r.removeFromTop (6);
-        auto pathRow = r.removeFromTop (24);
+        browserCol.removeFromTop (6);
+        auto pathRow = browserCol.removeFromTop (24);
         pathLabel_.setBounds (pathRow.removeFromLeft (40));
         pathEdit_.setBounds (pathRow);
 
-        r.removeFromTop (4);
-        auto fileRow = r.removeFromTop (24);
-        Label dummy; dummy.setText ("File:", dontSendNotification);
-        // (Filename label inline, drawn next to the edit — no allocation needed.)
-        // We draw label text in paint? simpler: use a static area for the label.
-        const auto labelArea = fileRow.removeFromLeft (40);
-        filenameLabelArea_ = labelArea;
+        browserCol.removeFromTop (4);
+        auto fileRow = browserCol.removeFromTop (24);
+        filenameLabelArea_ = fileRow.removeFromLeft (40);
         filenameEdit_.setBounds (fileRow);
 
-        r.removeFromTop (6);
+        browserCol.removeFromTop (6);
         if (browser_ != nullptr)
-            browser_->setBounds (r);
+            browser_->setBounds (browserCol);
+
+        r.removeFromLeft (10);
+
+        /* === Column 3 — Mode-extras pane.  Mirrors FT2's right-side
+         * "extras" (patterns, sample slots).  Content swaps per mode:
+         *   Sample        — sampler-slot mirror (placeholder for now)
+         *   Session       — recent-sessions placeholder
+         *   Plugin Paths  — three stacked CLAP / VST / VST3 sections. === */
+        extrasBounds_ = r;
+
+        auto& svc = DiskOpService::get();
+        const bool pluginPaths = svc.getMode() == DiskOpService::Mode::kPluginPaths;
+        for (int i = 0; i < pluginPathsSections_.size(); ++i)
+        {
+            pluginPathsSections_[i]->setVisible (pluginPaths);
+        }
+        if (pluginPaths && ! pluginPathsSections_.isEmpty())
+        {
+            auto col = r;
+            const int h = juce::jmax (60, col.getHeight() / 3);
+            pluginPathsSections_[0]->setBounds (col.removeFromTop (h));
+            col.removeFromTop (4);
+            pluginPathsSections_[1]->setBounds (col.removeFromTop (h));
+            col.removeFromTop (4);
+            pluginPathsSections_[2]->setBounds (col);
+        }
+
+        extrasPlaceholder_.setVisible (! pluginPaths);
+        if (! pluginPaths) extrasPlaceholder_.setBounds (extrasBounds_);
     }
 
     void paintOverChildren (Graphics& g) override
@@ -248,6 +404,13 @@ public:
         {
             if (svc.getCurrentDirectory().isDirectory())
                 browser_->setRoot (svc.getCurrentDirectory());
+        }
+
+        /* Mode changed → re-layout to swap right-pane content. */
+        if (lastMode_ != svc.getMode())
+        {
+            lastMode_ = svc.getMode();
+            resized();
         }
     }
 
@@ -353,8 +516,16 @@ private:
     String currentWildcard_;
     bool   allFiles_ = false;
 
+    /* Mode-extras right pane.  Plugin Paths mode shows 3 PluginPathsSection
+     * children; other modes show a single placeholder Label for now (Sample
+     * mode's sample-bank mirror, Session mode's recent-sessions list lands
+     * in a follow-up). */
+    OwnedArray<PluginPathsSection> pluginPathsSections_;
+    Label extrasPlaceholder_ { {}, "Sample bank mirror — coming next iteration." };
+
     /* Layout cache. */
-    Rectangle<int> sidebarBounds_, toolbarBounds_;
+    Rectangle<int> sidebarBounds_, toolbarBounds_, extrasBounds_;
+    DiskOpService::Mode lastMode_ { (DiskOpService::Mode) -1 };
 };
 
 
