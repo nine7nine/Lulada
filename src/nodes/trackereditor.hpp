@@ -67,6 +67,14 @@ private:
     std::unique_ptr<PatternView> patternView;
     std::unique_ptr<juce::Viewport> viewport;
     std::unique_ptr<Toolbar> toolbar;
+
+    /* Toolbar diff state — gates refreshToolbar() inside the 30Hz
+     * timerCallback so we don't keep rebuilding label strings + button
+     * states on idle frames.  Sentinels force first-tick refresh. */
+    int   lastToolbarPatternIndex_ = -1;
+    int   lastToolbarPatternCount_ = -1;
+    float lastToolbarBpm_          = -1.0f;
+    bool  lastToolbarEditMode_     = false;
 };
 
 } // namespace element

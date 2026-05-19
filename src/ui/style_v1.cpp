@@ -1062,14 +1062,38 @@ void LookAndFeel_E1::drawPopupMenuBackground (Graphics& g, int width, int height
     g.fillRoundedRectangle (r, 0.0f);
 }
 
-void LookAndFeel_E1::getIdealPopupMenuItemSize (const String& text, 
-                                                bool isSeparator, 
-                                                int standardMenuItemHeight, 
-                                                int& idealWidth, 
+void LookAndFeel_E1::getIdealPopupMenuItemSize (const String& text,
+                                                bool isSeparator,
+                                                int standardMenuItemHeight,
+                                                int& idealWidth,
                                                 int& idealHeight)
 {
-    LookAndFeel_V3::getIdealPopupMenuItemSize (text, 
+    LookAndFeel_V3::getIdealPopupMenuItemSize (text,
         isSeparator, standardMenuItemHeight, idealWidth, idealHeight);
+}
+
+void LookAndFeel_E1::drawPopupMenuItem (Graphics& g, const Rectangle<int>& area,
+                                        bool isSeparator, bool isActive, bool isHighlighted, bool isTicked, bool hasSubMenu,
+                                        const String& text, const String& shortcutKeyText,
+                                        const Drawable* icon, const Colour* textColourToUse)
+{
+    if (isSeparator)
+    {
+        /* Separator: darker than the menu body so it reads as a "cut"
+         * rather than a bright line on a dark field.  JUCE's default
+         * uses textColourId @ alpha 0.3 which paints LIGHTER than the
+         * widgetBackgroundColor body — wrong direction. */
+        auto r = area.reduced (5, 0);
+        r.removeFromTop ((r.getHeight() / 2) - 1);
+        g.setColour (findColour (PopupMenu::backgroundColourId).darker (0.55f));
+        g.fillRect (r.removeFromTop (1));
+        return;
+    }
+
+    LookAndFeel_V3::drawPopupMenuItem (g, area,
+                                       isSeparator, isActive, isHighlighted, isTicked, hasSubMenu,
+                                       text, shortcutKeyText,
+                                       icon, textColourToUse);
 }
 
 //==============================================================================
@@ -1080,13 +1104,11 @@ Font LookAndFeel_E1::getMenuBarFont (MenuBarComponent&, int, const String&)
 
 void LookAndFeel_E1::drawMenuBarBackground (Graphics& g, int width, int height, bool /*isMouseOverBar*/, MenuBarComponent& /*mbc*/)
 {
-    /* Element: flat fill that matches the transport / toolbar strip
-     * directly below the menu bar (see Content's inner toolbar paint
-     * — same Colors::contentBackgroundColor.brighter(0.1f)).  Using
-     * a different shade made the menu bar read as a separate widget;
-     * matching them gives one continuous header strip.  No gradient,
-     * no 1px separator line. */
-    g.fillAll (Colors::contentBackgroundColor.brighter (0.1f));
+    /* Element: flat fill that matches Content's backgroundColor
+     * (0xff16191A — the blue-grey tone) so the menu bar + top toolbar
+     * + body + status bar read as one continuous frame.  No gradient,
+     * no 1px separator. */
+    g.fillAll (Colors::backgroundColor);
 }
 
 void LookAndFeel_E1::drawMenuBarItem (Graphics& g, int width, int height, int /*itemIndex*/, const String& itemText, bool isMouseOverItem, bool isMenuOpen, bool /*isMouseOverBar*/, MenuBarComponent& bar)

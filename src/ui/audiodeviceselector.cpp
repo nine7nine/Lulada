@@ -1084,9 +1084,18 @@ private:
             current.useDefaultOutputChannels = false;
         }
 
-        /* setAudioDeviceSetup closes + reopens the JackAudioIODevice
-         * with the updated JackClient port counts AND the widened
-         * active-channel masks in one step. */
+        /* JackAudioIODevice registers JACK ports in its CONSTRUCTOR
+         * (jack.cpp ctor calls jack_port_register N times based on
+         * JackClient::getNumMainInputs/Outputs at that moment).
+         * setAudioDeviceSetup alone only calls open() on the existing
+         * device when device name is unchanged — that doesn't
+         * re-register ports, so the new count is silently ignored.
+         * closeAudioDevice() forces deleteCurrentDevice() →
+         * currentAudioDevice = nullptr → the next setAudioDeviceSetup
+         * sees `needsNewDevice = true` and constructs a fresh
+         * JackAudioIODevice, which picks up the updated port counts
+         * and registers / unregisters the matching JACK ports. */
+        devs->closeAudioDevice();
         devs->setAudioDeviceSetup (current, true);
     }
 

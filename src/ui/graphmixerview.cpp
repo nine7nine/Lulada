@@ -1,7 +1,9 @@
 // Copyright 2019-2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <element/engine.hpp>
 #include <element/services.hpp>
+#include <element/tags.hpp>
 #include <element/ui/style.hpp>
 
 #include "ui/nodechannelstrip.hpp"
@@ -271,7 +273,8 @@ private:
 };
 
 class GraphMixerView::Content : public Component,
-                                public DragAndDropContainer
+                                public DragAndDropContainer,
+                                private ValueTree::Listener
 {
 public:
     Content (GraphMixerView& v, GuiService& gui, Session* sess)
@@ -287,13 +290,29 @@ public:
         _conns.push_back (ui.nodeSelected.connect (std::bind (&Content::onNodeSelected, this)));
         auto& ssrv = *gui.sibling<SessionService>();
         _conns.push_back (ssrv.sigSessionLoaded.connect ([this]() {
+            attachToActiveGraph();
             model->refreshNodes();
             model->setNode (session->getActiveGraph());
         }));
+
+        /* sigNodeRemoved is the authoritative signal for node removal —
+         * the ValueTree listener path doesn't always fire here (e.g. when
+         * the removed node wasn't the selected one + the listener gets
+         * stranded on a stale graph tree), leading to a stale strip
+         * sticking around after remove + re-add.  Mirror what
+         * GraphEditorView does and refresh on sigNodeRemoved unconditionally. */
+        auto& eng = *gui.sibling<EngineService>();
+        _conns.push_back (eng.sigNodeRemoved.connect ([this] (const Node&) {
+            attachToActiveGraph();
+            stabilize();
+        }));
+
+        attachToActiveGraph();
     }
 
     ~Content()
     {
+        detachFromActiveGraph();
         for (auto& c : _conns)
             c.disconnect();
         _conns.clear();
@@ -301,6 +320,44 @@ public:
         box.setModel (nullptr);
         model.reset();
     }
+
+    /* Auto-refresh on graph-node add/remove so newly-added nodes show
+     * up without requiring a click. */
+    void attachToActiveGraph()
+    {
+        if (session == nullptr) return;
+        auto g = session->getActiveGraph();
+        if (! g.isValid()) return;
+        auto t = g.data();
+        if (t == attachedGraph_) return;
+        detachFromActiveGraph();
+        attachedGraph_ = t;
+        if (attachedGraph_.isValid())
+            attachedGraph_.addListener (this);
+    }
+
+    void detachFromActiveGraph()
+    {
+        if (attachedGraph_.isValid())
+            attachedGraph_.removeListener (this);
+        attachedGraph_ = ValueTree();
+    }
+
+    void valueTreeChildAdded (ValueTree&, ValueTree& child) override
+    {
+        if (child.hasType (types::Node) || child.hasType (tags::nodes))
+            stabilize();
+    }
+
+    void valueTreeChildRemoved (ValueTree&, ValueTree& child, int) override
+    {
+        if (child.hasType (types::Node) || child.hasType (tags::nodes))
+            stabilize();
+    }
+
+    void valueTreePropertyChanged (ValueTree&, const Identifier&) override {}
+    void valueTreeChildOrderChanged (ValueTree&, int, int) override {}
+    void valueTreeParentChanged (ValueTree&) override {}
 
     void onNodeSelected()
     {
@@ -349,6 +406,7 @@ private:
     ChannelStripComponent channelStrip;
     HorizontalListBox box;
     std::vector<SignalConnection> _conns;
+    ValueTree attachedGraph_;
 };
 
 GraphMixerView::GraphMixerView()

@@ -45,11 +45,16 @@ public:
 
 TransportBar::TransportBar()
 {
+    /* Transport icons are colour-coded so they read against the bold
+     * neutral border + dark body: play=green, stop=blue, record=red,
+     * rewind=white.  These tint the icon glyph itself, independent of
+     * any toggle-on body wash from backgroundOnColourId. */
     play = std::make_unique<PlayButton>();
     addAndMakeVisible (play.get());
     play->setPath (getIcons().fasPlay, 4.4f);
     play->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     play->addListener (this);
+    play->setIconColour (Colour (0xff5cd65c));
     play->setColour (TextButton::buttonOnColourId, Colours::chartreuse);
     play->setColour (SettingButton::backgroundOnColourId, Colors::toggleGreen);
 
@@ -58,12 +63,14 @@ TransportBar::TransportBar()
     stop->setPath (getIcons().fasStop, 4.4f);
     stop->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     stop->addListener (this);
+    stop->setIconColour (Colour (0xff4ea1ff));
 
     record = std::make_unique<RecordButton>();
     addAndMakeVisible (record.get());
     record->setPath (getIcons().fasCircle, 4.4f);
     record->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     record->addListener (this);
+    record->setIconColour (Colour (0xffff4d4d));
     record->setColour (SettingButton::backgroundOnColourId, Colours::red);
 
     toZero = std::make_unique<SeekZeroButton>();
@@ -73,6 +80,7 @@ TransportBar::TransportBar()
     toZero->setPath (toZeroPath, 4.4f);
     toZero->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     toZero->addListener (this);
+    toZero->setIconColour (Colours::white);
 
     barLabel = std::make_unique<BarLabel> (*this);
     addAndMakeVisible (barLabel.get());
@@ -87,7 +95,10 @@ TransportBar::TransportBar()
     subLabel->setName ("subLabel");
 
     setBeatTime (0.f);
-    setSize (280, 16);
+    /* Default size sized for tempoBarHeight (26 in the main toolbar)
+     * — the parent Toolbar will resize us with the real height, but
+     * we still need a non-zero initial extent for updateWidth(). */
+    setSize (240, 26);
     updateWidth();
 
     startTimer (88);
@@ -137,14 +148,30 @@ void TransportBar::paint (Graphics& g)
 
 void TransportBar::resized()
 {
-    play->setBounds (80, 0, 20, 16);
-    stop->setBounds (102, 0, 20, 16);
-    record->setBounds (124, 0, 20, 16);
-    toZero->setBounds (146, 0, 20, 16);
+    /* Height-driven layout — fills whatever vertical space the parent
+     * toolbar gives us (typically tempoBarHeight ≈ 26px), so transport
+     * buttons read as the same family as the tempo / view-selector
+     * buttons rather than a hardcoded 16px sliver.  Widths:
+     *   - bar/beat/sub labels: 1.6× height (room for 2-3 digits)
+     *   - transport icon buttons: 1.25× height (a bit wider than tall
+     *     so the icon doesn't crowd the bold edge stroke)
+     *   - 2px gaps between cells, 6px gap between the position
+     *     labels and the transport buttons. */
+    const int h = getHeight();
+    const int labelW = juce::jmax (24, juce::roundToInt (h * 1.6f));
+    const int btnW   = juce::jmax (22, juce::roundToInt (h * 1.25f));
+    constexpr int gap = 2;
+    constexpr int groupGap = 6;
 
-    barLabel->setBounds (0, 0, 24, 16);
-    beatLabel->setBounds (26, 0, 24, 16);
-    subLabel->setBounds (52, 0, 24, 16);
+    int x = 0;
+    barLabel->setBounds  (x, 0, labelW, h); x += labelW + gap;
+    beatLabel->setBounds (x, 0, labelW, h); x += labelW + gap;
+    subLabel->setBounds  (x, 0, labelW, h); x += labelW + groupGap;
+
+    play->setBounds   (x, 0, btnW, h); x += btnW + gap;
+    stop->setBounds   (x, 0, btnW, h); x += btnW + gap;
+    record->setBounds (x, 0, btnW, h); x += btnW + gap;
+    toZero->setBounds (x, 0, btnW, h);
 }
 
 void TransportBar::buttonClicked (Button* buttonThatWasClicked)

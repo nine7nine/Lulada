@@ -1459,12 +1459,24 @@ private:
          * close + reopen with the updated MIDI port set.  Audio port
          * counts are left at whatever the user already configured;
          * setAudioDeviceSetup pulls the full state from the manager
-         * so audio side is unchanged. */
+         * so audio side is unchanged.
+         *
+         * JackAudioIODevice registers its MIDI ports (jack.cpp:532-546
+         * jack_port_register loop on JACK_DEFAULT_MIDI_TYPE) in its
+         * constructor only — never in open().  JUCE's
+         * setAudioDeviceSetup skips device recreation when the input/
+         * output device NAME hasn't changed (juce_AudioDeviceManager
+         * .cpp:835: `needsNewDevice = name changed || currentAudioDevice
+         * == nullptr`).  Force-null currentAudioDevice via
+         * closeAudioDevice() so the next setAudioDeviceSetup constructs
+         * a fresh JackAudioIODevice and re-runs the MIDI port-register
+         * loop with the new count. */
         auto& devs = world.devices();
         devs.applyJackPortCountsFromSettings (world.settings());
 
         juce::AudioDeviceManager::AudioDeviceSetup current;
         devs.getAudioDeviceSetup (current);
+        devs.closeAudioDevice();
         devs.setAudioDeviceSetup (current, true);
     }
 #endif

@@ -368,6 +368,8 @@ void MainMenu::buildViewMenu (Commands& cmd, PopupMenu& menu)
 {
     menu.addCommandItem (&cmd, Commands::showPatchBay, "Patch Bay");
     menu.addCommandItem (&cmd, Commands::showGraphEditor, "Graph Editor");
+    menu.addCommandItem (&cmd, Commands::showArrangement, "Arrangement");
+    menu.addCommandItem (&cmd, Commands::showTrackerHost, "Trackers");
     menu.addSeparator();
     menu.addCommandItem (&cmd, Commands::showGraphMixer, "Graph Mixer");
     menu.addCommandItem (&cmd, Commands::showConsole, "Console");

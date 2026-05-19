@@ -737,28 +737,20 @@ void EngineService::removeNode (const Node& node)
         sigNodeRemoved (node);
     }
 
-    if (auto gp = dynamic_cast<GraphNode*> (graph.getObject()))
-    {
-        const bool asyncNotify = false;
-        // workaround: removal of a duplex node in reality has
-        // cleared the graph's ports
-        if (node.isAudioInputNode())
-        {
-            gp->setNumPorts (PortType::Audio, 0, true, asyncNotify);
-        }
-        else if (node.isAudioOutputNode())
-        {
-            gp->setNumPorts (PortType::Audio, 0, false, asyncNotify);
-        }
-        else if (node.isMidiInputNode())
-        {
-            gp->setNumPorts (PortType::Midi, 0, true, asyncNotify);
-        }
-        else if (node.isMidiOutputNode())
-        {
-            gp->setNumPorts (PortType::Midi, 0, false, asyncNotify);
-        }
-    }
+    /* Removing an IONode block must NOT zero the parent graph's
+     * port count.  The configured count (set via the Graph
+     * properties Audio Ins/Outs slider, the Preferences "Audio in
+     * ports" / "Audio out ports" spinners, or the session model)
+     * is the source of truth — JACK exposes that many ports, and
+     * re-adding the IONode should pick the same count back up via
+     * IONode::refreshPorts() → graph->getNumPorts().  The old
+     * `setNumPorts(0)` here was a workaround for an obsolete
+     * GraphNode::removeNode that cleared parent ports; current
+     * GraphNode::removeNode (engine/graphnode.cpp) doesn't touch
+     * port counts, so this branch is dead weight that breaks
+     * remove-then-readd by forcing the new IONode to fall back to
+     * IONode::setParentGraph's default (2 audio / 1 midi). */
+    juce::ignoreUnused (graph);
 }
 
 void EngineService::removeNode (const Uuid& uuid)
