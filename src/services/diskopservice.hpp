@@ -43,6 +43,13 @@ public:
         return inst;
     }
 
+    /** Activation broadcaster — fires on double-click in the file
+     *  browser (or other "go" gestures).  Separate from the main
+     *  change broadcast so consumers that only want the activation
+     *  edge don't get woken on every keystroke / selection change. */
+    juce::ChangeBroadcaster activations;
+    void fireActivation() { activations.sendChangeMessage(); }
+
     /* --- current mode ------------------------------------------------- */
     Mode getMode() const noexcept { return mode_; }
     void setMode (Mode m)

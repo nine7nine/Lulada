@@ -24,8 +24,7 @@ namespace element {
  *  Quick-Nav row enumerates ~/.wine/dosdevices/ so the user can jump
  *  between Linux paths and Wine drive letters with one click. */
 class DiskOpContentView : public ContentView,
-                          public juce::ChangeListener,
-                          public juce::FileBrowserListener
+                          public juce::ChangeListener
 {
 public:
     DiskOpContentView();
@@ -38,12 +37,6 @@ public:
     void willBeRemoved() override;
 
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
-
-    /* FileBrowserListener */
-    void selectionChanged() override;
-    void fileClicked (const juce::File&, const juce::MouseEvent&) override;
-    void fileDoubleClicked (const juce::File&) override;
-    void browserRootChanged (const juce::File&) override;
 
 private:
     class Impl;

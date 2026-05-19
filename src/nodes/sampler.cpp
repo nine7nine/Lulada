@@ -56,6 +56,16 @@ void ensureMixerInterpolationTablesReady()
     std::call_once (flag, [] { setupMixerInterpolationTables(); });
 }
 
+/* Shared slot palette so the keymap + bank slot-list + Disk Op sample
+ * bank all colour matching slots identically.  32 distinct hues; slot
+ * -1 / unloaded → neutral gray. */
+inline juce::Colour slotPaletteColour (int slot, float sat = 0.55f, float val = 0.85f)
+{
+    if (slot < 0) return juce::Colour { 0xff'30'30'30 };
+    const float h = (slot % 32) / 32.0f;
+    return juce::Colour::fromHSV (h, sat, val, 1.0f);
+}
+
 /* FT2 auto-vibrato sine table (256 entries, -64..+64).  Sourced from
  * ft2_tables.c::autoVibSineTab.  Used by AutoVibrato pitch modulation. */
 static const int8_t kAutoVibSineTab[256] = {
@@ -787,6 +797,7 @@ public:
             g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
             g.drawText ("(load a sample to set loop points)",
                         bounds.toFloat(), Justification::centred);
+            lastSeenN_ = 0;
             return;
         }
 
@@ -798,13 +809,24 @@ public:
         const auto* d = slot->data16L.get();
         if (n <= 0 || w <= 0 || d == nullptr) return;
 
+        /* (Re-)init the viewport to full sample when the slot changes
+         * (different numSamples). */
+        if (lastSeenN_ != n || viewEnd_ <= viewStart_ || viewEnd_ > n)
+        {
+            viewStart_ = 0;
+            viewEnd_   = n;
+            lastSeenN_ = n;
+        }
+        const int vRange = viewEnd_ - viewStart_;
+
         g.setColour (Colour { 0xff'5a'a5'd0 });
         for (int x = 0; x < w; ++x)
         {
-            const int s0 = (int) ((int64_t) x * n / w);
-            const int s1 = (int) std::max ((int64_t) s0 + 1, (int64_t) (x + 1) * n / w);
+            const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
+            const int64_t s1 = juce::jmax (s0 + 1,
+                                            (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
             int mn = INT16_MAX, mx = INT16_MIN;
-            for (int i = s0; i < s1 && i < n; ++i)
+            for (int64_t i = s0; i < s1 && i < n; ++i)
             {
                 const int v = d[i];
                 if (v < mn) mn = v;
@@ -817,8 +839,8 @@ public:
 
         if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
         {
-            const float x0 = bounds.getX() + (float) bounds.getWidth() * slot->loopStart / (float) n;
-            const float x1 = bounds.getX() + (float) bounds.getWidth() * (slot->loopStart + slot->loopLength) / (float) n;
+            const float x0 = bounds.getX() + sampleToPixelF (slot->loopStart, w);
+            const float x1 = bounds.getX() + sampleToPixelF (slot->loopStart + slot->loopLength, w);
             g.setColour (Colour { 0x33'ff'a0'40 });
             g.fillRect (x0, bounds.getY(), x1 - x0, bounds.getHeight());
             g.setColour (Colour { 0xff'ff'a0'40 });
@@ -834,10 +856,25 @@ public:
             g.setColour (Colour { 0xff'40'ff'80 });
             for (int pos : positions)
             {
-                if (pos < 0 || pos >= n) continue;
-                const float x = bounds.getX() + (float) bounds.getWidth() * pos / (float) n;
+                if (pos < viewStart_ || pos >= viewEnd_) continue;
+                const float x = bounds.getX() + sampleToPixelF (pos, w);
                 g.fillRect (x - 0.5f, bounds.getY(), 1.5f, bounds.getHeight());
             }
+        }
+
+        /* Tiny zoom indicator (e.g. "1.0x" / "12.3x") top-right. */
+        if (vRange > 0 && n > 0)
+        {
+            const float zoomX = (float) n / (float) vRange;
+            g.setColour (Colour { 0xff'7a'7a'7a });
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 10.0f, Font::plain));
+            const String label = (zoomX < 9.99f)
+                                 ? String::formatted ("%.2fx", zoomX)
+                                 : String::formatted ("%.1fx", zoomX);
+            g.drawText (label,
+                        Rectangle<float> (bounds.getRight() - 48, bounds.getY() + 2,
+                                          44, 12),
+                        Justification::right);
         }
     }
 
@@ -848,14 +885,14 @@ public:
         if (slot->loopMode == SamplerLoopMode::kNone || slot->loopLength <= 0)
         {
             slot->loopMode   = SamplerLoopMode::kForward;
-            slot->loopStart  = pixelToSample (e.x, slot->numSamples);
+            slot->loopStart  = pixelToSample (e.x);
             slot->loopLength = juce::jmax (1, slot->numSamples - slot->loopStart);
             draggingMarker   = 1;
             repaint();
             return;
         }
-        const int x0 = sampleToPixel (slot->loopStart, slot->numSamples);
-        const int x1 = sampleToPixel (slot->loopStart + slot->loopLength, slot->numSamples);
+        const int x0 = sampleToPixel (slot->loopStart);
+        const int x1 = sampleToPixel (slot->loopStart + slot->loopLength);
         draggingMarker = (std::abs (e.x - x0) < std::abs (e.x - x1)) ? 0 : 1;
     }
 
@@ -865,7 +902,7 @@ public:
         auto* slot = getSlot ? getSlot() : nullptr;
         if (slot == nullptr || ! slot->isLoaded()) return;
 
-        const int newPos = pixelToSample (e.x, slot->numSamples);
+        const int newPos = pixelToSample (e.x);
         if (draggingMarker == 0)
         {
             const int oldEnd = slot->loopStart + slot->loopLength;
@@ -882,9 +919,72 @@ public:
 
     void mouseUp (const MouseEvent&) override { draggingMarker = -1; }
 
+    /** Trackpad pinch — primary zoom gesture, anchored at the cursor. */
+    void mouseMagnify (const MouseEvent& e, float scaleFactor) override
+    {
+        applyZoom (e.x, (double) scaleFactor);
+    }
+
+    /** Trackpad 2-finger scroll.  deltaX → pan, deltaY → zoom (fallback
+     *  for users without a pinch-capable trackpad). */
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+
+        if (std::abs (w.deltaX) > std::abs (w.deltaY))
+        {
+            const int range = viewEnd_ - viewStart_;
+            const int shift = (int) std::lround (range * -w.deltaX * 0.5);
+            const int n = slot->numSamples;
+            int newStart = juce::jlimit (0, juce::jmax (0, n - range),
+                                          viewStart_ + shift);
+            viewStart_ = newStart;
+            viewEnd_   = newStart + range;
+            repaint();
+        }
+        else if (std::abs (w.deltaY) > 0.001f)
+        {
+            const double factor = (w.deltaY > 0) ? (1.0 / 1.20) : 1.20;
+            applyZoom (e.x, factor);
+        }
+    }
+
+    void mouseDoubleClick (const MouseEvent&) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot != nullptr && slot->isLoaded())
+        {
+            viewStart_ = 0;
+            viewEnd_   = slot->numSamples;
+            repaint();
+        }
+    }
+
+private:
+    void applyZoom (int anchorPx, double factor)
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        if (viewEnd_ <= viewStart_) { viewStart_ = 0; viewEnd_ = n; }
+        const int anchorSamp = pixelToSample (anchorPx);
+        int newRange = juce::jmax (4, (int) std::lround ((viewEnd_ - viewStart_) / factor));
+        newRange = juce::jmin (n, newRange);
+        const double tRel = double (anchorSamp - viewStart_)
+                          / juce::jmax (1, viewEnd_ - viewStart_);
+        int newStart = (int) std::lround (anchorSamp - tRel * newRange);
+        newStart = juce::jlimit (0, juce::jmax (0, n - newRange), newStart);
+        viewStart_ = newStart;
+        viewEnd_   = newStart + newRange;
+        repaint();
+    }
+public:
+
 private:
     void timerCallback() override
     {
+        if (! isShowing()) return;     /* free CPU when off-screen */
         auto* slot = getSlot ? getSlot() : nullptr;
         std::vector<int> cur = slot != nullptr ? playheadsFor (slot) : std::vector<int>();
         if (cur == lastPlayheads_)
@@ -893,25 +993,38 @@ private:
         repaint();
     }
 
-    int pixelToSample (int x, int n) const
+    int pixelToSample (int x) const
     {
         const auto bounds = getLocalBounds().reduced (2);
         const int w = bounds.getWidth();
-        if (w <= 0) return 0;
-        return (int) juce::jlimit ((int64_t) 0, (int64_t) n,
-                                    (int64_t) (x - bounds.getX()) * n / w);
+        if (w <= 0) return viewStart_;
+        const int range = juce::jmax (1, viewEnd_ - viewStart_);
+        return (int) juce::jlimit ((int64_t) viewStart_, (int64_t) viewEnd_,
+                                    (int64_t) viewStart_
+                                       + (int64_t) (x - bounds.getX()) * range / w);
     }
-    int sampleToPixel (int s, int n) const
+    int sampleToPixel (int s) const
     {
         const auto bounds = getLocalBounds().reduced (2);
-        if (n <= 0) return bounds.getX();
-        return bounds.getX() + (int) ((int64_t) bounds.getWidth() * s / n);
+        if (viewEnd_ <= viewStart_) return bounds.getX();
+        return bounds.getX() + (int) ((int64_t) (s - viewStart_) * bounds.getWidth()
+                                         / juce::jmax (1, viewEnd_ - viewStart_));
+    }
+    float sampleToPixelF (int s, int w) const
+    {
+        if (viewEnd_ <= viewStart_ || w <= 0) return 0.0f;
+        return (float) ((int64_t) (s - viewStart_) * w
+                         / juce::jmax (1, viewEnd_ - viewStart_));
     }
 
     std::function<SamplerSampleSlot*()> getSlot;
     PlayheadQuery playheadsFor;
     std::vector<int> lastPlayheads_;
     int draggingMarker = -1;
+
+    /* Viewport state — defaults reset whenever slot length changes. */
+    int viewStart_ = 0, viewEnd_ = 0;
+    int lastSeenN_ = 0;
 };
 
 
@@ -1191,7 +1304,11 @@ public:
                                           true,false,true,false,true };
         static const int blackOffsetPC[12] = { -1, 0, -1, 1, -1, -1, 3, -1, 4, -1, 5, -1 };
 
-        /* Pass 1: whites — gray-white base + slot-color accent strip. */
+        /* Pass 1: whites — gray base, faint slot-color tint, big bold
+         * white slot number.  Vivid colour lives only in the 6 px
+         * top stripe. */
+        const Colour grayWhite  { 0xff'5a'5a'5a };   /* darker gray base */
+        const Colour grayBlack  { 0xff'18'18'18 };
         int whiteIdx = 0;
         for (int n = 0; n < 24; ++n)
         {
@@ -1204,35 +1321,53 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            g.setColour (Colour { 0xff'b8'b8'b8 });   /* light gray base */
+            /* Mostly the gray base; slot tint is desaturated + dim so
+             * the blend barely shifts brightness.  Full slot colour is
+             * reserved for the 6 px top stripe. */
+            const Colour base = hasAssign
+                              ? grayWhite.interpolatedWith (
+                                    slotPaletteColour (assignedSlot, 0.4f, 0.4f),
+                                    0.18f)
+                              : grayWhite;
+            g.setColour (base);
             g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
-            g.setColour (Colour { 0xff'2a'2a'2a });
-            g.drawRect (x, bounds.getY(), whiteW, whiteH, 1.0f);
 
-            /* Slot-color accent — top stripe only, not the whole key. */
+            /* Top colour stripe — small, vivid. */
             if (hasAssign)
             {
-                const auto accent = slotColour (assignedSlot);
-                g.setColour (accent);
-                g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 10.0f);
-                g.setColour (Colour { 0xff'30'30'30 });
-                g.drawHorizontalLine (juce::roundToInt (bounds.getY() + 10),
-                                      x + 1.0f, x + whiteW);
+                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.85f));
+                g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 6.0f);
             }
 
-            /* Slot # — large, centred on the lower half of the key. */
-            g.setColour (hasAssign ? Colours::black : Colour { 0xff'70'70'70 });
-            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
-                                    13.0f, Font::bold));
-            const String s = hasAssign ? String (assignedSlot + 1)
-                                       : String (CharPointer_UTF8 ("\xe2\x80\x94"));
-            g.drawText (s, Rectangle<float> (x, bounds.getBottom() - 22,
-                                              whiteW, 18),
-                        Justification::centred);
+            g.setColour (Colour { 0xff'1a'1a'1a });
+            g.drawRect (x, bounds.getY(), whiteW, whiteH, 1.0f);
+
+            /* Slot # — big bold white centred. */
+            if (hasAssign)
+            {
+                g.setColour (Colours::white);
+                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        16.0f, Font::bold));
+                g.drawText (String (assignedSlot + 1),
+                            Rectangle<float> (x, bounds.getCentreY() - 8,
+                                              whiteW, 24),
+                            Justification::centred);
+            }
+            else
+            {
+                g.setColour (Colour { 0xff'40'40'40 });
+                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        13.0f, Font::bold));
+                g.drawText (String (CharPointer_UTF8 ("\xe2\x80\x94")),
+                            Rectangle<float> (x, bounds.getCentreY() - 8,
+                                              whiteW, 16),
+                            Justification::centred);
+            }
             ++whiteIdx;
         }
 
-        /* Pass 2: blacks — dark base + slot-color accent top stripe. */
+        /* Pass 2: blacks — darker gray base, slot tint when assigned,
+         * bold white slot number centred. */
         for (int n = 0; n < 24; ++n)
         {
             const int note = baseNote + n;
@@ -1248,26 +1383,32 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            g.setColour (Colour { 0xff'1c'1c'1c });
+            const Colour base = hasAssign
+                              ? grayBlack.interpolatedWith (
+                                    slotPaletteColour (assignedSlot, 0.55f, 0.35f),
+                                    0.30f)
+                              : grayBlack;
+            g.setColour (base);
             g.fillRect (x, bounds.getY(), blackW, blackH);
+
+            /* Top colour stripe on black keys too, slimmer (4 px). */
             if (hasAssign)
             {
-                const auto accent = slotColour (assignedSlot).withMultipliedBrightness (0.85f);
-                g.setColour (accent);
-                g.fillRect (x, bounds.getY(), blackW, 6.0f);
+                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.8f));
+                g.fillRect (x, bounds.getY(), blackW, 4.0f);
             }
-            g.setColour (Colour { 0xff'1a'1a'1a });
+
+            g.setColour (Colour { 0xff'08'08'08 });
             g.drawRect (x, bounds.getY(), blackW, blackH, 1.0f);
 
-            /* Slot # in white on black key. */
             if (hasAssign)
             {
-                g.setColour (Colour { 0xff'e8'e8'e8 });
+                g.setColour (Colours::white);
                 g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
-                                        10.0f, Font::bold));
+                                        12.0f, Font::bold));
                 g.drawText (String (assignedSlot + 1),
-                            Rectangle<float> (x, bounds.getY() + blackH - 16,
-                                              blackW, 14),
+                            Rectangle<float> (x, bounds.getY() + blackH * 0.5f - 8,
+                                              blackW, 16),
                             Justification::centred);
             }
         }
@@ -1396,13 +1537,8 @@ private:
         return -1;
     }
 
-    /** Colour for slot index in the 16-step palette. */
-    static Colour slotColour (int slot)
-    {
-        if (slot < 0) return Colour { 0xff'30'30'30 };
-        const float h = (slot % 16) / 16.0f;
-        return Colour::fromHSV (h, 0.55f, 0.85f, 1.0f);
-    }
+    /** Shim — old in-class palette is now the shared free function. */
+    static Colour slotColour (int slot) { return slotPaletteColour (slot); }
 
     GetInstrument getInst;
     GetActiveSlot getSlot;
@@ -1904,27 +2040,1072 @@ private:
 
 
 /* ===========================================================================
- * SamplerSamplePage / SamplerFXPage — stubs for F2 / F3.
- * Each draws a centered placeholder label so the nav tab does something
- * visible.  Real content lands in subsequent phases.
+ * SampleEditCanvas — large waveform display with range selection +
+ * viewport zoom.  Coordinates are int sample indices (0..numSamples).
+ * Range selection: [selStart_..selEnd_) — half-open.  Viewport:
+ * [viewStart_..viewEnd_).  Renders only the visible window.
  * ========================================================================*/
-class SamplerStubPage : public Component
+class SampleEditCanvas : public Component
 {
 public:
-    explicit SamplerStubPage (bool isSample)
+    using GetSlot = std::function<SamplerSampleSlot*()>;
+    using RangeChangedCb = std::function<void()>;
+
+    explicit SampleEditCanvas (GetSlot gs, RangeChangedCb cb = {})
+        : getSlot (std::move (gs)), onRangeChanged (std::move (cb)) {}
+
+    void setViewport (int s, int e)
     {
-        label_.setText (isSample
-                          ? "Sample editor — F2 (waveform + range + cut/copy/paste).  Coming next."
-                          : "Effects — F3 (lp/hp filter, resonance, generators, normalize).  Coming next.",
-                        dontSendNotification);
-        label_.setJustificationType (Justification::centred);
-        label_.setColour (Label::textColourId, Colour { 0xff'7a'7a'7a });
-        label_.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 13.0f, Font::plain));
-        addAndMakeVisible (label_);
+        viewStart_ = s; viewEnd_ = e;
+        repaint();
     }
-    void resized() override { label_.setBounds (getLocalBounds()); }
+    void setSelection (int s, int e)
+    {
+        selStart_ = juce::jmin (s, e);
+        selEnd_   = juce::jmax (s, e);
+        if (onRangeChanged) onRangeChanged();
+        repaint();
+    }
+    void clearSelection() { selStart_ = selEnd_ = -1; if (onRangeChanged) onRangeChanged(); repaint(); }
+    int  getSelStart() const noexcept { return selStart_; }
+    int  getSelEnd()   const noexcept { return selEnd_; }
+    int  getViewStart() const noexcept { return viewStart_; }
+    int  getViewEnd()   const noexcept { return viewEnd_; }
+    bool hasSelection() const noexcept { return selStart_ >= 0 && selEnd_ > selStart_; }
+
+    void paint (Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        g.setColour (Colour { 0xff'0c'0c'0c });
+        g.fillRect (bounds);
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawRect (bounds, 1.0f);
+
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded())
+        {
+            g.setColour (Colour { 0xff'5a'5a'5a });
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 12.0f, Font::plain));
+            g.drawText ("(no sample loaded for this slot)",
+                        bounds, Justification::centred);
+            return;
+        }
+
+        const int n = slot->numSamples;
+        if (viewEnd_ <= 0 || viewEnd_ > n) viewEnd_ = n;
+        if (viewStart_ < 0 || viewStart_ >= viewEnd_) viewStart_ = 0;
+
+        const int vRange = viewEnd_ - viewStart_;
+        if (vRange <= 0) return;
+
+        const int   w  = juce::roundToInt (bounds.getWidth());
+        const float h  = bounds.getHeight();
+        const float midY = bounds.getCentreY();
+        const float halfH = h * 0.45f;
+        const auto* d = slot->data16L.get();
+        if (w <= 0) return;
+
+        /* Selection shading (under the waveform). */
+        if (hasSelection())
+        {
+            const float sx0 = sampleToPixel (selStart_, w);
+            const float sx1 = sampleToPixel (selEnd_,   w);
+            if (sx1 > sx0)
+            {
+                g.setColour (Colour { 0x44'40'a0'ff });
+                g.fillRect (bounds.getX() + sx0, bounds.getY(),
+                            sx1 - sx0, bounds.getHeight());
+            }
+        }
+
+        /* Loop region shade (over selection, under waveform). */
+        if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
+        {
+            const float lx0 = sampleToPixel (slot->loopStart, w);
+            const float lx1 = sampleToPixel (slot->loopStart + slot->loopLength, w);
+            if (lx1 > lx0)
+            {
+                g.setColour (Colour { 0x33'ff'a0'40 });
+                g.fillRect (bounds.getX() + lx0, bounds.getY(),
+                            lx1 - lx0, bounds.getHeight());
+            }
+        }
+
+        /* Centerline. */
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawHorizontalLine ((int) midY, bounds.getX(), bounds.getRight());
+
+        /* Min/max envelope per pixel column. */
+        g.setColour (Colour { 0xff'5a'a5'd0 });
+        for (int x = 0; x < w; ++x)
+        {
+            const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
+            const int64_t s1 = juce::jmax (s0 + 1,
+                                            (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
+            int mn = INT16_MAX, mx = INT16_MIN;
+            for (int64_t i = s0; i < s1 && i < n; ++i)
+            {
+                const int v = d[i];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            const float yMin = midY - (mn / 32768.0f) * halfH;
+            const float yMax = midY - (mx / 32768.0f) * halfH;
+            g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
+        }
+
+        /* Selection edge markers. */
+        if (hasSelection())
+        {
+            const float sx0 = sampleToPixel (selStart_, w);
+            const float sx1 = sampleToPixel (selEnd_,   w);
+            g.setColour (Colour { 0xff'40'a0'ff });
+            g.fillRect (bounds.getX() + sx0 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+            g.fillRect (bounds.getX() + sx1 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+        }
+
+        /* Loop region markers. */
+        if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
+        {
+            const float lx0 = sampleToPixel (slot->loopStart, w);
+            const float lx1 = sampleToPixel (slot->loopStart + slot->loopLength, w);
+            g.setColour (Colour { 0xff'ff'a0'40 });
+            g.fillRect (bounds.getX() + lx0 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+            g.fillRect (bounds.getX() + lx1 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+        }
+    }
+
+    void mouseDown (const MouseEvent& e) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int s = pixelToSample (e.x);
+        if (e.mods.isShiftDown() && hasSelection())
+            setSelection (selStart_, s);
+        else
+            { dragAnchor_ = s; setSelection (s, s); }
+    }
+    void mouseDrag (const MouseEvent& e) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        if (dragAnchor_ < 0) return;
+        setSelection (dragAnchor_, pixelToSample (e.x));
+    }
+    void mouseUp (const MouseEvent&) override { dragAnchor_ = -1; }
+    void mouseDoubleClick (const MouseEvent&) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        setSelection (0, slot->numSamples);
+    }
+
+    /** Trackpad pinch — primary zoom gesture, anchored at cursor. */
+    void mouseMagnify (const MouseEvent& e, float scaleFactor) override
+    {
+        applyZoom (e.x, (double) scaleFactor);
+    }
+
+    /** Trackpad 2-finger scroll: deltaX = pan, deltaY = zoom (fallback). */
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+
+        if (std::abs (w.deltaX) > std::abs (w.deltaY))
+        {
+            const int range = viewEnd_ - viewStart_;
+            const int shift = (int) std::lround (range * -w.deltaX * 0.5);
+            int newStart = juce::jlimit (0, juce::jmax (0, n - range),
+                                          viewStart_ + shift);
+            setViewport (newStart, newStart + range);
+        }
+        else if (std::abs (w.deltaY) > 0.001f)
+        {
+            const double factor = (w.deltaY > 0) ? (1.0 / 1.20) : 1.20;
+            applyZoom (e.x, factor);
+        }
+    }
+
 private:
-    Label label_;
+    void applyZoom (int anchorPx, double factor)
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        if (viewEnd_ <= viewStart_) { viewStart_ = 0; viewEnd_ = n; }
+        const int anchorSamp = pixelToSample (anchorPx);
+        int newRange = juce::jmax (4, (int) std::lround ((viewEnd_ - viewStart_) / factor));
+        newRange = juce::jmin (n, newRange);
+        const double tRel = double (anchorSamp - viewStart_)
+                          / juce::jmax (1, viewEnd_ - viewStart_);
+        int newStart = (int) std::lround (anchorSamp - tRel * newRange);
+        newStart = juce::jlimit (0, juce::jmax (0, n - newRange), newStart);
+        setViewport (newStart, newStart + newRange);
+    }
+
+    int pixelToSample (int x) const
+    {
+        const auto bounds = getLocalBounds().reduced (2);
+        const int w = bounds.getWidth();
+        if (w <= 0) return viewStart_;
+        const int vRange = viewEnd_ - viewStart_;
+        return juce::jlimit (viewStart_, viewEnd_,
+                             viewStart_ + (int) ((int64_t) (x - bounds.getX()) * vRange / w));
+    }
+    float sampleToPixel (int s, int w) const
+    {
+        const int vRange = viewEnd_ - viewStart_;
+        if (vRange <= 0 || w <= 0) return 0.0f;
+        return (float) ((int64_t) (s - viewStart_) * w / vRange);
+    }
+
+    GetSlot getSlot;
+    RangeChangedCb onRangeChanged;
+    int viewStart_ = 0, viewEnd_ = 0;
+    int selStart_  = -1, selEnd_  = -1;
+    int dragAnchor_ = -1;
+};
+
+
+/* ===========================================================================
+ * SamplerSamplePage — Sample editor.  Big waveform + range select + zoom
+ * + cut/copy/paste/crop + length/loop info + loop-mode radio.
+ *
+ * Operations mutate the int16 buffer in place; loopStart/loopLength are
+ * adjusted to stay in range when the buffer shrinks/grows.  Clipboard is
+ * per-pane state (one shared buffer for all slots within this editor
+ * instance — fine for a single-window app).
+ * ========================================================================*/
+class SamplerSamplePage : public Component
+{
+public:
+    using GetSlot = std::function<SamplerSampleSlot*()>;
+    using OnChange = std::function<void()>;
+
+    SamplerSamplePage (GetSlot gs, OnChange cb)
+        : getSlot (std::move (gs)),
+          onChange (std::move (cb)),
+          canvas ([this] { return getSlot ? getSlot() : nullptr; },
+                  [this] { refreshInfo(); })
+    {
+        addAndMakeVisible (canvas);
+
+        configureBtn (cutBtn,    "Cut",       [this] { doCut(); });
+        configureBtn (copyBtn,   "Copy",      [this] { doCopy(); });
+        configureBtn (pasteBtn,  "Paste",     [this] { doPaste(); });
+        configureBtn (cropBtn,   "Crop",      [this] { doCrop(); });
+        configureBtn (selAllBtn, "Sel All",   [this] { selectAll(); });
+        configureBtn (selNoneBtn,"Sel None",  [this] { canvas.clearSelection(); refreshInfo(); });
+        configureBtn (zoomInBtn, "Zoom in",   [this] { zoomToSelection(); });
+        configureBtn (zoomOutBtn,"Zoom out",  [this] { zoomOut(); });
+        configureBtn (zoomAllBtn,"Show all",  [this] { zoomAll(); });
+        configureBtn (loopSetBtn,"Loop=Sel",  [this] { loopFromSelection(); });
+
+        loopRadio.addItem ("Loop: Off",      1);
+        loopRadio.addItem ("Loop: Forward",  2);
+        loopRadio.addItem ("Loop: Pingpong", 3);
+        loopRadio.setColour (ComboBox::backgroundColourId, Colour { 0xff'24'24'24 });
+        loopRadio.setColour (ComboBox::textColourId,        Colour { 0xff'd0'd0'd0 });
+        loopRadio.onChange = [this] {
+            if (auto* s = getSlot ? getSlot() : nullptr)
+                s->loopMode = (SamplerLoopMode) (loopRadio.getSelectedId() - 1);
+            if (onChange) onChange();
+            refreshInfo();
+            canvas.repaint();
+        };
+        addAndMakeVisible (loopRadio);
+
+        for (auto* l : { &infoLength, &infoSel, &infoLoop, &infoView })
+        {
+            l->setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+            addAndMakeVisible (*l);
+        }
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (8);
+
+        /* Top: action bar. */
+        auto topRow = r.removeFromTop (24);
+        const int btnW = 70;
+        cutBtn   .setBounds (topRow.removeFromLeft (btnW)); topRow.removeFromLeft (3);
+        copyBtn  .setBounds (topRow.removeFromLeft (btnW)); topRow.removeFromLeft (3);
+        pasteBtn .setBounds (topRow.removeFromLeft (btnW)); topRow.removeFromLeft (3);
+        cropBtn  .setBounds (topRow.removeFromLeft (btnW)); topRow.removeFromLeft (10);
+        selAllBtn.setBounds (topRow.removeFromLeft (btnW)); topRow.removeFromLeft (3);
+        selNoneBtn.setBounds(topRow.removeFromLeft (btnW)); topRow.removeFromLeft (10);
+        zoomInBtn.setBounds (topRow.removeFromLeft (btnW)); topRow.removeFromLeft (3);
+        zoomOutBtn.setBounds(topRow.removeFromLeft (btnW)); topRow.removeFromLeft (3);
+        zoomAllBtn.setBounds(topRow.removeFromLeft (btnW)); topRow.removeFromLeft (10);
+        loopSetBtn.setBounds(topRow.removeFromLeft (90));   topRow.removeFromLeft (10);
+        loopRadio .setBounds(topRow.removeFromLeft (150));
+        r.removeFromTop (8);
+
+        /* Bottom info row. */
+        auto bot = r.removeFromBottom (20);
+        infoLength.setBounds (bot.removeFromLeft (180));
+        infoSel   .setBounds (bot.removeFromLeft (260));
+        infoLoop  .setBounds (bot.removeFromLeft (200));
+        infoView  .setBounds (bot);
+        r.removeFromBottom (4);
+
+        /* Rest: canvas. */
+        canvas.setBounds (r);
+    }
+
+    /** Called when the page becomes visible or slot changes. */
+    void refresh()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s != nullptr && s->numSamples > 0)
+        {
+            if (canvas.getViewEnd() <= 0 || canvas.getViewEnd() > s->numSamples)
+                canvas.setViewport (0, s->numSamples);
+        }
+        else
+        {
+            canvas.setViewport (0, 0);
+            canvas.clearSelection();
+        }
+        loopRadio.setSelectedId (s ? (int) s->loopMode + 1 : 1, dontSendNotification);
+        refreshInfo();
+        canvas.repaint();
+    }
+
+private:
+    void refreshInfo()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        infoLength.setText (s ? String::formatted ("Length: %d", s->numSamples)
+                              : "Length: —", dontSendNotification);
+        if (s && canvas.hasSelection())
+            infoSel.setText (String::formatted ("Sel: %d..%d (%d)",
+                                                  canvas.getSelStart(),
+                                                  canvas.getSelEnd(),
+                                                  canvas.getSelEnd() - canvas.getSelStart()),
+                              dontSendNotification);
+        else
+            infoSel.setText ("Sel: (none)", dontSendNotification);
+        infoLoop.setText (s ? String::formatted ("Loop: %d + %d",
+                                                  s->loopStart, s->loopLength)
+                            : "Loop: —", dontSendNotification);
+        infoView.setText (String::formatted ("View: %d..%d",
+                                              canvas.getViewStart(), canvas.getViewEnd()),
+                          dontSendNotification);
+    }
+
+    void configureBtn (TextButton& b, const String& t, std::function<void()> on)
+    {
+        b.setButtonText (t);
+        b.onClick = std::move (on);
+        b.setColour (TextButton::buttonColourId,    Colour { 0xff'24'24'24 });
+        b.setColour (TextButton::textColourOffId,   Colour { 0xff'd0'd0'd0 });
+        addAndMakeVisible (b);
+    }
+
+    void selectAll()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || ! s->isLoaded()) return;
+        canvas.setSelection (0, s->numSamples);
+        refreshInfo();
+    }
+    void zoomAll()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr) return;
+        canvas.setViewport (0, juce::jmax (0, s->numSamples));
+        refreshInfo();
+    }
+    void zoomToSelection()
+    {
+        if (! canvas.hasSelection()) return;
+        canvas.setViewport (canvas.getSelStart(), canvas.getSelEnd());
+        refreshInfo();
+    }
+    void zoomOut()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr) return;
+        const int vs = canvas.getViewStart();
+        const int ve = canvas.getViewEnd();
+        const int span = ve - vs;
+        const int cx = (vs + ve) / 2;
+        const int newSpan = juce::jmin (s->numSamples, span * 2);
+        const int newVs = juce::jmax (0, cx - newSpan / 2);
+        const int newVe = juce::jmin (s->numSamples, newVs + newSpan);
+        canvas.setViewport (newVs, newVe);
+        refreshInfo();
+    }
+
+    /** Cut: copy selection to clipboard, then splice out of the buffer. */
+    void doCut()
+    {
+        if (! copyToClipboard()) return;
+        spliceOutSelection();
+    }
+    bool doCopy() { return copyToClipboard(); }
+
+    bool copyToClipboard()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || ! canvas.hasSelection()) return false;
+        const int a = canvas.getSelStart();
+        const int b = canvas.getSelEnd();
+        const int n = juce::jmax (0, b - a);
+        if (n <= 0) return false;
+        clipL.assign (s->data16L.get() + a, s->data16L.get() + b);
+        if (s->isStereo && s->data16R)
+        { clipR.assign (s->data16R.get() + a, s->data16R.get() + b); clipStereo = true; }
+        else
+        { clipR.clear(); clipStereo = false; }
+        return true;
+    }
+
+    /** Paste: replace selection (or insert at sel-start if no range). */
+    void doPaste()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || clipL.empty()) return;
+
+        const int oldN = s->numSamples;
+        const int a = juce::jmax (0, canvas.hasSelection() ? canvas.getSelStart() : oldN);
+        const int b = juce::jmax (a, canvas.hasSelection() ? canvas.getSelEnd()   : a);
+        const int newN = oldN - (b - a) + (int) clipL.size();
+
+        std::unique_ptr<int16_t[]> newL (new int16_t[(size_t) newN]);
+        std::unique_ptr<int16_t[]> newR;
+        if (s->isStereo) newR.reset (new int16_t[(size_t) newN]);
+
+        /* Pre-selection. */
+        std::memcpy (newL.get(), s->data16L.get(), (size_t) a * sizeof (int16_t));
+        if (s->isStereo && s->data16R)
+            std::memcpy (newR.get(), s->data16R.get(), (size_t) a * sizeof (int16_t));
+        /* Clipboard. */
+        std::memcpy (newL.get() + a, clipL.data(), clipL.size() * sizeof (int16_t));
+        if (s->isStereo && newR)
+        {
+            if (clipStereo && ! clipR.empty())
+                std::memcpy (newR.get() + a, clipR.data(), clipR.size() * sizeof (int16_t));
+            else
+                std::memcpy (newR.get() + a, clipL.data(), clipL.size() * sizeof (int16_t));
+        }
+        /* Post-selection. */
+        const int tailLen = oldN - b;
+        if (tailLen > 0)
+        {
+            std::memcpy (newL.get() + a + (int) clipL.size(),
+                         s->data16L.get() + b, (size_t) tailLen * sizeof (int16_t));
+            if (s->isStereo && newR)
+                std::memcpy (newR.get() + a + (int) clipL.size(),
+                             s->data16R.get() + b, (size_t) tailLen * sizeof (int16_t));
+        }
+
+        s->data16L  = std::move (newL);
+        s->data16R  = std::move (newR);
+        s->numSamples = newN;
+        fixupLoopAfterEdit (s, a, (int) clipL.size() - (b - a));
+        canvas.setSelection (a, a + (int) clipL.size());
+        zoomAll();
+        notifyChange();
+    }
+
+    void spliceOutSelection()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || ! canvas.hasSelection()) return;
+        const int a = canvas.getSelStart();
+        const int b = canvas.getSelEnd();
+        const int oldN = s->numSamples;
+        const int newN = oldN - (b - a);
+        if (newN <= 0)
+        {
+            /* Wipe sample entirely. */
+            s->data16L.reset();
+            s->data16R.reset();
+            s->numSamples = 0;
+            s->loopStart  = 0;
+            s->loopLength = 0;
+            canvas.clearSelection();
+            zoomAll();
+            notifyChange();
+            return;
+        }
+        std::unique_ptr<int16_t[]> newL (new int16_t[(size_t) newN]);
+        std::unique_ptr<int16_t[]> newR;
+        std::memcpy (newL.get(), s->data16L.get(), (size_t) a * sizeof (int16_t));
+        std::memcpy (newL.get() + a, s->data16L.get() + b,
+                     (size_t) (oldN - b) * sizeof (int16_t));
+        if (s->isStereo && s->data16R)
+        {
+            newR.reset (new int16_t[(size_t) newN]);
+            std::memcpy (newR.get(), s->data16R.get(), (size_t) a * sizeof (int16_t));
+            std::memcpy (newR.get() + a, s->data16R.get() + b,
+                         (size_t) (oldN - b) * sizeof (int16_t));
+        }
+        s->data16L  = std::move (newL);
+        s->data16R  = std::move (newR);
+        s->numSamples = newN;
+        fixupLoopAfterEdit (s, a, -(b - a));
+        canvas.clearSelection();
+        zoomAll();
+        notifyChange();
+    }
+
+    /** Crop: keep selection, drop everything else. */
+    void doCrop()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || ! canvas.hasSelection()) return;
+        const int a = canvas.getSelStart();
+        const int b = canvas.getSelEnd();
+        const int newN = b - a;
+        if (newN <= 0) return;
+        std::unique_ptr<int16_t[]> newL (new int16_t[(size_t) newN]);
+        std::unique_ptr<int16_t[]> newR;
+        std::memcpy (newL.get(), s->data16L.get() + a, (size_t) newN * sizeof (int16_t));
+        if (s->isStereo && s->data16R)
+        {
+            newR.reset (new int16_t[(size_t) newN]);
+            std::memcpy (newR.get(), s->data16R.get() + a, (size_t) newN * sizeof (int16_t));
+        }
+        s->data16L  = std::move (newL);
+        s->data16R  = std::move (newR);
+        s->numSamples = newN;
+        s->loopStart  = juce::jlimit (0, newN - 1,
+                                       s->loopStart - a);
+        s->loopLength = juce::jlimit (0, newN - s->loopStart, s->loopLength);
+        canvas.setSelection (0, newN);
+        zoomAll();
+        notifyChange();
+    }
+
+    void loopFromSelection()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || ! canvas.hasSelection()) return;
+        const int a = canvas.getSelStart();
+        const int b = canvas.getSelEnd();
+        s->loopStart  = juce::jlimit (0, s->numSamples - 1, a);
+        s->loopLength = juce::jlimit (1, s->numSamples - s->loopStart, b - a);
+        if (s->loopMode == SamplerLoopMode::kNone)
+            s->loopMode = SamplerLoopMode::kForward;
+        loopRadio.setSelectedId ((int) s->loopMode + 1, dontSendNotification);
+        refreshInfo();
+        canvas.repaint();
+        notifyChange();
+    }
+
+    static void fixupLoopAfterEdit (SamplerSampleSlot* s, int editAt, int delta)
+    {
+        if (s == nullptr) return;
+        const int loopEnd = s->loopStart + s->loopLength;
+        const auto shift = [editAt, delta] (int& v) {
+            if (v >= editAt) v += delta;
+            if (v < 0) v = 0;
+        };
+        int newStart = s->loopStart;
+        int newEnd   = loopEnd;
+        shift (newStart);
+        shift (newEnd);
+        s->loopStart  = juce::jlimit (0, juce::jmax (0, s->numSamples - 1), newStart);
+        s->loopLength = juce::jlimit (0, s->numSamples - s->loopStart,
+                                       newEnd - s->loopStart);
+    }
+
+    void notifyChange()
+    {
+        if (onChange) onChange();
+        refreshInfo();
+        canvas.repaint();
+    }
+
+    GetSlot getSlot;
+    OnChange onChange;
+    SampleEditCanvas canvas;
+
+    TextButton cutBtn, copyBtn, pasteBtn, cropBtn;
+    TextButton selAllBtn, selNoneBtn;
+    TextButton zoomInBtn, zoomOutBtn, zoomAllBtn;
+    TextButton loopSetBtn;
+    ComboBox   loopRadio;
+    Label      infoLength, infoSel, infoLoop, infoView;
+
+    std::vector<int16_t> clipL, clipR;
+    bool                 clipStereo = false;
+};
+
+
+/* ===========================================================================
+ * Shared generator-wave shape function.  `frac` is the phase ∈ [0,1).
+ * Returns y ∈ [-1, +1].  Used by both the FX page's Generate effect
+ * and the small live-preview canvas next to the wave combo. */
+inline double genWaveSample (int kind, double frac)
+{
+    switch (kind)
+    {
+        case 1: /* Sine */
+            return std::sin (frac * juce::MathConstants<double>::twoPi);
+        case 2: /* Square */
+            return frac < 0.5 ? 1.0 : -1.0;
+        case 3: /* Triangle */
+            return frac < 0.5 ? (-1.0 + 4.0 * frac)
+                              : ( 3.0 - 4.0 * frac);
+        case 4: /* Saw up */
+            return 2.0 * frac - 1.0;
+        case 5: /* Saw down */
+            return 1.0 - 2.0 * frac;
+        case 6: /* Pulse 25% */
+            return frac < 0.25 ? 1.0 : -1.0;
+        case 7: /* Pulse 12.5% */
+            return frac < 0.125 ? 1.0 : -1.0;
+        case 8: /* Half-sine (|sin|) */
+            return 2.0 * std::abs (std::sin (frac * juce::MathConstants<double>::pi)) - 1.0;
+        case 9: /* Quarter-sine (positive half) */
+            return frac < 0.5
+                   ? std::sin (frac * 2.0 * juce::MathConstants<double>::pi)
+                   : -1.0;
+        case 10: /* White noise */
+            return (juce::Random::getSystemRandom().nextDouble() * 2.0) - 1.0;
+        default: return 0.0;
+    }
+}
+
+
+/* ===========================================================================
+ * WavePreviewCanvas — small visualisation of the currently-selected
+ * generator wave at the chosen cycles + amplitude.  Renders pure DSP
+ * — no audio, no sample data — so it's free to repaint cheaply when
+ * any of the inputs change. */
+class WavePreviewCanvas : public Component
+{
+public:
+    void setParams (int kind, double cycles, double amplitude)
+    {
+        if (kind == kind_ && std::abs (cycles - cycles_) < 1e-6
+            && std::abs (amplitude - amp_) < 1e-6)
+            return;
+        kind_ = kind; cycles_ = cycles; amp_ = amplitude;
+        repaint();
+    }
+
+    void paint (Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        g.setColour (Colour { 0xff'10'10'10 });
+        g.fillRect (bounds);
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawRect (bounds, 1.0f);
+
+        const float midY  = bounds.getCentreY();
+        const float halfH = bounds.getHeight() * 0.45f;
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawHorizontalLine ((int) midY, bounds.getX(), bounds.getRight());
+
+        const int w = juce::roundToInt (bounds.getWidth());
+        if (w <= 0 || cycles_ <= 0.0) return;
+
+        Path path;
+        const float gain = juce::jlimit (0.0f, 1.0f, (float) amp_);
+        bool started = false;
+        for (int x = 0; x < w; ++x)
+        {
+            const double phase = double (x) / double (w) * cycles_;
+            const double frac  = phase - std::floor (phase);
+            double y = genWaveSample (kind_, frac);
+            const float ypx = midY - (float) y * halfH * gain;
+            if (! started) { path.startNewSubPath (bounds.getX() + x, ypx); started = true; }
+            else            path.lineTo            (bounds.getX() + x, ypx);
+        }
+        g.setColour (Colour { 0xff'5a'a5'd0 });
+        g.strokePath (path, PathStrokeType (1.5f));
+    }
+
+private:
+    int    kind_   = 1;
+    double cycles_ = 1.0;
+    double amp_    = 1.0;
+};
+
+
+/* ===========================================================================
+ * SamplerFXPage — sample-DSP effects panel.  Each effect operates on the
+ * currently-selected range of the slot's buffer (or the whole sample if
+ * no selection).  Algorithms ported from ft2-clone's
+ * ft2_sample_ed_features.c (BSD-3) — math kept, SDL UI dropped.
+ *
+ * Effects implemented:
+ *   Amplify   (gain × samples)
+ *   Normalize (peak-scale to 1.0)
+ *   LP filter (single-pole, normalised cutoff 0..1)
+ *   HP filter (single-pole, normalised cutoff 0..1)
+ *   Generator (sine / square / triangle / saw — replace or mix)
+ *   X-Fade    (cross-fade loop boundary smoothing)
+ *   Reverse   (flip selection)
+ * ========================================================================*/
+class SamplerFXPage : public Component
+{
+public:
+    using GetSlot  = std::function<SamplerSampleSlot*()>;
+    using OnChange = std::function<void()>;
+
+    SamplerFXPage (GetSlot gs, OnChange cb)
+        : getSlot (std::move (gs)),
+          onChange (std::move (cb))
+    {
+        configureBtn (amplifyBtn,  "Amplify",   [this] { applyAmplify(); });
+        configureBtn (normalizeBtn,"Normalize", [this] { applyNormalize(); });
+        configureBtn (reverseBtn,  "Reverse",   [this] { applyReverse(); });
+        configureBtn (lpBtn,       "Low-pass",  [this] { applyFilter (true); });
+        configureBtn (hpBtn,       "High-pass", [this] { applyFilter (false); });
+        configureBtn (genBtn,      "Generate",  [this] { applyGenerator(); });
+        configureBtn (xfadeBtn,    "X-Fade loop", [this] { applyXFade(); });
+
+        configureSlider (gainSlider,   0.0,   400.0, 0.1,  "%");
+        gainSlider.setValue (100.0);
+        configureSlider (cutoffSlider, 0.001, 1.0,   0.001, "norm");
+        cutoffSlider.setValue (0.25);
+        configureSlider (cyclesSlider, 0.5,   64.0,  0.5,  "cyc");
+        cyclesSlider.setValue (1.0);
+        configureSlider (amplitudeSlider, 0.0, 100.0, 0.1, "%");
+        amplitudeSlider.setValue (100.0);
+        configureSlider (xfadeLenSlider, 1.0,  4096.0, 1.0, "smp");
+        xfadeLenSlider.setValue (64.0);
+
+        genWaveCombo.addItem ("Sine",            1);
+        genWaveCombo.addItem ("Square",          2);
+        genWaveCombo.addItem ("Triangle",        3);
+        genWaveCombo.addItem ("Saw up",          4);
+        genWaveCombo.addItem ("Saw down",        5);
+        genWaveCombo.addItem ("Pulse 25%",       6);
+        genWaveCombo.addItem ("Pulse 12.5%",     7);
+        genWaveCombo.addItem ("Half-sine",       8);
+        genWaveCombo.addItem ("Quarter-sine",    9);
+        genWaveCombo.addItem ("Noise",          10);
+        genWaveCombo.setSelectedId (1, dontSendNotification);
+        genWaveCombo.setColour (ComboBox::backgroundColourId, Colour { 0xff'24'24'24 });
+        genWaveCombo.setColour (ComboBox::textColourId,        Colour { 0xff'd0'd0'd0 });
+        genWaveCombo.onChange = [this] { refreshWavePreview(); };
+        addAndMakeVisible (genWaveCombo);
+
+        addAndMakeVisible (wavePreview_);
+        cyclesSlider   .onValueChange = [this] { refreshWavePreview(); };
+        amplitudeSlider.onValueChange = [this] { refreshWavePreview(); };
+        refreshWavePreview();
+
+        genMixToggle.setButtonText ("Mix (vs replace)");
+        genMixToggle.setColour (ToggleButton::textColourId, Colour { 0xff'b0'b0'b0 });
+        addAndMakeVisible (genMixToggle);
+
+        for (auto* l : { &gainLbl, &cutoffLbl, &cyclesLbl, &amplLbl, &xfadeLenLbl, &statusLbl })
+        {
+            l->setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+            addAndMakeVisible (*l);
+        }
+        gainLbl    .setText ("Gain (%):",   dontSendNotification);
+        cutoffLbl  .setText ("Cutoff:",     dontSendNotification);
+        cyclesLbl  .setText ("Cycles:",     dontSendNotification);
+        amplLbl    .setText ("Amplitude:",  dontSendNotification);
+        xfadeLenLbl.setText ("X-Fade len:", dontSendNotification);
+
+        statusLbl.setText ("FX operate on the selection (or whole sample if no selection).",
+                           dontSendNotification);
+        statusLbl.setJustificationType (Justification::centredLeft);
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (8);
+
+        auto row = [&] (const Label& l, Slider& s, TextButton& btn) {
+            auto rr = r.removeFromTop (28);
+            const_cast<Label&> (l).setBounds (rr.removeFromLeft (110));
+            btn.setBounds (rr.removeFromRight (110));
+            rr.removeFromRight (8);
+            s.setBounds (rr);
+            r.removeFromTop (4);
+        };
+
+        row (gainLbl,        gainSlider,      amplifyBtn);
+        {
+            auto rr = r.removeFromTop (28);
+            rr.removeFromLeft (110);
+            normalizeBtn.setBounds (rr.removeFromRight (110));
+            reverseBtn  .setBounds (rr.removeFromRight (110));
+            r.removeFromTop (4);
+        }
+        row (cutoffLbl,      cutoffSlider,    lpBtn);
+        {
+            auto rr = r.removeFromTop (28);
+            rr.removeFromLeft (110);
+            hpBtn.setBounds (rr.removeFromRight (110));
+            r.removeFromTop (8);
+        }
+
+        /* Generator block: combo + mix toggle row, then wave preview
+         * canvas spanning the row above the cycles/amplitude sliders. */
+        {
+            auto rr = r.removeFromTop (28);
+            rr.removeFromLeft (110);
+            genWaveCombo.setBounds (rr.removeFromLeft (140));
+            rr.removeFromLeft (8);
+            genMixToggle.setBounds (rr.removeFromLeft (160));
+            r.removeFromTop (4);
+        }
+        /* Live wave preview — 110 px label gutter on the left so it
+         * lines up with the slider rows below. */
+        {
+            auto rr = r.removeFromTop (60);
+            rr.removeFromLeft (110);
+            rr.removeFromRight (8);
+            wavePreview_.setBounds (rr);
+            r.removeFromTop (6);
+        }
+        row (cyclesLbl,    cyclesSlider,    genBtn);
+        row (amplLbl,      amplitudeSlider, xfadeBtn);
+        row (xfadeLenLbl,  xfadeLenSlider,  xfadeBtn);   /* shares button row visually */
+
+        r.removeFromTop (8);
+        statusLbl.setBounds (r.removeFromTop (20));
+    }
+
+private:
+    void configureBtn (TextButton& b, const String& t, std::function<void()> on)
+    {
+        b.setButtonText (t);
+        b.onClick = std::move (on);
+        b.setColour (TextButton::buttonColourId,    Colour { 0xff'24'24'24 });
+        b.setColour (TextButton::textColourOffId,   Colour { 0xff'd0'd0'd0 });
+        addAndMakeVisible (b);
+    }
+    void configureSlider (Slider& s, double lo, double hi, double step, const String& suffix)
+    {
+        s.setSliderStyle (Slider::LinearBar);
+        s.setRange (lo, hi, step);
+        s.setTextValueSuffix ("  " + suffix);
+        s.setColour (Slider::backgroundColourId, Colour { 0xff'24'24'24 });
+        s.setColour (Slider::trackColourId,      Colour { 0xff'4a'7a'b5 });
+        addAndMakeVisible (s);
+    }
+
+    /** Operate on the active selection if any; otherwise whole sample. */
+    bool getRange (int& a, int& b)
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || ! s->isLoaded()) return false;
+        a = 0;
+        b = s->numSamples;
+        if (selStart_ >= 0 && selEnd_ > selStart_)
+        {
+            a = juce::jmax (0, selStart_);
+            b = juce::jmin (s->numSamples, selEnd_);
+        }
+        return b > a;
+    }
+
+    /** External link — called by the editor when the user selects a
+     *  range in the Sample page.  FX page then operates on that range. */
+public:
+    void setSelection (int a, int b) { selStart_ = a; selEnd_ = b; }
+private:
+
+    void mutateInt16 (std::function<int16_t (int16_t)> fn,
+                      std::function<int16_t (int16_t)> fnR = {})
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        int a, b;
+        if (! getRange (a, b)) return;
+        for (int i = a; i < b; ++i)
+            s->data16L[i] = fn (s->data16L[i]);
+        if (s->isStereo && s->data16R)
+            for (int i = a; i < b; ++i)
+                s->data16R[i] = (fnR ? fnR : fn) (s->data16R[i]);
+        notifyChange();
+    }
+
+    void applyAmplify()
+    {
+        const double g = gainSlider.getValue() / 100.0;
+        mutateInt16 ([g] (int16_t v) {
+            const int x = (int) std::lround (v * g);
+            return (int16_t) juce::jlimit (-32768, 32767, x);
+        });
+    }
+
+    void applyNormalize()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        int a, b;
+        if (! getRange (a, b)) return;
+        int peak = 1;
+        for (int i = a; i < b; ++i)
+            peak = juce::jmax (peak, (int) std::abs ((int) s->data16L[i]));
+        if (s->isStereo && s->data16R)
+            for (int i = a; i < b; ++i)
+                peak = juce::jmax (peak, (int) std::abs ((int) s->data16R[i]));
+        if (peak <= 0) return;
+        const double target = 32767.0 * (amplitudeSlider.getValue() / 100.0);
+        const double g = target / (double) peak;
+        mutateInt16 ([g] (int16_t v) {
+            const int x = (int) std::lround (v * g);
+            return (int16_t) juce::jlimit (-32768, 32767, x);
+        });
+    }
+
+    void applyReverse()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        int a, b;
+        if (! getRange (a, b)) return;
+        for (int i = a, j = b - 1; i < j; ++i, --j)
+        {
+            std::swap (s->data16L[i], s->data16L[j]);
+            if (s->isStereo && s->data16R)
+                std::swap (s->data16R[i], s->data16R[j]);
+        }
+        notifyChange();
+    }
+
+    /** Single-pole IIR filter.  cutoff = normalised 0..1 (1 = nyquist).
+     *  y[n] = y[n-1] + alpha * (x[n] - y[n-1])  — LP.
+     *  HP form: y[n] = a * (y[n-1] + x[n] - x[n-1]). */
+    void applyFilter (bool lowPass)
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        int a, b;
+        if (! getRange (a, b)) return;
+        const double cutoff = juce::jlimit (0.001, 1.0, cutoffSlider.getValue());
+        const double alpha  = cutoff;
+
+        auto runLP = [alpha] (int16_t* d, int from, int to) {
+            double y = (double) d[from];
+            for (int i = from; i < to; ++i)
+            {
+                y += alpha * ((double) d[i] - y);
+                d[i] = (int16_t) juce::jlimit (-32768, 32767, (int) std::lround (y));
+            }
+        };
+        auto runHP = [alpha] (int16_t* d, int from, int to) {
+            double y = 0.0, prev = (double) d[from];
+            const double aCoef = 1.0 - alpha;
+            for (int i = from; i < to; ++i)
+            {
+                const double x = (double) d[i];
+                y = aCoef * (y + x - prev);
+                prev = x;
+                d[i] = (int16_t) juce::jlimit (-32768, 32767, (int) std::lround (y));
+            }
+        };
+        if (lowPass)
+        {
+            runLP (s->data16L.get(), a, b);
+            if (s->isStereo && s->data16R) runLP (s->data16R.get(), a, b);
+        }
+        else
+        {
+            runHP (s->data16L.get(), a, b);
+            if (s->isStereo && s->data16R) runHP (s->data16R.get(), a, b);
+        }
+        notifyChange();
+    }
+
+    void applyGenerator()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        int a, b;
+        if (! getRange (a, b)) return;
+        const int   length = b - a;
+        const double cycles = cyclesSlider.getValue();
+        const double amp    = (amplitudeSlider.getValue() / 100.0) * 32767.0;
+        const bool mix      = genMixToggle.getToggleState();
+        const int wave      = genWaveCombo.getSelectedId();   /* 1..4 */
+
+        auto sampleAt = [&] (int i) -> int16_t {
+            const double phase = (double) i / (double) length * cycles;
+            const double frac  = phase - std::floor (phase);
+            const double y = genWaveSample (wave, frac);
+            return (int16_t) juce::jlimit (-32768, 32767,
+                                            (int) std::lround (y * amp));
+        };
+
+        for (int i = a; i < b; ++i)
+        {
+            const int16_t g = sampleAt (i - a);
+            if (mix)
+            {
+                const int sum = (int) s->data16L[i] + (int) g;
+                s->data16L[i] = (int16_t) juce::jlimit (-32768, 32767, sum);
+                if (s->isStereo && s->data16R)
+                {
+                    const int sumR = (int) s->data16R[i] + (int) g;
+                    s->data16R[i] = (int16_t) juce::jlimit (-32768, 32767, sumR);
+                }
+            }
+            else
+            {
+                s->data16L[i] = g;
+                if (s->isStereo && s->data16R) s->data16R[i] = g;
+            }
+        }
+        notifyChange();
+    }
+
+    /** X-fade the loop boundary.  Linear cross-fade across N samples
+     *  around loopStart and loopStart+loopLength using neighbours. */
+    void applyXFade()
+    {
+        auto* s = getSlot ? getSlot() : nullptr;
+        if (s == nullptr || ! s->isLoaded()) return;
+        if (s->loopLength <= 0) return;
+        const int N = juce::jlimit (1, juce::jmin (s->loopLength, 4096),
+                                     (int) xfadeLenSlider.getValue());
+        const int loopEnd = s->loopStart + s->loopLength;
+        const int leftIn  = juce::jmax (0, s->loopStart - N / 2);
+        const int rightIn = juce::jmin (s->numSamples, loopEnd + N / 2);
+
+        auto fade = [&] (int16_t* d) {
+            for (int i = 0; i < N && (loopEnd + i) < s->numSamples; ++i)
+            {
+                const double t = (double) i / (double) N;
+                const int srcA = loopEnd + i;
+                const int srcB = s->loopStart + i;
+                const int x = (int) std::lround (d[srcA] * (1.0 - t) + d[srcB] * t);
+                d[srcA] = (int16_t) juce::jlimit (-32768, 32767, x);
+            }
+        };
+        fade (s->data16L.get());
+        if (s->isStereo && s->data16R) fade (s->data16R.get());
+        juce::ignoreUnused (leftIn, rightIn);
+        notifyChange();
+    }
+
+    void notifyChange()
+    {
+        if (onChange) onChange();
+    }
+
+    GetSlot  getSlot;
+    OnChange onChange;
+    int      selStart_ = -1, selEnd_ = -1;
+
+    void refreshWavePreview()
+    {
+        wavePreview_.setParams (genWaveCombo.getSelectedId(),
+                                cyclesSlider.getValue(),
+                                amplitudeSlider.getValue() / 100.0);
+    }
+
+    TextButton amplifyBtn, normalizeBtn, reverseBtn, lpBtn, hpBtn, genBtn, xfadeBtn;
+    Slider     gainSlider, cutoffSlider, cyclesSlider, amplitudeSlider, xfadeLenSlider;
+    ComboBox   genWaveCombo;
+    ToggleButton genMixToggle;
+    WavePreviewCanvas wavePreview_;
+    Label      gainLbl, cutoffLbl, cyclesLbl, amplLbl, xfadeLenLbl, statusLbl;
 };
 
 
@@ -1957,8 +3138,16 @@ public:
                          slotList.selectRow (activeSlot, true, false);
                          refresh();
                      }),
-        samplePage_ (true),
-        fxPage_     (false)
+        samplePage_ ([this] { return currentSlot(); },
+                     [this] {
+                         waveformView.repaint();
+                         slotList.repaint();
+                     }),
+        fxPage_     ([this] { return currentSlot(); },
+                     [this] {
+                         waveformView.repaint();
+                         slotList.repaint();
+                     })
     {
         /* === Nav tabs (Bank / Inst / Sample / FX). === */
         auto setupNav = [this] (TextButton& b, const String& text, Page p) {
@@ -2062,6 +3251,21 @@ public:
         tabBar.addTab ("AutoVib", Colour { 0xff'18'18'18 }, &autoVibWrap,   false);
         tabBar.setTabBarDepth (22);
         addAndMakeVisible (tabBar);
+
+        /* Add / Del envelope-point buttons inside the Bank-page Vol/Pan
+         * tabs.  Shared logic with the Inst page so envelopes are
+         * editable from either place. */
+        auto setupEnvBtn = [] (TextButton& b, const String& t) {
+            b.setButtonText (t);
+            b.setColour (TextButton::buttonColourId, Colour { 0xff'24'24'24 });
+            b.setColour (TextButton::textColourOffId, Colour { 0xff'd0'd0'd0 });
+        };
+        setupEnvBtn (volTabAddBtn, "Add"); setupEnvBtn (volTabDelBtn, "Del");
+        setupEnvBtn (panTabAddBtn, "Add"); setupEnvBtn (panTabDelBtn, "Del");
+        volTabAddBtn.onClick = [this] { addEnvPointBank (true);  };
+        volTabDelBtn.onClick = [this] { delEnvPointBank (true);  };
+        panTabAddBtn.onClick = [this] { addEnvPointBank (false); };
+        panTabDelBtn.onClick = [this] { delEnvPointBank (false); };
 
         configureParamSlider (fadeoutSlider, "Fade", 0.0, 4095.0, 1.0,
             [this](double v) {
@@ -2167,34 +3371,44 @@ public:
         if (currentPage_ != Page::kBank)
             return;
 
-        /* === Bank page: existing layout (slot list + per-slot + waveform + tabs). === */
+        /* === Bank page: slot list fills full height on the left, right
+         * pane gets per-slot params, large waveform, tabbed envelopes,
+         * interp + status pinned at the bottom. === */
         auto bankR = body;
+
+        /* Left column: load/clear pinned at bottom, slot list fills above. */
         auto leftCol = bankR.removeFromLeft (270);
-        slotList.setBounds (leftCol.removeFromTop (260));
-        leftCol.removeFromTop (6);
-        auto pathRow = leftCol.removeFromTop (24);
-        clearBtn.setBounds (pathRow.removeFromRight (50)); pathRow.removeFromRight (4);
-        loadBtn .setBounds (pathRow);
+        auto leftFooter = leftCol.removeFromBottom (24);
+        clearBtn.setBounds (leftFooter.removeFromRight (50)); leftFooter.removeFromRight (4);
+        loadBtn .setBounds (leftFooter);
+        leftCol.removeFromBottom (6);
+        slotList.setBounds (leftCol);
 
         bankR.removeFromLeft (12);
 
+        /* Right column: footer (interp + status) pinned at bottom. */
+        auto rightFooter = bankR.removeFromBottom (32);
+        rightFooter.removeFromBottom (4);
+        auto interpRow = rightFooter.removeFromTop (26);
+        interpCombo.setBounds (interpRow.removeFromLeft (140));
+        interpRow.removeFromLeft (8);
+        status.setBounds (interpRow);
+
+        /* Right column: per-slot param sliders at top. */
         const int rowH = 22;
         rootSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         relSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         fineSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         volSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (4);
+        loopCombo.setBounds (bankR.removeFromTop (rowH));   bankR.removeFromTop (6);
 
-        loopCombo.setBounds (bankR.removeFromTop (rowH));   bankR.removeFromTop (4);
-        waveformView.setBounds (bankR.removeFromTop (80));  bankR.removeFromTop (6);
-
-        tabBar.setBounds (bankR.removeFromTop (150)); bankR.removeFromTop (4);
-
-        auto interpRow = bankR.removeFromTop (26);
-        interpCombo.setBounds (interpRow.removeFromLeft (140));
-
-        bankR.removeFromTop (2);
-        status.setBounds (bankR.removeFromTop (28));
+        /* Remaining vertical splits 55% waveform / 45% tabbed envelope. */
+        const int splitH = bankR.getHeight();
+        const int waveH = juce::jmax (140, (splitH - 8) * 11 / 20);
+        waveformView.setBounds (bankR.removeFromTop (waveH));
+        bankR.removeFromTop (8);
+        tabBar.setBounds (bankR);
     }
 
     /** Switch the visible body page and update tab toggle state. */
@@ -2229,7 +3443,8 @@ public:
         samplePage_ .setVisible (sample);
         fxPage_     .setVisible (fx);
 
-        if (inst) instPage_.refresh();
+        if (inst)   instPage_.refresh();
+        if (sample) samplePage_.refresh();
         resized();
     }
 
@@ -2248,11 +3463,18 @@ public:
 
         auto inst = node.getInstrument (activeInstrument);
         const auto* slot = inst ? inst->getSlot (row) : nullptr;
+        const bool hasSample = slot && slot->isLoaded();
+
+        /* Slot-color stripe down the left edge — matches keymap palette
+         * so the eye can connect bank row ↔ tinted keys. */
+        g.setColour (hasSample ? slotPaletteColour (row, 0.65f, 0.85f)
+                               : Colour { 0xff'2a'2a'2a });
+        g.fillRect (0, 0, 6, height);
 
         g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 12.0f, Font::plain));
 
         g.setColour (slot != nullptr ? Colour { 0xff'd4'd4'd4 } : Colour { 0xff'5a'5a'5a });
-        g.drawText (String::formatted ("%02d", row + 1), 6, 0, 28, height,
+        g.drawText (String::formatted ("%02d", row + 1), 12, 0, 28, height,
                     Justification::centredLeft);
 
         int lo = -1, hi = -1;
@@ -2271,11 +3493,11 @@ public:
                               ? (midiNoteName (lo) + "  " + midiNoteName (hi))
                               : String ("        ");
         g.setColour (Colour { 0xff'd0'80'40 });
-        g.drawText (rng, 38, 0, 80, height, Justification::centredLeft);
+        g.drawText (rng, 44, 0, 80, height, Justification::centredLeft);
 
         g.setColour (slot != nullptr ? Colour { 0xff'b0'b0'b0 } : Colour { 0xff'40'40'40 });
         g.drawText (slot != nullptr ? slot->name : String (juce::CharPointer_UTF8 ("\xe2\x80\x94")),
-                    124, 0, width - 130, height, Justification::centredLeft);
+                    130, 0, width - 136, height, Justification::centredLeft);
     }
 
     void selectedRowsChanged (int lastRowSelected) override
@@ -2356,11 +3578,27 @@ private:
             panEnvWrap.removeAllChildren();
             volEnvWrap.addAndMakeVisible (volEnvView.get());
             panEnvWrap.addAndMakeVisible (panEnvView.get());
+            volEnvWrap.addAndMakeVisible (volTabAddBtn);
+            volEnvWrap.addAndMakeVisible (volTabDelBtn);
+            panEnvWrap.addAndMakeVisible (panTabAddBtn);
+            panEnvWrap.addAndMakeVisible (panTabDelBtn);
             volEnvWrap.onResized = [this] {
-                if (volEnvView) volEnvView->setBounds (volEnvWrap.getLocalBounds().reduced (2));
+                auto r = volEnvWrap.getLocalBounds().reduced (2);
+                auto btnRow = r.removeFromBottom (22);
+                volTabAddBtn.setBounds (btnRow.removeFromLeft (60));
+                btnRow.removeFromLeft (4);
+                volTabDelBtn.setBounds (btnRow.removeFromLeft (60));
+                r.removeFromBottom (3);
+                if (volEnvView) volEnvView->setBounds (r);
             };
             panEnvWrap.onResized = [this] {
-                if (panEnvView) panEnvView->setBounds (panEnvWrap.getLocalBounds().reduced (2));
+                auto r = panEnvWrap.getLocalBounds().reduced (2);
+                auto btnRow = r.removeFromBottom (22);
+                panTabAddBtn.setBounds (btnRow.removeFromLeft (60));
+                btnRow.removeFromLeft (4);
+                panTabDelBtn.setBounds (btnRow.removeFromLeft (60));
+                r.removeFromBottom (3);
+                if (panEnvView) panEnvView->setBounds (r);
             };
             volEnvWrap.resized();
             panEnvWrap.resized();
@@ -2371,6 +3609,39 @@ private:
             avSweepSlider.setValue ((double) inst->autoVib.sweep, dontSendNotification);
             avTypeCombo  .setSelectedId ((int) inst->autoVib.type + 1, dontSendNotification);
         }
+    }
+
+    /* Bank-page envelope point add/del — mirrors SamplerInstPage's
+     * Add/Del so envelope editing works from the Vol/Pan tab too. */
+    void addEnvPointBank (bool isVol)
+    {
+        auto inst = node.getInstrument (activeInstrument);
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length >= 12) return;
+        if (e.length == 0) { e.points[0] = { 0, 64 }; e.length = 1; }
+        const int prevX = e.points[e.length - 1].x;
+        const int prevY = e.points[e.length - 1].y;
+        const int newX  = juce::jmin (324, prevX + 20);
+        e.points[e.length] = { (int16_t) newX, (int16_t) prevY };
+        e.length = (uint8_t) (e.length + 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+        instPage_.refresh();
+    }
+    void delEnvPointBank (bool isVol)
+    {
+        auto inst = node.getInstrument (activeInstrument);
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length <= 2) return;
+        e.length = (uint8_t) (e.length - 1);
+        if (e.sustainPoint >= e.length) e.sustainPoint = (uint8_t) (e.length - 1);
+        if (e.loopStart   >= e.length) e.loopStart   = (uint8_t) (e.length - 1);
+        if (e.loopEnd     >= e.length) e.loopEnd     = (uint8_t) (e.length - 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+        instPage_.refresh();
     }
 
     void onLoad()
@@ -2482,6 +3753,7 @@ private:
 
     TabbedComponent tabBar { TabbedButtonBar::TabsAtTop };
     ResizableWrap   volEnvWrap, panEnvWrap, autoVibWrap;
+    TextButton      volTabAddBtn, volTabDelBtn, panTabAddBtn, panTabDelBtn;
     std::unique_ptr<FT2EnvelopeView> volEnvView, panEnvView;
 
     Slider       fadeoutSlider, avDepthSlider, avRateSlider, avSweepSlider;
@@ -2496,9 +3768,9 @@ private:
     /* Paged container — nav state + sub-pages. */
     Page currentPage_ = Page::kBank;
     TextButton bankNavBtn, instNavBtn, sampleNavBtn, fxNavBtn;
-    SamplerInstPage  instPage_;
-    SamplerStubPage  samplePage_;
-    SamplerStubPage  fxPage_;
+    SamplerInstPage   instPage_;
+    SamplerSamplePage samplePage_;
+    SamplerFXPage     fxPage_;
 };
 
 AudioProcessorEditor* SamplerNode::createEditor()

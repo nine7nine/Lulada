@@ -3,6 +3,7 @@
 
 #include "ui/diskopview.hpp"
 #include "services/diskopservice.hpp"
+#include "ui/nativefilelist.hpp"
 
 #include <element/services.hpp>
 #include <element/context.hpp>
@@ -268,7 +269,8 @@ private:
  *     grows when the user actually uses a bank.
  * ========================================================================*/
 class SampleBankPane : public Component,
-                       private Timer
+                       private Timer,
+                       private ChangeListener
 {
 public:
     static constexpr int kNumBanks         = SamplerNode::kMaxInstruments;   /* 128 */
@@ -292,7 +294,7 @@ public:
 
         configureBtn (addSamplerBtn_, "+ Sampler", [this] { addSamplerToGraph(); });
         configureBtn (refreshBtn_, "Refresh",     [this] { rebuildSamplerList(); });
-        configureBtn (loadBtn_,    "Load → slot", [this] { loadIntoSelectedSlot(); });
+        configureBtn (loadBtn_,    "Load to slot", [this] { loadIntoSelectedSlot(); });
         configureBtn (loadBankBtn_, "Fill bank (dir)", [this] { fillBankFromDirectory(); });
 
         instrumentList_.model = this;
@@ -321,10 +323,22 @@ public:
             addAndMakeVisible (*l);
         }
 
+        DiskOpService::get().activations.addChangeListener (this);
         startTimerHz (2);
     }
 
-    ~SampleBankPane() override { stopTimer(); }
+    ~SampleBankPane() override
+    {
+        DiskOpService::get().activations.removeChangeListener (this);
+        stopTimer();
+    }
+
+    /** Activation listener — double-click in the file browser. */
+    void changeListenerCallback (ChangeBroadcaster*) override
+    {
+        if (! isShowing()) return;
+        loadIntoSelectedSlot();
+    }
 
     void connect (Services* services)
     {
@@ -474,8 +488,20 @@ public:
 private:
     void timerCallback() override
     {
+        /* Skip work entirely when the pane isn't visible — the Disk Op
+         * page only renders this in Sample mode.  Saves a graph walk
+         * + ListBox repaint pair every 500ms while the user is in
+         * Plugin Paths / Session mode or has the whole Disk Op view
+         * hidden behind another nav page. */
+        if (! isShowing()) return;
+
         const int curCount = countSamplerNodes();
         if (curCount != lastSamplerCount_) rebuildSamplerList();
+
+        /* Cache invalidation only when graph state actually shifts.
+         * Idle-tick paint cost goes from ~128 graph walks (one per
+         * row's paintListBoxItem) to 0. */
+        cachedNode_ = nullptr;
         instrumentList_.list.repaint();
         slotList_.list.repaint();
     }
@@ -492,6 +518,14 @@ private:
 
     SamplerNode* getSamplerProcessor (int index) const
     {
+        /* Cached for the duration of one Timer-tick burst of paints —
+         * walking the active graph hundreds of times per frame chokes
+         * winelib wineserver round-trips.  The cache is invalidated in
+         * timerCallback when sampler count changes, and once per 500ms
+         * tick anyway to pick up other graph mutations. */
+        if (cachedNode_ && cachedSamplerIdx_ == index)
+            return cachedNode_;
+
         if (services_ == nullptr) return nullptr;
         const auto session = services_->context().session();
         if (session == nullptr) return nullptr;
@@ -508,7 +542,11 @@ private:
             if (hit != index) continue;
             if (auto* obj = n.getObject())
                 if (auto* sp = dynamic_cast<SamplerNode*> (obj->getAudioProcessor()))
+                {
+                    cachedNode_ = sp;
+                    cachedSamplerIdx_ = index;
                     return sp;
+                }
         }
         return nullptr;
     }
@@ -555,7 +593,8 @@ private:
 
         if (n == 0)
         {
-            samplerCombo_.addItem ("(no Sampler — click + Sampler)", 1);
+            samplerCombo_.addItem ("(no Sampler in graph)", 1);
+            samplerCombo_.setSelectedId (1, dontSendNotification);
             samplerCombo_.setEnabled (false);
         }
         else
@@ -581,20 +620,53 @@ private:
         auto* eng = services_->find<EngineService>();
         if (eng == nullptr) return;
         eng->addNode (EL_NODE_ID_SAMPLER, EL_NODE_FORMAT_NAME);
-        /* timerCallback will pick up the count change within ~500ms. */
+        /* EngineService::addNode is synchronous — invalidate the cached
+         * SamplerNode pointer so the next getSamplerProcessor walks the
+         * graph fresh and picks up the new node. */
+        cachedNode_ = nullptr;
+        cachedSamplerIdx_ = -1;
+        rebuildSamplerList();
+    }
+
+    /** Pick a slot to load into when the user hasn't explicitly
+     *  selected one in the slot list.  Prefer the first empty slot,
+     *  fall back to slot 0. */
+    int pickLoadSlot (SamplerNode* sn)
+    {
+        const int sel = slotList_.list.getSelectedRow();
+        if (sel >= 0) return sel;
+        if (sn != nullptr)
+        {
+            if (auto inst = sn->getInstrument (activeInstrument_))
+                for (int i = 0; i < SamplerInstrument::kNumSlots; ++i)
+                    if (inst->getSlot (i) == nullptr) return i;
+        }
+        return 0;
     }
 
     void loadIntoSelectedSlot()
     {
-        const int slotRow = slotList_.list.getSelectedRow();
-        if (slotRow < 0) return;
-        auto* sn = getSamplerProcessor (activeSampler_);
-        if (sn == nullptr) return;
         const auto sel = DiskOpService::get().getSelectedFile();
         if (! sel.existsAsFile()) return;
 
+        /* Auto-create a Sampler if the graph doesn't have one yet —
+         * user expects "load a sample" to Just Work, not silently
+         * no-op because + Sampler was never pressed. */
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr)
+        {
+            addSamplerToGraph();
+            sn = getSamplerProcessor (activeSampler_);
+            if (sn == nullptr) return;   /* genuinely couldn't add */
+        }
+
+        const int slotRow = pickLoadSlot (sn);
         ensureInstrumentExists (sn, activeInstrument_);
         sn->loadSampleToSlot (activeInstrument_, slotRow, sel);
+        /* Move the slot-list cursor to the slot we just wrote so the
+         * user sees the result + the next Load goes to the slot after
+         * (FT2-ish auto-advance). */
+        slotList_.list.selectRow (slotRow);
         instrumentList_.list.repaint();
         slotList_.list.repaint();
     }
@@ -604,10 +676,16 @@ private:
      *  alphabetical order, matching the active mode's wildcard. */
     void fillBankFromDirectory()
     {
-        auto* sn = getSamplerProcessor (activeSampler_);
-        if (sn == nullptr) return;
         const auto dir = DiskOpService::get().getCurrentDirectory();
         if (! dir.isDirectory()) return;
+
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr)
+        {
+            addSamplerToGraph();
+            sn = getSamplerProcessor (activeSampler_);
+            if (sn == nullptr) return;
+        }
 
         WildcardFileFilter filter (
             DiskOpService::getWildcardForMode (DiskOpService::Mode::kSample),
@@ -636,6 +714,8 @@ private:
     int activeSampler_    = 0;
     int activeInstrument_ = 0;
     int lastSamplerCount_ = -1;
+    mutable SamplerNode* cachedNode_ = nullptr;
+    mutable int          cachedSamplerIdx_ = -1;
 
     Label title_, instrumentLabel_, slotsLabel_;
     ComboBox samplerCombo_;
@@ -647,11 +727,14 @@ private:
  * DiskOpContentView::Impl
  * ========================================================================*/
 class DiskOpContentView::Impl : public Component,
-                                public FileBrowserListener
+                                public NativeFileListComponent::Listener
 {
 public:
-    explicit Impl (DiskOpContentView& owner) : owner_ (owner)
+    explicit Impl (DiskOpContentView& owner) : owner_ (owner),
+          browser_ (dirCache_)
     {
+        addAndMakeVisible (browser_);
+        browser_.addListener (this);
         for (int i = 0; i < (int) DiskOpService::Mode::kNumModes; ++i)
         {
             auto btn = std::make_unique<ToggleButton> (
@@ -691,9 +774,11 @@ public:
         };
         addAndMakeVisible (filenameEdit_);
 
-        rebuildBrowser();
+        applyWildcard();
+        if (DiskOpService::get().getCurrentDirectory().isDirectory())
+            browser_.setRoot (DiskOpService::get().getCurrentDirectory());
 
-        configureActionButton (refreshBtn_, "Refresh", [this] { refreshBrowser(); });
+        configureActionButton (refreshBtn_, "Refresh", [this] { browser_.refresh(); });
         configureActionButton (setPathBtn_, "Set path", [this] {
             DiskOpService::get().setCurrentDirectory (File (pathEdit_.getText().trim()));
         });
@@ -711,7 +796,7 @@ public:
         allFilesToggle_.setColour (ToggleButton::textColourId, kTextColour);
         allFilesToggle_.onClick = [this] {
             allFiles_ = allFilesToggle_.getToggleState();
-            rebuildBrowser();
+            applyWildcard();
         };
         addAndMakeVisible (allFilesToggle_);
 
@@ -753,7 +838,7 @@ public:
         if (sampleBank_) sampleBank_->connect (&services);
     }
 
-    ~Impl() override { detachBrowser(); }
+    ~Impl() override { browser_.removeListener (this); }
 
     void paint (Graphics& g) override
     {
@@ -825,8 +910,7 @@ public:
         filenameEdit_.setBounds (fileRow);
 
         browserCol.removeFromTop (6);
-        if (browser_ != nullptr)
-            browser_->setBounds (browserCol);
+        browser_.setBounds (browserCol);
 
         r.removeFromLeft (10);
 
@@ -874,33 +958,23 @@ public:
         g.drawText ("File:", filenameLabelArea_, Justification::centredLeft);
     }
 
-    /* === FileBrowserListener (relays into the service) ================== */
-    void selectionChanged() override
+    /* === NativeFileListComponent::Listener ============================== */
+    void selectionChanged (const File& sel) override
     {
-        if (browser_ == nullptr) return;
-        const auto sel = browser_->getSelectedFile (0);
         if (sel.existsAsFile())
         {
             DiskOpService::get().setSelectedFile (sel);
             filenameEdit_.setText (sel.getFileName(), dontSendNotification);
         }
-        else if (sel.isDirectory())
-        {
-            DiskOpService::get().setCurrentDirectory (sel);
-        }
     }
-    void fileClicked (const File&, const MouseEvent&) override {}
-    void fileDoubleClicked (const File& f) override
+    void fileActivated (const File& f) override
     {
-        if (f.isDirectory())
-            DiskOpService::get().setCurrentDirectory (f);
-        else if (f.existsAsFile())
-        {
-            DiskOpService::get().setSelectedFile (f);
-            statusLabel_.setText ("Selected: " + f.getFileName(), dontSendNotification);
-        }
+        if (! f.existsAsFile()) return;
+        DiskOpService::get().setSelectedFile (f);
+        statusLabel_.setText ("Selected: " + f.getFileName(), dontSendNotification);
+        DiskOpService::get().fireActivation();
     }
-    void browserRootChanged (const File& newRoot) override
+    void rootChanged (const File& newRoot) override
     {
         DiskOpService::get().setCurrentDirectory (newRoot);
     }
@@ -919,17 +993,16 @@ public:
         modeBadge_.setText ("Mode: " + DiskOpService::getModeName (svc.getMode()),
                             dontSendNotification);
 
-        /* If the filter changed because the mode changed, rebuild. */
-        const auto wildcard = DiskOpService::getWildcardForMode (svc.getMode());
-        if (wildcard != currentWildcard_)
-            rebuildBrowser();
+        /* If the filter changed because the mode changed, push it
+         * through (no rebuild needed — the native lister filters in
+         * the worker thread). */
+        applyWildcard();
 
-        /* If cwd changed externally, push to the browser. */
-        if (browser_ != nullptr
-            && browser_->getRoot() != svc.getCurrentDirectory())
+        /* If cwd changed externally, push to the lister. */
+        if (browser_.getRoot() != svc.getCurrentDirectory()
+            && svc.getCurrentDirectory().isDirectory())
         {
-            if (svc.getCurrentDirectory().isDirectory())
-                browser_->setRoot (svc.getCurrentDirectory());
+            browser_.setRoot (svc.getCurrentDirectory());
         }
 
         /* Mode changed → re-layout to swap right-pane content. */
@@ -959,47 +1032,19 @@ private:
         addAndMakeVisible (b);
     }
 
-    void rebuildBrowser()
+    /** Sync the native lister's wildcard with the current mode +
+     *  "All files" toggle.  Cheap — the lister re-queries the cache
+     *  with the new filter and re-pulls from the cached snapshot
+     *  (or queues a worker scan if not cached yet). */
+    void applyWildcard()
     {
-        detachBrowser();
-
         auto& svc = DiskOpService::get();
-        currentWildcard_ = allFiles_
-                               ? "*"
+        const auto wildcard = allFiles_
+                               ? juce::String ("*")
                                : DiskOpService::getWildcardForMode (svc.getMode());
-        filter_ = std::make_unique<WildcardFileFilter> (
-            currentWildcard_, "*",
-            "Files for " + DiskOpService::getModeName (svc.getMode()) + " mode");
-
-        const auto start = svc.getCurrentDirectory().isDirectory()
-                              ? svc.getCurrentDirectory()
-                              : File::getSpecialLocation (File::userHomeDirectory);
-
-        browser_ = std::make_unique<FileBrowserComponent> (
-            FileBrowserComponent::openMode
-                | FileBrowserComponent::canSelectFiles
-                | FileBrowserComponent::filenameBoxIsReadOnly,
-            start, filter_.get(), nullptr);
-        browser_->addListener (this);
-        addAndMakeVisible (*browser_);
-        resized();
-    }
-
-    void detachBrowser()
-    {
-        if (browser_)
-        {
-            browser_->removeListener (this);
-            removeChildComponent (browser_.get());
-            browser_.reset();
-        }
-        filter_.reset();
-    }
-
-    void refreshBrowser()
-    {
-        if (browser_ != nullptr)
-            browser_->refresh();
+        if (wildcard == currentWildcard_) return;
+        currentWildcard_ = wildcard;
+        browser_.setWildcard (wildcard);
     }
 
     void rebuildWineDriveButtons()
@@ -1036,9 +1081,10 @@ private:
     TextButton refreshBtn_, setPathBtn_, homeBtn_, rootBtn_;
     OwnedArray<TextButton> wineBtns_;
 
-    /* Embedded file browser. */
-    std::unique_ptr<WildcardFileFilter>   filter_;
-    std::unique_ptr<FileBrowserComponent> browser_;
+    /* Embedded file browser — native POSIX-backed lister with a
+     * shared worker-thread cache (no juce::FileBrowserComponent). */
+    NativeDirCache          dirCache_;
+    NativeFileListComponent browser_;
     String currentWildcard_;
     bool   allFiles_ = false;
 
@@ -1096,10 +1142,6 @@ void DiskOpContentView::changeListenerCallback (ChangeBroadcaster*)
     if (impl_) impl_->syncFromService();
 }
 
-/* Stub overrides — Impl owns the real FileBrowserComponent + listener. */
-void DiskOpContentView::selectionChanged() {}
-void DiskOpContentView::fileClicked (const File&, const MouseEvent&) {}
-void DiskOpContentView::fileDoubleClicked (const File&) {}
-void DiskOpContentView::browserRootChanged (const File&) {}
+/* File-list events handled by Impl (NativeFileListComponent::Listener). */
 
 } // namespace element
