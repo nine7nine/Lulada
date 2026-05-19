@@ -4,7 +4,19 @@
 #include "ui/diskopview.hpp"
 #include "services/diskopservice.hpp"
 
+#include <element/services.hpp>
+#include <element/context.hpp>
+#include <element/plugins.hpp>
+#include <element/nodefactory.hpp>
+#include <element/settings.hpp>
+#include <element/session.hpp>
+#include <element/processor.hpp>
+#include <element/node.h>
+
 using namespace juce;
+
+#include "ui/pluginmanagercomponent.hpp"  /* uses unqualified juce types */
+#include "nodes/sampler.hpp"
 
 namespace element {
 
@@ -32,12 +44,16 @@ constexpr float kHeaderFontSize = 13.0f;
 
 
 /* ===========================================================================
- * PluginPathsSection — one ListBox + Add/Remove/Up/Down per plugin format.
- * Add appends the currently-browsed Disk Op directory.
+ * PluginPathsSection — one ListBox + Add/Remove/Up/Down/Save+Rescan per
+ * format.  Reads/writes the real PluginManager settings (same persisted
+ * key PluginListComponent uses) so edits here have first-class effect.
+ *
+ * The DiskOpService cache is hydrated from settings on first wire-up
+ * and pushed back every time the user mutates the list; we don't
+ * shadow-store a parallel copy.
  * ========================================================================*/
 class PluginPathsSection : public Component,
-                           private ListBoxModel,
-                           private ChangeListener
+                           private ListBoxModel
 {
 public:
     explicit PluginPathsSection (DiskOpService::PluginFormat fmt) : format_ (fmt)
@@ -58,26 +74,37 @@ public:
 
         configureBtn (addBtn_, "Add cwd", [this] {
             const auto cwd = DiskOpService::get().getCurrentDirectory();
-            DiskOpService::get().addPluginPath (format_, cwd);
+            auto p = paths_;
+            if (cwd.isDirectory()) { p.add (cwd); commit (p); }
         });
         configureBtn (removeBtn_, "Remove", [this] {
             const int sel = list_.getSelectedRow();
-            if (sel >= 0) DiskOpService::get().removePluginPath (format_, sel);
+            if (sel < 0 || sel >= paths_.getNumPaths()) return;
+            auto p = paths_;
+            p.remove (sel);
+            commit (p);
         });
-        configureBtn (upBtn_, "Up", [this] {
-            DiskOpService::get().movePluginPath (format_, list_.getSelectedRow(), -1);
-        });
-        configureBtn (downBtn_, "Down", [this] {
-            DiskOpService::get().movePluginPath (format_, list_.getSelectedRow(), +1);
-        });
+        configureBtn (upBtn_, "Up",   [this] { moveSelection (-1); });
+        configureBtn (downBtn_, "Down", [this] { moveSelection (+1); });
+        configureBtn (saveBtn_, "Save & Rescan", [this] { rescan(); });
+        saveBtn_.setColour (TextButton::buttonColourId,
+                            Colour { 0xff'30'4a'30 });
+        saveBtn_.setColour (TextButton::textColourOffId, kAccentAmber);
 
-        DiskOpService::get().addChangeListener (this);
         refresh();
     }
 
-    ~PluginPathsSection() override
+    /** Wire to real PluginManager + properties.  Called from
+     *  DiskOpContentView once Services is available.  Pulls the
+     *  persisted FileSearchPath for this format and pushes it both into
+     *  the list and the DiskOpService cache. */
+    void connect (PluginManager* pm, PropertiesFile* props)
     {
-        DiskOpService::get().removeChangeListener (this);
+        pm_    = pm;
+        props_ = props;
+        paths_ = readPersisted();
+        DiskOpService::get().setPluginPaths (format_, paths_);
+        refresh();
     }
 
     void resized() override
@@ -88,18 +115,212 @@ public:
 
         auto btnRow = r.removeFromBottom (22);
         addBtn_   .setBounds (btnRow.removeFromLeft (74)); btnRow.removeFromLeft (4);
-        removeBtn_.setBounds (btnRow.removeFromLeft (74)); btnRow.removeFromLeft (4);
+        removeBtn_.setBounds (btnRow.removeFromLeft (66)); btnRow.removeFromLeft (4);
         upBtn_    .setBounds (btnRow.removeFromLeft (40)); btnRow.removeFromLeft (4);
-        downBtn_  .setBounds (btnRow.removeFromLeft (40));
+        downBtn_  .setBounds (btnRow.removeFromLeft (40)); btnRow.removeFromLeft (8);
+        saveBtn_  .setBounds (btnRow.removeFromLeft (110));
         r.removeFromBottom (4);
 
         list_.setBounds (r);
     }
 
     /* === ListBoxModel ============================================== */
+    int getNumRows() override { return paths_.getNumPaths(); }
+    void paintListBoxItem (int row, Graphics& g, int width, int height,
+                           bool rowIsSelected) override
+    {
+        if (rowIsSelected)
+        {
+            g.setColour (kAccentBlue.withAlpha (0.3f));
+            g.fillRect (0, 0, width, height);
+        }
+        if (row < 0 || row >= paths_.getNumPaths()) return;
+        g.setColour (kTextColour);
+        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                kFontSize, Font::plain));
+        g.drawText (paths_[row].getFullPathName(),
+                    6, 0, width - 12, height, Justification::centredLeft);
+    }
+
+private:
+    FileSearchPath readPersisted() const
+    {
+        if (props_ == nullptr || pm_ == nullptr) return {};
+        switch (format_)
+        {
+            case DiskOpService::kCLAP:
+                if (auto* prov = pm_->getProvider ("CLAP"))
+                    return PluginListComponent::getLastSearchPath (*props_, *prov);
+                break;
+            case DiskOpService::kVST2:
+                if (auto* fmt = pm_->getAudioPluginFormat ("VST"))
+                    return PluginListComponent::getLastSearchPath (*props_, *fmt);
+                break;
+            case DiskOpService::kVST3:
+                if (auto* fmt = pm_->getAudioPluginFormat ("VST3"))
+                    return PluginListComponent::getLastSearchPath (*props_, *fmt);
+                break;
+            default: break;
+        }
+        return {};
+    }
+
+    void writePersisted (const FileSearchPath& p)
+    {
+        if (props_ == nullptr || pm_ == nullptr) return;
+        switch (format_)
+        {
+            case DiskOpService::kCLAP:
+                if (auto* prov = pm_->getProvider ("CLAP"))
+                    PluginListComponent::setLastSearchPath (*props_, *prov, p);
+                break;
+            case DiskOpService::kVST2:
+                if (auto* fmt = pm_->getAudioPluginFormat ("VST"))
+                    PluginListComponent::setLastSearchPath (*props_, *fmt, p);
+                break;
+            case DiskOpService::kVST3:
+                if (auto* fmt = pm_->getAudioPluginFormat ("VST3"))
+                    PluginListComponent::setLastSearchPath (*props_, *fmt, p);
+                break;
+            default: break;
+        }
+    }
+
+    void commit (const FileSearchPath& newPaths)
+    {
+        paths_ = newPaths;
+        writePersisted (paths_);
+        DiskOpService::get().setPluginPaths (format_, paths_);
+        refresh();
+    }
+
+    void moveSelection (int delta)
+    {
+        const int sel = list_.getSelectedRow();
+        if (sel < 0 || sel >= paths_.getNumPaths()) return;
+        const int dst = sel + delta;
+        if (dst < 0 || dst >= paths_.getNumPaths()) return;
+        FileSearchPath p;
+        for (int i = 0; i < paths_.getNumPaths(); ++i)
+            p.add (paths_[i]);
+        const File a = p[sel];
+        const File b = p[dst];
+        p.remove (sel);
+        p.add (b, sel);
+        p.remove (dst);
+        p.add (a, dst);
+        commit (p);
+        list_.selectRow (dst);
+    }
+
+    void rescan()
+    {
+        if (pm_ == nullptr) return;
+        const String fmtName = format_ == DiskOpService::kCLAP ? "CLAP"
+                             : format_ == DiskOpService::kVST2 ? "VST"
+                             : format_ == DiskOpService::kVST3 ? "VST3"
+                             : String();
+        if (fmtName.isEmpty()) return;
+        pm_->scanAudioPlugins ({ fmtName });
+    }
+
+    void configureBtn (TextButton& b, const String& text, std::function<void()> on)
+    {
+        b.setButtonText (text);
+        b.onClick = std::move (on);
+        b.setColour (TextButton::buttonColourId, kPanelColour);
+        b.setColour (TextButton::textColourOffId, kTextColour);
+        addAndMakeVisible (b);
+    }
+    void refresh()
+    {
+        list_.updateContent();
+        list_.repaint();
+    }
+
+    DiskOpService::PluginFormat format_;
+    PluginManager*   pm_    = nullptr;
+    PropertiesFile*  props_ = nullptr;
+    FileSearchPath   paths_;
+
+    Label  title_;
+    ListBox list_;
+    TextButton addBtn_, removeBtn_, upBtn_, downBtn_, saveBtn_;
+};
+
+
+/* ===========================================================================
+ * SampleBankPane — Sample mode's right-side content.  Enumerates
+ * SamplerNodes from the active graph, picks one (combo at top), shows
+ * its currently-active instrument's 16 slots as a list.  Click a slot
+ * → load DiskOpService's selected file into it.  Refresh button
+ * re-walks the graph when the user adds/removes sampler nodes.
+ * ========================================================================*/
+class SampleBankPane : public Component,
+                       private ListBoxModel,
+                       private Timer
+{
+public:
+    SampleBankPane()
+    {
+        title_.setText ("Sample Bank", dontSendNotification);
+        title_.setColour (Label::textColourId, kTextColour);
+        title_.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                     kHeaderFontSize, Font::bold));
+        addAndMakeVisible (title_);
+
+        samplerCombo_.setColour (ComboBox::backgroundColourId, kPanelColour);
+        samplerCombo_.setColour (ComboBox::textColourId, kTextColour);
+        samplerCombo_.onChange = [this] {
+            activeSampler_ = samplerCombo_.getSelectedId() - 1;
+            refresh();
+        };
+        addAndMakeVisible (samplerCombo_);
+
+        configureBtn (refreshBtn_, "Refresh", [this] { rebuildSamplerList(); });
+        configureBtn (loadBtn_, "Load → slot", [this] { loadIntoSelectedSlot(); });
+
+        slotList_.setModel (this);
+        slotList_.setRowHeight (22);
+        slotList_.setColour (ListBox::backgroundColourId, kBgColour);
+        slotList_.setColour (ListBox::outlineColourId,    kOutlineColour);
+        slotList_.setOutlineThickness (1);
+        addAndMakeVisible (slotList_);
+
+        startTimerHz (2);   /* graph changes are rare; cheap poll. */
+    }
+
+    ~SampleBankPane() override { stopTimer(); }
+
+    /** Pull the active graph from Services so we can enumerate
+     *  SamplerNodes.  Called once from DiskOpContentView. */
+    void connect (Services* services)
+    {
+        services_ = services;
+        rebuildSamplerList();
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (4);
+        title_.setBounds (r.removeFromTop (18));
+        r.removeFromTop (4);
+
+        auto topRow = r.removeFromTop (24);
+        refreshBtn_.setBounds (topRow.removeFromRight (70)); topRow.removeFromRight (4);
+        loadBtn_   .setBounds (topRow.removeFromRight (90)); topRow.removeFromRight (4);
+        samplerCombo_.setBounds (topRow);
+        r.removeFromTop (4);
+
+        slotList_.setBounds (r);
+    }
+
+    /* === ListBoxModel ============================================== */
     int getNumRows() override
     {
-        return DiskOpService::get().getPluginPaths (format_).getNumPaths();
+        auto inst = activeInstrument();
+        if (inst == nullptr) return 0;
+        return SamplerInstrument::kNumSlots;
     }
     void paintListBoxItem (int row, Graphics& g, int width, int height,
                            bool rowIsSelected) override
@@ -109,17 +330,39 @@ public:
             g.setColour (kAccentBlue.withAlpha (0.3f));
             g.fillRect (0, 0, width, height);
         }
-        const auto path = DiskOpService::get().getPluginPaths (format_);
-        if (row < 0 || row >= path.getNumPaths()) return;
-        g.setColour (kTextColour);
+        auto inst = activeInstrument();
+        const auto* slot = inst ? inst->getSlot (row) : nullptr;
+
         g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
                                 kFontSize, Font::plain));
-        g.drawText (path[row].getFullPathName(),
-                    6, 0, width - 12, height, Justification::centredLeft);
+
+        g.setColour (slot ? kTextColour : kEmptyText);
+        g.drawText (String::formatted ("%02d", row + 1),
+                    6, 0, 28, height, Justification::centredLeft);
+
+        g.setColour (slot ? kAccentAmber : kEmptyText);
+        g.drawText (slot ? slot->name
+                         : String (CharPointer_UTF8 ("\xe2\x80\x94")),
+                    38, 0, width - 44, height, Justification::centredLeft);
+    }
+    void listBoxItemDoubleClicked (int row, const MouseEvent&) override
+    {
+        slotList_.selectRow (row);
+        loadIntoSelectedSlot();
     }
 
 private:
-    void configureBtn (TextButton& b, const String& text, std::function<void()> on)
+    void timerCallback() override
+    {
+        /* Cheap diff-poll for sampler node count / instrument count
+         * change.  No graph traversal if neither moved. */
+        const int curCount = countSamplerNodes();
+        if (curCount != lastSamplerCount_) rebuildSamplerList();
+        slotList_.repaint();
+    }
+
+    void configureBtn (TextButton& b, const String& text,
+                       std::function<void()> on)
     {
         b.setButtonText (text);
         b.onClick = std::move (on);
@@ -127,17 +370,102 @@ private:
         b.setColour (TextButton::textColourOffId, kTextColour);
         addAndMakeVisible (b);
     }
-    void changeListenerCallback (ChangeBroadcaster*) override { refresh(); }
-    void refresh()
+
+    SamplerNode* getSamplerProcessor (int index) const
     {
-        list_.updateContent();
-        list_.repaint();
+        if (services_ == nullptr) return nullptr;
+        const auto session = services_->context().session();
+        if (session == nullptr) return nullptr;
+        const Node graph = session->getActiveGraph();
+        if (! graph.isValid()) return nullptr;
+
+        int hit = -1;
+        for (int i = 0; i < graph.getNumNodes(); ++i)
+        {
+            const Node n = graph.getNode (i);
+            const auto id = n.getFileOrIdentifier().toString();
+            if (id != EL_NODE_ID_SAMPLER) continue;
+            ++hit;
+            if (hit != index) continue;
+            if (auto* obj = n.getObject())
+                if (auto* sp = dynamic_cast<SamplerNode*> (obj->getAudioProcessor()))
+                    return sp;
+        }
+        return nullptr;
     }
 
-    DiskOpService::PluginFormat format_;
-    Label  title_;
-    ListBox list_;
-    TextButton addBtn_, removeBtn_, upBtn_, downBtn_;
+    int countSamplerNodes() const
+    {
+        if (services_ == nullptr) return 0;
+        const auto session = services_->context().session();
+        if (session == nullptr) return 0;
+        const Node graph = session->getActiveGraph();
+        if (! graph.isValid()) return 0;
+        int c = 0;
+        for (int i = 0; i < graph.getNumNodes(); ++i)
+        {
+            const Node n = graph.getNode (i);
+            if (n.getFileOrIdentifier().toString() == EL_NODE_ID_SAMPLER) ++c;
+        }
+        return c;
+    }
+
+    void rebuildSamplerList()
+    {
+        samplerCombo_.clear (dontSendNotification);
+        const int n = countSamplerNodes();
+        lastSamplerCount_ = n;
+
+        for (int i = 0; i < n; ++i)
+            samplerCombo_.addItem ("Sampler " + String (i + 1), i + 1);
+
+        if (n == 0)
+        {
+            samplerCombo_.addItem ("(no Sampler in graph)", 1);
+            samplerCombo_.setEnabled (false);
+        }
+        else
+        {
+            samplerCombo_.setEnabled (true);
+            if (activeSampler_ >= n) activeSampler_ = 0;
+            samplerCombo_.setSelectedId (activeSampler_ + 1, dontSendNotification);
+        }
+        refresh();
+    }
+
+    SamplerInstrument::Ptr activeInstrument() const
+    {
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return nullptr;
+        return sn->getInstrument (0);   /* first instrument for now */
+    }
+
+    void loadIntoSelectedSlot()
+    {
+        const int row = slotList_.getSelectedRow();
+        if (row < 0) return;
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        const auto sel = DiskOpService::get().getSelectedFile();
+        if (! sel.existsAsFile()) return;
+        sn->loadSampleToSlot (0, row, sel);
+        slotList_.repaint();
+    }
+
+    void refresh()
+    {
+        slotList_.updateContent();
+        slotList_.repaint();
+    }
+
+    Services* services_ = nullptr;
+    int activeSampler_ = 0;
+    int lastSamplerCount_ = -1;
+
+    Label title_;
+    ComboBox samplerCombo_;
+    TextButton refreshBtn_, loadBtn_;
+    ListBox  slotList_;
 };
 
 
@@ -225,14 +553,30 @@ public:
             pluginPathsSections_.add (std::move (sec));
         }
 
-        /* Mode-extras placeholder shown in non-Plugin-Paths modes. */
+        /* Sample-bank pane — visible in Sample mode. */
+        sampleBank_ = std::make_unique<SampleBankPane>();
+        addChildComponent (*sampleBank_);
+
+        /* Mode-extras placeholder for Session mode (until that wires in). */
         extrasPlaceholder_.setJustificationType (Justification::centred);
         extrasPlaceholder_.setColour (Label::textColourId, kMutedText);
         extrasPlaceholder_.setFont (FontOptions (
             Font::getDefaultMonospacedFontName(), kFontSize, Font::plain));
-        addAndMakeVisible (extrasPlaceholder_);
+        addChildComponent (extrasPlaceholder_);
 
         syncFromService();
+    }
+
+    /** Connect to real Services-backed APIs (PluginManager paths,
+     *  graph traversal for the sample bank). */
+    void wireServices (Services& services)
+    {
+        services_ = &services;
+        auto& pm  = services.context().plugins();
+        auto* propsFile = services.context().settings().getUserSettings();
+        for (auto& s : pluginPathsSections_)
+            s->connect (&pm, propsFile);
+        if (sampleBank_) sampleBank_->connect (&services);
     }
 
     ~Impl() override { detachBrowser(); }
@@ -282,10 +626,10 @@ public:
 
         r.removeFromLeft (8);
 
-        /* === Column 2 — File browser column.  Narrow per design note:
-         * "file navigation is never going to require full horizontal."
-         * Holds toolbar / path / filename / FileBrowserComponent. === */
-        const int browserColW = juce::jmin (480, r.getWidth() * 5 / 12);
+        /* === Column 2 — File browser column.  50/50 split with the
+         * extras column.  Holds toolbar / path / filename /
+         * FileBrowserComponent. === */
+        const int browserColW = juce::jmax (0, (r.getWidth() - 10) / 2);
         auto browserCol = r.removeFromLeft (browserColW);
 
         toolbarBounds_ = browserCol.removeFromTop (36);
@@ -320,11 +664,14 @@ public:
         extrasBounds_ = r;
 
         auto& svc = DiskOpService::get();
-        const bool pluginPaths = svc.getMode() == DiskOpService::Mode::kPluginPaths;
-        for (int i = 0; i < pluginPathsSections_.size(); ++i)
-        {
-            pluginPathsSections_[i]->setVisible (pluginPaths);
-        }
+        const auto mode = svc.getMode();
+        const bool pluginPaths = mode == DiskOpService::Mode::kPluginPaths;
+        const bool sampleMode  = mode == DiskOpService::Mode::kSample;
+
+        for (auto& s : pluginPathsSections_) s->setVisible (pluginPaths);
+        if (sampleBank_) sampleBank_->setVisible (sampleMode);
+        extrasPlaceholder_.setVisible (! pluginPaths && ! sampleMode);
+
         if (pluginPaths && ! pluginPathsSections_.isEmpty())
         {
             auto col = r;
@@ -335,9 +682,14 @@ public:
             col.removeFromTop (4);
             pluginPathsSections_[2]->setBounds (col);
         }
-
-        extrasPlaceholder_.setVisible (! pluginPaths);
-        if (! pluginPaths) extrasPlaceholder_.setBounds (extrasBounds_);
+        else if (sampleMode && sampleBank_)
+        {
+            sampleBank_->setBounds (r);
+        }
+        else
+        {
+            extrasPlaceholder_.setBounds (r);
+        }
     }
 
     void paintOverChildren (Graphics& g) override
@@ -517,11 +869,14 @@ private:
     bool   allFiles_ = false;
 
     /* Mode-extras right pane.  Plugin Paths mode shows 3 PluginPathsSection
-     * children; other modes show a single placeholder Label for now (Sample
-     * mode's sample-bank mirror, Session mode's recent-sessions list lands
-     * in a follow-up). */
+     * children; Sample mode shows the SampleBankPane mirroring the active
+     * graph's first SamplerNode; Session mode currently shows a
+     * placeholder Label until session save/load wires up. */
     OwnedArray<PluginPathsSection> pluginPathsSections_;
-    Label extrasPlaceholder_ { {}, "Sample bank mirror — coming next iteration." };
+    std::unique_ptr<SampleBankPane> sampleBank_;
+    Label extrasPlaceholder_ { {}, "Session recents — coming next iteration." };
+
+    Services* services_ = nullptr;
 
     /* Layout cache. */
     Rectangle<int> sidebarBounds_, toolbarBounds_, extrasBounds_;
@@ -542,6 +897,11 @@ DiskOpContentView::DiskOpContentView()
 DiskOpContentView::~DiskOpContentView()
 {
     DiskOpService::get().removeChangeListener (this);
+}
+
+void DiskOpContentView::initializeView (Services& services)
+{
+    if (impl_) impl_->wireServices (services);
 }
 
 void DiskOpContentView::paint (Graphics& g)
