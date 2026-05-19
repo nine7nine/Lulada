@@ -1947,21 +1947,42 @@ void TrackerEditor::timerCallback()
     /* Toolbar: only refresh when transport / pattern state actually
      * differs from last frame, so the 30Hz tick doesn't keep rebuilding
      * label strings + repainting buttons on idle. */
-    int   newPatternIndex = patternView ? patternView->getPatternIndex() : 0;
-    int   newPatternCount = patternView ? patternView->getPatternCount() : 1;
-    float newBpm          = patternView ? patternView->getBPM() : 120.f;
-    bool  newEditMode     = patternView ? patternView->getEditMode() : false;
+    int   newPatternIndex  = patternView ? patternView->getPatternIndex() : 0;
+    int   newPatternCount  = patternView ? patternView->getPatternCount() : 1;
+    float newBpm           = patternView ? patternView->getBPM() : 120.f;
+    bool  newEditMode      = patternView ? patternView->getEditMode() : false;
+    int   newOctave        = patternView ? patternView->getOctave() : 4;
+    int   newEditStep      = patternView ? patternView->getEditStep() : 1;
+    int   newPatternLength = patternView ? patternView->getPatternLength() : 0;
+    int   newTrackCount    = patternView ? patternView->getTrackCount() : 0;
+    bool  newFollow        = patternView ? patternView->getFollowPlayhead() : false;
+    bool  newCanUndo       = canUndo();
+    bool  newCanRedo       = canRedo();
 
-    if (newPatternIndex != lastToolbarPatternIndex_
-        || newPatternCount != lastToolbarPatternCount_
+    if (newPatternIndex  != lastToolbarPatternIndex_
+        || newPatternCount  != lastToolbarPatternCount_
         || std::abs (newBpm - lastToolbarBpm_) > 0.01f
-        || newEditMode != lastToolbarEditMode_)
+        || newEditMode      != lastToolbarEditMode_
+        || newOctave        != lastToolbarOctave_
+        || newEditStep      != lastToolbarEditStep_
+        || newPatternLength != lastToolbarPatternLength_
+        || newTrackCount    != lastToolbarTrackCount_
+        || newFollow        != lastToolbarFollow_
+        || newCanUndo       != lastToolbarCanUndo_
+        || newCanRedo       != lastToolbarCanRedo_)
     {
         refreshToolbar();
-        lastToolbarPatternIndex_ = newPatternIndex;
-        lastToolbarPatternCount_ = newPatternCount;
-        lastToolbarBpm_          = newBpm;
-        lastToolbarEditMode_     = newEditMode;
+        lastToolbarPatternIndex_  = newPatternIndex;
+        lastToolbarPatternCount_  = newPatternCount;
+        lastToolbarBpm_           = newBpm;
+        lastToolbarEditMode_      = newEditMode;
+        lastToolbarOctave_        = newOctave;
+        lastToolbarEditStep_      = newEditStep;
+        lastToolbarPatternLength_ = newPatternLength;
+        lastToolbarTrackCount_    = newTrackCount;
+        lastToolbarFollow_        = newFollow;
+        lastToolbarCanUndo_       = newCanUndo;
+        lastToolbarCanRedo_       = newCanRedo;
     }
 }
 
