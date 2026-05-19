@@ -188,8 +188,6 @@ ArrangementView::ArrangementView()
 {
     setName (EL_VIEW_ARRANGEMENT);
 
-    addAndMakeVisible (playBtn_);
-    addAndMakeVisible (stopBtn_);
     addAndMakeVisible (rescanBtn_);
     addAndMakeVisible (posLabel_);
     addAndMakeVisible (bpmLabel_);
@@ -204,13 +202,6 @@ ArrangementView::ArrangementView()
     bpmLabel_.setText ("BPM: 120.0", juce::dontSendNotification);
     bpmLabel_.setColour (juce::Label::textColourId, Colors::textColor);
 
-    playBtn_.onClick = [this]() { togglePlay(); };
-    stopBtn_.onClick = [this]()
-    {
-        if (services_ != nullptr)
-            if (auto* eng = services_->context().audio().get())
-                eng->setPlaying (false);
-    };
     rescanBtn_.onClick = [this]() { rescanTrackers(); };
 }
 
@@ -283,16 +274,13 @@ void ArrangementView::valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree& 
 
 void ArrangementView::resized()
 {
+    /* Transport (play/stop/record) lives in the global top toolbar —
+     * don't duplicate it here.  Tight tracker-toolbar-style spacing. */
     auto r = getLocalBounds();
     auto top = r.removeFromTop (kHeaderH).reduced (4, 4);
-    playBtn_.setBounds (top.removeFromLeft (60));
-    top.removeFromLeft (4);
-    stopBtn_.setBounds (top.removeFromLeft (60));
-    top.removeFromLeft (12);
-    rescanBtn_.setBounds (top.removeFromLeft (80));
-    top.removeFromLeft (16);
-    bpmLabel_.setBounds (top.removeFromLeft (120));
-    posLabel_.setBounds (top.removeFromLeft (120));
+    rescanBtn_.setBounds (top.removeFromLeft (56)); top.removeFromLeft (10);
+    bpmLabel_ .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
+    posLabel_ .setBounds (top.removeFromLeft (96));
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
 }
@@ -300,7 +288,7 @@ void ArrangementView::resized()
 void ArrangementView::paint (Graphics& g)
 {
     g.fillAll (Colors::contentBackgroundColor);
-    g.setColour (Colors::widgetBackgroundColor.darker());
+    g.setColour (Colors::backgroundColor);
     g.fillRect (getLocalBounds().removeFromTop (kHeaderH));
 }
 
@@ -374,25 +362,6 @@ void ArrangementView::rescanTrackers()
     if (body_ != nullptr) body_->resizeForLanes();
 }
 
-void ArrangementView::togglePlay()
-{
-    if (services_ == nullptr) return;
-    auto* eng = services_->context().audio().get();
-    if (eng == nullptr) return;
-
-    const bool currentlyPlaying = monitor_ != nullptr && monitor_->playing.get();
-    if (currentlyPlaying)
-    {
-        eng->setPlaying (false);
-    }
-    else
-    {
-        eng->seekToAudioFrame (0);
-        for (auto& l : lanes_) l.lastDispatchedBlockIdx = -1;
-        eng->setPlaying (true);
-    }
-}
-
 double ArrangementView::computePlayheadBeats() const
 {
     if (monitor_ == nullptr) return 0.0;
@@ -438,12 +407,6 @@ void ArrangementView::updateTransportLabel()
     {
         posLabel_.setText ("Beat: " + String (beat, 2), juce::dontSendNotification);
         lastBeatShown_ = beat;
-    }
-    const bool nowPlaying = monitor_->playing.get();
-    if (nowPlaying != lastPlayBtnState_)
-    {
-        playBtn_.setButtonText (nowPlaying ? "Pause" : "Play");
-        lastPlayBtnState_ = nowPlaying;
     }
 }
 

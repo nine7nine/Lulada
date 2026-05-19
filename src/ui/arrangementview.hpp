@@ -10,6 +10,8 @@
 #include <element/services.hpp>
 #include <element/transport.hpp>
 
+#include "ui/blocktoolbutton.hpp"
+
 #define EL_VIEW_ARRANGEMENT "ArrangementView"
 
 namespace element {
@@ -73,7 +75,6 @@ private:
     friend class Body;
 
     void rescanTrackers();
-    void togglePlay();
     void attachToActiveGraph();
     void detachFromActiveGraph();
     void updateTransportLabel();
@@ -87,9 +88,7 @@ private:
     void timerCallback() override;
 
     Services* services_ = nullptr;
-    juce::TextButton playBtn_ { "Play" };
-    juce::TextButton stopBtn_ { "Stop" };
-    juce::TextButton rescanBtn_ { "Rescan" };
+    BlockToolButton rescanBtn_ { "Rescan" };
     juce::Label posLabel_;
     juce::Label bpmLabel_;
     juce::Viewport viewport_;
@@ -106,7 +105,6 @@ private:
      * burning string allocations on idle ticks. */
     float lastBpmShown_ = -1.0f;
     double lastBeatShown_ = -999.0;
-    bool lastPlayBtnState_ = false;
 
     /* Active graph we're attached to as a ValueTree listener — pulled
      * from session->getActiveGraph().data() when the view is opened. */
