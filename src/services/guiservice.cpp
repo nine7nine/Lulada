@@ -319,6 +319,9 @@ GuiService::GuiService (Context& w, Services& a)
 
 GuiService::~GuiService()
 {
+    /* Cancel any pending stabilise coalesce so the AsyncUpdater
+     * doesn't fire into a half-destructed GuiService. */
+    stabiliser.cancelPendingUpdate();
     updates.reset();
     sGuiControllerInstances.removeFirstMatchingValue (this);
     if (sGuiControllerInstances.size() <= 0)
@@ -1080,6 +1083,24 @@ bool GuiService::perform (const InvocationInfo& info)
 
 void GuiService::stabilizeContent()
 {
+    /* Coalesce: a user action that touches multiple model layers
+     * (session, devices, plugins) frequently chains 3-10
+     * stabilizeContent calls in the same event-loop turn — each
+     * synchronously fanning out to every view + the menu + the
+     * system tray.  Flag + AsyncUpdater collapses that to one
+     * refresh on the next loop iteration. */
+    stabiliser.contentPending = true;
+    stabiliser.triggerAsyncUpdate();
+}
+
+void GuiService::stabilizeViews()
+{
+    stabiliser.viewsPending = true;
+    stabiliser.triggerAsyncUpdate();
+}
+
+void GuiService::stabilizeContentNow()
+{
     if (auto* cc = _content.get())
         cc->stabilize();
     refreshMainMenu();
@@ -1089,7 +1110,7 @@ void GuiService::stabilizeContent()
     sigRefreshed();
 }
 
-void GuiService::stabilizeViews()
+void GuiService::stabilizeViewsNow()
 {
     if (auto* cc = _content.get())
     {
@@ -1099,6 +1120,24 @@ void GuiService::stabilizeViews()
         cc->stabilizeViews();
         cc->refreshToolbar();
         cc->refreshStatusBar();
+    }
+}
+
+void GuiService::StabiliseCoalescer::handleAsyncUpdate()
+{
+    /* Order matters: stabilizeViewsNow may toggle enabled state +
+     * refresh toolbar/statusbar; doing it before contentNow means
+     * the deep view fan-out from contentNow lands on already-
+     * normalized view state. */
+    if (viewsPending)
+    {
+        viewsPending = false;
+        gui.stabilizeViewsNow();
+    }
+    if (contentPending)
+    {
+        contentPending = false;
+        gui.stabilizeContentNow();
     }
 }
 
