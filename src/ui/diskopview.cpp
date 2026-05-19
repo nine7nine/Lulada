@@ -593,7 +593,8 @@ private:
 
         if (n == 0)
         {
-            samplerCombo_.addItem ("(no Sampler — click + Sampler)", 1);
+            samplerCombo_.addItem ("(no Sampler in graph)", 1);
+            samplerCombo_.setSelectedId (1, dontSendNotification);
             samplerCombo_.setEnabled (false);
         }
         else
@@ -619,20 +620,53 @@ private:
         auto* eng = services_->find<EngineService>();
         if (eng == nullptr) return;
         eng->addNode (EL_NODE_ID_SAMPLER, EL_NODE_FORMAT_NAME);
-        /* timerCallback will pick up the count change within ~500ms. */
+        /* EngineService::addNode is synchronous — invalidate the cached
+         * SamplerNode pointer so the next getSamplerProcessor walks the
+         * graph fresh and picks up the new node. */
+        cachedNode_ = nullptr;
+        cachedSamplerIdx_ = -1;
+        rebuildSamplerList();
+    }
+
+    /** Pick a slot to load into when the user hasn't explicitly
+     *  selected one in the slot list.  Prefer the first empty slot,
+     *  fall back to slot 0. */
+    int pickLoadSlot (SamplerNode* sn)
+    {
+        const int sel = slotList_.list.getSelectedRow();
+        if (sel >= 0) return sel;
+        if (sn != nullptr)
+        {
+            if (auto inst = sn->getInstrument (activeInstrument_))
+                for (int i = 0; i < SamplerInstrument::kNumSlots; ++i)
+                    if (inst->getSlot (i) == nullptr) return i;
+        }
+        return 0;
     }
 
     void loadIntoSelectedSlot()
     {
-        const int slotRow = slotList_.list.getSelectedRow();
-        if (slotRow < 0) return;
-        auto* sn = getSamplerProcessor (activeSampler_);
-        if (sn == nullptr) return;
         const auto sel = DiskOpService::get().getSelectedFile();
         if (! sel.existsAsFile()) return;
 
+        /* Auto-create a Sampler if the graph doesn't have one yet —
+         * user expects "load a sample" to Just Work, not silently
+         * no-op because + Sampler was never pressed. */
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr)
+        {
+            addSamplerToGraph();
+            sn = getSamplerProcessor (activeSampler_);
+            if (sn == nullptr) return;   /* genuinely couldn't add */
+        }
+
+        const int slotRow = pickLoadSlot (sn);
         ensureInstrumentExists (sn, activeInstrument_);
         sn->loadSampleToSlot (activeInstrument_, slotRow, sel);
+        /* Move the slot-list cursor to the slot we just wrote so the
+         * user sees the result + the next Load goes to the slot after
+         * (FT2-ish auto-advance). */
+        slotList_.list.selectRow (slotRow);
         instrumentList_.list.repaint();
         slotList_.list.repaint();
     }
@@ -642,10 +676,16 @@ private:
      *  alphabetical order, matching the active mode's wildcard. */
     void fillBankFromDirectory()
     {
-        auto* sn = getSamplerProcessor (activeSampler_);
-        if (sn == nullptr) return;
         const auto dir = DiskOpService::get().getCurrentDirectory();
         if (! dir.isDirectory()) return;
+
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr)
+        {
+            addSamplerToGraph();
+            sn = getSamplerProcessor (activeSampler_);
+            if (sn == nullptr) return;
+        }
 
         WildcardFileFilter filter (
             DiskOpService::getWildcardForMode (DiskOpService::Mode::kSample),
