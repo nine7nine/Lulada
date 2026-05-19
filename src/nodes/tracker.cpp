@@ -385,6 +385,33 @@ void TrackerNode::clearUndoHistory()
 
 /* ===================================================================== */
 
+void TrackerNode::advanceToPattern (int patternIdx)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr) return;
+    if (patternIdx < 0 || patternIdx >= mod_->nseq) return;
+    mod_->pending_pattern_jump = patternIdx;
+    mod_->pending_break_row = 0;
+}
+
+int TrackerNode::currentPatternIndex() const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr) return -1;
+    for (int s = 0; s < mod_->nseq; ++s)
+        if (mod_->seq[s] == mod_->curr_seq)
+            return s;
+    return -1;
+}
+
+int TrackerNode::numPatterns() const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    return mod_ != nullptr ? mod_->nseq : 0;
+}
+
+/* ===================================================================== */
+
 void TrackerNode::setState (const void* data, int size)
 {
     if (data == nullptr || size <= 0) return;
