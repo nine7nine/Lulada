@@ -63,7 +63,7 @@ public:
         title_.setText (DiskOpService::getPluginFormatName (fmt) + " paths",
                         dontSendNotification);
         title_.setColour (Label::textColourId, kTextColour);
-        title_.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        title_.setFont (FontOptions (
                                      kHeaderFontSize, Font::bold));
         addAndMakeVisible (title_);
 
@@ -138,7 +138,7 @@ public:
         }
         if (row < 0 || row >= paths_.getNumPaths()) return;
         g.setColour (kTextColour);
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        g.setFont (FontOptions (
                                 kFontSize, Font::plain));
         g.drawText (paths_[row].getFullPathName(),
                     6, 0, width - 12, height, Justification::centredLeft);
@@ -280,7 +280,7 @@ public:
     {
         title_.setText ("Sample Bank", dontSendNotification);
         title_.setColour (Label::textColourId, kTextColour);
-        title_.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        title_.setFont (FontOptions (
                                      kHeaderFontSize, Font::bold));
         addAndMakeVisible (title_);
 
@@ -318,7 +318,7 @@ public:
         for (auto* l : { &instrumentLabel_, &slotsLabel_ })
         {
             l->setColour (Label::textColourId, kMutedText);
-            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+            l->setFont (FontOptions (
                                      kFontSize, Font::plain));
             addAndMakeVisible (*l);
         }
@@ -414,7 +414,7 @@ public:
         const int loaded = inst ? inst->numLoaded() : 0;
         const bool used  = (inst && (loaded > 0 || inst->name.isNotEmpty()));
 
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        g.setFont (FontOptions (
                                 kFontSize, Font::plain));
         g.setColour (used ? kTextColour : kMutedText);
         g.drawText (String::formatted ("%03d", row + 1),
@@ -440,7 +440,7 @@ public:
         auto inst = getInstrumentRaw (activeInstrument_);
         const auto* slot = inst ? inst->getSlot (row) : nullptr;
 
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        g.setFont (FontOptions (
                                 kFontSize, Font::plain));
         g.setColour (slot ? kTextColour : kEmptyText);
         g.drawText (String::formatted ("%02d", row + 1),
@@ -954,7 +954,7 @@ public:
     {
         /* Inline labels that didn't merit a Label component. */
         g.setColour (kTextColour);
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 12.0f, Font::plain));
+        g.setFont (FontOptions ( 12.0f, Font::plain));
         g.drawText ("File:", filenameLabelArea_, Justification::centredLeft);
     }
 
@@ -1019,7 +1019,7 @@ private:
         l.setText (text, dontSendNotification);
         l.setJustificationType (Justification::centredLeft);
         l.setColour (Label::textColourId, kTextColour);
-        l.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 12.0f, Font::plain));
+        l.setFont (FontOptions ( 12.0f, Font::plain));
         addAndMakeVisible (l);
     }
     void configureActionButton (TextButton& b, const String& text,

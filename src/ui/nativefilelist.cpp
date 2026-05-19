@@ -255,12 +255,11 @@ NativeFileListComponent::NativeFileListComponent (NativeDirCache& cache)
 
     pathLabel_.setColour (Label::backgroundColourId, kPanelColour);
     pathLabel_.setColour (Label::textColourId,        kTextColour);
-    pathLabel_.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
-                                     11.0f, Font::plain));
+    pathLabel_.setFont (FontOptions (13.0f, Font::plain));
     addAndMakeVisible (pathLabel_);
 
     list_.setModel (this);
-    list_.setRowHeight (20);
+    list_.setRowHeight (22);
     list_.setColour (ListBox::backgroundColourId, kBgColour);
     list_.setColour (ListBox::outlineColourId,    kOutlineColour);
     list_.setOutlineThickness (1);
@@ -330,16 +329,19 @@ void NativeFileListComponent::paintListBoxItem (int row, Graphics& g, int w, int
 
     if (sel) { g.setColour (kSelTint); g.fillRect (0, 0, w, h); }
 
-    g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+    /* Default sans-serif font for readability (matches the Plugin
+     * Manager / VST scanner list).  Monospaced reserved for the
+     * sampler keymap + tracker grid where character alignment matters. */
+    g.setFont (FontOptions (13.0f, Font::plain));
 
     /* Icon glyph: directories get a folder mark, files get a dot. */
     g.setColour (e.isDir ? kDirColour : kMutedText);
     g.drawText (e.isDir ? String (CharPointer_UTF8 ("\xe2\x96\xb8"))   /* small triangle */
                         : String ("\xe2\x80\xa2"),
-                6, 0, 16, h, Justification::centred);
+                6, 0, 18, h, Justification::centred);
 
     g.setColour (e.isDir ? kDirColour : kTextColour);
-    g.drawText (e.name, 26, 0, w - 100, h, Justification::centredLeft);
+    g.drawText (e.name, 28, 0, w - 110, h, Justification::centredLeft);
 
     if (! e.isDir && e.size > 0)
     {
@@ -349,7 +351,7 @@ void NativeFileListComponent::paintListBoxItem (int row, Graphics& g, int w, int
                                 ? String::formatted ("%.1f KB", e.size / 1024.0)
                                 : String::formatted ("%lld B", (long long) e.size));
         g.setColour (kMutedText);
-        g.drawText (sz, w - 84, 0, 78, h, Justification::centredRight);
+        g.drawText (sz, w - 92, 0, 86, h, Justification::centredRight);
     }
 }
 
