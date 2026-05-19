@@ -65,11 +65,13 @@ void TrackerNode::render (RenderContext& rc)
      * GraphNode::setPlayHead() which delegates to the AudioEngine's
      * Transport (audioengine.cpp:911). */
     bool wantPlaying = lastPlayingState_;
+    bool wantRecording = false;
     if (auto* const playhead = getPlayHead())
     {
         if (auto pos = playhead->getPosition())
         {
             wantPlaying = pos->getIsPlaying();
+            wantRecording = pos->getIsRecording();
             if (auto bpm = pos->getBpm())
                 mod_->bpm = (float) *bpm;
         }
@@ -79,6 +81,29 @@ void TrackerNode::render (RenderContext& rc)
     {
         module_play (mod_, wantPlaying ? 1 : 0);
         lastPlayingState_ = wantPlaying;
+    }
+    mod_->recording = wantRecording ? 1 : 0;
+
+    /* Drain incoming MIDI from upstream (port 0 is our MIDI input).
+     * Push events into clt->midi_in_buffer for the engine to consume in
+     * module_advance — record / trigger / indicator paths run from
+     * there. The buffer is then cleared so we can write our output. */
+    if (rc.midi.getNumBuffers() > 0)
+    {
+        if (auto* in = rc.midi.getWriteBuffer (0))
+        {
+            for (const auto& metaEvent : *in)
+            {
+                const auto msg = metaEvent.getMessage();
+                const auto* raw = msg.getRawData();
+                const int rawLen = msg.getRawDataSize();
+                if (rawLen <= 0) continue;
+                midi_event mev = midi_decode_event (const_cast<unsigned char*> (raw), rawLen);
+                mev.time = 0;
+                midi_in_buffer_add (mod_->clt, mev);
+            }
+            in->clear();
+        }
     }
 
     /* Advance engine by one audio buffer. Frame counter is monotonic
@@ -226,12 +251,10 @@ void TrackerNode::refreshPorts()
     if (createdPorts_) return;
 
     PortList newPorts;
-    /* Single MIDI output port. Tracks separate by MIDI channel on the
-     * wire — Element graph downstream uses MidiChannelSplitter or
-     * MidiRouter to fan out per-channel.  (Multi-output topology will
-     * matter when the Sampler node lands — that's an AUDIO concern,
-     * DESIGN.md Option A — but MIDI is fine on a single port.) */
-    newPorts.add (PortType::Midi, 0, 0, "midi_out", "MIDI Out", false);
+    /* 1 MIDI input (for live recording / pattern triggers) +
+     * 1 MIDI output (channel-multiplexed per track). */
+    newPorts.add (PortType::Midi, 0, 0, "midi_in",  "MIDI In",  true);
+    newPorts.add (PortType::Midi, 1, 0, "midi_out", "MIDI Out", false);
     createdPorts_ = true;
     setPorts (newPorts);
 }
@@ -242,41 +265,56 @@ void TrackerNode::getState (juce::MemoryBlock& block)
 
     {
         juce::ScopedLock sl (engineLock_);
-        if (mod_ != nullptr && mod_->curr_seq != nullptr)
+        if (mod_ != nullptr)
         {
-            auto* seq = mod_->curr_seq;
-            tree.setProperty ("bpm",    (double) mod_->bpm, nullptr);
-            tree.setProperty ("length", seq->length,        nullptr);
-            tree.setProperty ("rpb",    seq->rpb,           nullptr);
+            tree.setProperty ("bpm", (double) mod_->bpm, nullptr);
 
-            for (int t = 0; t < seq->ntrk; ++t)
+            /* Current pattern index — used to restore the active
+             * pattern on load. */
+            int currIdx = 0;
+            for (int i = 0; i < mod_->nseq; ++i)
+                if (mod_->seq[i] == mod_->curr_seq) { currIdx = i; break; }
+            tree.setProperty ("currentPattern", currIdx, nullptr);
+
+            for (int p = 0; p < mod_->nseq; ++p)
             {
-                auto* trk = seq->trk[t];
-                if (! trk) continue;
+                auto* seq = mod_->seq[p];
+                if (! seq) continue;
 
-                juce::ValueTree tt ("track");
-                tt.setProperty ("port",    trk->port,    nullptr);
-                tt.setProperty ("channel", trk->channel, nullptr);
-                tt.setProperty ("ncols",   trk->ncols,   nullptr);
+                juce::ValueTree pat ("pattern");
+                pat.setProperty ("length", seq->length, nullptr);
+                pat.setProperty ("rpb",    seq->rpb,    nullptr);
 
-                /* Only save non-empty cells to keep state compact. */
-                for (int c = 0; c < trk->ncols; ++c)
+                for (int t = 0; t < seq->ntrk; ++t)
                 {
-                    for (int r = 0; r < seq->length; ++r)
-                    {
-                        const auto& row = trk->rows[c][r];
-                        if (row.type == 0) continue;
+                    auto* trk = seq->trk[t];
+                    if (! trk) continue;
 
-                        juce::ValueTree rowNode ("row");
-                        rowNode.setProperty ("c", c,             nullptr);
-                        rowNode.setProperty ("r", r,             nullptr);
-                        rowNode.setProperty ("t", row.type,      nullptr);
-                        rowNode.setProperty ("n", row.note,      nullptr);
-                        rowNode.setProperty ("v", row.velocity,  nullptr);
-                        tt.appendChild (rowNode, nullptr);
+                    juce::ValueTree tt ("track");
+                    tt.setProperty ("port",    trk->port,    nullptr);
+                    tt.setProperty ("channel", trk->channel, nullptr);
+                    tt.setProperty ("ncols",   trk->ncols,   nullptr);
+                    tt.setProperty ("muted",   trk->playing == 0, nullptr);
+
+                    for (int c = 0; c < trk->ncols; ++c)
+                    {
+                        for (int r = 0; r < seq->length; ++r)
+                        {
+                            const auto& row = trk->rows[c][r];
+                            if (row.type == 0) continue;
+
+                            juce::ValueTree rowNode ("row");
+                            rowNode.setProperty ("c", c,             nullptr);
+                            rowNode.setProperty ("r", r,             nullptr);
+                            rowNode.setProperty ("t", row.type,      nullptr);
+                            rowNode.setProperty ("n", row.note,      nullptr);
+                            rowNode.setProperty ("v", row.velocity,  nullptr);
+                            tt.appendChild (rowNode, nullptr);
+                        }
                     }
+                    pat.appendChild (tt, nullptr);
                 }
-                tree.appendChild (tt, nullptr);
+                tree.appendChild (pat, nullptr);
             }
         }
     }
@@ -287,6 +325,59 @@ void TrackerNode::getState (juce::MemoryBlock& block)
         tree.writeToStream (gzip);
     }
 }
+
+/* === Undo / redo via state-memento ====================================== */
+
+void TrackerNode::pushUndo()
+{
+    juce::MemoryBlock block;
+    getState (block);
+    if (block.getSize() == 0) return;
+
+    if (undoStack_.size() >= (int) kMaxUndo)
+        undoStack_.remove (0);
+    undoStack_.add (block);
+    redoStack_.clearQuick();
+}
+
+bool TrackerNode::canUndo() const noexcept { return ! undoStack_.isEmpty(); }
+bool TrackerNode::canRedo() const noexcept { return ! redoStack_.isEmpty(); }
+
+void TrackerNode::undo()
+{
+    if (undoStack_.isEmpty()) return;
+
+    juce::MemoryBlock current;
+    getState (current);
+    redoStack_.add (current);
+    if (redoStack_.size() > (int) kMaxUndo)
+        redoStack_.remove (0);
+
+    auto target = undoStack_.removeAndReturn (undoStack_.size() - 1);
+    setState (target.getData(), (int) target.getSize());
+}
+
+void TrackerNode::redo()
+{
+    if (redoStack_.isEmpty()) return;
+
+    juce::MemoryBlock current;
+    getState (current);
+    undoStack_.add (current);
+    if (undoStack_.size() > (int) kMaxUndo)
+        undoStack_.remove (0);
+
+    auto target = redoStack_.removeAndReturn (redoStack_.size() - 1);
+    setState (target.getData(), (int) target.getSize());
+}
+
+void TrackerNode::clearUndoHistory()
+{
+    undoStack_.clearQuick();
+    redoStack_.clearQuick();
+}
+
+/* ===================================================================== */
 
 void TrackerNode::setState (const void* data, int size)
 {
@@ -309,44 +400,98 @@ void TrackerNode::setState (const void* data, int size)
     mod_ = module_new();
     if (mod_ == nullptr) return;
 
-    const float bpm    = (float) (double) tree.getProperty ("bpm",    120.0);
-    const int   length =         (int)    tree.getProperty ("length", 16);
-    const int   rpb    =         (int)    tree.getProperty ("rpb",    4);
+    const float bpm = (float) (double) tree.getProperty ("bpm", 120.0);
+    const int   currIdx = (int) tree.getProperty ("currentPattern", 0);
 
-    sequence* seq = sequence_new (length);
-    seq->rpb = rpb;
-
-    for (int i = 0; i < tree.getNumChildren(); ++i)
+    /* Walk pattern children. Backwards-compat: if the tree has 'track'
+     * children directly (old single-pattern format) fall through to a
+     * legacy path. */
+    bool sawPattern = false;
+    for (int p = 0; p < tree.getNumChildren(); ++p)
     {
-        const auto tt = tree.getChild (i);
-        if (tt.getType() != juce::Identifier ("track")) continue;
+        const auto pat = tree.getChild (p);
+        if (pat.getType() != juce::Identifier ("pattern")) continue;
+        sawPattern = true;
 
-        const int port    = (int) tt.getProperty ("port",    0);
-        const int channel = (int) tt.getProperty ("channel", 0);
+        const int length = (int) pat.getProperty ("length", 16);
+        const int rpb    = (int) pat.getProperty ("rpb",    4);
 
-        track* trk = track_new (port, channel, length, length, TRACK_DEF_CTRLPR);
+        sequence* seq = sequence_new (length);
+        seq->rpb = rpb;
 
-        for (int j = 0; j < tt.getNumChildren(); ++j)
+        for (int i = 0; i < pat.getNumChildren(); ++i)
         {
-            const auto rowNode = tt.getChild (j);
-            if (rowNode.getType() != juce::Identifier ("row")) continue;
+            const auto tt = pat.getChild (i);
+            if (tt.getType() != juce::Identifier ("track")) continue;
 
-            const int c     = (int) rowNode.getProperty ("c", 0);
-            const int r     = (int) rowNode.getProperty ("r", 0);
-            const int rtype = (int) rowNode.getProperty ("t", 0);
-            const int note  = (int) rowNode.getProperty ("n", 0);
-            const int vel   = (int) rowNode.getProperty ("v", 100);
+            const int port    = (int) tt.getProperty ("port",    0);
+            const int channel = (int) tt.getProperty ("channel", 0);
+            const bool muted  = (bool) tt.getProperty ("muted", false);
 
-            if (r >= 0 && r < length)
-                track_set_row (trk, c, r, rtype, note, vel, 0);
+            track* trk = track_new (port, channel, length, length, TRACK_DEF_CTRLPR);
+
+            for (int j = 0; j < tt.getNumChildren(); ++j)
+            {
+                const auto rowNode = tt.getChild (j);
+                if (rowNode.getType() != juce::Identifier ("row")) continue;
+
+                const int c     = (int) rowNode.getProperty ("c", 0);
+                const int r     = (int) rowNode.getProperty ("r", 0);
+                const int rtype = (int) rowNode.getProperty ("t", 0);
+                const int note  = (int) rowNode.getProperty ("n", 0);
+                const int vel   = (int) rowNode.getProperty ("v", 100);
+
+                if (r >= 0 && r < length)
+                    track_set_row (trk, c, r, rtype, note, vel, 0);
+            }
+            if (muted) trk->playing = 0;
+            sequence_add_track (seq, trk);
         }
-        sequence_add_track (seq, trk);
+        module_add_sequence (mod_, seq);
     }
 
-    module_add_sequence (mod_, seq);
-    mod_->curr_seq = seq;
-    mod_->bpm      = bpm;
-    sequence_set_playing (seq, 1);
+    /* Legacy single-pattern format support — load 'track' children
+     * directly under root into one pattern. */
+    if (! sawPattern)
+    {
+        const int length = (int) tree.getProperty ("length", 16);
+        const int rpb    = (int) tree.getProperty ("rpb",    4);
+        sequence* seq = sequence_new (length);
+        seq->rpb = rpb;
+        for (int i = 0; i < tree.getNumChildren(); ++i)
+        {
+            const auto tt = tree.getChild (i);
+            if (tt.getType() != juce::Identifier ("track")) continue;
+            const int port    = (int) tt.getProperty ("port",    0);
+            const int channel = (int) tt.getProperty ("channel", 0);
+            track* trk = track_new (port, channel, length, length, TRACK_DEF_CTRLPR);
+            for (int j = 0; j < tt.getNumChildren(); ++j)
+            {
+                const auto rowNode = tt.getChild (j);
+                if (rowNode.getType() != juce::Identifier ("row")) continue;
+                const int c = (int) rowNode.getProperty ("c", 0);
+                const int r = (int) rowNode.getProperty ("r", 0);
+                if (r < 0 || r >= length) continue;
+                track_set_row (trk, c, r,
+                               (int) rowNode.getProperty ("t", 0),
+                               (int) rowNode.getProperty ("n", 0),
+                               (int) rowNode.getProperty ("v", 100), 0);
+            }
+            sequence_add_track (seq, trk);
+        }
+        module_add_sequence (mod_, seq);
+    }
+
+    /* Activate curr_seq, pause others (one-pattern-at-a-time semantics). */
+    if (mod_->nseq > 0)
+    {
+        const int idx = juce::jlimit (0, mod_->nseq - 1, currIdx);
+        for (int i = 0; i < mod_->nseq; ++i)
+            sequence_set_playing (mod_->seq[i], 0);
+        mod_->curr_seq = mod_->seq[idx];
+        sequence_set_playing (mod_->curr_seq, 1);
+    }
+    mod_->bpm = bpm;
 
     mod_->clt->jack_sample_rate = (jack_nframes_t) currentSampleRate_;
     mod_->clt->jack_buffer_size = (jack_nframes_t) currentBufferSize_;
