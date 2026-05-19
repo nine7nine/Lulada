@@ -328,6 +328,7 @@ public:
         if (semis >= 0)
         {
             const int midiNote = juce::jlimit (0, 127, (octave + 1) * 12 + semis);
+            previewNote (midiNote); // audible preview before commit
             writeCell (midiNote);
             return true;
         }
@@ -347,15 +348,33 @@ public:
         if (x < kRowGutterWidth) return;
 
         /* Click in track header (top band):
-         *   plain      → toggle mute
-         *   Shift+click → solo (mute others; re-solo cancels) */
+         *   plain                  → toggle mute
+         *   Shift+click            → solo (mute others; re-solo cancels)
+         *   click in channel pill  → cycle channel (right-click reverses) */
         if (y >= 0 && y < kTrackHeaderH)
         {
             const int trk = (x - kRowGutterWidth) / kTrackWidth;
             if (trk >= 0 && trk < s.ntrk)
             {
-                if (e.mods.isShiftDown()) soloTrack (trk);
-                else                      toggleTrackMute (trk);
+                const int trkXBase = kRowGutterWidth + trk * kTrackWidth;
+                const int pillRight = trkXBase + kTrackWidth - 8;
+                const int pillLeft  = trkXBase + kTrackWidth - 36;
+                const bool inPill = (x >= pillLeft && x <= pillRight && y <= 22);
+                if (inPill)
+                {
+                    /* Cycle channel; jump cursor to this track first
+                     * so cycleCursorTrackChannel acts on the clicked one. */
+                    cursorTrack = trk;
+                    cycleCursorTrackChannel (e.mods.isRightButtonDown() ? -1 : 1);
+                }
+                else if (e.mods.isShiftDown())
+                {
+                    soloTrack (trk);
+                }
+                else
+                {
+                    toggleTrackMute (trk);
+                }
             }
             return;
         }
@@ -1259,6 +1278,62 @@ public:
         clearSelection();
     }
 
+    /** Emit a brief audible preview of a note via the queue buffer, so
+     *  the user hears what they're typing.  Schedules the note_off
+     *  ~200 ms later via callAfterDelay; SafePointer guards against
+     *  the editor being destroyed before the timer fires. */
+    void previewNote (int midiNote)
+    {
+        if (trackerNode == nullptr) return;
+        int port = 0, channel = 0;
+        {
+            juce::ScopedLock sl (trackerNode->engineLock());
+            auto* mod = trackerNode->modulePtr();
+            if (mod == nullptr || mod->curr_seq == nullptr) return;
+            auto* seq = mod->curr_seq;
+            if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+            auto* trk = seq->trk[cursorTrack];
+            if (! trk) return;
+            port = trk->port;
+            channel = trk->channel;
+            queue_midi_note_on (mod->clt, seq, port, channel, midiNote, 100);
+        }
+
+        juce::Component::SafePointer<PatternView> weakSelf (this);
+        juce::Timer::callAfterDelay (200,
+            [weakSelf, midiNote, port, channel]()
+            {
+                if (auto* self = weakSelf.getComponent())
+                {
+                    if (self->trackerNode == nullptr) return;
+                    juce::ScopedLock sl (self->trackerNode->engineLock());
+                    auto* mod = self->trackerNode->modulePtr();
+                    if (mod == nullptr || mod->curr_seq == nullptr) return;
+                    queue_midi_note_off (mod->clt, mod->curr_seq, port, channel, midiNote);
+                }
+            });
+    }
+
+    /** Cycle the cursor track's MIDI channel (1..16) — channel pill
+     *  click in header. */
+    void cycleCursorTrackChannel (int delta = 1)
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk) return;
+        int ch = trk->channel + delta;
+        while (ch < 0)  ch += 16;
+        while (ch > 15) ch -= 16;
+        trk->channel = ch;
+        repaint();
+    }
+
     /* === Edit-mode + octave + edit-step toggles ====================== */
 
     bool getEditMode() const noexcept { return editMode; }
@@ -1358,6 +1433,8 @@ private:
                 "  Click        jump cursor to cell",
                 "  Click header        toggle track mute",
                 "  Shift+Click header  solo track (others muted)",
+                "  Click channel pill  cycle MIDI channel 1..16",
+                "                      (right-click reverses)",
                 "",
                 "PATTERN / TRACKS",
                 "  Ctrl+Up/Dn   pattern length -/+ 1",
@@ -1383,7 +1460,9 @@ private:
                 "  F1 / ?       toggle this help",
                 "",
                 "(transport via Element's main play/stop; BPM follows",
-                " Element.  Edit step + FOLLOW playhead on toolbar)"
+                " Element.  Edit step + FOLLOW playhead on toolbar.",
+                " Note keys preview through downstream synth. Live MIDI",
+                " input recorded into pattern when Element is recording.)"
             };
 
             const int lineHeight = 18;

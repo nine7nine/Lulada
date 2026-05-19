@@ -65,11 +65,13 @@ void TrackerNode::render (RenderContext& rc)
      * GraphNode::setPlayHead() which delegates to the AudioEngine's
      * Transport (audioengine.cpp:911). */
     bool wantPlaying = lastPlayingState_;
+    bool wantRecording = false;
     if (auto* const playhead = getPlayHead())
     {
         if (auto pos = playhead->getPosition())
         {
             wantPlaying = pos->getIsPlaying();
+            wantRecording = pos->getIsRecording();
             if (auto bpm = pos->getBpm())
                 mod_->bpm = (float) *bpm;
         }
@@ -79,6 +81,29 @@ void TrackerNode::render (RenderContext& rc)
     {
         module_play (mod_, wantPlaying ? 1 : 0);
         lastPlayingState_ = wantPlaying;
+    }
+    mod_->recording = wantRecording ? 1 : 0;
+
+    /* Drain incoming MIDI from upstream (port 0 is our MIDI input).
+     * Push events into clt->midi_in_buffer for the engine to consume in
+     * module_advance — record / trigger / indicator paths run from
+     * there. The buffer is then cleared so we can write our output. */
+    if (rc.midi.getNumBuffers() > 0)
+    {
+        if (auto* in = rc.midi.getWriteBuffer (0))
+        {
+            for (const auto& metaEvent : *in)
+            {
+                const auto msg = metaEvent.getMessage();
+                const auto* raw = msg.getRawData();
+                const int rawLen = msg.getRawDataSize();
+                if (rawLen <= 0) continue;
+                midi_event mev = midi_decode_event (const_cast<unsigned char*> (raw), rawLen);
+                mev.time = 0;
+                midi_in_buffer_add (mod_->clt, mev);
+            }
+            in->clear();
+        }
     }
 
     /* Advance engine by one audio buffer. Frame counter is monotonic
@@ -226,12 +251,10 @@ void TrackerNode::refreshPorts()
     if (createdPorts_) return;
 
     PortList newPorts;
-    /* Single MIDI output port. Tracks separate by MIDI channel on the
-     * wire — Element graph downstream uses MidiChannelSplitter or
-     * MidiRouter to fan out per-channel.  (Multi-output topology will
-     * matter when the Sampler node lands — that's an AUDIO concern,
-     * DESIGN.md Option A — but MIDI is fine on a single port.) */
-    newPorts.add (PortType::Midi, 0, 0, "midi_out", "MIDI Out", false);
+    /* 1 MIDI input (for live recording / pattern triggers) +
+     * 1 MIDI output (channel-multiplexed per track). */
+    newPorts.add (PortType::Midi, 0, 0, "midi_in",  "MIDI In",  true);
+    newPorts.add (PortType::Midi, 1, 0, "midi_out", "MIDI Out", false);
     createdPorts_ = true;
     setPorts (newPorts);
 }
