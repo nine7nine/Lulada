@@ -127,6 +127,9 @@ public:
         paintHeader (g, s);
         paintGutter (g, s);
         paintCells  (g, s);
+
+        if (showHelp)
+            paintHelp (g);
     }
 
     int desiredWidth (int ntrk) const
@@ -165,6 +168,37 @@ public:
     bool keyPressed (const juce::KeyPress& kp) override
     {
         const int kc = kp.getKeyCode();
+        const auto mods = kp.getModifiers();
+        const bool ctrl  = mods.isCtrlDown() || mods.isCommandDown();
+        const bool shift = mods.isShiftDown();
+
+        // F1 / ? toggles help overlay.
+        if (kc == juce::KeyPress::F1Key || kc == '?')
+        {
+            showHelp = ! showHelp;
+            repaint();
+            return true;
+        }
+
+        // Any key while help is up dismisses it.
+        if (showHelp)
+        {
+            showHelp = false;
+            repaint();
+            return true;
+        }
+
+        // Ctrl-modified shortcuts first so plain arrow handlers below
+        // don't shadow Ctrl+Up/Down.
+        if (ctrl)
+        {
+            if (kc == juce::KeyPress::upKey)
+                { changePatternLength (shift ?  16 :  1); return true; }
+            if (kc == juce::KeyPress::downKey)
+                { changePatternLength (shift ? -16 : -1); return true; }
+            if (kc == 'T' || kc == 't') { addTrack();            return true; }
+            if (kc == 'W' || kc == 'w') { deleteCurrentTrack();  return true; }
+        }
 
         // ESC toggles edit mode
         if (kc == juce::KeyPress::escapeKey)
@@ -196,13 +230,39 @@ public:
             return true;
         }
 
+        // Tab cycles cursor sub-column: note → vel-hi → vel-lo → note.
+        if (kc == juce::KeyPress::tabKey)
+        {
+            if (shift) cursorSubCol = (cursorSubCol + 2) % 3;
+            else       cursorSubCol = (cursorSubCol + 1) % 3;
+            repaint();
+            return true;
+        }
+
         if (! editMode) return false;
 
-        // Delete / backspace: clear cell.
+        // Delete / backspace: clear cell (note column only).
         if (kc == juce::KeyPress::deleteKey || kc == juce::KeyPress::backspaceKey)
         {
-            writeCell (-1); // type = none
+            if (cursorSubCol == 0) writeCell (-1);
+            else                   writeVelocityNybble (0); // zero the nybble
             return true;
+        }
+
+        if (cursorSubCol > 0)
+        {
+            // Velocity sub-column: accept hex digits.
+            int nybble = -1;
+            if      (kc >= '0' && kc <= '9') nybble = kc - '0';
+            else if (kc >= 'A' && kc <= 'F') nybble = 10 + (kc - 'A');
+            else if (kc >= 'a' && kc <= 'f') nybble = 10 + (kc - 'a');
+
+            if (nybble >= 0)
+            {
+                writeVelocityNybble (nybble);
+                return true;
+            }
+            return false; // don't treat hex letters as note input
         }
 
         /* Note input.  JUCE on X11 returns the raw keysym for letter
@@ -400,7 +460,20 @@ private:
                 if (r == cursorRow && t == cursorTrack)
                 {
                     g.setColour (kCursorHighlight);
-                    g.fillRect (tx, y, kTrackWidth - 1, kRowHeight);
+                    /* Sub-column-aware highlight:
+                     *   0 = note (left half),
+                     *   1 = vel-hi nybble,
+                     *   2 = vel-lo nybble */
+                    const int noteX = tx + 4;
+                    const int noteW = kColumnSubWidth + 8;
+                    const int velX  = tx + 8 + kColumnSubWidth + 4;
+                    const int velNybbleW = kColumnSubWidth / 2;
+                    if (cursorSubCol == 0)
+                        g.fillRect (noteX, y, noteW, kRowHeight);
+                    else if (cursorSubCol == 1)
+                        g.fillRect (velX, y, velNybbleW, kRowHeight);
+                    else
+                        g.fillRect (velX + velNybbleW, y, velNybbleW, kRowHeight);
                 }
 
                 g.setColour (kRowDividerColour);
@@ -507,25 +580,165 @@ private:
 
         if (midiNote < 0)
         {
-            // Clear: type = 0 (none).
-            track_set_row (trk, 0 /*col*/, cursorRow, 0, 0, 0, 0);
+            track_set_row (trk, 0, cursorRow, 0, 0, 0, 0); // clear
         }
         else
         {
-            // type = 1 (note_on), velocity = 100 default.
             track_set_row (trk, 0, cursorRow, 1, midiNote, 100, 0);
         }
 
         const int next = cursorRow + 1;
         cursorRow = next < seq->length ? next : 0;
+        ensureCursorVisible();
         repaint();
     }
 
+    /** Set one hex nybble of the cell's velocity. cursorSubCol == 1
+     *  writes the high nybble; == 2 writes the low nybble. After the
+     *  low nybble, advance to next row + return cursor to note column. */
+    void writeVelocityNybble (int nybble)
+    {
+        if (trackerNode == nullptr) return;
+        if (cursorSubCol < 1 || cursorSubCol > 2) return;
+
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk || cursorRow < 0 || cursorRow >= seq->length) return;
+
+        /* Velocity edit only applies if there's a note here. */
+        const auto& current = trk->rows[0][cursorRow];
+        if (current.type != 1) return; // not a note_on; ignore
+
+        int vel = current.velocity;
+        if (cursorSubCol == 1)
+            vel = ((nybble & 0x0f) << 4) | (vel & 0x0f);
+        else
+            vel = (vel & 0xf0) | (nybble & 0x0f);
+        vel = juce::jlimit (0, 127, vel);
+
+        track_set_row (trk, 0, cursorRow, current.type, current.note, vel, 0);
+
+        if (cursorSubCol == 1)
+        {
+            cursorSubCol = 2;
+        }
+        else
+        {
+            cursorSubCol = 0;
+            const int next = cursorRow + 1;
+            cursorRow = next < seq->length ? next : 0;
+            ensureCursorVisible();
+        }
+        repaint();
+    }
+
+    void changePatternLength (int delta)
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        const int newLen = juce::jlimit (1, 1024, seq->length + delta);
+        if (newLen == seq->length) return;
+        sequence_set_length (seq, newLen);
+        if (cursorRow >= newLen) cursorRow = newLen - 1;
+        repaint();
+    }
+
+    void addTrack()
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (seq->ntrk >= 16) return; // soft cap; engine has no hard limit
+        const int newCh = seq->ntrk; // simplest scheme — channel == track idx
+        track* trk = track_new (0 /*port*/, newCh, seq->length, seq->length, TRACK_DEF_CTRLPR);
+        sequence_add_track (seq, trk);
+        cursorTrack = seq->ntrk - 1;
+        repaint();
+    }
+
+    void deleteCurrentTrack()
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (seq->ntrk <= 1) return; // keep at least one track
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        sequence_del_track (seq, cursorTrack);
+        if (cursorTrack >= seq->ntrk) cursorTrack = seq->ntrk - 1;
+        repaint();
+    }
+
+    void paintHelp (juce::Graphics& g)
+    {
+        if (auto* vp = findParentComponentOfClass<juce::Viewport>())
+        {
+            const auto vis = vp->getViewArea();
+            g.setColour (juce::Colour { 0xee'08'08'08 });
+            g.fillRect (vis);
+            g.setColour (juce::Colours::white.withAlpha (0.85f));
+            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                          13.0f, juce::Font::plain));
+
+            const juce::StringArray lines = {
+                "TRACKER KEYBINDINGS",
+                "",
+                "EDIT MODE",
+                "  ESC          toggle edit mode (red dot in corner)",
+                "  Z S X D C V G B H N J M ,    notes (low row, C to C+1)",
+                "  Q 2 W 3 E R 5 T 6 Y 7 U I    notes (high row, C+12 up)",
+                "  [ / ]        octave -/+",
+                "  Shift+1..8   set octave 1..8",
+                "  Delete       clear note (or zero velocity nybble)",
+                "  Tab / S-Tab  cycle sub-column (note / vel-hi / vel-lo)",
+                "  0-9 A-F      set velocity hex digit (in vel sub-cols)",
+                "",
+                "NAVIGATION",
+                "  Arrows       move cursor",
+                "  PgUp / PgDn  jump 16 rows",
+                "  Home / End   first / last row",
+                "  Click        jump cursor to cell",
+                "",
+                "PATTERN",
+                "  Ctrl+Up/Dn   pattern length -/+ 1",
+                "  Ctrl+Shift+Up/Dn   length -/+ 16",
+                "  Ctrl+T       add track",
+                "  Ctrl+W       remove cursor track (keeps last)",
+                "",
+                "  F1 / ?       toggle this help",
+                "",
+                "(transport via Element's main play/stop;",
+                " BPM follows Element)"
+            };
+
+            const int lineHeight = 18;
+            int y = vis.getY() + 16;
+            for (const auto& line : lines)
+            {
+                g.drawText (line, vis.getX() + 24, y, vis.getWidth() - 48, lineHeight,
+                            juce::Justification::centredLeft);
+                y += lineHeight;
+            }
+        }
+    }
+
     TrackerNode* trackerNode;
-    int cursorRow   = 0;
-    int cursorTrack = 0;
-    int octave      = 4;
-    bool editMode   = false;
+    int cursorRow    = 0;
+    int cursorTrack  = 0;
+    int cursorSubCol = 0; // 0 = note, 1 = vel-hi, 2 = vel-lo
+    int octave       = 4;
+    bool editMode    = false;
+    bool showHelp    = false;
 };
 
 
