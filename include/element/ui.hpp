@@ -176,6 +176,27 @@ private:
         GuiService& ui;
     } foregroundCheck;
 
+    /** Coalesces back-to-back stabilizeContent / stabilizeViews calls
+     *  into one refresh per message-loop turn.  Cuts down on the
+     *  10+-deep stabilize cascade chains the GUI perf handoff doc
+     *  called out (handoff item #4).  Multiple flags allow a single
+     *  trip through handleAsyncUpdate to honor whichever paths got
+     *  requested since the last refresh.
+     *
+     *  Public stabilizeContent / stabilizeViews just set the flags +
+     *  trigger; the actual work is in stabilizeContentNow /
+     *  stabilizeViewsNow, called from handleAsyncUpdate. */
+    struct StabiliseCoalescer : public juce::AsyncUpdater {
+        explicit StabiliseCoalescer (GuiService& g) : gui (g) {}
+        void handleAsyncUpdate() override;
+        GuiService& gui;
+        bool contentPending { false };
+        bool viewsPending   { false };
+    } stabiliser { *this };
+
+    void stabilizeContentNow();
+    void stabilizeViewsNow();
+
     friend class juce::ChangeBroadcaster;
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
 

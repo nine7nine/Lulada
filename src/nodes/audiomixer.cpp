@@ -184,22 +184,50 @@ private:
 
         void stabilizeContent()
         {
-            const double dB = (double) Decibels::gainToDecibels (monitor->getGain(), (float) EL_FADER_MIN_DB);
-            if (fader.getValue() != dB)
+            /* Diff-gate against the raw monitor state so the per-tick
+             * cost when nothing changed is two atomic reads + two
+             * float / bool compares.  Decibels::gainToDecibels (log10)
+             * + fader.setValue + Button::setToggleState only run on an
+             * actual model change.  Was firing every 24Hz tick for
+             * every strip before — biggest single CPU win in the
+             * mixer view. */
+            const float curGain = monitor->getGain();
+            if (curGain != lastGain_)
             {
-                fader.setValue (dB, dontSendNotification);
-                updateLabels();
+                lastGain_ = curGain;
+                const double dB = (double) Decibels::gainToDecibels (curGain, (float) EL_FADER_MIN_DB);
+                if (fader.getValue() != dB)
+                {
+                    fader.setValue (dB, dontSendNotification);
+                    updateLabels();
+                }
             }
 
-            mute.setToggleState (monitor->isMuted(), dontSendNotification);
+            const bool curMuted = monitor->isMuted();
+            if (curMuted != lastMuted_)
+            {
+                lastMuted_ = curMuted;
+                mute.setToggleState (curMuted, dontSendNotification);
+            }
         }
 
         void processMeter()
         {
+            /* SimpleMeter::setValue already diff-gates per port
+             * (simplemeter.cpp:338).  meter.refresh() walks each
+             * SimpleMeterValue and only triggers repaint when its
+             * level / peak is non-trivial (simplemeter.cpp:44-48) —
+             * silent strips cost a handful of atomic reads, no
+             * paint().  Was meter.repaint() unconditionally before,
+             * forcing a per-tick repaint of every visible strip even
+             * with the engine idle. */
             for (int i = 0; i < monitor->getNumChannels(); ++i)
                 meter.setValue (i, monitor->getLevel (i));
-            meter.repaint();
+            meter.refresh();
         }
+
+        float lastGain_ = std::numeric_limits<float>::quiet_NaN();
+        bool  lastMuted_ = false;
     };
 
     typedef ReferenceCountedArray<AudioMixerProcessor::Monitor> MonitorList;

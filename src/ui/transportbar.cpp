@@ -209,18 +209,22 @@ void TransportBar::setBeatTime (const float t)
 
 void TransportBar::stabilize()
 {
-    if (checkForMonitor())
-    {
-        // std::clog << "pos beats monitor: " << monitor->getPositionBeats() << std::endl;
+    if (! checkForMonitor())
+        return;
 
-        int bars = 0, beats = 0, sub = 0;
-        monitor->getBarsAndBeats (bars, beats, sub);
-        barLabel->tempoValue = bars + 1;
-        beatLabel->tempoValue = beats + 1;
-        subLabel->tempoValue = sub + 1;
-        for (auto* c : { barLabel.get(), beatLabel.get(), subLabel.get() })
-            c->repaint();
-    }
+    int bars = 0, beats = 0, sub = 0;
+    monitor->getBarsAndBeats (bars, beats, sub);
+
+    /* juce::Value::setValue only fires its listener chain on actual
+     * delta (juce_Value.cpp::ValueSource::setValue), and
+     * DragableIntLabel hooks valueChanged → repaint().  So a stable
+     * transport position costs three int writes + three Value
+     * equality checks per 88ms tick — no paint().  The previous
+     * unconditional `c->repaint()` loop forced a paint of all three
+     * labels every tick whether bars/beats/sub changed or not. */
+    barLabel->tempoValue  = bars + 1;
+    beatLabel->tempoValue = beats + 1;
+    subLabel->tempoValue  = sub + 1;
 }
 
 void TransportBar::updateWidth()

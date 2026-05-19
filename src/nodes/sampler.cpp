@@ -500,7 +500,22 @@ public:
     }
 
 private:
-    void timerCallback() override { repaint(); }
+    void timerCallback() override
+    {
+        /* Diff-gate the playhead-chase repaint: only repaint when
+         * playhead positions change (note-on / note-off / position
+         * sweep).  Idle ticks (no voices playing) cost one slot
+         * query + a vector equality check.  Pre-diff this was a full
+         * waveform + playhead repaint 30 times a second forever. */
+        auto* slot = getSlot ? getSlot() : nullptr;
+        std::vector<int> cur = slot != nullptr ? playheadsFor (slot) : std::vector<int>();
+        if (cur == lastPlayheads_)
+            return;
+        lastPlayheads_ = std::move (cur);
+        repaint();
+    }
+
+    std::vector<int> lastPlayheads_;
 
 public:
 
@@ -937,13 +952,19 @@ private:
 
     void refresh()
     {
+        /* Diff-gated 8Hz editor refresh.  Heavy operations
+         * (slotList.repaint, waveformView.repaint, adsrView.setParams,
+         * status.setText with formatted-string alloc) are gated on
+         * actual underlying state change.  Slider / combo setValue
+         * with dontSendNotification self-gates inside JUCE so we
+         * leave those unconditional. */
         auto inst = node.getInstrument();
-        slotList.updateContent();
-        slotList.repaint();
-        if (slotList.getSelectedRow() != activeSlot)
+        const int slotListSel = slotList.getSelectedRow();
+        if (slotListSel != activeSlot)
             slotList.selectRow (activeSlot, true, false);
 
-        if (auto* slot = currentSlot())
+        auto* slot = currentSlot();
+        if (slot != nullptr)
         {
             rootSlider.setValue ((double) slot->rootNote, dontSendNotification);
             fineSlider.setValue ((double) slot->finetune, dontSendNotification);
@@ -951,21 +972,71 @@ private:
             panSlider .setValue ((double) slot->panning,  dontSendNotification);
             loopCombo.setSelectedId ((int) slot->loopMode + 1, dontSendNotification);
         }
-        waveformView.repaint();
-
-        adsrView.setParams (node.getAdsr());
         interpCombo.setSelectedId ((int) node.getInterpMode() + 1, dontSendNotification);
 
-        const int n = inst ? inst->numLoaded() : 0;
+        /* slotList content cheap-gate: the slot list content changes
+         * only on load / clear / activeSlot move.  Detect via slot
+         * pointer + load-count snapshot. */
+        const int numLoaded = inst ? inst->numLoaded() : 0;
+        const SamplerSampleSlot* slotPtr = slot;
+        const bool listDirty = (numLoaded != lastNumLoaded_)
+                            || (slotPtr   != lastSlotPtr_)
+                            || (activeSlot != lastActiveSlot_);
+        if (listDirty)
+        {
+            slotList.updateContent();
+            slotList.repaint();
+        }
+
+        /* Waveform-view repaint gate: trigger only on slot pointer
+         * change (load / clear / activeSlot move) — its own internal
+         * playhead-chase timer handles per-frame playhead motion. */
+        if (slotPtr != lastSlotPtr_)
+            waveformView.repaint();
+
+        /* ADSR snapshot — only push to the curve view on change. */
+        const auto adsr = node.getAdsr();
+        if (adsr.attack  != lastAdsr_.attack
+         || adsr.decay   != lastAdsr_.decay
+         || adsr.sustain != lastAdsr_.sustain
+         || adsr.release != lastAdsr_.release)
+        {
+            adsrView.setParams (adsr);
+            lastAdsr_ = adsr;
+        }
+
+        /* Status text: avoid the per-tick String::formatted alloc by
+         * comparing the underlying integers + slot name first. */
+        const int voices = node.getNumVoices();
         const String slotName = (inst && inst->getSlot (activeSlot))
                                   ? inst->getSlot (activeSlot)->name
                                   : String ("(empty)");
-        status.setText (String::formatted ("Slot %02d: %s   |   %d/%d loaded   |   %d voices",
-                                            activeSlot + 1, slotName.toRawUTF8(),
-                                            n, SamplerInstrument::kNumSlots,
-                                            node.getNumVoices()),
-                        dontSendNotification);
+        if (numLoaded != lastNumLoaded_
+         || voices    != lastVoices_
+         || activeSlot != lastActiveSlot_
+         || slotName  != lastSlotName_)
+        {
+            status.setText (String::formatted ("Slot %02d: %s   |   %d/%d loaded   |   %d voices",
+                                                activeSlot + 1, slotName.toRawUTF8(),
+                                                numLoaded, SamplerInstrument::kNumSlots,
+                                                voices),
+                            dontSendNotification);
+        }
+
+        lastNumLoaded_  = numLoaded;
+        lastSlotPtr_    = slotPtr;
+        lastActiveSlot_ = activeSlot;
+        lastVoices_     = voices;
+        lastSlotName_   = slotName;
     }
+
+    /* Diff-gate snapshot — see refresh(). */
+    int                   lastNumLoaded_   { -1 };
+    int                   lastVoices_      { -1 };
+    int                   lastActiveSlot_  { -1 };
+    const SamplerSampleSlot* lastSlotPtr_  { nullptr };
+    SamplerNode::AdsrParams lastAdsr_      { -1.0f, -1.0f, -1.0f, -1.0f };
+    String                lastSlotName_;
 
     SamplerNode& node;
 
