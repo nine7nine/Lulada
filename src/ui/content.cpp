@@ -13,6 +13,7 @@
 
 #include "services/mappingservice.hpp"
 #include "services/sessionservice.hpp"
+#include "ui/blocktoolbutton.hpp"
 #include "ui/midiblinker.hpp"
 #include <element/ui/mainwindow.hpp>
 #include "ui/mainmenu.hpp"
@@ -48,19 +49,84 @@ bool ContentView::keyPressed (const KeyPress& k)
 }
 
 //=============================================================================
+/* 4 colour-coded view selectors that replace the old monolithic
+ * "view" toggle.  Each cell maps to one main-window page: PatchBay /
+ * Graph / Arrangement / Trackers.  Active page = bright fill;
+ * inactive = darker / desaturated variant.  Tick state mirrors the
+ * Commands::show* ApplicationCommandInfo so it stays in sync with
+ * keyboard shortcuts + menu invocations. */
+class ViewSelectorBar : public juce::Component,
+                        private juce::Timer
+{
+public:
+    ViewSelectorBar()
+        : patchBtn ("P", juce::Colour::fromRGB ( 80, 160, 200)),
+          graphBtn ("G", juce::Colour::fromRGB (110, 170, 110)),
+          arrBtn   ("A", juce::Colour::fromRGB (220, 140,  60)),
+          trkBtn   ("T", juce::Colour::fromRGB (160, 100, 180))
+    {
+        auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID)
+        {
+            b.setTooltip (tip);
+            b.onClick = [this, commandID]() {
+                ViewHelpers::invokeDirectly (this, commandID, true);
+            };
+            addAndMakeVisible (b);
+        };
+        wire (patchBtn, "Patch Bay",    Commands::showPatchBay);
+        wire (graphBtn, "Graph Editor", Commands::showGraphEditor);
+        wire (arrBtn,   "Arrangement",  Commands::showArrangement);
+        wire (trkBtn,   "Trackers",     Commands::showTrackerHost);
+
+        startTimer (150); // tick-state refresh; cheap, no repaint when nothing changed
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        const int n  = 4;
+        const int w  = r.getWidth() / n;
+        patchBtn.setBounds (r.removeFromLeft (w));
+        graphBtn.setBounds (r.removeFromLeft (w));
+        arrBtn  .setBounds (r.removeFromLeft (w));
+        trkBtn  .setBounds (r);
+    }
+
+private:
+    void timerCallback() override
+    {
+        auto* gui = ViewHelpers::getGuiController (this);
+        if (gui == nullptr) return;
+        auto& cm = gui->commands();
+        auto refresh = [&cm] (BlockToolButton& b, int id)
+        {
+            const auto* info = cm.getCommandForID (id);
+            const bool ticked = info != nullptr
+                && (info->flags & juce::ApplicationCommandInfo::isTicked) != 0;
+            if (b.getToggleState() != ticked)
+            {
+                b.setToggleState (ticked, juce::dontSendNotification);
+                b.repaint();
+            }
+        };
+        refresh (patchBtn, Commands::showPatchBay);
+        refresh (graphBtn, Commands::showGraphEditor);
+        refresh (arrBtn,   Commands::showArrangement);
+        refresh (trkBtn,   Commands::showTrackerHost);
+    }
+
+    BlockToolButton patchBtn, graphBtn, arrBtn, trkBtn;
+};
+
 class Content::Toolbar : public Component,
                          public Button::Listener,
                          public Timer
 {
 public:
     Toolbar (Content& o)
-        : owner (o), viewBtn ("e")
+        : owner (o)
     {
-        addAndMakeVisible (viewBtn);
-        viewBtn.setButtonText (TRANS ("view"));
-
-        for (auto* b : { (Button*) &viewBtn })
-            b->addListener (this);
+        addAndMakeVisible (viewSelector);
         addAndMakeVisible (tempoBar);
         addAndMakeVisible (transport);
 
@@ -124,36 +190,42 @@ public:
     {
         Rectangle<int> r (getLocalBounds());
 
+        /* Tight padding — was 10px outer + 16px vertical, now 4px outer
+         * + 6px vertical.  Keeps the strip slim like the bottom
+         * statusbar and stops the top tempo/transport row from
+         * floating in dead space. */
         const int tempoBarWidth = jmax (120, tempoBar.getWidth());
-        const int tempoBarHeight = getHeight() - 16;
+        const int tempoBarHeight = getHeight() - 6;
 
-        tempoBar.setBounds (10, 8, tempoBarWidth, tempoBarHeight);
+        tempoBar.setBounds (4, 3, tempoBarWidth, tempoBarHeight);
 
-        r.removeFromRight (pluginMenu.isVisible() ? 4 : 10);
+        r.removeFromRight (4);
 
         if (pluginMenu.isVisible())
         {
             int pms = tempoBarHeight + 3;
             pluginMenu.setBounds (r.removeFromRight (tempoBarHeight).withSizeKeepingCentre (pms, pms));
-            r.removeFromRight (4);
+            r.removeFromRight (2);
         }
 
         if (midiBlinker.isVisible())
         {
             const int blinkerW = 8;
             midiBlinker.setBounds (r.removeFromRight (blinkerW).withSizeKeepingCentre (blinkerW, tempoBarHeight));
-            r.removeFromRight (4);
+            r.removeFromRight (2);
         }
 
-        if (viewBtn.isVisible())
+        if (viewSelector.isVisible())
         {
-            viewBtn.setBounds (r.removeFromRight (tempoBarHeight * 2)
-                                   .withSizeKeepingCentre (tempoBarHeight * 2, tempoBarHeight));
+            /* 4 colour-coded view buttons, each ~tempoBarHeight wide,
+             * total ~4× the old viewBtn footprint. */
+            viewSelector.setBounds (r.removeFromRight (tempoBarHeight * 4)
+                                       .withSizeKeepingCentre (tempoBarHeight * 4, tempoBarHeight));
         }
 
         if (mapButton.isVisible())
         {
-            r.removeFromRight (4);
+            r.removeFromRight (2);
             mapButton.setBounds (r.removeFromRight (tempoBarHeight * 2)
                                      .withSizeKeepingCentre (tempoBarHeight * 2, tempoBarHeight));
         }
@@ -168,17 +240,18 @@ public:
 
     void paint (Graphics& g) override
     {
-        g.setColour (Colors::contentBackgroundColor.brighter (0.1f));
+        /* Match the parent Content's backgroundColor (0xff16191A — the
+         * blue-grey tone) exactly.  This is the color the body area
+         * actually shows (Content::paint fills with backgroundColor,
+         * NOT contentBackgroundColor), so top + body + bottom read as
+         * one continuous frame. */
+        g.setColour (Colors::backgroundColor);
         g.fillRect (getLocalBounds());
     }
 
     void buttonClicked (Button* btn) override
     {
-        if (btn == &viewBtn)
-        {
-            ViewHelpers::invokeDirectly (this, Commands::rotateContentView, true);
-        }
-        else if (btn == &mapButton)
+        if (btn == &mapButton)
         {
             if (auto* mapping = owner.services().find<MappingService>())
             {
@@ -208,7 +281,7 @@ private:
     Content& owner;
     SessionPtr session;
     MidiIOMonitorPtr midiIOMonitor;
-    SettingButton viewBtn;
+    ViewSelectorBar viewSelector;
     SettingButton mapButton;
     TempoAndMeterBar tempoBar;
     TransportBar transport;
@@ -267,18 +340,18 @@ public:
 
     void paint (Graphics& g) override
     {
-        g.setColour (Colors::contentBackgroundColor.brighter (0.1f));
+        /* Match the top Toolbar + body — Colors::backgroundColor
+         * (0xff16191A blue-grey).  Top + body + bottom strips frame
+         * the body without a tone shift.  No top 2-line border — the
+         * status text sits flush against the body so the bottom strip
+         * blends in instead of slicing the window with a bright line. */
+        g.setColour (Colors::backgroundColor);
         g.fillRect (getLocalBounds());
 
         const Colour lineColor (0xff545454);
         g.setColour (lineColor);
-
         g.drawLine (streamingStatusLabel.getX(), 0, streamingStatusLabel.getX(), getHeight());
         g.drawLine (sampleRateLabel.getX(), 0, sampleRateLabel.getX(), getHeight());
-        g.setColour (lineColor.darker());
-        g.drawLine (0, 0, getWidth(), 0);
-        g.setColour (lineColor);
-        g.drawLine (0, 1, getWidth(), 1);
     }
 
     void resized() override
@@ -437,14 +510,16 @@ void Content::setStatusBarVisible (bool vis)
     if (statusBarVisible == vis)
         return;
     statusBarVisible = vis;
-    statusBar->setVisible (vis);
+    if (statusBar)
+        statusBar->setVisible (vis);
     resized();
     refreshStatusBar();
 }
 
 void Content::refreshStatusBar()
 {
-    statusBar->updateLabels();
+    if (statusBar)
+        statusBar->updateLabels();
 }
 
 Context& Content::context() { return _context; }

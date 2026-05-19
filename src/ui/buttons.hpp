@@ -55,6 +55,13 @@ public:
         pathReduction = juce::roundToInt (jmax (2.f, reduceby));
     }
 
+    /** Override the path-icon tint.  When unset (default Colour()),
+     *  the icon falls back to `getTextColour().brighter(0.15f)`.
+     *  Set per-button (e.g. play=green, stop=blue, record=red) so the
+     *  transport row is readable against the bold neutral border
+     *  recipe instead of melting into the dark body. */
+    inline void setIconColour (Colour c) { iconColour = c; repaint(); }
+
 protected:
     virtual Colour getTextColour()
     {
@@ -63,6 +70,8 @@ protected:
 
     /** @internal */
     void paintButton (Graphics& g, bool isMouseOverButton, bool isButtonDown) override;
+
+    Colour iconColour;
 
 private:
     String yes = "Yes";
@@ -182,9 +191,17 @@ public:
 
     void paint (Graphics& g) override
     {
-        const bool isOn = false;
+        /* Tracker-toolbar style: flat 0xff2c2c2c body + near-invisible
+         * dark border + 0xffd0d0d0 text.  Same recipe as
+         * SettingButton + BlockToolButton so the whole toolbar reads
+         * as one consistent strip. */
+        constexpr float cornerSize = 2.0f;
+        const auto box = getLocalBounds().reduced (1);
 
-        g.fillAll (isOn ? Colors::toggleOrange : Colors::widgetBackgroundColor.brighter());
+        g.setColour (Colour (0xff2c2c2c));
+        g.fillRoundedRectangle (box.toFloat(), cornerSize);
+        g.setColour (Colour (0xff5a5a5a));
+        g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.0f);
 
         String text;
         if (isEnabled() && tempoValue.toString().isNotEmpty())
@@ -203,12 +220,9 @@ public:
         if (text.isNotEmpty())
         {
             g.setFont (12.f);
-            g.setColour (isEnabled() ? Colours::black : Colours::darkgrey);
+            g.setColour (isEnabled() ? Colour (0xffd0d0d0) : Colour (0xff707070));
             g.drawText (text, getLocalBounds(), Justification::centred);
         }
-
-        g.setColour (Colors::widgetBackgroundColor.brighter().brighter());
-        g.drawRect (0, 0, getWidth(), getHeight());
     }
 
     void mouseDown (const MouseEvent& ev) override
@@ -324,9 +338,16 @@ public:
 
     void paint (Graphics& g) override
     {
-        const bool isOn = false;
+        /* Match the rest of the main toolbar — flat 0xff2c2c2c body,
+         * bold 0xff5a5a5a border, 0xffd0d0d0 text.  Same recipe as
+         * SettingButton / DragableIntLabel / TempoLabel / TapTempoButton. */
+        constexpr float cornerSize = 2.0f;
+        const auto box = getLocalBounds().reduced (1);
 
-        g.fillAll (isOn ? Colors::toggleOrange : element::Colors::widgetBackgroundColor.brighter());
+        g.setColour (Colour (0xff2c2c2c));
+        g.fillRoundedRectangle (box.toFloat(), cornerSize);
+        g.setColour (Colour (0xff5a5a5a));
+        g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.0f);
 
         String text = beatsPerBar.toString();
         text << " / " << String (BeatType ((BeatType::ID) (int) beatDivisor.getValue()).divisor());
@@ -334,12 +355,9 @@ public:
         if (text.isNotEmpty())
         {
             g.setFont (12.f);
-            g.setColour (isEnabled() ? Colours::black : Colours::darkgrey);
+            g.setColour (isEnabled() ? Colour (0xffd0d0d0) : Colour (0xff707070));
             g.drawText (text, getLocalBounds(), Justification::centred);
         }
-
-        g.setColour (element::Colors::widgetBackgroundColor.brighter().brighter());
-        g.drawRect (0, 0, getWidth(), getHeight());
     }
 
     void updateMeter (int bpb, int div, const bool notify = false)

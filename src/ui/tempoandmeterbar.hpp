@@ -191,19 +191,24 @@ private:
     protected:
         void paintButton (Graphics& g, bool isMouseOverButton, bool isButtonDown) override
         {
+            /* Block-style: rounded body + soft neutral border, matches
+             * SettingButton + BlockToolButton recipe. */
             const bool isOn = getToggleState();
+            constexpr float cornerSize = 2.4f;
+            const auto box = getLocalBounds().reduced (1);
 
-            g.fillAll (isOn ? Colors::toggleOrange : Colors::widgetBackgroundColor.brighter());
+            g.setColour (isOn ? Colors::toggleOrange.withMultipliedSaturation (0.55f).withMultipliedBrightness (0.7f)
+                              : Colour (0xff2c2c2c));
+            g.fillRoundedRectangle (box.toFloat(), cornerSize);
+            g.setColour (Colour (0xff5a5a5a));
+            g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.0f);
 
             if (getButtonText().isNotEmpty())
             {
                 g.setFont (Font (FontOptions (12.f)));
-                g.setColour (Colours::black);
+                g.setColour (Colours::white.withAlpha (isOn ? 1.0f : 0.85f));
                 g.drawText (getButtonText(), getLocalBounds(), Justification::centred);
             }
-
-            g.setColour (Colors::widgetBackgroundColor.brighter().brighter());
-            g.drawRect (0, 0, getWidth(), getHeight());
         }
     } extButton;
 
@@ -251,29 +256,28 @@ private:
 
         void paint (Graphics& g) override
         {
-            const bool isOn = false;
+            /* Tracker-toolbar style — flat dark body + soft border +
+             * light text.  Same recipe as SettingButton + BlockToolButton. */
+            constexpr float cornerSize = 2.0f;
+            const auto box = getLocalBounds().reduced (1);
 
-            g.fillAll (isOn ? Colors::toggleOrange : Colors::widgetBackgroundColor.brighter());
+            g.setColour (Colour (0xff2c2c2c));
+            g.fillRoundedRectangle (box.toFloat(), cornerSize);
+            g.setColour (Colour (0xff5a5a5a));
+            g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.0f);
 
             String text;
             if (isEnabled() && tempoValue.toString().isNotEmpty())
-            {
                 text = String ((double) tempoValue.getValue(), 2);
-            }
             else
-            {
                 text = String (engineTempo, 2);
-            }
 
             if (text.isNotEmpty())
             {
                 g.setFont (Font (FontOptions (12.f)));
-                g.setColour (isEnabled() ? Colours::black : Colours::darkgrey);
+                g.setColour (isEnabled() ? Colour (0xffd0d0d0) : Colour (0xff707070));
                 g.drawText (text, getLocalBounds(), Justification::centred);
             }
-
-            g.setColour (Colors::widgetBackgroundColor.brighter().brighter());
-            g.drawRect (0, 0, getWidth(), getHeight());
         }
 
         void resized() override
@@ -350,17 +354,22 @@ private:
     protected:
         void paintButton (Graphics& g, bool isMouseOverButton, bool isButtonDown) override
         {
-            g.fillAll (isButtonDown ? Colors::toggleOrange : Colors::widgetBackgroundColor.brighter());
+            constexpr float cornerSize = 2.0f;
+            const auto box = getLocalBounds().reduced (1);
+
+            g.setColour (isButtonDown
+                            ? Colors::toggleOrange.withMultipliedSaturation (0.65f).withMultipliedBrightness (0.7f)
+                            : Colour (0xff2c2c2c));
+            g.fillRoundedRectangle (box.toFloat(), cornerSize);
+            g.setColour (Colour (0xff5a5a5a));
+            g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.0f);
 
             if (getButtonText().isNotEmpty())
             {
                 g.setFont (Font (FontOptions (12.f)));
-                g.setColour (Colours::black);
+                g.setColour (Colour (0xffd0d0d0));
                 g.drawText (getButtonText(), getLocalBounds(), Justification::centred);
             }
-
-            g.setColour (Colors::widgetBackgroundColor.brighter().brighter());
-            g.drawRect (0, 0, getWidth(), getHeight());
         }
 
     private:

@@ -157,6 +157,10 @@ public:
     virtual void drawMenuBarBackground (juce::Graphics&, int width, int height, bool isMouseOverBar, juce::MenuBarComponent&) override;
     virtual void drawMenuBarItem (juce::Graphics&, int width, int height, int itemIndex, const juce::String& itemText, bool isMouseOverItem, bool isMenuOpen, bool isMouseOverBar, juce::MenuBarComponent&) override;
     virtual void getIdealPopupMenuItemSize (const juce::String& text, bool isSeparator, int standardMenuItemHeight, int& idealWidth, int& idealHeight) override;
+    virtual void drawPopupMenuItem (juce::Graphics&, const juce::Rectangle<int>& area,
+                                    bool isSeparator, bool isActive, bool isHighlighted, bool isTicked, bool hasSubMenu,
+                                    const juce::String& text, const juce::String& shortcutKeyText,
+                                    const juce::Drawable* icon, const juce::Colour* textColourToUse) override;
 
     virtual juce::Font getMenuBarFont (juce::MenuBarComponent&, int itemIndex, const juce::String& itemText) override;
 
