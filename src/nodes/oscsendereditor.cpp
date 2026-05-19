@@ -63,7 +63,13 @@ OSCSenderNodeEditor::OSCSenderNodeEditor (const Node& node)
     };
 
     oscSenderNodePtr->addChangeListener (this);
-    startTimerHz (60);
+    /* 60Hz was wasteful for a human-readable log view — LogListBox
+     * already coalesces multi-add bursts via triggerAsyncUpdate +
+     * single handleAsyncUpdate repaint, so the bottleneck was the
+     * 60-times-per-second lock+copy from the node's outbound queue.
+     * 24Hz keeps the log feeling live without doubling the polling
+     * cost over the rest of the diff-gated UI. */
+    startTimerHz (24);
 }
 
 OSCSenderNodeEditor::~OSCSenderNodeEditor()
@@ -81,12 +87,11 @@ OSCSenderNodeEditor::~OSCSenderNodeEditor()
 void OSCSenderNodeEditor::timerCallback()
 {
     const std::vector<OSCMessage> oscMessages = oscSenderNodePtr->getOscMessages();
-
-    for (auto msg : oscMessages)
-    {
+    if (oscMessages.empty())
+        return;
+    for (const auto& msg : oscMessages)
         oscSenderLog.addOSCMessage (msg);
-    }
-};
+}
 
 void OSCSenderNodeEditor::resized()
 {

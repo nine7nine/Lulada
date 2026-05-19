@@ -178,7 +178,15 @@ public:
             if (static_cast<float> (channelStrip.getVolume()) != cv)
                 channelStrip.setVolume (cv, dontSendNotification);
 
-            channelStrip.setPower (! ptr->isSuspended(), false);
+            /* setPower already self-gates (channelstrip.hpp:34
+             * early-returns when state unchanged), but reading
+             * isSuspended() once and comparing here avoids one extra
+             * call site per tick and keeps the diff-gate pattern
+             * consistent with the volume + mute branches above. */
+            const bool curPower = ! ptr->isSuspended();
+            if (channelStrip.isPowerOn() != curPower)
+                channelStrip.setPower (curPower, false);
+
             if (channelStrip.isMuted() != ptr->isMuted())
                 channelStrip.setMuted (ptr->isMuted(), false);
         }
