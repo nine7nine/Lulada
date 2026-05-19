@@ -3,6 +3,7 @@
 
 #include "ui/diskopview.hpp"
 #include "services/diskopservice.hpp"
+#include "ui/nativefilelist.hpp"
 
 #include <element/services.hpp>
 #include <element/context.hpp>
@@ -686,11 +687,14 @@ private:
  * DiskOpContentView::Impl
  * ========================================================================*/
 class DiskOpContentView::Impl : public Component,
-                                public FileBrowserListener
+                                public NativeFileListComponent::Listener
 {
 public:
-    explicit Impl (DiskOpContentView& owner) : owner_ (owner)
+    explicit Impl (DiskOpContentView& owner) : owner_ (owner),
+          browser_ (dirCache_)
     {
+        addAndMakeVisible (browser_);
+        browser_.addListener (this);
         for (int i = 0; i < (int) DiskOpService::Mode::kNumModes; ++i)
         {
             auto btn = std::make_unique<ToggleButton> (
@@ -730,9 +734,11 @@ public:
         };
         addAndMakeVisible (filenameEdit_);
 
-        rebuildBrowser();
+        applyWildcard();
+        if (DiskOpService::get().getCurrentDirectory().isDirectory())
+            browser_.setRoot (DiskOpService::get().getCurrentDirectory());
 
-        configureActionButton (refreshBtn_, "Refresh", [this] { refreshBrowser(); });
+        configureActionButton (refreshBtn_, "Refresh", [this] { browser_.refresh(); });
         configureActionButton (setPathBtn_, "Set path", [this] {
             DiskOpService::get().setCurrentDirectory (File (pathEdit_.getText().trim()));
         });
@@ -750,7 +756,7 @@ public:
         allFilesToggle_.setColour (ToggleButton::textColourId, kTextColour);
         allFilesToggle_.onClick = [this] {
             allFiles_ = allFilesToggle_.getToggleState();
-            rebuildBrowser();
+            applyWildcard();
         };
         addAndMakeVisible (allFilesToggle_);
 
@@ -792,7 +798,7 @@ public:
         if (sampleBank_) sampleBank_->connect (&services);
     }
 
-    ~Impl() override { detachBrowser(); }
+    ~Impl() override { browser_.removeListener (this); }
 
     void paint (Graphics& g) override
     {
@@ -864,8 +870,7 @@ public:
         filenameEdit_.setBounds (fileRow);
 
         browserCol.removeFromTop (6);
-        if (browser_ != nullptr)
-            browser_->setBounds (browserCol);
+        browser_.setBounds (browserCol);
 
         r.removeFromLeft (10);
 
@@ -913,39 +918,23 @@ public:
         g.drawText ("File:", filenameLabelArea_, Justification::centredLeft);
     }
 
-    /* === FileBrowserListener (relays into the service) ================== */
-    void selectionChanged() override
+    /* === NativeFileListComponent::Listener ============================== */
+    void selectionChanged (const File& sel) override
     {
-        if (browser_ == nullptr) return;
-        const auto sel = browser_->getSelectedFile (0);
         if (sel.existsAsFile())
         {
             DiskOpService::get().setSelectedFile (sel);
             filenameEdit_.setText (sel.getFileName(), dontSendNotification);
         }
-        else if (sel.isDirectory())
-        {
-            DiskOpService::get().setCurrentDirectory (sel);
-        }
     }
-    void fileClicked (const File&, const MouseEvent&) override {}
-    void fileDoubleClicked (const File& f) override
+    void fileActivated (const File& f) override
     {
-        if (f.isDirectory())
-        {
-            DiskOpService::get().setCurrentDirectory (f);
-            return;
-        }
-        if (f.existsAsFile())
-        {
-            DiskOpService::get().setSelectedFile (f);
-            statusLabel_.setText ("Selected: " + f.getFileName(), dontSendNotification);
-            /* Fire activation — Sample mode listens and loads into
-             * the currently focused slot. */
-            DiskOpService::get().fireActivation();
-        }
+        if (! f.existsAsFile()) return;
+        DiskOpService::get().setSelectedFile (f);
+        statusLabel_.setText ("Selected: " + f.getFileName(), dontSendNotification);
+        DiskOpService::get().fireActivation();
     }
-    void browserRootChanged (const File& newRoot) override
+    void rootChanged (const File& newRoot) override
     {
         DiskOpService::get().setCurrentDirectory (newRoot);
     }
@@ -964,17 +953,16 @@ public:
         modeBadge_.setText ("Mode: " + DiskOpService::getModeName (svc.getMode()),
                             dontSendNotification);
 
-        /* If the filter changed because the mode changed, rebuild. */
-        const auto wildcard = DiskOpService::getWildcardForMode (svc.getMode());
-        if (wildcard != currentWildcard_)
-            rebuildBrowser();
+        /* If the filter changed because the mode changed, push it
+         * through (no rebuild needed — the native lister filters in
+         * the worker thread). */
+        applyWildcard();
 
-        /* If cwd changed externally, push to the browser. */
-        if (browser_ != nullptr
-            && browser_->getRoot() != svc.getCurrentDirectory())
+        /* If cwd changed externally, push to the lister. */
+        if (browser_.getRoot() != svc.getCurrentDirectory()
+            && svc.getCurrentDirectory().isDirectory())
         {
-            if (svc.getCurrentDirectory().isDirectory())
-                browser_->setRoot (svc.getCurrentDirectory());
+            browser_.setRoot (svc.getCurrentDirectory());
         }
 
         /* Mode changed → re-layout to swap right-pane content. */
@@ -1004,47 +992,19 @@ private:
         addAndMakeVisible (b);
     }
 
-    void rebuildBrowser()
+    /** Sync the native lister's wildcard with the current mode +
+     *  "All files" toggle.  Cheap — the lister re-queries the cache
+     *  with the new filter and re-pulls from the cached snapshot
+     *  (or queues a worker scan if not cached yet). */
+    void applyWildcard()
     {
-        detachBrowser();
-
         auto& svc = DiskOpService::get();
-        currentWildcard_ = allFiles_
-                               ? "*"
+        const auto wildcard = allFiles_
+                               ? juce::String ("*")
                                : DiskOpService::getWildcardForMode (svc.getMode());
-        filter_ = std::make_unique<WildcardFileFilter> (
-            currentWildcard_, "*",
-            "Files for " + DiskOpService::getModeName (svc.getMode()) + " mode");
-
-        const auto start = svc.getCurrentDirectory().isDirectory()
-                              ? svc.getCurrentDirectory()
-                              : File::getSpecialLocation (File::userHomeDirectory);
-
-        browser_ = std::make_unique<FileBrowserComponent> (
-            FileBrowserComponent::openMode
-                | FileBrowserComponent::canSelectFiles
-                | FileBrowserComponent::filenameBoxIsReadOnly,
-            start, filter_.get(), nullptr);
-        browser_->addListener (this);
-        addAndMakeVisible (*browser_);
-        resized();
-    }
-
-    void detachBrowser()
-    {
-        if (browser_)
-        {
-            browser_->removeListener (this);
-            removeChildComponent (browser_.get());
-            browser_.reset();
-        }
-        filter_.reset();
-    }
-
-    void refreshBrowser()
-    {
-        if (browser_ != nullptr)
-            browser_->refresh();
+        if (wildcard == currentWildcard_) return;
+        currentWildcard_ = wildcard;
+        browser_.setWildcard (wildcard);
     }
 
     void rebuildWineDriveButtons()
@@ -1081,9 +1041,10 @@ private:
     TextButton refreshBtn_, setPathBtn_, homeBtn_, rootBtn_;
     OwnedArray<TextButton> wineBtns_;
 
-    /* Embedded file browser. */
-    std::unique_ptr<WildcardFileFilter>   filter_;
-    std::unique_ptr<FileBrowserComponent> browser_;
+    /* Embedded file browser — native POSIX-backed lister with a
+     * shared worker-thread cache (no juce::FileBrowserComponent). */
+    NativeDirCache          dirCache_;
+    NativeFileListComponent browser_;
     String currentWildcard_;
     bool   allFiles_ = false;
 
@@ -1141,10 +1102,6 @@ void DiskOpContentView::changeListenerCallback (ChangeBroadcaster*)
     if (impl_) impl_->syncFromService();
 }
 
-/* Stub overrides — Impl owns the real FileBrowserComponent + listener. */
-void DiskOpContentView::selectionChanged() {}
-void DiskOpContentView::fileClicked (const File&, const MouseEvent&) {}
-void DiskOpContentView::fileDoubleClicked (const File&) {}
-void DiskOpContentView::browserRootChanged (const File&) {}
+/* File-list events handled by Impl (NativeFileListComponent::Listener). */
 
 } // namespace element
