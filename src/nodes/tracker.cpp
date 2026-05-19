@@ -185,13 +185,13 @@ void TrackerNode::drainEngineToMidi (RenderContext& rc, int numSamples)
 
 void TrackerNode::installTestPattern()
 {
-    /* 16-row × 2-track demo. Phase-2 placeholder until the editor can
-     * author patterns. Both tracks emit on port 0 (same JUCE MidiBuffer)
-     * but different MIDI channels (1 and 2). */
+    /* 16-row × 2-track demo. Both tracks emit on the single MIDI output
+     * port; they separate downstream by MIDI channel (1 vs 2). Use a
+     * MidiChannelSplitter / MidiRouter to fan out per-channel. */
     constexpr int kLen = 16;
     sequence* seq = sequence_new (kLen);
 
-    /* Track 0 — channel 1 (display "Channel 1"), descending bass line. */
+    /* Track 0 — port 0, MIDI channel 1, descending bass line. */
     track* trk0 = track_new (0, 0, kLen, kLen, TRACK_DEF_CTRLPR);
     track_set_row (trk0, 0,  0, 1, 36, 110, 0); // C2
     track_set_row (trk0, 0,  4, 1, 43, 100, 0); // G2
@@ -199,7 +199,7 @@ void TrackerNode::installTestPattern()
     track_set_row (trk0, 0, 12, 1, 39,  90, 0); // D#2
     sequence_add_track (seq, trk0);
 
-    /* Track 1 — channel 2, melodic 8th-note arp over an octave. */
+    /* Track 1 — port 0 (shared), MIDI channel 2, melodic 8th-note arp. */
     track* trk1 = track_new (0, 1, kLen, kLen, TRACK_DEF_CTRLPR);
     track_set_row (trk1, 0,  0, 1, 60, 100, 0); // C4
     track_set_row (trk1, 0,  2, 1, 64, 100, 0); // E4
@@ -226,21 +226,133 @@ void TrackerNode::refreshPorts()
     if (createdPorts_) return;
 
     PortList newPorts;
-    /* Phase 1: 1 MIDI output. Expand to 16 (one per track) in Phase 2. */
+    /* Single MIDI output port. Tracks separate by MIDI channel on the
+     * wire — Element graph downstream uses MidiChannelSplitter or
+     * MidiRouter to fan out per-channel.  (Multi-output topology will
+     * matter when the Sampler node lands — that's an AUDIO concern,
+     * DESIGN.md Option A — but MIDI is fine on a single port.) */
     newPorts.add (PortType::Midi, 0, 0, "midi_out", "MIDI Out", false);
     createdPorts_ = true;
     setPorts (newPorts);
 }
 
-void TrackerNode::setState (const void* data, int size)
-{
-    (void) data; (void) size;
-    /* State persistence comes in Phase 2 with the pattern editor. */
-}
-
 void TrackerNode::getState (juce::MemoryBlock& block)
 {
-    (void) block;
+    juce::ValueTree tree ("tracker");
+
+    {
+        juce::ScopedLock sl (engineLock_);
+        if (mod_ != nullptr && mod_->curr_seq != nullptr)
+        {
+            auto* seq = mod_->curr_seq;
+            tree.setProperty ("bpm",    (double) mod_->bpm, nullptr);
+            tree.setProperty ("length", seq->length,        nullptr);
+            tree.setProperty ("rpb",    seq->rpb,           nullptr);
+
+            for (int t = 0; t < seq->ntrk; ++t)
+            {
+                auto* trk = seq->trk[t];
+                if (! trk) continue;
+
+                juce::ValueTree tt ("track");
+                tt.setProperty ("port",    trk->port,    nullptr);
+                tt.setProperty ("channel", trk->channel, nullptr);
+                tt.setProperty ("ncols",   trk->ncols,   nullptr);
+
+                /* Only save non-empty cells to keep state compact. */
+                for (int c = 0; c < trk->ncols; ++c)
+                {
+                    for (int r = 0; r < seq->length; ++r)
+                    {
+                        const auto& row = trk->rows[c][r];
+                        if (row.type == 0) continue;
+
+                        juce::ValueTree rowNode ("row");
+                        rowNode.setProperty ("c", c,             nullptr);
+                        rowNode.setProperty ("r", r,             nullptr);
+                        rowNode.setProperty ("t", row.type,      nullptr);
+                        rowNode.setProperty ("n", row.note,      nullptr);
+                        rowNode.setProperty ("v", row.velocity,  nullptr);
+                        tt.appendChild (rowNode, nullptr);
+                    }
+                }
+                tree.appendChild (tt, nullptr);
+            }
+        }
+    }
+
+    juce::MemoryOutputStream stream (block, false);
+    {
+        juce::GZIPCompressorOutputStream gzip (stream);
+        tree.writeToStream (gzip);
+    }
+}
+
+void TrackerNode::setState (const void* data, int size)
+{
+    if (data == nullptr || size <= 0) return;
+
+    const auto tree = juce::ValueTree::readFromGZIPData (data, (size_t) size);
+    if (! tree.isValid() || tree.getType() != juce::Identifier ("tracker"))
+        return;
+
+    juce::ScopedLock sl (engineLock_);
+
+    /* Tear down current module + rebuild from saved state. */
+    if (mod_ != nullptr)
+    {
+        module_play (mod_, 0);
+        module_free (mod_);
+        mod_ = nullptr;
+    }
+
+    mod_ = module_new();
+    if (mod_ == nullptr) return;
+
+    const float bpm    = (float) (double) tree.getProperty ("bpm",    120.0);
+    const int   length =         (int)    tree.getProperty ("length", 16);
+    const int   rpb    =         (int)    tree.getProperty ("rpb",    4);
+
+    sequence* seq = sequence_new (length);
+    seq->rpb = rpb;
+
+    for (int i = 0; i < tree.getNumChildren(); ++i)
+    {
+        const auto tt = tree.getChild (i);
+        if (tt.getType() != juce::Identifier ("track")) continue;
+
+        const int port    = (int) tt.getProperty ("port",    0);
+        const int channel = (int) tt.getProperty ("channel", 0);
+
+        track* trk = track_new (port, channel, length, length, TRACK_DEF_CTRLPR);
+
+        for (int j = 0; j < tt.getNumChildren(); ++j)
+        {
+            const auto rowNode = tt.getChild (j);
+            if (rowNode.getType() != juce::Identifier ("row")) continue;
+
+            const int c     = (int) rowNode.getProperty ("c", 0);
+            const int r     = (int) rowNode.getProperty ("r", 0);
+            const int rtype = (int) rowNode.getProperty ("t", 0);
+            const int note  = (int) rowNode.getProperty ("n", 0);
+            const int vel   = (int) rowNode.getProperty ("v", 100);
+
+            if (r >= 0 && r < length)
+                track_set_row (trk, c, r, rtype, note, vel, 0);
+        }
+        sequence_add_track (seq, trk);
+    }
+
+    module_add_sequence (mod_, seq);
+    mod_->curr_seq = seq;
+    mod_->bpm      = bpm;
+    sequence_set_playing (seq, 1);
+
+    mod_->clt->jack_sample_rate = (jack_nframes_t) currentSampleRate_;
+    mod_->clt->jack_buffer_size = (jack_nframes_t) currentBufferSize_;
+    mod_->clt->jack_last_frame  = 0;
+    sampleCounter_     = 0;
+    lastPlayingState_  = false;
 }
 
 } // namespace element
