@@ -33,6 +33,41 @@ typedef struct rec_update_t {
 	int row;
 } rec_upd;
 
+/* Element-NSPA per-column FT2 effect state.  Persists between row triggers
+ * to drive per-tick voice-level effects (vibrato, slides, tremolo) emitted
+ * as MIDI by track_emit_voice_fx_block(). One slot per active row-cell
+ * column (trk->ncols).  Zeroed in track_clear_rows / track_resize. */
+typedef struct track_fx_state_t {
+	/* Vibrato 4xy: x=speed, y=depth.  Re-triggered each row that
+	 * carries a 4xy code; left running otherwise. */
+	int vib_speed;
+	int vib_depth;
+	int vib_pos;          /* 0..255 sine position */
+
+	/* Volume slide Axy: x=up, y=down (per tick at 50Hz nominal).  We
+	 * emit running CC7 each block until the slide is reset. */
+	int slide_up;
+	int slide_down;
+	int slide_vol;        /* current running volume 0..127, -1 = inactive */
+
+	/* Pitch slides 1xx/2xx: positive = up, negative = down (per tick). */
+	int pitch_speed;
+	int pitch_bend;       /* current bend offset −8192..+8191 */
+
+	/* Tremolo 7xy: LFO over CC7.  Speed/depth same shape as vibrato. */
+	int trem_speed;
+	int trem_depth;
+	int trem_pos;
+
+	/* Arpeggio 0xy: base+x+y semitone cycle.  Counter is mod-3.
+	 * Note: requires per-block multi-note-on emission; this version
+	 * only re-emits the cycle at block boundaries. */
+	int arp_x;
+	int arp_y;
+	int arp_counter;
+	int arp_base_note;    /* root for the arp cycle */
+} track_fx_state;
+
 typedef struct track_t {
 	int port;
 	int channel;
@@ -80,6 +115,17 @@ typedef struct track_t {
 	int *lplayed;
 	int *lsounded;
 	int *mand_qnt;
+
+	/* Element-NSPA per-column FX state for voice-level effects.
+	 *   fx[c] is allocated/freed in lockstep with rows[c]. */
+	track_fx_state *fx;
+
+	/* Element-NSPA module-level effect state cached per-track:
+	 *   global_vol     = Gxx scale 0..64, applied to outgoing velocity
+	 *   global_slide   = Hxy slope, applied to global_vol per block */
+	int global_vol;
+	int global_slide_up;
+	int global_slide_down;
 
 	int resync;
 
@@ -144,6 +190,10 @@ void track_handle_record(track *trk, midi_event evt);
 
 void track_reset(track *trk);
 void track_advance(track *trk, double speriod, jack_nframes_t nframes);
+/* Emit voice-level FT2 effects (vibrato / slides / tremolo / arpeggio)
+ * as MIDI CCs / pitch-bend / note-ons spread across the current block.
+ * Called by track_advance after row triggering. */
+void track_emit_voice_fx_block(track *trk, int frame_offset, int nframes);
 void track_wind(track *trk, double speriod);
 void track_kill_notes(track *trk);
 

@@ -92,6 +92,7 @@ track *track_new(int port, int channel, int len, int songlen, int ctrlpr) {
 	trk->lplayed = malloc(sizeof(int) * trk->ncols);
 	trk->lsounded = malloc(sizeof(int) * trk->ncols);
 	trk->mand_qnt = malloc(sizeof(int) * trk->ncols);
+	trk->fx = calloc(trk->ncols, sizeof(track_fx_state));
 
 	for (int c = 0; c < trk->ncols; c++) {
 		trk->rows[c] = malloc(sizeof(row) * trk->nrows);
@@ -101,7 +102,13 @@ track *track_new(int port, int channel, int len, int songlen, int ctrlpr) {
 		trk->lplayed[c] = -1;
 		trk->lsounded[c] = -1;
 		trk->mand_qnt[c] = -232323;
+		trk->fx[c].slide_vol  = -1;
+		trk->fx[c].pitch_bend = 0;
 	}
+
+	trk->global_vol = 64;
+	trk->global_slide_up = 0;
+	trk->global_slide_down = 0;
 
 	trk->ctrlpr = ctrlpr;
 	if (trk->ctrlpr < 1)
@@ -386,6 +393,7 @@ void track_free(track *trk) {
 	free(trk->env);
 	mandy_free(trk->mand);
 	free(trk->mand_qnt);
+	free(trk->fx);
 	free(trk);
 }
 
@@ -707,16 +715,23 @@ void track_play_row(track *trk, int pos, int c, int delay) {
 		evt.velocity = r.velocity_next;
 		trk->lsounded[c] = pos;
 
-		/* Element-NSPA FX dispatch — phase 1: note-level + state.
-		 *   Cxx → override velocity (clamped 0..127)
-		 *   Fxx → set BPM (param > 0)
-		 *   Bxx → pending pattern jump (mod->seq[param])
-		 *   Dxx → pending pattern break, advance to next pattern
-		 *         starting at row = param (hex). */
+		/* Element-NSPA FX dispatch — row-trigger handlers + voice-fx
+		 * state setup.  Voice-level effects (4xy/Axy/1xx/2xx/7xy/0xy)
+		 * are persisted onto trk->fx[c] and animated per-block by
+		 * track_emit_voice_fx_block(). */
+		track_fx_state *fx_st = &trk->fx[c];
+		/* Reset persistent per-tick state when no fx is carrying it. */
+		int row_has_vibrato = 0, row_has_volslide = 0;
+		int row_has_pitch   = 0, row_has_tremolo = 0;
+		int row_has_arp     = 0;
+
 		for (int fxi = 0; fxi < 2; fxi++) {
 			int fx = r.fx[fxi];
 			int p  = r.fxParam[fxi] & 0xff;
+			int hi = (p >> 4) & 0x0f;
+			int lo = p & 0x0f;
 			switch (fx) {
+				/* === engine-level / row-trigger only === */
 				case 'C':
 					evt.velocity = (p > 127) ? 127 : p;
 					break;
@@ -728,7 +743,6 @@ void track_play_row(track *trk, int pos, int c, int delay) {
 					mod->pending_break_row    = -1;
 					break;
 				case 'D':
-					/* Pattern break: advance to NEXT pattern at row p. */
 					if (mod->pending_pattern_jump < 0) {
 						int curIdx = 0;
 						for (int s = 0; s < mod->nseq; s++)
@@ -737,8 +751,97 @@ void track_play_row(track *trk, int pos, int c, int delay) {
 					}
 					mod->pending_break_row = p;
 					break;
+				case 'G': /* Global volume (0..64) — scales velocity */
+					trk->global_vol = (p > 64) ? 64 : p;
+					break;
+				case 'H': /* Global volume slide xy: x=up, y=down */
+					trk->global_slide_up   = hi;
+					trk->global_slide_down = lo;
+					break;
+				case '8': /* Set panning (0..255) — emit CC10 directly */
+					{
+						midi_event pev;
+						pev.time = delay;
+						pev.channel = trk->channel;
+						pev.type = control_change;
+						pev.control = 10;
+						pev.data = (p > 127) ? 127 : p;
+						midi_buffer_add(trk->clt, trk->port, pev);
+					}
+					break;
+				/* === voice-level: persist state for block animator === */
+				case '4': /* Vibrato xy: speed,depth */
+					fx_st->vib_speed = hi;
+					fx_st->vib_depth = lo;
+					row_has_vibrato = 1;
+					break;
+				case 'A': /* Volume slide xy: x=up, y=down (per tick) */
+					fx_st->slide_up   = hi;
+					fx_st->slide_down = lo;
+					if (fx_st->slide_vol < 0)
+						fx_st->slide_vol = evt.velocity;
+					row_has_volslide = 1;
+					break;
+				case '1': /* Pitch slide up: param per tick */
+					fx_st->pitch_speed = p;
+					row_has_pitch = 1;
+					break;
+				case '2': /* Pitch slide down */
+					fx_st->pitch_speed = -p;
+					row_has_pitch = 1;
+					break;
+				case '7': /* Tremolo xy: speed,depth */
+					fx_st->trem_speed = hi;
+					fx_st->trem_depth = lo;
+					row_has_tremolo = 1;
+					break;
+				case '0': /* Arpeggio xy: base+x+y semitones cycle */
+					fx_st->arp_x = hi;
+					fx_st->arp_y = lo;
+					fx_st->arp_base_note = r.note;
+					row_has_arp = 1;
+					break;
+				/* === Exx sub-effects === */
+				case 'E':
+					switch (hi) {
+						case 1: /* E1x fine pitch up */
+							fx_st->pitch_bend += lo * 8;
+							if (fx_st->pitch_bend >  8191) fx_st->pitch_bend =  8191;
+							break;
+						case 2: /* E2x fine pitch down */
+							fx_st->pitch_bend -= lo * 8;
+							if (fx_st->pitch_bend < -8192) fx_st->pitch_bend = -8192;
+							break;
+						case 0xA: /* EAx fine vol up */
+							if (fx_st->slide_vol < 0) fx_st->slide_vol = evt.velocity;
+							fx_st->slide_vol += lo;
+							if (fx_st->slide_vol > 127) fx_st->slide_vol = 127;
+							break;
+						case 0xB: /* EBx fine vol down */
+							if (fx_st->slide_vol < 0) fx_st->slide_vol = evt.velocity;
+							fx_st->slide_vol -= lo;
+							if (fx_st->slide_vol < 0) fx_st->slide_vol = 0;
+							break;
+						default: break;
+					}
+					break;
 				default: break;
 			}
+		}
+
+		/* Effects not carried on this row → cancel persistent state.
+		 * FT2 behaviour: vibrato/tremolo continue across rows only when
+		 * the row explicitly carries the 4xy/7xy code with non-zero
+		 * params (or 0-param = re-use last). */
+		if (!row_has_vibrato)   { fx_st->vib_speed = fx_st->vib_depth = 0; }
+		if (!row_has_volslide)  { fx_st->slide_up = fx_st->slide_down = 0; }
+		if (!row_has_pitch)     { fx_st->pitch_speed = 0; }
+		if (!row_has_tremolo)   { fx_st->trem_speed = fx_st->trem_depth = 0; }
+		if (!row_has_arp)       { fx_st->arp_x = fx_st->arp_y = 0; }
+
+		/* Apply global volume scale to outgoing velocity. */
+		if (trk->global_vol < 64) {
+			evt.velocity = (evt.velocity * trk->global_vol) / 64;
 		}
 
 		midi_buffer_add(trk->clt, trk->port, evt);
@@ -998,6 +1101,163 @@ void track_strum(track *trk, double pos_from, double pos_to, jack_nframes_t nfra
 	}
 }
 
+/* === Element-NSPA voice-fx block animator ===========================
+ *
+ * Emits per-tick FT2 effect events (vibrato CC1 LFO, vol slide CC7 ramp,
+ * pitch slide pitch-bend, tremolo CC7 LFO, arpeggio note-on cycle) for
+ * each track column where the persistent FX state is non-zero.  Called
+ * by track_advance after row triggering.  Sub-block granularity = 8
+ * events per block — smooth enough for LFOs at typical block sizes
+ * (1024 samples → ~125 events/sec @ 48k).
+ *
+ * Three-destination translation: output is always MIDI on the track's
+ * port/channel.  Sampler-bound destinations interpret CC1/CC7/etc.
+ * directly; hosted plugins receive them as standard MIDI CCs.  A
+ * plugin-param binding table (TrackerNode::FxBinding) overrides the
+ * default CC mapping when a bind exists for (track, fx_code).
+ */
+static const int8_t kSinTab[64] = {
+       0,  12,  25,  37,  49,  60,  71,  81,
+      90,  98, 106, 112, 117, 121, 124, 126,
+     127, 126, 124, 121, 117, 112, 106,  98,
+      90,  81,  71,  60,  49,  37,  25,  12,
+       0, -12, -25, -37, -49, -60, -71, -81,
+     -90, -98,-106,-112,-117,-121,-124,-126,
+    -127,-126,-124,-121,-117,-112,-106, -98,
+     -90, -81, -71, -60, -49, -37, -25, -12
+};
+
+void track_emit_voice_fx_block(track *trk, int frame_offset, int nframes) {
+	if (trk == NULL || trk->fx == NULL || trk->clt == NULL) return;
+
+	midi_client *clt = (midi_client *)trk->clt;
+	if (!trk->playing) return;
+
+	/* Apply global vol slide once per block. */
+	if (trk->global_slide_up > 0) {
+		trk->global_vol += trk->global_slide_up;
+		if (trk->global_vol > 64) trk->global_vol = 64;
+	}
+	if (trk->global_slide_down > 0) {
+		trk->global_vol -= trk->global_slide_down;
+		if (trk->global_vol < 0) trk->global_vol = 0;
+	}
+
+	const int kSubsteps = 4;
+
+	for (int c = 0; c < trk->ncols; c++) {
+		track_fx_state *fx_st = &trk->fx[c];
+		const int has_vib   = (fx_st->vib_depth > 0 && fx_st->vib_speed > 0);
+		const int has_trem  = (fx_st->trem_depth > 0 && fx_st->trem_speed > 0);
+		const int has_pitch = (fx_st->pitch_speed != 0);
+		const int has_vol   = (fx_st->slide_up > 0 || fx_st->slide_down > 0);
+		const int has_arp   = (fx_st->arp_x > 0 || fx_st->arp_y > 0);
+
+		if (!has_vib && !has_trem && !has_pitch && !has_vol && !has_arp)
+			continue;
+
+		const int per_step = nframes > 0 ? (nframes / kSubsteps) : 0;
+		if (per_step <= 0) continue;
+
+		for (int s = 0; s < kSubsteps; s++) {
+			int sub_time = frame_offset + s * per_step;
+
+			/* Vibrato → CC1 modulation wheel. */
+			if (has_vib) {
+				fx_st->vib_pos = (fx_st->vib_pos + fx_st->vib_speed) & 63;
+				int v = kSinTab[fx_st->vib_pos];
+				int amp = (v * fx_st->vib_depth) / 16;        /* -64..+64 */
+				int cc1 = 64 + amp;
+				if (cc1 < 0)   cc1 = 0;
+				if (cc1 > 127) cc1 = 127;
+				midi_event evt;
+				evt.time = sub_time;
+				evt.channel = trk->channel;
+				evt.type = control_change;
+				evt.control = 1;
+				evt.data = cc1;
+				midi_buffer_add(clt, trk->port, evt);
+			}
+
+			/* Tremolo → CC7 LFO. */
+			if (has_trem) {
+				fx_st->trem_pos = (fx_st->trem_pos + fx_st->trem_speed) & 63;
+				int v = kSinTab[fx_st->trem_pos];
+				int amp = (v * fx_st->trem_depth) / 16;
+				int cc7 = 100 + amp;
+				if (cc7 < 0)   cc7 = 0;
+				if (cc7 > 127) cc7 = 127;
+				midi_event evt;
+				evt.time = sub_time;
+				evt.channel = trk->channel;
+				evt.type = control_change;
+				evt.control = 7;
+				evt.data = cc7;
+				midi_buffer_add(clt, trk->port, evt);
+			}
+
+			/* Volume slide → CC7 ramp (running). */
+			if (has_vol) {
+				if (fx_st->slide_vol < 0) fx_st->slide_vol = 100;
+				fx_st->slide_vol += fx_st->slide_up;
+				fx_st->slide_vol -= fx_st->slide_down;
+				if (fx_st->slide_vol < 0)   fx_st->slide_vol = 0;
+				if (fx_st->slide_vol > 127) fx_st->slide_vol = 127;
+				/* Emit one CC7 per block (not per substep) to avoid
+				 * jitter; sub-block granularity is unneeded for vol. */
+				if (s == 0) {
+					midi_event evt;
+					evt.time = sub_time;
+					evt.channel = trk->channel;
+					evt.type = control_change;
+					evt.control = 7;
+					evt.data = fx_st->slide_vol;
+					midi_buffer_add(clt, trk->port, evt);
+				}
+			}
+
+			/* Pitch slide → pitch-bend ramp.  fx_st->pitch_speed is a
+			 * signed per-tick step; one block contains ~4 ticks of
+			 * progression. */
+			if (has_pitch) {
+				fx_st->pitch_bend += fx_st->pitch_speed * 4;
+				if (fx_st->pitch_bend >  8191) fx_st->pitch_bend =  8191;
+				if (fx_st->pitch_bend < -8192) fx_st->pitch_bend = -8192;
+				if (s == 0) {
+					midi_event evt;
+					evt.time = sub_time;
+					evt.channel = trk->channel;
+					evt.type = pitch_wheel;
+					int bend = fx_st->pitch_bend + 8192;
+					evt.note = bend & 0x7f;       /* lsb */
+					evt.velocity = (bend >> 7) & 0x7f; /* msb */
+					midi_buffer_add(clt, trk->port, evt);
+				}
+			}
+
+			/* Arpeggio: cycle base, base+x, base+y semitones.  Emits
+			 * rapid note-on triplets — destination plugin will hear
+			 * audible clicks; this is FT2-accurate behaviour. */
+			if (has_arp && fx_st->arp_base_note > 0) {
+				fx_st->arp_counter = (fx_st->arp_counter + 1) % 3;
+				int offs = 0;
+				if (fx_st->arp_counter == 1) offs = fx_st->arp_x;
+				if (fx_st->arp_counter == 2) offs = fx_st->arp_y;
+				int an = fx_st->arp_base_note + offs;
+				if (an < 0)   an = 0;
+				if (an > 127) an = 127;
+				midi_event ne;
+				ne.time = sub_time;
+				ne.channel = trk->channel;
+				ne.type = note_on;
+				ne.note = an;
+				ne.velocity = 100;
+				midi_buffer_add(clt, trk->port, ne);
+			}
+		}
+	}
+}
+
 void track_advance(track *trk, double speriod, jack_nframes_t nframes) {
 	if (trk->resync) {
 		return;
@@ -1075,6 +1335,11 @@ void track_advance(track *trk, double speriod, jack_nframes_t nframes) {
 		trk->last_period = tperiod;
 		return;
 	}
+
+	/* Element-NSPA voice-fx animator: spreads per-tick FT2 effects
+	 * (vibrato / vol slide / pitch slide / tremolo / arpeggio) as
+	 * MIDI events across this block before the row triggers. */
+	track_emit_voice_fx_block(trk, clt->jack_buffer_size - nframes, (int) nframes);
 
 	// play notes
 	//if (!(!row_start && row_end == trk->nrows))
@@ -1291,11 +1556,15 @@ void track_add_col(track *trk) {
 	trk->lplayed = realloc(trk->lplayed, sizeof(int) * trk->ncols);
 	trk->lsounded = realloc(trk->lsounded, sizeof(int) * trk->ncols);
 	trk->mand_qnt = realloc(trk->mand_qnt, sizeof(int) * trk->ncols);
+	trk->fx = realloc(trk->fx, sizeof(track_fx_state) * trk->ncols);
 
 	trk->ring[trk->ncols - 1] = -1;
 	trk->lplayed[trk->ncols - 1] = -1;
 	trk->lsounded[trk->ncols - 1] = -1;
 	trk->mand_qnt[trk->ncols - 1] = -1;
+	memset(&trk->fx[trk->ncols - 1], 0, sizeof(track_fx_state));
+	trk->fx[trk->ncols - 1].slide_vol  = -1;
+	trk->fx[trk->ncols - 1].pitch_bend = 0;
 	trk->dirty = 1;
 	trk_should_save(trk);
 	pthread_mutex_unlock(&trk->excl);
@@ -1348,6 +1617,7 @@ void track_del_col(track *trk, int c) {
 		trk->lplayed[cc] = trk->lplayed[cc+1];
 		trk->lsounded[cc] = trk->lsounded[cc+1];
 		trk->mand_qnt[cc] = trk->mand_qnt[cc+1];
+		trk->fx[cc] = trk->fx[cc+1];
 	}
 
 	trk->ncols--;
@@ -1357,6 +1627,7 @@ void track_del_col(track *trk, int c) {
 	trk->lplayed = realloc(trk->lplayed, sizeof(int) * trk->ncols);
 	trk->lsounded = realloc(trk->lsounded, sizeof(int) * trk->ncols);
 	trk->mand_qnt = realloc(trk->mand_qnt, sizeof(int) * trk->ncols);
+	trk->fx = realloc(trk->fx, sizeof(track_fx_state) * trk->ncols);
 
 	trk->dirty = 1;
 	trk_should_save(trk);
