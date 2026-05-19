@@ -185,13 +185,14 @@ void TrackerNode::drainEngineToMidi (RenderContext& rc, int numSamples)
 
 void TrackerNode::installTestPattern()
 {
-    /* 16-row × 2-track demo. Phase-2 placeholder until the editor can
-     * author patterns. Both tracks emit on port 0 (same JUCE MidiBuffer)
-     * but different MIDI channels (1 and 2). */
+    /* 16-row × 2-track demo. Each track routes to its own JUCE MidiBuffer
+     * output (track 0 → port 0, track 1 → port 1) so downstream nodes can
+     * be wired independently in Element's graph.  Channels 1 & 2 also
+     * differ in case a downstream node prefers channel-routing. */
     constexpr int kLen = 16;
     sequence* seq = sequence_new (kLen);
 
-    /* Track 0 — channel 1 (display "Channel 1"), descending bass line. */
+    /* Track 0 — port 0, MIDI channel 1, descending bass line. */
     track* trk0 = track_new (0, 0, kLen, kLen, TRACK_DEF_CTRLPR);
     track_set_row (trk0, 0,  0, 1, 36, 110, 0); // C2
     track_set_row (trk0, 0,  4, 1, 43, 100, 0); // G2
@@ -199,8 +200,8 @@ void TrackerNode::installTestPattern()
     track_set_row (trk0, 0, 12, 1, 39,  90, 0); // D#2
     sequence_add_track (seq, trk0);
 
-    /* Track 1 — channel 2, melodic 8th-note arp over an octave. */
-    track* trk1 = track_new (0, 1, kLen, kLen, TRACK_DEF_CTRLPR);
+    /* Track 1 — port 1, MIDI channel 2, melodic 8th-note arp. */
+    track* trk1 = track_new (1, 1, kLen, kLen, TRACK_DEF_CTRLPR);
     track_set_row (trk1, 0,  0, 1, 60, 100, 0); // C4
     track_set_row (trk1, 0,  2, 1, 64, 100, 0); // E4
     track_set_row (trk1, 0,  4, 1, 67, 100, 0); // G4
@@ -226,8 +227,19 @@ void TrackerNode::refreshPorts()
     if (createdPorts_) return;
 
     PortList newPorts;
-    /* Phase 1: 1 MIDI output. Expand to 16 (one per track) in Phase 2. */
-    newPorts.add (PortType::Midi, 0, 0, "midi_out", "MIDI Out", false);
+    /* 4 MIDI output ports — track N routes to port N for the first 4
+     * tracks. Beyond that, tracks share port 3 (engine still emits on
+     * the per-track port field). Element graph shows 4 distinct output
+     * pins so each track can wire to its own downstream node per
+     * DESIGN.md Option A. */
+    int idx = 0;
+    for (int p = 0; p < 4; ++p)
+    {
+        newPorts.add (PortType::Midi, idx++, p,
+                      juce::String::formatted ("midi_out_%d", p),
+                      juce::String::formatted ("Out %d", p + 1),
+                      false);
+    }
     createdPorts_ = true;
     setPorts (newPorts);
 }

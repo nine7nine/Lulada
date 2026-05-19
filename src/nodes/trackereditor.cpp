@@ -138,6 +138,30 @@ public:
         return kTrackHeaderH + juce::jmax (1, rows) * kRowHeight;
     }
 
+    /** Resize this Component to the full pattern extent so the parent
+     *  Viewport can scroll. Called from the editor's timer + resized. */
+    void updateGridSize()
+    {
+        if (trackerNode == nullptr) return;
+
+        int rows = 16, ntrk = 1;
+        {
+            juce::ScopedLock sl (trackerNode->engineLock());
+            if (auto* mod = trackerNode->modulePtr())
+            {
+                if (auto* seq = mod->curr_seq)
+                {
+                    rows = seq->length;
+                    ntrk = seq->ntrk;
+                }
+            }
+        }
+        const int w = desiredWidth (ntrk);
+        const int h = desiredHeight (rows);
+        if (getWidth() != w || getHeight() != h)
+            setSize (w, h);
+    }
+
     bool keyPressed (const juce::KeyPress& kp) override
     {
         const int kc = kp.getKeyCode();
@@ -446,7 +470,25 @@ private:
     {
         cursorRow   = juce::jlimit (0, juce::jmax (0, s.rows - 1), row);
         cursorTrack = juce::jlimit (0, juce::jmax (0, s.ntrk - 1), trk);
+        ensureCursorVisible();
         repaint();
+    }
+
+    /** Scroll the parent Viewport so the cursor cell stays on screen. */
+    void ensureCursorVisible()
+    {
+        if (auto* vp = findParentComponentOfClass<juce::Viewport>())
+        {
+            const int rowY = kTrackHeaderH + cursorRow * kRowHeight;
+            const int trkX = kRowGutterWidth + cursorTrack * kTrackWidth;
+            const juce::Rectangle<int> cell (trkX, rowY,
+                                              kTrackWidth, kRowHeight);
+            const auto vis = vp->getViewArea();
+            if (! vis.contains (cell))
+                vp->setViewPosition (
+                    juce::jmax (0, trkX - vis.getWidth() / 2),
+                    juce::jmax (0, rowY - vis.getHeight() / 2));
+        }
     }
 
     /** Write a note (>= 0) or clear (< 0) at the cursor. Advances cursor
@@ -493,18 +535,29 @@ TrackerEditor::TrackerEditor (const Node& n)
     : NodeEditor (n)
 {
     setOpaque (true);
+
     patternView.reset (new PatternView (getNodeObjectOfType<TrackerNode>()));
-    addAndMakeVisible (patternView.get());
+
+    viewport.reset (new juce::Viewport());
+    viewport->setViewedComponent (patternView.get(), false);
+    viewport->setScrollBarsShown (true, true);
+    viewport->setWantsKeyboardFocus (false);  // forward to PatternView
+    addAndMakeVisible (viewport.get());
+
     patternView->grabKeyboardFocus();
 
     setResizable (true);
-    setSize (kRowGutterWidth + 2 * kTrackWidth, kTrackHeaderH + 16 * kRowHeight + 4);
+    /* Default: ~24 rows visible × first 4 tracks visible (gutter +
+     * 4 track widths + scrollbar) + header. Resizable beyond. */
+    setSize (kRowGutterWidth + 4 * kTrackWidth + 16,
+             kTrackHeaderH + 24 * kRowHeight + 4);
     startTimerHz (30);
 }
 
 TrackerEditor::~TrackerEditor()
 {
     stopTimer();
+    viewport.reset();
     patternView.reset();
 }
 
@@ -515,14 +568,21 @@ void TrackerEditor::paint (juce::Graphics& g)
 
 void TrackerEditor::resized()
 {
+    if (viewport)
+        viewport->setBounds (getLocalBounds());
+    /* PatternView::resized will fire next via the viewport; it sizes
+     * itself to the engine pattern's full extent. */
     if (patternView)
-        patternView->setBounds (getLocalBounds());
+        patternView->updateGridSize();
 }
 
 void TrackerEditor::timerCallback()
 {
     if (patternView)
+    {
+        patternView->updateGridSize();
         patternView->repaint();
+    }
 }
 
 } // namespace element

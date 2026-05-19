@@ -36,6 +36,7 @@ private:
 
     class PatternView;
     std::unique_ptr<PatternView> patternView;
+    std::unique_ptr<juce::Viewport> viewport;
 };
 
 } // namespace element
