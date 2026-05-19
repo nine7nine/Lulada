@@ -404,6 +404,8 @@ void track_clear_rows(track *trk, int c) {
 		trk->rows[c][t].velocity_next = 100;
 		trk->rows[c][t].delay_next = 0;
 		trk->rows[c][t].clt = trk->clt;
+		trk->rows[c][t].fx[0] = trk->rows[c][t].fx[1] = 0;
+		trk->rows[c][t].fxParam[0] = trk->rows[c][t].fxParam[1] = 0;
 	}
 
 	pthread_mutex_unlock(&trk->excl);
@@ -704,6 +706,40 @@ void track_play_row(track *trk, int pos, int c, int delay) {
 		evt.note = r.note;
 		evt.velocity = r.velocity_next;
 		trk->lsounded[c] = pos;
+
+		/* Element-NSPA FX dispatch — phase 1: note-level + state.
+		 *   Cxx → override velocity (clamped 0..127)
+		 *   Fxx → set BPM (param > 0)
+		 *   Bxx → pending pattern jump (mod->seq[param])
+		 *   Dxx → pending pattern break, advance to next pattern
+		 *         starting at row = param (hex). */
+		for (int fxi = 0; fxi < 2; fxi++) {
+			int fx = r.fx[fxi];
+			int p  = r.fxParam[fxi] & 0xff;
+			switch (fx) {
+				case 'C':
+					evt.velocity = (p > 127) ? 127 : p;
+					break;
+				case 'F':
+					if (p > 0) mod->bpm = (float) p;
+					break;
+				case 'B':
+					mod->pending_pattern_jump = p;
+					mod->pending_break_row    = -1;
+					break;
+				case 'D':
+					/* Pattern break: advance to NEXT pattern at row p. */
+					if (mod->pending_pattern_jump < 0) {
+						int curIdx = 0;
+						for (int s = 0; s < mod->nseq; s++)
+							if (mod->seq[s] == mod->curr_seq) { curIdx = s; break; }
+						mod->pending_pattern_jump = (curIdx + 1) % (mod->nseq > 0 ? mod->nseq : 1);
+					}
+					mod->pending_break_row = p;
+					break;
+				default: break;
+			}
+		}
 
 		midi_buffer_add(trk->clt, trk->port, evt);
 		module_handle_inception(trk, evt);
@@ -1433,6 +1469,8 @@ void track_resize(track *trk, int size) {
 			trk->rows[c][n].velocity_range = 0;
 			trk->rows[c][n].delay_range = 0;
 			trk->rows[c][n].clt = trk->clt;
+			trk->rows[c][n].fx[0] = trk->rows[c][n].fx[1] = 0;
+			trk->rows[c][n].fxParam[0] = trk->rows[c][n].fxParam[1] = 0;
 		}
 	}
 

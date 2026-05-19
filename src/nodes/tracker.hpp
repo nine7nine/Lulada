@@ -60,6 +60,19 @@ public:
     juce::CriticalSection& engineLock() noexcept { return engineLock_; }
     module* modulePtr() noexcept { return mod_; }
 
+    /** Programmatically jump to a specific pattern at the next buffer
+     *  boundary.  Called by the main-window arrangement view to drive
+     *  pattern sequencing via direct C++ call — no MIDI program-change
+     *  plumbing.  Thread-safe: acquires engineLock_.  Out-of-range
+     *  indices are silently ignored. */
+    void advanceToPattern (int patternIdx);
+
+    /** Current pattern index (0-based).  Returns -1 if engine is
+     *  uninitialised.  Used by the arrangement view to highlight the
+     *  active block. */
+    int currentPatternIndex() const noexcept;
+    int numPatterns() const noexcept;
+
     /** Undo / redo.  Snapshots whole-module state into a memento stack.
      *  Editor calls pushUndo() before any mutation. */
     void pushUndo();

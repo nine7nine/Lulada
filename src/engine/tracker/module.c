@@ -255,6 +255,34 @@ void module_advance(module *mod, jack_nframes_t curr_frames) {
 		}
 	}
 
+	/* Element-NSPA FX dispatch — apply pending Bxx / Dxx pattern
+	 * changes at the end of the buffer.  Mid-buffer switching isn't
+	 * supported; the remainder of this buffer plays the old pattern
+	 * and the next buffer starts the new one. */
+	if (mod->pending_pattern_jump >= 0 && mod->nseq > 0)
+	{
+		int idx = mod->pending_pattern_jump;
+		if (idx < 0) idx = 0;
+		if (idx >= mod->nseq) idx = mod->nseq - 1;
+		sequence *target = mod->seq[idx];
+
+		for (int i = 0; i < mod->nseq; i++)
+			sequence_set_playing(mod->seq[i], 0);
+		sequence_set_playing(target, 1);
+		mod->curr_seq = target;
+
+		double startRow = 0.0;
+		if (mod->pending_break_row >= 0 && mod->pending_break_row < target->length)
+			startRow = (double) mod->pending_break_row;
+		target->pos = startRow;
+		for (int t = 0; t < target->ntrk; t++)
+			target->trk[t]->pos = startRow;
+		target->lost = 0;
+
+		mod->pending_pattern_jump = -1;
+		mod->pending_break_row    = -1;
+	}
+
 	//printf("%f %f %f %d %d\n", mod->song_pos, mod->seq[0]->pos, timeline_get_qb_time(mod->tline, mod->tline->pos), mod->clt->jack_buffer_size, mod->clt->jack_sample_rate);
 	module_excl_out(mod);
 }
@@ -347,6 +375,8 @@ module *module_new() {
 	mod->pnq_hack = 0;
 	mod->inception = 0;
 	mod->should_save = 0;
+	mod->pending_pattern_jump = -1;
+	mod->pending_break_row    = -1;
 	timeline_update(mod->tline);
 
 	return mod;

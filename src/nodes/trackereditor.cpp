@@ -11,11 +11,30 @@ namespace {
 /* Layout constants — Renoise-ish. Tunable later. */
 constexpr int kRowHeight        = 18;
 constexpr int kRowGutterWidth   = 40;
-constexpr int kTrackWidth       = 120;
+constexpr int kTrackWidth       = 168;
 constexpr int kTrackHeaderH     = 30;
 constexpr int kColumnSubWidth   = 32;
 constexpr float kCellFontSize   = 13.0f;
 constexpr float kHeaderFontSize = 12.0f;
+
+/* Sub-column X positions (relative to the track's left edge) and widths.
+ * Each FX column takes 36 px (12 per char × 3 chars). */
+constexpr int kNoteX      = 4;
+constexpr int kNoteW      = 36;     // "C-5", incl trailing pad
+constexpr int kVelX       = 44;     // velocity column
+constexpr int kVelHalfW   = 12;     // each nybble character
+constexpr int kVelW       = 24;     // hi+lo
+constexpr int kFx1X       = 76;     // FX1 column start
+constexpr int kFxCharW    = 12;     // letter / hi / lo each 12 px wide
+constexpr int kFxColW     = 36;     // FX column total (letter + hi + lo)
+constexpr int kFx2X       = 120;    // FX2 column start
+
+/* Total sub-columns the cursor walks through (per track):
+ *   0  note
+ *   1  vel-hi    2  vel-lo
+ *   3  fx1-let   4  fx1-hi  5  fx1-lo
+ *   6  fx2-let   7  fx2-hi  8  fx2-lo */
+constexpr int kNumSubCols = 9;
 
 /* Dark palette. */
 const juce::Colour kBgColour          { 0xff'18'18'18 };
@@ -295,29 +314,47 @@ public:
 
         if (! editMode) return false;
 
-        // Delete / backspace
+        // Delete / backspace — context-aware clear.
         if (kc == juce::KeyPress::deleteKey || kc == juce::KeyPress::backspaceKey)
         {
-            if (selActive)               clearSelectionCells();
-            else if (cursorSubCol == 0)  writeCell (-1);
-            else                         writeVelocityNybble (0);
+            if (selActive)                                   clearSelectionCells();
+            else if (cursorSubCol == 0)                      writeCell (-1);
+            else if (cursorSubCol == 1 || cursorSubCol == 2) writeVelocityNybble (0);
+            else if (cursorSubCol == 3 || cursorSubCol == 6) writeFxLetter (0);
+            else                                              writeFxNybble (0);
             return true;
         }
 
-        if (cursorSubCol > 0)
+        /* Velocity sub-columns: hex digits write nybbles. */
+        if (cursorSubCol == 1 || cursorSubCol == 2)
         {
-            // Velocity sub-column: accept hex digits.
             int nybble = -1;
             if      (kc >= '0' && kc <= '9') nybble = kc - '0';
             else if (kc >= 'A' && kc <= 'F') nybble = 10 + (kc - 'A');
             else if (kc >= 'a' && kc <= 'f') nybble = 10 + (kc - 'a');
+            if (nybble >= 0) { writeVelocityNybble (nybble); return true; }
+            return false;
+        }
 
-            if (nybble >= 0)
-            {
-                writeVelocityNybble (nybble);
-                return true;
-            }
-            return false; // don't treat hex letters as note input
+        /* FX letter sub-columns: accept A-Z and 0-9 (FT2 effect codes). */
+        if (cursorSubCol == 3 || cursorSubCol == 6)
+        {
+            const int up = (kc >= 'a' && kc <= 'z') ? (kc - 32) : kc;
+            if ((up >= 'A' && up <= 'Z') || (up >= '0' && up <= '9'))
+            { writeFxLetter (up); return true; }
+            return false;
+        }
+
+        /* FX param hex sub-columns: hex digits. */
+        if (cursorSubCol == 4 || cursorSubCol == 5
+            || cursorSubCol == 7 || cursorSubCol == 8)
+        {
+            int nybble = -1;
+            if      (kc >= '0' && kc <= '9') nybble = kc - '0';
+            else if (kc >= 'A' && kc <= 'F') nybble = 10 + (kc - 'A');
+            else if (kc >= 'a' && kc <= 'f') nybble = 10 + (kc - 'a');
+            if (nybble >= 0) { writeFxNybble (nybble); return true; }
+            return false;
         }
 
         /* Note input.  JUCE on X11 returns the raw keysym for letter
@@ -416,7 +453,11 @@ public:
     }
 
 private:
-    struct Cell { int type = 0; int note = 0; int velocity = 0; };
+    struct Cell {
+        int type = 0; int note = 0; int velocity = 0;
+        int fx[2] {0, 0};
+        int fxParam[2] {0, 0};
+    };
     struct TrackS {
         int port = 0, channel = 0, ncols = 1;
         bool muted = false;
@@ -471,6 +512,10 @@ private:
                 cell.type     = row.type;
                 cell.note     = row.note;
                 cell.velocity = row.velocity;
+                cell.fx[0]      = row.fx[0];
+                cell.fx[1]      = row.fx[1];
+                cell.fxParam[0] = row.fxParam[0];
+                cell.fxParam[1] = row.fxParam[1];
             }
         }
     }
@@ -622,20 +667,20 @@ private:
                 if (r == cursorRow && t == cursorTrack)
                 {
                     g.setColour (kCursorHighlight);
-                    /* Sub-column-aware highlight:
-                     *   0 = note (left half),
-                     *   1 = vel-hi nybble,
-                     *   2 = vel-lo nybble */
-                    const int noteX = tx + 4;
-                    const int noteW = kColumnSubWidth + 8;
-                    const int velX  = tx + 8 + kColumnSubWidth + 4;
-                    const int velNybbleW = kColumnSubWidth / 2;
-                    if (cursorSubCol == 0)
-                        g.fillRect (noteX, y, noteW, kRowHeight);
-                    else if (cursorSubCol == 1)
-                        g.fillRect (velX, y, velNybbleW, kRowHeight);
-                    else
-                        g.fillRect (velX + velNybbleW, y, velNybbleW, kRowHeight);
+                    int sx = 0, sw = 0;
+                    switch (cursorSubCol)
+                    {
+                        case 0: sx = tx + kNoteX;                 sw = kNoteW;     break;
+                        case 1: sx = tx + kVelX;                  sw = kVelHalfW;  break;
+                        case 2: sx = tx + kVelX + kVelHalfW;      sw = kVelHalfW;  break;
+                        case 3: sx = tx + kFx1X;                  sw = kFxCharW;   break;
+                        case 4: sx = tx + kFx1X + kFxCharW;       sw = kFxCharW;   break;
+                        case 5: sx = tx + kFx1X + 2 * kFxCharW;   sw = kFxCharW;   break;
+                        case 6: sx = tx + kFx2X;                  sw = kFxCharW;   break;
+                        case 7: sx = tx + kFx2X + kFxCharW;       sw = kFxCharW;   break;
+                        case 8: sx = tx + kFx2X + 2 * kFxCharW;   sw = kFxCharW;   break;
+                    }
+                    g.fillRect (sx, y, sw, kRowHeight);
                 }
 
                 g.setColour (kRowDividerColour);
@@ -643,48 +688,94 @@ private:
 
                 if (! trk.cells.empty() && r < (int) trk.cells.size())
                 {
-                    drawCell (g, trk.cells[(size_t) r], tx + 8, y, kRowHeight);
+                    drawCell (g, trk.cells[(size_t) r], tx, y, kRowHeight);
                 }
                 else
                 {
-                    drawEmptyCell (g, tx + 8, y, kRowHeight);
+                    drawEmptyCell (g, tx, y, kRowHeight);
                 }
             }
         }
     }
 
+    /* x is the track-left edge (tx).  We draw three column groups:
+     *   note (kNoteX), velocity (kVelX), FX1 (kFx1X), FX2 (kFx2X). */
     void drawCell (juce::Graphics& g, const Cell& cell, int x, int y, int h)
     {
+        /* Note + velocity */
         if (cell.type == 1)
         {
             g.setColour (kNoteTextColour);
             g.drawText (formatNote (cell.note),
-                        x, y, kColumnSubWidth, h,
+                        x + kNoteX, y, kNoteW, h,
                         juce::Justification::centredLeft);
             g.setColour (kVelTextColour);
             g.drawText (juce::String::toHexString (cell.velocity).toUpperCase().paddedLeft ('0', 2),
-                        x + kColumnSubWidth + 8, y, kColumnSubWidth, h,
+                        x + kVelX, y, kVelW, h,
                         juce::Justification::centredLeft);
         }
         else if (cell.type == 2)
         {
             g.setColour (kEmptyCellColour.brighter (0.4f));
-            g.drawText ("OFF", x, y, kColumnSubWidth, h,
+            g.drawText ("OFF",
+                        x + kNoteX, y, kNoteW, h,
+                        juce::Justification::centredLeft);
+            g.setColour (kEmptyCellColour);
+            g.drawText ("--", x + kVelX, y, kVelW, h,
                         juce::Justification::centredLeft);
         }
         else
         {
-            drawEmptyCell (g, x, y, h);
+            g.setColour (kEmptyCellColour);
+            g.drawText ("---", x + kNoteX, y, kNoteW, h,
+                        juce::Justification::centredLeft);
+            g.drawText ("--", x + kVelX, y, kVelW, h,
+                        juce::Justification::centredLeft);
+        }
+
+        /* FX columns */
+        drawFxCell (g, cell.fx[0], cell.fxParam[0], x + kFx1X, y, h);
+        drawFxCell (g, cell.fx[1], cell.fxParam[1], x + kFx2X, y, h);
+    }
+
+    void drawFxCell (juce::Graphics& g, int fxType, int fxParam,
+                     int x, int y, int h)
+    {
+        const bool hasFx = fxType > 0;
+        const juce::Colour fxLetterColour { 0xff'7a'c0'd4 };
+        const juce::Colour fxParamColour  { 0xff'a0'a0'a0 };
+
+        if (hasFx)
+        {
+            g.setColour (fxLetterColour);
+            char ch = (char) (fxType & 0x7f);
+            g.drawText (juce::String::charToString ((juce_wchar) ch),
+                        x, y, kFxCharW, h, juce::Justification::centred);
+            g.setColour (fxParamColour);
+            const int hi = (fxParam >> 4) & 0x0f;
+            const int lo = fxParam & 0x0f;
+            const auto hex = juce::String ("0123456789ABCDEF");
+            g.drawText (hex.substring (hi, hi + 1),
+                        x + kFxCharW, y, kFxCharW, h, juce::Justification::centred);
+            g.drawText (hex.substring (lo, lo + 1),
+                        x + 2 * kFxCharW, y, kFxCharW, h, juce::Justification::centred);
+        }
+        else
+        {
+            g.setColour (kEmptyCellColour);
+            g.drawText (".", x, y, kFxCharW, h, juce::Justification::centred);
+            g.drawText (".", x + kFxCharW, y, kFxCharW, h, juce::Justification::centred);
+            g.drawText (".", x + 2 * kFxCharW, y, kFxCharW, h, juce::Justification::centred);
         }
     }
 
     void drawEmptyCell (juce::Graphics& g, int x, int y, int h)
     {
         g.setColour (kEmptyCellColour);
-        g.drawText ("---", x, y, kColumnSubWidth, h,
-                    juce::Justification::centredLeft);
-        g.drawText ("--", x + kColumnSubWidth + 8, y, kColumnSubWidth, h,
-                    juce::Justification::centredLeft);
+        g.drawText ("---", x + kNoteX, y, kNoteW, h, juce::Justification::centredLeft);
+        g.drawText ("--",  x + kVelX,  y, kVelW,  h, juce::Justification::centredLeft);
+        drawFxCell (g, 0, 0, x + kFx1X, y, h);
+        drawFxCell (g, 0, 0, x + kFx2X, y, h);
     }
 
     void moveCursor (int dRow, int dTrack)
@@ -717,7 +808,7 @@ private:
         snapshot (s);
         if (dir > 0)
         {
-            if (cursorSubCol < 2)
+            if (cursorSubCol < kNumSubCols - 1)
                 ++cursorSubCol;
             else if (cursorTrack < s.ntrk - 1)
             {
@@ -732,7 +823,7 @@ private:
             else if (cursorTrack > 0)
             {
                 --cursorTrack;
-                cursorSubCol = 2;
+                cursorSubCol = kNumSubCols - 1;
             }
         }
         ensureCursorVisible();
@@ -805,6 +896,72 @@ private:
             cursorRow = (next < seq->length) ? next : (next % seq->length);
         }
         ensureCursorVisible();
+        repaint();
+    }
+
+    /** Write a letter into the FX-letter sub-column (cursorSubCol 3 or
+     *  6).  Sets fx[slot] = ASCII letter; clears via 0. After write,
+     *  advance cursor to the FX-hi sub-column of the same FX slot. */
+    void writeFxLetter (int letter)
+    {
+        if (trackerNode == nullptr) return;
+        const int slot = (cursorSubCol == 3) ? 0 : 1;
+        if (cursorSubCol != 3 && cursorSubCol != 6) return;
+        trackerNode->pushUndo();
+
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk || cursorRow < 0 || cursorRow >= seq->length) return;
+
+        trk->rows[0][cursorRow].fx[slot] = letter;
+        if (letter == 0)
+            trk->rows[0][cursorRow].fxParam[slot] = 0;
+        ++cursorSubCol;
+        repaint();
+    }
+
+    /** Set one hex nybble of an FX param.
+     *  cursorSubCol 4/7 = high nybble of FX1/FX2; 5/8 = low nybble.
+     *  After low-nybble write, optionally advance to next row. */
+    void writeFxNybble (int nybble)
+    {
+        if (trackerNode == nullptr) return;
+        if (cursorSubCol < 4 || cursorSubCol > 8 || cursorSubCol == 6) return;
+        const int slot = (cursorSubCol <= 5) ? 0 : 1;
+        const bool isHi = (cursorSubCol == 4 || cursorSubCol == 7);
+        trackerNode->pushUndo();
+
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk || cursorRow < 0 || cursorRow >= seq->length) return;
+
+        int v = trk->rows[0][cursorRow].fxParam[slot];
+        if (isHi) v = ((nybble & 0x0f) << 4) | (v & 0x0f);
+        else      v = (v & 0xf0) | (nybble & 0x0f);
+        trk->rows[0][cursorRow].fxParam[slot] = v & 0xff;
+
+        if (isHi)
+        {
+            ++cursorSubCol; // hi → lo
+        }
+        else
+        {
+            /* After low-nybble: stay in same sub-column but auto-advance row. */
+            if (editStep > 0)
+            {
+                const int next = cursorRow + editStep;
+                cursorRow = (next < seq->length) ? next : (next % seq->length);
+            }
+            ensureCursorVisible();
+        }
         repaint();
     }
 
@@ -1182,6 +1339,10 @@ public:
                 dst.note     = src.note;
                 dst.velocity = src.velocity;
                 dst.delay    = src.delay;
+                dst.fx[0]      = src.fx[0];
+                dst.fx[1]      = src.fx[1];
+                dst.fxParam[0] = src.fxParam[0];
+                dst.fxParam[1] = src.fxParam[1];
             }
         }
     }
@@ -1262,6 +1423,10 @@ public:
                 if (! trk) continue;
                 const auto& src = clipboard[(size_t) dr][(size_t) dt];
                 track_set_row (trk, 0, targetRow, src.type, src.note, src.velocity, src.delay);
+                trk->rows[0][targetRow].fx[0]      = src.fx[0];
+                trk->rows[0][targetRow].fx[1]      = src.fx[1];
+                trk->rows[0][targetRow].fxParam[0] = src.fxParam[0];
+                trk->rows[0][targetRow].fxParam[1] = src.fxParam[1];
             }
         }
         repaint();
@@ -1482,7 +1647,11 @@ private:
     int selAnchorTrack = 0;
     bool selActive     = false;
 
-    struct ClipCell { int type = 0; int note = 0; int velocity = 0; int delay = 0; };
+    struct ClipCell {
+        int type = 0; int note = 0; int velocity = 0; int delay = 0;
+        int fx[2] {0, 0};
+        int fxParam[2] {0, 0};
+    };
     /* Clipboard contents: indexed by [rowOffset][trackOffset]. */
     std::vector<std::vector<ClipCell>> clipboard;
 

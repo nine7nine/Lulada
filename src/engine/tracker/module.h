@@ -70,6 +70,12 @@ typedef struct module_t {
 	int pnq_hack;
 	int inception;
 	int should_save;
+	/* Element-NSPA FX state machine: pending pattern jump (Bxx) +
+	 * break-row (Dxx).  Set by track_play_row when it sees the
+	 * matching FX letter; applied at the end of module_advance after
+	 * all sequences finish their pass. -1 = no pending change. */
+	int pending_pattern_jump;
+	int pending_break_row;
 } module;
 
 module *module_new(void);
