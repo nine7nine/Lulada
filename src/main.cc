@@ -231,45 +231,4 @@ namespace {
 }
 #endif
 
-// =============================================================================
-// Linux-side message-thread RT priority bump.
-//
-// JUCE GUI is single-threaded by design: every paint() / Timer /
-// mouse / key event runs on the MessageManager thread.  On wine-nspa
-// PREEMPT_RT the audio thread runs SCHED_FIFO@80 and plugin workers
-// run SCHED_FIFO@70-79; if the message thread is plain SCHED_OTHER
-// it gets starved on a busy audio burst, surfacing as toolbar /
-// tracker hitches.
-//
-// SCHED_RR @ 20 sits well below the audio RT band (audio always
-// preempts → DSP latency unaffected), well above SCHED_OTHER, and
-// has the round-robin time-quantum that SCHED_FIFO lacks (so the
-// GUI thread can't monopolise a core even if JUCE accidentally
-// spins).
-//
-// Best-effort: failed sched_setscheduler returns EPERM silently and
-// startup continues at whatever priority the kernel granted (which
-// for the winelib build is already the Wine-promoted RT class via
-// SetPriorityClass(REALTIME) above).
-//
-// Static-init placement is safe because START_JUCE_APPLICATION
-// expands to a main() that calls JUCEApplicationBase::main() on the
-// entry thread — so the thread running statics IS the future
-// MessageManager thread.
-#if defined (__linux__)
-#include <sched.h>
-namespace {
-    struct MessageThreadRtPromote
-    {
-        MessageThreadRtPromote() noexcept
-        {
-            struct sched_param param {};
-            param.sched_priority = 20;
-            (void) ::sched_setscheduler (0, SCHED_RR, &param);
-        }
-    };
-    static MessageThreadRtPromote message_thread_rt_promote {};
-}
-#endif
-
 START_JUCE_APPLICATION (element::Application)
