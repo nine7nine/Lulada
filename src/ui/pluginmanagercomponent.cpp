@@ -251,10 +251,21 @@ private:
         progressWindow.setVisible (false);
         progressWindow.removeFromDesktop();
 
-        MessageManager::getInstance()->runDispatchLoopUntil (14);
-        StringArray failedFiles; // TODO
-
-        owner.scanFinished (failedFiles);
+        /* Was: runDispatchLoopUntil(14) — a paranoia sleep to let the
+         * progress-window destroy events drain before scanFinished
+         * potentially opens another modal.  Recursively pumping the
+         * message loop from inside an event handler causes input-lag
+         * spikes + re-entrancy bugs (see handoff doc item #2).
+         *
+         * Replace with MessageManager::callAsync: the destroy events
+         * already in the queue get processed normally on the way
+         * back to the loop, and scanFinished fires on the very next
+         * iteration with a clean stack.  Same latency profile, no
+         * recursive pumping. */
+        MessageManager::callAsync ([&owner = owner] {
+            StringArray failedFiles; // TODO
+            owner.scanFinished (failedFiles);
+        });
     }
 
     void timerCallback() override
@@ -275,7 +286,16 @@ private:
     {
         pluginBeingScanned = File::createFileWithoutCheckingPath (pluginName.trim())
                                  .getFileName();
-        MessageManager::getInstance()->runDispatchLoopUntil (14);
+        /* Was: runDispatchLoopUntil(14) — recursive message-loop
+         * pump to give the progress window a chance to repaint with
+         * the new plugin name.  No longer needed: the scan runs in
+         * a separate process (PluginScanner::scannerExeFile, see
+         * pluginmanager.cpp:500), so this callback already hops back
+         * to the message thread cleanly between plugins.  The 20ms
+         * progress-window Timer (startTimer call in startScan)
+         * picks up the new pluginBeingScanned in its next tick and
+         * calls progressWindow.setMessage().  Max label-update
+         * latency is one timer tick (~20ms) — same UX, no pump. */
     }
 
     void audioPluginScanProgress (const float reportedProgress) override
