@@ -232,6 +232,9 @@ public:
         node.setLastNoteChannel (midiChannel);
         Synthesiser::noteOn (midiChannel, midiNoteNumber, velocity);
     }
+    /* JUCE's Synthesiser swallows program-change events without exposing
+     * an override hook — we run our own MIDI scan in SamplerNode::processBlock
+     * before renderNextBlock to handle them.  See SamplerNode::processBlock. */
 private:
     SamplerNode& node;
 };
@@ -1679,6 +1682,23 @@ void SamplerNode::releaseResources()
 void SamplerNode::processBlock (AudioBuffer<float>& audio_, MidiBuffer& midi)
 {
     audio_.clear();
+
+    /* Scan for MIDI program-change events and update channel→instrument
+     * binding before renderNextBlock dispatches notes.  PC value 0..127
+     * maps directly to instrument index.  If the index exceeds the
+     * loaded count, fall back to the channel default. */
+    for (const auto& meta : midi)
+    {
+        const auto msg = meta.getMessage();
+        if (! msg.isProgramChange()) continue;
+        const int ch = msg.getChannel();         /* 1..16 */
+        const int pc = msg.getProgramChangeNumber();
+        if (pc >= 0 && pc < (int) instruments.size())
+            bindChannelToInstrument (ch, pc);
+        else
+            bindChannelToInstrument (ch, -1);   /* default mapping */
+    }
+
     synth->renderNextBlock (audio_, midi, 0, audio_.getNumSamples());
 }
 
