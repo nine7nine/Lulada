@@ -60,6 +60,15 @@ public:
     juce::CriticalSection& engineLock() noexcept { return engineLock_; }
     module* modulePtr() noexcept { return mod_; }
 
+    /** Undo / redo.  Snapshots whole-module state into a memento stack.
+     *  Editor calls pushUndo() before any mutation. */
+    void pushUndo();
+    bool canUndo() const noexcept;
+    bool canRedo() const noexcept;
+    void undo();
+    void redo();
+    void clearUndoHistory();
+
 protected:
     void refreshPorts() override;
 
@@ -79,6 +88,13 @@ private:
     int currentBufferSize_ = 1024;
     bool lastPlayingState_ = false;
     juce::CriticalSection engineLock_;
+
+    /* Undo / redo memento stacks. Each entry is a serialised state
+     * blob (same wire format as getState). Capped at 64 entries to
+     * keep memory bounded. */
+    enum { kMaxUndo = 64 };
+    juce::Array<juce::MemoryBlock> undoStack_;
+    juce::Array<juce::MemoryBlock> redoStack_;
 };
 
 } // namespace element

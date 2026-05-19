@@ -128,6 +128,8 @@ public:
         paintGutter (g, s);
         paintCells  (g, s);
 
+        ensurePlayheadVisible (s.playheadRow);
+
         if (showHelp)
             paintHelp (g);
     }
@@ -201,8 +203,33 @@ public:
             if (kc == juce::KeyPress::pageDownKey)
                 { switchPattern ( 1); return true; }
             if (kc == 'N' || kc == 'n') { newPattern();          return true; }
+            if (kc == 'D' || kc == 'd') { duplicatePattern();    return true; }
             if (kc == 'T' || kc == 't') { addTrack();            return true; }
-            if (kc == 'W' || kc == 'w') { deleteCurrentTrack();  return true; }
+            if (kc == 'W' || kc == 'w')
+            {
+                if (shift) deletePattern();
+                else       deleteCurrentTrack();
+                return true;
+            }
+            if (kc == 'Z' || kc == 'z')
+            {
+                if (shift) redoOp(); else undoOp();
+                return true;
+            }
+            if (kc == 'Y' || kc == 'y') { redoOp();        return true; }
+            if (kc == 'C' || kc == 'c') { copySelection(); return true; }
+            if (kc == 'X' || kc == 'x') { cutSelection();  return true; }
+            if (kc == 'V' || kc == 'v') { pasteClipboard();return true; }
+            if (kc == 'A' || kc == 'a')
+            {
+                /* Select All — anchor at (0,0), cursor at (length-1, ntrk-1). */
+                Snapshot s; snapshot (s);
+                selAnchorRow = 0; selAnchorTrack = 0;
+                cursorRow = s.rows - 1; cursorTrack = s.ntrk - 1;
+                selActive = true;
+                repaint();
+                return true;
+            }
         }
 
         // ESC toggles edit mode
@@ -213,15 +240,30 @@ public:
             return true;
         }
 
-        // Navigation works regardless of edit mode.
-        if (kc == juce::KeyPress::upKey)         { moveCursor (-1, 0);  return true; }
-        if (kc == juce::KeyPress::downKey)       { moveCursor ( 1, 0);  return true; }
-        if (kc == juce::KeyPress::leftKey)       { moveCursor ( 0, -1); return true; }
-        if (kc == juce::KeyPress::rightKey)      { moveCursor ( 0,  1); return true; }
-        if (kc == juce::KeyPress::pageUpKey)     { moveCursor (-16, 0); return true; }
-        if (kc == juce::KeyPress::pageDownKey)   { moveCursor ( 16, 0); return true; }
-        if (kc == juce::KeyPress::homeKey)       { setCursorAbs (0, cursorTrack); return true; }
-        if (kc == juce::KeyPress::endKey)        { setCursorAbs (INT_MAX, cursorTrack); return true; }
+        /* Navigation. Shift-modified navigation extends the selection;
+         * plain navigation clears it. */
+        auto nav = [&] (auto&& fn) {
+            if (shift) extendSelectionToCursor();
+            else       clearSelection();
+            fn();
+            if (shift) { selActive = true; repaint(); }
+        };
+        if (kc == juce::KeyPress::upKey)         { nav ([&]{ moveCursor (-1, 0); });  return true; }
+        if (kc == juce::KeyPress::downKey)       { nav ([&]{ moveCursor ( 1, 0); });  return true; }
+        if (kc == juce::KeyPress::leftKey)       { nav ([&]{ stepSubCol (-1); });     return true; }
+        if (kc == juce::KeyPress::rightKey)      { nav ([&]{ stepSubCol ( 1); });     return true; }
+        if (kc == juce::KeyPress::pageUpKey)     { nav ([&]{ moveCursor (-16, 0); }); return true; }
+        if (kc == juce::KeyPress::pageDownKey)   { nav ([&]{ moveCursor ( 16, 0); }); return true; }
+        if (kc == juce::KeyPress::homeKey)       { nav ([&]{ setCursorAbs (0, cursorTrack); }); return true; }
+        if (kc == juce::KeyPress::endKey)        { nav ([&]{ setCursorAbs (INT_MAX, cursorTrack); }); return true; }
+
+        // Insert / Shift+Insert: insert / delete row at cursor (current track).
+        if (kc == juce::KeyPress::insertKey && editMode)
+        {
+            if (shift) deleteRowAtCursor();
+            else       insertRowAtCursor();
+            return true;
+        }
 
         // Octave change: [ ]
         if (kc == '[') { octave = juce::jmax (0, octave - 1); repaint(); return true; }
@@ -235,22 +277,30 @@ public:
             return true;
         }
 
-        // Tab cycles cursor sub-column: note → vel-hi → vel-lo → note.
+        // Tab / Shift+Tab: jump tracks.  (Sub-column traversal moved
+        // to Left/Right arrows below.)
         if (kc == juce::KeyPress::tabKey)
         {
-            if (shift) cursorSubCol = (cursorSubCol + 2) % 3;
-            else       cursorSubCol = (cursorSubCol + 1) % 3;
+            Snapshot s;
+            snapshot (s);
+            if (shift)
+                cursorTrack = juce::jmax (0, cursorTrack - 1);
+            else
+                cursorTrack = juce::jmin (s.ntrk - 1, cursorTrack + 1);
+            cursorSubCol = 0;
+            ensureCursorVisible();
             repaint();
             return true;
         }
 
         if (! editMode) return false;
 
-        // Delete / backspace: clear cell (note column only).
+        // Delete / backspace
         if (kc == juce::KeyPress::deleteKey || kc == juce::KeyPress::backspaceKey)
         {
-            if (cursorSubCol == 0) writeCell (-1);
-            else                   writeVelocityNybble (0); // zero the nybble
+            if (selActive)               clearSelectionCells();
+            else if (cursorSubCol == 0)  writeCell (-1);
+            else                         writeVelocityNybble (0);
             return true;
         }
 
@@ -296,22 +346,53 @@ public:
         const int y = e.y;
         if (x < kRowGutterWidth) return;
 
-        /* Click in track header (top band) → toggle mute. */
+        /* Click in track header (top band):
+         *   plain      → toggle mute
+         *   Shift+click → solo (mute others; re-solo cancels) */
         if (y >= 0 && y < kTrackHeaderH)
         {
             const int trk = (x - kRowGutterWidth) / kTrackWidth;
             if (trk >= 0 && trk < s.ntrk)
-                toggleTrackMute (trk);
+            {
+                if (e.mods.isShiftDown()) soloTrack (trk);
+                else                      toggleTrackMute (trk);
+            }
             return;
         }
 
-        /* Click in cell → jump cursor there. */
+        /* Click in cell → jump cursor there. Shift+click extends
+         * selection from existing anchor; plain click clears it. */
         const int row = (y - kTrackHeaderH) / kRowHeight;
         const int trk = (x - kRowGutterWidth) / kTrackWidth;
-
         if (row < 0 || row >= s.rows || trk < 0 || trk >= s.ntrk) return;
+
+        if (e.mods.isShiftDown())
+        {
+            extendSelectionToCursor();
+            cursorRow = row;
+            cursorTrack = trk;
+            selActive = true;
+        }
+        else
+        {
+            clearSelection();
+            cursorRow = row;
+            cursorTrack = trk;
+        }
+        repaint();
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        Snapshot s; snapshot (s);
+        const int row = (e.y - kTrackHeaderH) / kRowHeight;
+        const int trk = (e.x - kRowGutterWidth) / kTrackWidth;
+        if (row < 0 || row >= s.rows || trk < 0 || trk >= s.ntrk) return;
+
+        if (! selActive) extendSelectionToCursor();
         cursorRow = row;
         cursorTrack = trk;
+        selActive = true;
         repaint();
     }
 
@@ -505,6 +586,20 @@ private:
                     g.setColour (kPlayheadHighlight);
                     g.fillRect (tx, y, kTrackWidth - 1, kRowHeight);
                 }
+                /* Selection rectangle fill (before cursor on top). */
+                if (selActive)
+                {
+                    const int r0 = juce::jmin (selAnchorRow,   cursorRow);
+                    const int r1 = juce::jmax (selAnchorRow,   cursorRow);
+                    const int t0 = juce::jmin (selAnchorTrack, cursorTrack);
+                    const int t1 = juce::jmax (selAnchorTrack, cursorTrack);
+                    if (r >= r0 && r <= r1 && t >= t0 && t <= t1)
+                    {
+                        g.setColour (juce::Colour { 0x55'80'40'a0 });
+                        g.fillRect (tx, y, kTrackWidth - 1, kRowHeight);
+                    }
+                }
+
                 if (r == cursorRow && t == cursorTrack)
                 {
                     g.setColour (kCursorHighlight);
@@ -595,6 +690,55 @@ private:
         repaint();
     }
 
+    /** Step cursor one sub-column left/right.  At track boundaries
+     *  cross into the previous/next track. */
+    void stepSubCol (int dir)
+    {
+        Snapshot s;
+        snapshot (s);
+        if (dir > 0)
+        {
+            if (cursorSubCol < 2)
+                ++cursorSubCol;
+            else if (cursorTrack < s.ntrk - 1)
+            {
+                ++cursorTrack;
+                cursorSubCol = 0;
+            }
+        }
+        else
+        {
+            if (cursorSubCol > 0)
+                --cursorSubCol;
+            else if (cursorTrack > 0)
+            {
+                --cursorTrack;
+                cursorSubCol = 2;
+            }
+        }
+        ensureCursorVisible();
+        repaint();
+    }
+
+    /** When follow-playhead is on + playing, scroll viewport to keep
+     *  the playhead row roughly centred. Called from the editor's
+     *  timer via updateGridSize-style cadence. */
+    void ensurePlayheadVisible (int playheadRow)
+    {
+        if (! followPlayhead || playheadRow < 0) return;
+        if (auto* vp = findParentComponentOfClass<juce::Viewport>())
+        {
+            const int rowY = kTrackHeaderH + playheadRow * kRowHeight;
+            const auto vis = vp->getViewArea();
+            if (rowY < vis.getY() + 2 * kRowHeight
+                || rowY > vis.getBottom() - 3 * kRowHeight)
+            {
+                vp->setViewPosition (vis.getX(),
+                                     juce::jmax (0, rowY - vis.getHeight() / 2));
+            }
+        }
+    }
+
     /** Scroll the parent Viewport so the cursor cell stays on screen. */
     void ensureCursorVisible()
     {
@@ -617,6 +761,7 @@ private:
     void writeCell (int midiNote)
     {
         if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
 
         juce::ScopedLock sl (trackerNode->engineLock());
         auto* mod = trackerNode->modulePtr();
@@ -651,6 +796,7 @@ private:
     {
         if (trackerNode == nullptr) return;
         if (cursorSubCol < 1 || cursorSubCol > 2) return;
+        trackerNode->pushUndo();
 
         juce::ScopedLock sl (trackerNode->engineLock());
         auto* mod = trackerNode->modulePtr();
@@ -696,6 +842,7 @@ public:
     void changePatternLength (int delta)
     {
         if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
         juce::ScopedLock sl (trackerNode->engineLock());
         auto* mod = trackerNode->modulePtr();
         if (mod == nullptr || mod->curr_seq == nullptr) return;
@@ -710,6 +857,7 @@ public:
     void addTrack()
     {
         if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
         juce::ScopedLock sl (trackerNode->engineLock());
         auto* mod = trackerNode->modulePtr();
         if (mod == nullptr || mod->curr_seq == nullptr) return;
@@ -725,6 +873,7 @@ public:
     void deleteCurrentTrack()
     {
         if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
         juce::ScopedLock sl (trackerNode->engineLock());
         auto* mod = trackerNode->modulePtr();
         if (mod == nullptr || mod->curr_seq == nullptr) return;
@@ -743,6 +892,7 @@ public:
     void newPattern()
     {
         if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
         juce::ScopedLock sl (trackerNode->engineLock());
         auto* mod = trackerNode->modulePtr();
         if (mod == nullptr) return;
@@ -816,6 +966,297 @@ public:
             trk->playing = 1;
         }
         repaint();
+    }
+
+    /** Solo track t: mute all others.  If t is already the only
+     *  un-muted track, undo the solo (un-mute all). */
+    void soloTrack (int t)
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (t < 0 || t >= seq->ntrk) return;
+
+        /* Already solo'd? (t is unmuted, others all muted) → cancel. */
+        bool alreadySolo = (seq->trk[t]->playing == 1);
+        for (int i = 0; i < seq->ntrk && alreadySolo; ++i)
+            if (i != t && seq->trk[i]->playing == 1)
+                alreadySolo = false;
+
+        for (int i = 0; i < seq->ntrk; ++i)
+        {
+            auto* trk = seq->trk[i];
+            if (! trk) continue;
+            int wantPlaying = alreadySolo ? 1 : (i == t ? 1 : 0);
+            if (trk->playing == 1 && wantPlaying == 0)
+                track_kill_notes (trk);
+            trk->playing = wantPlaying;
+        }
+        repaint();
+    }
+
+    /** Insert a blank row at the cursor in the current track. Cells
+     *  from cursorRow .. length-2 shift down by one; last row is lost. */
+    void insertRowAtCursor()
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk) return;
+
+        for (int c = 0; c < trk->ncols; ++c)
+        {
+            for (int r = seq->length - 1; r > cursorRow; --r)
+            {
+                const auto& src = trk->rows[c][r - 1];
+                track_set_row (trk, c, r, src.type, src.note, src.velocity, src.delay);
+            }
+            track_set_row (trk, c, cursorRow, 0, 0, 0, 0); // blank
+        }
+        repaint();
+    }
+
+    /** Delete the row at the cursor in the current track. Cells from
+     *  cursorRow+1 .. length-1 shift up; last row becomes blank. */
+    void deleteRowAtCursor()
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk) return;
+
+        for (int c = 0; c < trk->ncols; ++c)
+        {
+            for (int r = cursorRow; r < seq->length - 1; ++r)
+            {
+                const auto& src = trk->rows[c][r + 1];
+                track_set_row (trk, c, r, src.type, src.note, src.velocity, src.delay);
+            }
+            track_set_row (trk, c, seq->length - 1, 0, 0, 0, 0);
+        }
+        repaint();
+    }
+
+    /** Clone current pattern as a new sequence + switch to it. */
+    void duplicatePattern()
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        sequence* clone = sequence_clone (mod->curr_seq);
+        if (! clone) return;
+        module_add_sequence (mod, clone);
+
+        for (int i = 0; i < mod->nseq; ++i)
+            sequence_set_playing (mod->seq[i], 0);
+        sequence_set_playing (clone, 1);
+        mod->curr_seq = clone;
+
+        cursorRow = 0;
+        cursorTrack = 0;
+        cursorSubCol = 0;
+        repaint();
+    }
+
+    /** Delete the current pattern. Keeps at least one. */
+    void deletePattern()
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->nseq <= 1 || mod->curr_seq == nullptr) return;
+
+        int idx = 0;
+        for (int i = 0; i < mod->nseq; ++i)
+            if (mod->seq[i] == mod->curr_seq) { idx = i; break; }
+
+        module_del_sequence (mod, idx);
+        if (mod->nseq <= 0) return;
+
+        const int newIdx = juce::jmin (idx, mod->nseq - 1);
+        for (int i = 0; i < mod->nseq; ++i)
+            sequence_set_playing (mod->seq[i], 0);
+        mod->curr_seq = mod->seq[newIdx];
+        sequence_set_playing (mod->curr_seq, 1);
+
+        if (cursorRow   >= mod->curr_seq->length) cursorRow   = mod->curr_seq->length - 1;
+        if (cursorTrack >= mod->curr_seq->ntrk)   cursorTrack = mod->curr_seq->ntrk - 1;
+        cursorSubCol = 0;
+        repaint();
+    }
+
+    bool getFollowPlayhead() const noexcept { return followPlayhead; }
+    void toggleFollowPlayhead() { followPlayhead = ! followPlayhead; repaint(); }
+
+    /* === Selection / clipboard / undo ================================ */
+
+    bool hasSelection() const noexcept { return selActive; }
+    void clearSelection() { selActive = false; repaint(); }
+
+    /** Start or extend selection to current cursor position. */
+    void extendSelectionToCursor()
+    {
+        if (! selActive)
+        {
+            selAnchorRow   = cursorRow;
+            selAnchorTrack = cursorTrack;
+            selActive = true;
+        }
+        repaint();
+    }
+
+    void selectionBounds (int& r0, int& r1, int& t0, int& t1) const
+    {
+        if (! selActive)
+        {
+            r0 = r1 = cursorRow;
+            t0 = t1 = cursorTrack;
+            return;
+        }
+        r0 = juce::jmin (selAnchorRow,   cursorRow);
+        r1 = juce::jmax (selAnchorRow,   cursorRow);
+        t0 = juce::jmin (selAnchorTrack, cursorTrack);
+        t1 = juce::jmax (selAnchorTrack, cursorTrack);
+    }
+
+    void copySelection()
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+
+        int r0, r1, t0, t1;
+        selectionBounds (r0, r1, t0, t1);
+        r0 = juce::jlimit (0, seq->length - 1, r0);
+        r1 = juce::jlimit (0, seq->length - 1, r1);
+        t0 = juce::jlimit (0, seq->ntrk - 1,   t0);
+        t1 = juce::jlimit (0, seq->ntrk - 1,   t1);
+
+        clipboard.assign ((size_t) (r1 - r0 + 1),
+                          std::vector<ClipCell> ((size_t) (t1 - t0 + 1)));
+        for (int r = r0; r <= r1; ++r)
+        {
+            for (int t = t0; t <= t1; ++t)
+            {
+                auto* trk = seq->trk[t];
+                if (! trk) continue;
+                const auto& src = trk->rows[0][r];
+                auto& dst = clipboard[(size_t)(r - r0)][(size_t)(t - t0)];
+                dst.type     = src.type;
+                dst.note     = src.note;
+                dst.velocity = src.velocity;
+                dst.delay    = src.delay;
+            }
+        }
+    }
+
+    void cutSelection()
+    {
+        if (trackerNode == nullptr) return;
+        copySelection();
+        trackerNode->pushUndo();
+
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+
+        int r0, r1, t0, t1;
+        selectionBounds (r0, r1, t0, t1);
+        for (int r = r0; r <= r1; ++r)
+        {
+            for (int t = t0; t <= t1; ++t)
+            {
+                if (t < 0 || t >= seq->ntrk) continue;
+                auto* trk = seq->trk[t];
+                if (! trk) continue;
+                track_set_row (trk, 0, r, 0, 0, 0, 0);
+            }
+        }
+        repaint();
+    }
+
+    void clearSelectionCells()
+    {
+        if (! selActive) return;
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+
+        int r0, r1, t0, t1;
+        selectionBounds (r0, r1, t0, t1);
+        for (int r = r0; r <= r1; ++r)
+        {
+            for (int t = t0; t <= t1; ++t)
+            {
+                if (t < 0 || t >= seq->ntrk) continue;
+                auto* trk = seq->trk[t];
+                if (! trk) continue;
+                track_set_row (trk, 0, r, 0, 0, 0, 0);
+            }
+        }
+        repaint();
+    }
+
+    void pasteClipboard()
+    {
+        if (trackerNode == nullptr || clipboard.empty()) return;
+        trackerNode->pushUndo();
+
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+
+        const int rows  = (int) clipboard.size();
+        const int trks  = (int) clipboard[0].size();
+        for (int dr = 0; dr < rows; ++dr)
+        {
+            const int targetRow = cursorRow + dr;
+            if (targetRow < 0 || targetRow >= seq->length) continue;
+            for (int dt = 0; dt < trks; ++dt)
+            {
+                const int targetTrk = cursorTrack + dt;
+                if (targetTrk < 0 || targetTrk >= seq->ntrk) continue;
+                auto* trk = seq->trk[targetTrk];
+                if (! trk) continue;
+                const auto& src = clipboard[(size_t) dr][(size_t) dt];
+                track_set_row (trk, 0, targetRow, src.type, src.note, src.velocity, src.delay);
+            }
+        }
+        repaint();
+    }
+
+    void undoOp()
+    {
+        if (trackerNode) trackerNode->undo();
+        clearSelection();
+    }
+    void redoOp()
+    {
+        if (trackerNode) trackerNode->redo();
+        clearSelection();
     }
 
     /* === Edit-mode + octave + edit-step toggles ====================== */
@@ -903,15 +1344,20 @@ private:
                 "  [ / ]        octave -/+",
                 "  Shift+1..8   set octave 1..8",
                 "  Delete       clear note (or zero velocity nybble)",
-                "  Tab / S-Tab  cycle sub-column (note / vel-hi / vel-lo)",
                 "  0-9 A-F      set velocity hex digit (in vel sub-cols)",
+                "  Insert       insert row at cursor (current track)",
+                "  Shift+Insert delete row at cursor",
                 "",
                 "NAVIGATION",
-                "  Arrows       move cursor",
+                "  Up / Down    move cursor row",
+                "  Left / Right step sub-column (note / vel-hi / vel-lo,",
+                "                  crosses tracks at boundaries)",
+                "  Tab / S-Tab  jump to next / previous track",
                 "  PgUp / PgDn  jump 16 rows",
                 "  Home / End   first / last row",
                 "  Click        jump cursor to cell",
-                "  Click header toggle track mute",
+                "  Click header        toggle track mute",
+                "  Shift+Click header  solo track (others muted)",
                 "",
                 "PATTERN / TRACKS",
                 "  Ctrl+Up/Dn   pattern length -/+ 1",
@@ -919,12 +1365,25 @@ private:
                 "  Ctrl+T       add track",
                 "  Ctrl+W       remove cursor track (keeps last)",
                 "  Ctrl+N       new pattern",
+                "  Ctrl+D       duplicate current pattern",
+                "  Ctrl+Shift+W delete current pattern (keeps last)",
                 "  Ctrl+PgUp/Dn switch pattern -/+ (wraps)",
+                "",
+                "SELECTION / CLIPBOARD / UNDO",
+                "  Shift+Arrow / Shift+PgUp/Dn / Shift+Click",
+                "                  extend selection",
+                "  Ctrl+A       select all in current pattern",
+                "  Ctrl+C       copy selection",
+                "  Ctrl+X       cut selection",
+                "  Ctrl+V       paste at cursor",
+                "  Delete       clear selection (if active)",
+                "  Ctrl+Z       undo",
+                "  Ctrl+Y / Ctrl+Shift+Z   redo",
                 "",
                 "  F1 / ?       toggle this help",
                 "",
-                "(transport via Element's main play/stop;",
-                " BPM follows Element. Edit step + UI on toolbar)"
+                "(transport via Element's main play/stop; BPM follows",
+                " Element.  Edit step + FOLLOW playhead on toolbar)"
             };
 
             const int lineHeight = 18;
@@ -938,6 +1397,16 @@ private:
         }
     }
 
+    /* Selection state — anchor + cursor define an inclusive rectangle.
+     * Set on Shift+navigation; cleared on plain navigation. */
+    int selAnchorRow   = 0;
+    int selAnchorTrack = 0;
+    bool selActive     = false;
+
+    struct ClipCell { int type = 0; int note = 0; int velocity = 0; int delay = 0; };
+    /* Clipboard contents: indexed by [rowOffset][trackOffset]. */
+    std::vector<std::vector<ClipCell>> clipboard;
+
     TrackerNode* trackerNode;
     int cursorRow    = 0;
     int cursorTrack  = 0;
@@ -946,6 +1415,7 @@ private:
     int editStep     = 1; // auto-advance amount after a write (0 = no advance)
     bool editMode    = false;
     bool showHelp    = false;
+    bool followPlayhead = true; // scroll viewport with the playhead during playback
 };
 
 
@@ -974,6 +1444,13 @@ public:
         configureButton (patPrevBtn,   "<", [this]{ editor.switchPattern (-1); });
         configureButton (patNextBtn,   ">", [this]{ editor.switchPattern ( 1); });
         configureButton (patNewBtn,   "NEW",[this]{ editor.newPattern(); });
+        configureButton (patDupBtn,   "DUP",[this]{ editor.duplicatePattern(); });
+        configureButton (patDelBtn,   "DEL",[this]{ editor.deletePattern(); });
+        configureButton (followBtn,   "FOLLOW", [this]{ editor.toggleFollowPlayhead(); });
+        followBtn.setClickingTogglesState (true);
+
+        configureButton (undoBtn, "UND", [this]{ editor.undoOp(); });
+        configureButton (redoBtn, "RED", [this]{ editor.redoOp(); });
 
         configureLabel (octLabel);
         configureLabel (stepLabel);
@@ -992,6 +1469,11 @@ public:
         editBtn.setToggleState (editor.isEditMode(), juce::dontSendNotification);
         editBtn.setColour (juce::TextButton::buttonOnColourId,
                            juce::Colour { 0xff'c0'30'30 });
+        followBtn.setToggleState (editor.getFollowPlayhead(), juce::dontSendNotification);
+        followBtn.setColour (juce::TextButton::buttonOnColourId,
+                             juce::Colour { 0xff'40'80'40 });
+        undoBtn.setEnabled (editor.canUndo());
+        redoBtn.setEnabled (editor.canRedo());
 
         octLabel .setText (juce::String::formatted ("OCT %d",   editor.getOctave()),       juce::dontSendNotification);
         stepLabel.setText (juce::String::formatted ("STEP %d",  editor.getEditStep()),     juce::dontSendNotification);
@@ -1031,7 +1513,12 @@ public:
         place (lenMinusBtn, btnW);  place (lenLabel, lblW);  place (lenPlusBtn, btnW);  sep();
         place (trkRemoveBtn, btnW); place (trkLabel, lblW);  place (trkAddBtn, btnW);   sep();
         place (patPrevBtn, btnW);   place (patLabel, 72);    place (patNextBtn, btnW);
-        place (patNewBtn, 44); sep();
+        place (patNewBtn, 40);
+        place (patDupBtn, 40);
+        place (patDelBtn, 40);
+        sep();
+        place (followBtn, 56); sep();
+        place (undoBtn, 36); place (redoBtn, 36); sep();
         place (bpmLabel, 80); sep();
         place (helpBtn, btnW);
     }
@@ -1062,7 +1549,9 @@ private:
     juce::TextButton stepMinusBtn,  stepPlusBtn;
     juce::TextButton lenMinusBtn,   lenPlusBtn;
     juce::TextButton trkRemoveBtn,  trkAddBtn;
-    juce::TextButton patPrevBtn,    patNextBtn, patNewBtn;
+    juce::TextButton patPrevBtn,    patNextBtn, patNewBtn, patDupBtn, patDelBtn;
+    juce::TextButton followBtn;
+    juce::TextButton undoBtn, redoBtn;
     juce::Label octLabel, stepLabel, lenLabel, trkLabel, patLabel, bpmLabel;
 };
 
@@ -1090,7 +1579,7 @@ TrackerEditor::TrackerEditor (const Node& n)
     setResizable (true);
     /* Toolbar is ~36 tall; default body fits ~24 rows × 4 tracks. */
     constexpr int kToolbarH = 36;
-    setSize (juce::jmax (760, kRowGutterWidth + 4 * kTrackWidth + 16),
+    setSize (juce::jmax (1020, kRowGutterWidth + 4 * kTrackWidth + 16),
              kToolbarH + kTrackHeaderH + 24 * kRowHeight + 4);
     startTimerHz (30);
 }
@@ -1151,8 +1640,26 @@ void  TrackerEditor::deleteCurrentTrack()  { if (patternView) patternView->delet
 int   TrackerEditor::getPatternIndex() const { return patternView ? patternView->getPatternIndex() : 0; }
 int   TrackerEditor::getPatternCount() const { return patternView ? patternView->getPatternCount() : 1; }
 void  TrackerEditor::newPattern()          { if (patternView) patternView->newPattern(); }
+void  TrackerEditor::duplicatePattern()    { if (patternView) patternView->duplicatePattern(); }
+void  TrackerEditor::deletePattern()       { if (patternView) patternView->deletePattern(); }
 void  TrackerEditor::switchPattern (int d) { if (patternView) patternView->switchPattern (d); }
 float TrackerEditor::getBPM() const        { return patternView ? patternView->getBPM() : 120.f; }
 void  TrackerEditor::toggleHelp()          { if (patternView) patternView->toggleHelp(); }
+bool  TrackerEditor::getFollowPlayhead() const { return patternView ? patternView->getFollowPlayhead() : false; }
+void  TrackerEditor::toggleFollowPlayhead() { if (patternView) patternView->toggleFollowPlayhead(); }
+void  TrackerEditor::undoOp() { if (patternView) patternView->undoOp(); }
+void  TrackerEditor::redoOp() { if (patternView) patternView->redoOp(); }
+bool  TrackerEditor::canUndo() const
+{
+    if (auto* tn = const_cast<TrackerEditor*> (this)->getNodeObjectOfType<TrackerNode>())
+        return tn->canUndo();
+    return false;
+}
+bool  TrackerEditor::canRedo() const
+{
+    if (auto* tn = const_cast<TrackerEditor*> (this)->getNodeObjectOfType<TrackerNode>())
+        return tn->canRedo();
+    return false;
+}
 
 } // namespace element

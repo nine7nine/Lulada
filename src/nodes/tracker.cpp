@@ -303,6 +303,59 @@ void TrackerNode::getState (juce::MemoryBlock& block)
     }
 }
 
+/* === Undo / redo via state-memento ====================================== */
+
+void TrackerNode::pushUndo()
+{
+    juce::MemoryBlock block;
+    getState (block);
+    if (block.getSize() == 0) return;
+
+    if (undoStack_.size() >= (int) kMaxUndo)
+        undoStack_.remove (0);
+    undoStack_.add (block);
+    redoStack_.clearQuick();
+}
+
+bool TrackerNode::canUndo() const noexcept { return ! undoStack_.isEmpty(); }
+bool TrackerNode::canRedo() const noexcept { return ! redoStack_.isEmpty(); }
+
+void TrackerNode::undo()
+{
+    if (undoStack_.isEmpty()) return;
+
+    juce::MemoryBlock current;
+    getState (current);
+    redoStack_.add (current);
+    if (redoStack_.size() > (int) kMaxUndo)
+        redoStack_.remove (0);
+
+    auto target = undoStack_.removeAndReturn (undoStack_.size() - 1);
+    setState (target.getData(), (int) target.getSize());
+}
+
+void TrackerNode::redo()
+{
+    if (redoStack_.isEmpty()) return;
+
+    juce::MemoryBlock current;
+    getState (current);
+    undoStack_.add (current);
+    if (undoStack_.size() > (int) kMaxUndo)
+        undoStack_.remove (0);
+
+    auto target = redoStack_.removeAndReturn (redoStack_.size() - 1);
+    setState (target.getData(), (int) target.getSize());
+}
+
+void TrackerNode::clearUndoHistory()
+{
+    undoStack_.clearQuick();
+    redoStack_.clearQuick();
+}
+
+/* ===================================================================== */
+
 void TrackerNode::setState (const void* data, int size)
 {
     if (data == nullptr || size <= 0) return;

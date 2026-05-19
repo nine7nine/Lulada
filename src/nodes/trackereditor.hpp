@@ -45,9 +45,17 @@ public:
     int   getPatternIndex() const;
     int   getPatternCount() const;
     void  newPattern();
+    void  duplicatePattern();
+    void  deletePattern();
     void  switchPattern (int delta);
     float getBPM() const;
     void  toggleHelp();
+    bool  getFollowPlayhead() const;
+    void  toggleFollowPlayhead();
+    void  undoOp();
+    void  redoOp();
+    bool  canUndo() const;
+    bool  canRedo() const;
 
 private:
     void timerCallback() override;
