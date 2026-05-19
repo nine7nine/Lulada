@@ -2063,6 +2063,21 @@ public:
         tabBar.setTabBarDepth (22);
         addAndMakeVisible (tabBar);
 
+        /* Add / Del envelope-point buttons inside the Bank-page Vol/Pan
+         * tabs.  Shared logic with the Inst page so envelopes are
+         * editable from either place. */
+        auto setupEnvBtn = [] (TextButton& b, const String& t) {
+            b.setButtonText (t);
+            b.setColour (TextButton::buttonColourId, Colour { 0xff'24'24'24 });
+            b.setColour (TextButton::textColourOffId, Colour { 0xff'd0'd0'd0 });
+        };
+        setupEnvBtn (volTabAddBtn, "Add"); setupEnvBtn (volTabDelBtn, "Del");
+        setupEnvBtn (panTabAddBtn, "Add"); setupEnvBtn (panTabDelBtn, "Del");
+        volTabAddBtn.onClick = [this] { addEnvPointBank (true);  };
+        volTabDelBtn.onClick = [this] { delEnvPointBank (true);  };
+        panTabAddBtn.onClick = [this] { addEnvPointBank (false); };
+        panTabDelBtn.onClick = [this] { delEnvPointBank (false); };
+
         configureParamSlider (fadeoutSlider, "Fade", 0.0, 4095.0, 1.0,
             [this](double v) {
                 if (auto inst = node.getInstrument (activeInstrument))
@@ -2167,34 +2182,44 @@ public:
         if (currentPage_ != Page::kBank)
             return;
 
-        /* === Bank page: existing layout (slot list + per-slot + waveform + tabs). === */
+        /* === Bank page: slot list fills full height on the left, right
+         * pane gets per-slot params, large waveform, tabbed envelopes,
+         * interp + status pinned at the bottom. === */
         auto bankR = body;
+
+        /* Left column: load/clear pinned at bottom, slot list fills above. */
         auto leftCol = bankR.removeFromLeft (270);
-        slotList.setBounds (leftCol.removeFromTop (260));
-        leftCol.removeFromTop (6);
-        auto pathRow = leftCol.removeFromTop (24);
-        clearBtn.setBounds (pathRow.removeFromRight (50)); pathRow.removeFromRight (4);
-        loadBtn .setBounds (pathRow);
+        auto leftFooter = leftCol.removeFromBottom (24);
+        clearBtn.setBounds (leftFooter.removeFromRight (50)); leftFooter.removeFromRight (4);
+        loadBtn .setBounds (leftFooter);
+        leftCol.removeFromBottom (6);
+        slotList.setBounds (leftCol);
 
         bankR.removeFromLeft (12);
 
+        /* Right column: footer (interp + status) pinned at bottom. */
+        auto rightFooter = bankR.removeFromBottom (32);
+        rightFooter.removeFromBottom (4);
+        auto interpRow = rightFooter.removeFromTop (26);
+        interpCombo.setBounds (interpRow.removeFromLeft (140));
+        interpRow.removeFromLeft (8);
+        status.setBounds (interpRow);
+
+        /* Right column: per-slot param sliders at top. */
         const int rowH = 22;
         rootSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         relSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         fineSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         volSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (4);
+        loopCombo.setBounds (bankR.removeFromTop (rowH));   bankR.removeFromTop (6);
 
-        loopCombo.setBounds (bankR.removeFromTop (rowH));   bankR.removeFromTop (4);
-        waveformView.setBounds (bankR.removeFromTop (80));  bankR.removeFromTop (6);
-
-        tabBar.setBounds (bankR.removeFromTop (150)); bankR.removeFromTop (4);
-
-        auto interpRow = bankR.removeFromTop (26);
-        interpCombo.setBounds (interpRow.removeFromLeft (140));
-
-        bankR.removeFromTop (2);
-        status.setBounds (bankR.removeFromTop (28));
+        /* Remaining vertical splits 55% waveform / 45% tabbed envelope. */
+        const int splitH = bankR.getHeight();
+        const int waveH = juce::jmax (140, (splitH - 8) * 11 / 20);
+        waveformView.setBounds (bankR.removeFromTop (waveH));
+        bankR.removeFromTop (8);
+        tabBar.setBounds (bankR);
     }
 
     /** Switch the visible body page and update tab toggle state. */
@@ -2356,11 +2381,27 @@ private:
             panEnvWrap.removeAllChildren();
             volEnvWrap.addAndMakeVisible (volEnvView.get());
             panEnvWrap.addAndMakeVisible (panEnvView.get());
+            volEnvWrap.addAndMakeVisible (volTabAddBtn);
+            volEnvWrap.addAndMakeVisible (volTabDelBtn);
+            panEnvWrap.addAndMakeVisible (panTabAddBtn);
+            panEnvWrap.addAndMakeVisible (panTabDelBtn);
             volEnvWrap.onResized = [this] {
-                if (volEnvView) volEnvView->setBounds (volEnvWrap.getLocalBounds().reduced (2));
+                auto r = volEnvWrap.getLocalBounds().reduced (2);
+                auto btnRow = r.removeFromBottom (22);
+                volTabAddBtn.setBounds (btnRow.removeFromLeft (60));
+                btnRow.removeFromLeft (4);
+                volTabDelBtn.setBounds (btnRow.removeFromLeft (60));
+                r.removeFromBottom (3);
+                if (volEnvView) volEnvView->setBounds (r);
             };
             panEnvWrap.onResized = [this] {
-                if (panEnvView) panEnvView->setBounds (panEnvWrap.getLocalBounds().reduced (2));
+                auto r = panEnvWrap.getLocalBounds().reduced (2);
+                auto btnRow = r.removeFromBottom (22);
+                panTabAddBtn.setBounds (btnRow.removeFromLeft (60));
+                btnRow.removeFromLeft (4);
+                panTabDelBtn.setBounds (btnRow.removeFromLeft (60));
+                r.removeFromBottom (3);
+                if (panEnvView) panEnvView->setBounds (r);
             };
             volEnvWrap.resized();
             panEnvWrap.resized();
@@ -2371,6 +2412,39 @@ private:
             avSweepSlider.setValue ((double) inst->autoVib.sweep, dontSendNotification);
             avTypeCombo  .setSelectedId ((int) inst->autoVib.type + 1, dontSendNotification);
         }
+    }
+
+    /* Bank-page envelope point add/del — mirrors SamplerInstPage's
+     * Add/Del so envelope editing works from the Vol/Pan tab too. */
+    void addEnvPointBank (bool isVol)
+    {
+        auto inst = node.getInstrument (activeInstrument);
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length >= 12) return;
+        if (e.length == 0) { e.points[0] = { 0, 64 }; e.length = 1; }
+        const int prevX = e.points[e.length - 1].x;
+        const int prevY = e.points[e.length - 1].y;
+        const int newX  = juce::jmin (324, prevX + 20);
+        e.points[e.length] = { (int16_t) newX, (int16_t) prevY };
+        e.length = (uint8_t) (e.length + 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+        instPage_.refresh();
+    }
+    void delEnvPointBank (bool isVol)
+    {
+        auto inst = node.getInstrument (activeInstrument);
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length <= 2) return;
+        e.length = (uint8_t) (e.length - 1);
+        if (e.sustainPoint >= e.length) e.sustainPoint = (uint8_t) (e.length - 1);
+        if (e.loopStart   >= e.length) e.loopStart   = (uint8_t) (e.length - 1);
+        if (e.loopEnd     >= e.length) e.loopEnd     = (uint8_t) (e.length - 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+        instPage_.refresh();
     }
 
     void onLoad()
@@ -2482,6 +2556,7 @@ private:
 
     TabbedComponent tabBar { TabbedButtonBar::TabsAtTop };
     ResizableWrap   volEnvWrap, panEnvWrap, autoVibWrap;
+    TextButton      volTabAddBtn, volTabDelBtn, panTabAddBtn, panTabDelBtn;
     std::unique_ptr<FT2EnvelopeView> volEnvView, panEnvView;
 
     Slider       fadeoutSlider, avDepthSlider, avRateSlider, avSweepSlider;
