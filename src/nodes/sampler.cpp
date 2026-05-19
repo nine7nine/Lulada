@@ -2641,6 +2641,98 @@ private:
 
 
 /* ===========================================================================
+ * Shared generator-wave shape function.  `frac` is the phase ∈ [0,1).
+ * Returns y ∈ [-1, +1].  Used by both the FX page's Generate effect
+ * and the small live-preview canvas next to the wave combo. */
+inline double genWaveSample (int kind, double frac)
+{
+    switch (kind)
+    {
+        case 1: /* Sine */
+            return std::sin (frac * juce::MathConstants<double>::twoPi);
+        case 2: /* Square */
+            return frac < 0.5 ? 1.0 : -1.0;
+        case 3: /* Triangle */
+            return frac < 0.5 ? (-1.0 + 4.0 * frac)
+                              : ( 3.0 - 4.0 * frac);
+        case 4: /* Saw up */
+            return 2.0 * frac - 1.0;
+        case 5: /* Saw down */
+            return 1.0 - 2.0 * frac;
+        case 6: /* Pulse 25% */
+            return frac < 0.25 ? 1.0 : -1.0;
+        case 7: /* Pulse 12.5% */
+            return frac < 0.125 ? 1.0 : -1.0;
+        case 8: /* Half-sine (|sin|) */
+            return 2.0 * std::abs (std::sin (frac * juce::MathConstants<double>::pi)) - 1.0;
+        case 9: /* Quarter-sine (positive half) */
+            return frac < 0.5
+                   ? std::sin (frac * 2.0 * juce::MathConstants<double>::pi)
+                   : -1.0;
+        case 10: /* White noise */
+            return (juce::Random::getSystemRandom().nextDouble() * 2.0) - 1.0;
+        default: return 0.0;
+    }
+}
+
+
+/* ===========================================================================
+ * WavePreviewCanvas — small visualisation of the currently-selected
+ * generator wave at the chosen cycles + amplitude.  Renders pure DSP
+ * — no audio, no sample data — so it's free to repaint cheaply when
+ * any of the inputs change. */
+class WavePreviewCanvas : public Component
+{
+public:
+    void setParams (int kind, double cycles, double amplitude)
+    {
+        if (kind == kind_ && std::abs (cycles - cycles_) < 1e-6
+            && std::abs (amplitude - amp_) < 1e-6)
+            return;
+        kind_ = kind; cycles_ = cycles; amp_ = amplitude;
+        repaint();
+    }
+
+    void paint (Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        g.setColour (Colour { 0xff'10'10'10 });
+        g.fillRect (bounds);
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawRect (bounds, 1.0f);
+
+        const float midY  = bounds.getCentreY();
+        const float halfH = bounds.getHeight() * 0.45f;
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawHorizontalLine ((int) midY, bounds.getX(), bounds.getRight());
+
+        const int w = juce::roundToInt (bounds.getWidth());
+        if (w <= 0 || cycles_ <= 0.0) return;
+
+        Path path;
+        const float gain = juce::jlimit (0.0f, 1.0f, (float) amp_);
+        bool started = false;
+        for (int x = 0; x < w; ++x)
+        {
+            const double phase = double (x) / double (w) * cycles_;
+            const double frac  = phase - std::floor (phase);
+            double y = genWaveSample (kind_, frac);
+            const float ypx = midY - (float) y * halfH * gain;
+            if (! started) { path.startNewSubPath (bounds.getX() + x, ypx); started = true; }
+            else            path.lineTo            (bounds.getX() + x, ypx);
+        }
+        g.setColour (Colour { 0xff'5a'a5'd0 });
+        g.strokePath (path, PathStrokeType (1.5f));
+    }
+
+private:
+    int    kind_   = 1;
+    double cycles_ = 1.0;
+    double amp_    = 1.0;
+};
+
+
+/* ===========================================================================
  * SamplerFXPage — sample-DSP effects panel.  Each effect operates on the
  * currently-selected range of the slot's buffer (or the whole sample if
  * no selection).  Algorithms ported from ft2-clone's
@@ -2684,14 +2776,26 @@ public:
         configureSlider (xfadeLenSlider, 1.0,  4096.0, 1.0, "smp");
         xfadeLenSlider.setValue (64.0);
 
-        genWaveCombo.addItem ("Sine",     1);
-        genWaveCombo.addItem ("Square",   2);
-        genWaveCombo.addItem ("Triangle", 3);
-        genWaveCombo.addItem ("Sawtooth", 4);
+        genWaveCombo.addItem ("Sine",            1);
+        genWaveCombo.addItem ("Square",          2);
+        genWaveCombo.addItem ("Triangle",        3);
+        genWaveCombo.addItem ("Saw up",          4);
+        genWaveCombo.addItem ("Saw down",        5);
+        genWaveCombo.addItem ("Pulse 25%",       6);
+        genWaveCombo.addItem ("Pulse 12.5%",     7);
+        genWaveCombo.addItem ("Half-sine",       8);
+        genWaveCombo.addItem ("Quarter-sine",    9);
+        genWaveCombo.addItem ("Noise",          10);
         genWaveCombo.setSelectedId (1, dontSendNotification);
         genWaveCombo.setColour (ComboBox::backgroundColourId, Colour { 0xff'24'24'24 });
         genWaveCombo.setColour (ComboBox::textColourId,        Colour { 0xff'd0'd0'd0 });
+        genWaveCombo.onChange = [this] { refreshWavePreview(); };
         addAndMakeVisible (genWaveCombo);
+
+        addAndMakeVisible (wavePreview_);
+        cyclesSlider   .onValueChange = [this] { refreshWavePreview(); };
+        amplitudeSlider.onValueChange = [this] { refreshWavePreview(); };
+        refreshWavePreview();
 
         genMixToggle.setButtonText ("Mix (vs replace)");
         genMixToggle.setColour (ToggleButton::textColourId, Colour { 0xff'b0'b0'b0 });
@@ -2743,14 +2847,24 @@ public:
             r.removeFromTop (8);
         }
 
-        /* Generator block: combo + cycles + amplitude + mix + button. */
+        /* Generator block: combo + mix toggle row, then wave preview
+         * canvas spanning the row above the cycles/amplitude sliders. */
         {
             auto rr = r.removeFromTop (28);
             rr.removeFromLeft (110);
-            genWaveCombo.setBounds (rr.removeFromLeft (120));
+            genWaveCombo.setBounds (rr.removeFromLeft (140));
             rr.removeFromLeft (8);
-            genMixToggle.setBounds (rr.removeFromLeft (140));
+            genMixToggle.setBounds (rr.removeFromLeft (160));
             r.removeFromTop (4);
+        }
+        /* Live wave preview — 110 px label gutter on the left so it
+         * lines up with the slider rows below. */
+        {
+            auto rr = r.removeFromTop (60);
+            rr.removeFromLeft (110);
+            rr.removeFromRight (8);
+            wavePreview_.setBounds (rr);
+            r.removeFromTop (6);
         }
         row (cyclesLbl,    cyclesSlider,    genBtn);
         row (amplLbl,      amplitudeSlider, xfadeBtn);
@@ -2914,16 +3028,7 @@ private:
         auto sampleAt = [&] (int i) -> int16_t {
             const double phase = (double) i / (double) length * cycles;
             const double frac  = phase - std::floor (phase);
-            double y = 0.0;
-            switch (wave)
-            {
-                case 1: y = std::sin (frac * juce::MathConstants<double>::twoPi); break;
-                case 2: y = frac < 0.5 ? 1.0 : -1.0; break;
-                case 3: y = frac < 0.5 ? (-1.0 + 4.0 * frac)
-                                       : ( 3.0 - 4.0 * frac); break;
-                case 4: y = 2.0 * frac - 1.0; break;
-                default: break;
-            }
+            const double y = genWaveSample (wave, frac);
             return (int16_t) juce::jlimit (-32768, 32767,
                                             (int) std::lround (y * amp));
         };
@@ -2988,10 +3093,18 @@ private:
     OnChange onChange;
     int      selStart_ = -1, selEnd_ = -1;
 
+    void refreshWavePreview()
+    {
+        wavePreview_.setParams (genWaveCombo.getSelectedId(),
+                                cyclesSlider.getValue(),
+                                amplitudeSlider.getValue() / 100.0);
+    }
+
     TextButton amplifyBtn, normalizeBtn, reverseBtn, lpBtn, hpBtn, genBtn, xfadeBtn;
     Slider     gainSlider, cutoffSlider, cyclesSlider, amplitudeSlider, xfadeLenSlider;
     ComboBox   genWaveCombo;
     ToggleButton genMixToggle;
+    WavePreviewCanvas wavePreview_;
     Label      gainLbl, cutoffLbl, cyclesLbl, amplLbl, xfadeLenLbl, statusLbl;
 };
 
