@@ -1184,16 +1184,14 @@ public:
         const int totalWhite = kWhitePerOct * 2;          /* 14 whites in 2 oct */
         const float whiteW = bounds.getWidth() / (float) totalWhite;
         const float whiteH = bounds.getHeight();
-        const float blackH = whiteH * 0.6f;
+        const float blackH = whiteH * 0.62f;
         const float blackW = whiteW * 0.6f;
 
-        /* white-key flag per pitch class 0..11 */
         static const bool isWhite[12] = { true,false,true,false,true,true,false,
                                           true,false,true,false,true };
-        /* index of black key relative to its preceding white (-1 if no black between) */
         static const int blackOffsetPC[12] = { -1, 0, -1, 1, -1, -1, 3, -1, 4, -1, 5, -1 };
 
-        /* Pass 1: whites. */
+        /* Pass 1: whites — gray-white base + slot-color accent strip. */
         int whiteIdx = 0;
         for (int n = 0; n < 24; ++n)
         {
@@ -1201,31 +1199,40 @@ public:
             const int pc   = note % 12;
             if (! isWhite[pc]) continue;
             const float x  = bounds.getX() + whiteIdx * whiteW;
+            const int assignedSlot = inst ? inst->slotForNote (note) : -1;
+            const bool hasAssign   = inst && assignedSlot >= 0
+                                  && inst->getSlot (assignedSlot)
+                                  && inst->getSlot (assignedSlot)->isLoaded();
 
-            const auto fillCol = slotColour (inst, note);
-            g.setColour (fillCol);
+            g.setColour (Colour { 0xff'b8'b8'b8 });   /* light gray base */
             g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
             g.setColour (Colour { 0xff'2a'2a'2a });
             g.drawRect (x, bounds.getY(), whiteW, whiteH, 1.0f);
 
-            /* Slot # text on white key if assigned. */
-            if (inst != nullptr)
+            /* Slot-color accent — top stripe only, not the whole key. */
+            if (hasAssign)
             {
-                const int s = inst->slotForNote (note);
-                if (s >= 0 && s < SamplerInstrument::kNumSlots)
-                {
-                    g.setColour (Colours::black.withAlpha (0.7f));
-                    g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
-                                            9.0f, Font::plain));
-                    g.drawText (String (s + 1),
-                                Rectangle<float> (x, bounds.getBottom() - 14, whiteW, 12),
-                                Justification::centred);
-                }
+                const auto accent = slotColour (assignedSlot);
+                g.setColour (accent);
+                g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 10.0f);
+                g.setColour (Colour { 0xff'30'30'30 });
+                g.drawHorizontalLine (juce::roundToInt (bounds.getY() + 10),
+                                      x + 1.0f, x + whiteW);
             }
+
+            /* Slot # — large, centred on the lower half of the key. */
+            g.setColour (hasAssign ? Colours::black : Colour { 0xff'70'70'70 });
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                    13.0f, Font::bold));
+            const String s = hasAssign ? String (assignedSlot + 1)
+                                       : String (CharPointer_UTF8 ("\xe2\x80\x94"));
+            g.drawText (s, Rectangle<float> (x, bounds.getBottom() - 22,
+                                              whiteW, 18),
+                        Justification::centred);
             ++whiteIdx;
         }
 
-        /* Pass 2: blacks. */
+        /* Pass 2: blacks — dark base + slot-color accent top stripe. */
         for (int n = 0; n < 24; ++n)
         {
             const int note = baseNote + n;
@@ -1236,15 +1243,36 @@ public:
             const float xCentre = bounds.getX()
                                   + (oct * kWhitePerOct + bIdx + 1) * whiteW;
             const float x = xCentre - blackW * 0.5f;
+            const int assignedSlot = inst ? inst->slotForNote (note) : -1;
+            const bool hasAssign   = inst && assignedSlot >= 0
+                                  && inst->getSlot (assignedSlot)
+                                  && inst->getSlot (assignedSlot)->isLoaded();
 
-            const auto fillCol = slotColour (inst, note).withMultipliedBrightness (0.55f);
-            g.setColour (fillCol);
+            g.setColour (Colour { 0xff'1c'1c'1c });
             g.fillRect (x, bounds.getY(), blackW, blackH);
+            if (hasAssign)
+            {
+                const auto accent = slotColour (assignedSlot).withMultipliedBrightness (0.85f);
+                g.setColour (accent);
+                g.fillRect (x, bounds.getY(), blackW, 6.0f);
+            }
             g.setColour (Colour { 0xff'1a'1a'1a });
             g.drawRect (x, bounds.getY(), blackW, blackH, 1.0f);
+
+            /* Slot # in white on black key. */
+            if (hasAssign)
+            {
+                g.setColour (Colour { 0xff'e8'e8'e8 });
+                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        10.0f, Font::bold));
+                g.drawText (String (assignedSlot + 1),
+                            Rectangle<float> (x, bounds.getY() + blackH - 16,
+                                              blackW, 14),
+                            Justification::centred);
+            }
         }
 
-        /* Octave labels (C2, C3 etc.) bottom-left of each octave. */
+        /* Octave labels. */
         g.setColour (Colour { 0xff'70'70'70 });
         g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
                                 10.0f, Font::bold));
@@ -1263,10 +1291,45 @@ public:
         if (note < 0) return;
         const auto inst = getInst ? getInst() : nullptr;
         if (inst == nullptr) return;
+
+        if (e.mods.isPopupMenu())
+        {
+            /* Right-click → pick slot inline (no need to leave Inst page). */
+            PopupMenu m;
+            for (int i = 0; i < SamplerInstrument::kNumSlots; ++i)
+            {
+                const auto* slot = inst->getSlot (i);
+                const String label = String::formatted ("%02d  %s", i + 1,
+                    (slot && slot->isLoaded()) ? slot->name.toRawUTF8() : "(empty)");
+                m.addItem (i + 1, label,
+                           true,
+                           inst->slotForNote (note) == i);
+            }
+            const int chosen = m.showAt (this);
+            if (chosen >= 1 && chosen <= SamplerInstrument::kNumSlots)
+                inst->setSlotForNote (note, chosen - 1);
+            repaint();
+            return;
+        }
+
         const int slot  = getSlot ? getSlot() : -1;
         if (slot < 0 || slot >= SamplerInstrument::kNumSlots) return;
         inst->setSlotForNote (note, slot);
         dragAnchorNote_ = note;
+        repaint();
+    }
+
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
+    {
+        const int note = noteAt (e.x, e.y);
+        if (note < 0) return;
+        const auto inst = getInst ? getInst() : nullptr;
+        if (inst == nullptr) return;
+        const int cur = inst->slotForNote (note);
+        int next = cur + (w.deltaY > 0 ? +1 : -1);
+        if (next < 0)                                    next = SamplerInstrument::kNumSlots - 1;
+        if (next >= SamplerInstrument::kNumSlots)        next = 0;
+        inst->setSlotForNote (note, next);
         repaint();
     }
     void mouseDrag (const MouseEvent& e) override
@@ -1333,16 +1396,11 @@ private:
         return -1;
     }
 
-    /** Colour for a slot.  16-step palette; slot -1 / unloaded → grey. */
-    static Colour slotColour (SamplerInstrument::Ptr inst, int note)
+    /** Colour for slot index in the 16-step palette. */
+    static Colour slotColour (int slot)
     {
-        if (inst == nullptr) return Colour { 0xff'30'30'30 };
-        const int s = inst->slotForNote (note);
-        if (s < 0 || s >= SamplerInstrument::kNumSlots
-            || ! inst->getSlot (s) || ! inst->getSlot (s)->isLoaded())
-            return Colour { 0xff'1c'1c'1c };
-        /* HSV cycle 0..15. */
-        const float h = (s % 16) / 16.0f;
+        if (slot < 0) return Colour { 0xff'30'30'30 };
+        const float h = (slot % 16) / 16.0f;
         return Colour::fromHSV (h, 0.55f, 0.85f, 1.0f);
     }
 
@@ -1365,12 +1423,38 @@ class SamplerInstPage : public Component
 public:
     using GetInstrument = std::function<SamplerInstrument::Ptr()>;
     using GetActiveSlot = std::function<int()>;
+    using SetActiveSlot = std::function<void (int)>;
 
-    SamplerInstPage (GetInstrument gi, GetActiveSlot gs)
+    SamplerInstPage (GetInstrument gi, GetActiveSlot gs, SetActiveSlot ss)
         : getInst (std::move (gi)),
+          getActiveSlot (gs),
+          setActiveSlot (std::move (ss)),
           keymap (getInst, std::move (gs))
     {
         addAndMakeVisible (keymap);
+
+        slotPickLbl.setText ("Paint slot:", dontSendNotification);
+        slotPickLbl.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+        slotPickLbl.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                          11.0f, Font::plain));
+        addAndMakeVisible (slotPickLbl);
+
+        slotPickValue.setJustificationType (Justification::centred);
+        slotPickValue.setColour (Label::textColourId, Colour { 0xff'd0'80'40 });
+        slotPickValue.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                            13.0f, Font::bold));
+        addAndMakeVisible (slotPickValue);
+
+        configureNudge (slotDownBtn, "-", [this] {
+            const int s = getActiveSlot();
+            setActiveSlot (juce::jmax (0, s - 1));
+            refresh();
+        });
+        configureNudge (slotUpBtn, "+", [this] {
+            const int s = getActiveSlot();
+            setActiveSlot (juce::jmin (SamplerInstrument::kNumSlots - 1, s + 1));
+            refresh();
+        });
 
         for (int p = 1; p <= 6; ++p)
         {
@@ -1382,6 +1466,11 @@ public:
             addAndMakeVisible (*btn);
             predefBtns.add (std::move (btn));
         }
+
+        configureNudge (volAddBtn, "Add",  [this] { addEnvPoint (true);   });
+        configureNudge (volDelBtn, "Del",  [this] { delLastEnvPoint (true); });
+        configureNudge (panAddBtn, "Add",  [this] { addEnvPoint (false);  });
+        configureNudge (panDelBtn, "Del",  [this] { delLastEnvPoint (false); });
 
         configureNudge (volSusUp,  "+", [this] { nudgeEnvPoint (true,  +1, false); });
         configureNudge (volSusDn,  "-", [this] { nudgeEnvPoint (true,  -1, false); });
@@ -1502,19 +1591,30 @@ public:
             avTypeCombo  .setSelectedId ((int) inst->autoVib.type + 1, dontSendNotification);
             refreshFlagStates();
         }
+        slotPickValue.setText (String::formatted ("%02d", getActiveSlot() + 1),
+                               dontSendNotification);
+        keymap.repaint();
     }
 
     void resized() override
     {
         auto r = getLocalBounds().reduced (8);
 
-        /* Top strip: predef preset buttons. */
+        /* Top strip: predef preset buttons + active-slot picker. */
         auto top = r.removeFromTop (24);
         predefLbl.setBounds (top.removeFromLeft (60));
         for (auto& b : predefBtns) {
             b->setBounds (top.removeFromLeft (28));
             top.removeFromLeft (2);
         }
+        /* Slot picker right side. */
+        slotUpBtn   .setBounds (top.removeFromRight (24));
+        top.removeFromRight (2);
+        slotPickValue.setBounds (top.removeFromRight (38));
+        top.removeFromRight (2);
+        slotDownBtn .setBounds (top.removeFromRight (24));
+        top.removeFromRight (4);
+        slotPickLbl .setBounds (top.removeFromRight (90));
         r.removeFromTop (6);
 
         /* Envelope edit area: 2 horizontal panels, stacked. */
@@ -1554,12 +1654,14 @@ private:
         if (! isVol && panEnvView) panEnvView->setBounds (canvas);
 
         area.removeFromLeft (8);
-        /* Right strip: flag toggles + sustain/loop nudges. */
+        /* Right strip: Add/Del row + flag toggles + sustain/loop nudges. */
         auto& sus  = isVol ? volSusLbl  : panSusLbl;
         auto& loop = isVol ? volLoopLbl : panLoopLbl;
         auto& enabledBtn = isVol ? volEnabledBtn : panEnabledBtn;
         auto& susBtn     = isVol ? volSustainBtn : panSustainBtn;
         auto& loopBtn    = isVol ? volLoopBtn    : panLoopBtn;
+        auto& addBtn = isVol ? volAddBtn : panAddBtn;
+        auto& delBtn = isVol ? volDelBtn : panDelBtn;
         auto& susUp  = isVol ? volSusUp  : panSusUp;
         auto& susDn  = isVol ? volSusDn  : panSusDn;
         auto& lsUp   = isVol ? volLoopStartUp : panLoopStartUp;
@@ -1568,6 +1670,13 @@ private:
         auto& leDn   = isVol ? volLoopEndDn   : panLoopEndDn;
 
         auto col = area.reduced (0);
+        /* Add / Del envelope points row. */
+        auto adRow = col.removeFromTop (20);
+        addBtn.setBounds (adRow.removeFromLeft (74));
+        adRow.removeFromLeft (4);
+        delBtn.setBounds (adRow.removeFromLeft (74));
+        col.removeFromTop (6);
+
         enabledBtn.setBounds (col.removeFromTop (20)); col.removeFromTop (3);
         susBtn    .setBounds (col.removeFromTop (20)); col.removeFromTop (3);
         loopBtn   .setBounds (col.removeFromTop (20)); col.removeFromTop (6);
@@ -1585,7 +1694,6 @@ private:
         lsDn.setBounds (lsRow.removeFromRight (22));
         col.removeFromTop (3);
         auto leRow = col.removeFromTop (20);
-        Label dummy; dummy.setText ("end", dontSendNotification);
         leRow.removeFromLeft (50);
         leUp.setBounds (leRow.removeFromRight (22));
         leRow.removeFromRight (2);
@@ -1644,6 +1752,42 @@ private:
         panEnabledBtn.setToggleState (pe.flags & FT2Envelope::kEnabled, dontSendNotification);
         panSustainBtn.setToggleState (pe.flags & FT2Envelope::kSustain, dontSendNotification);
         panLoopBtn   .setToggleState (pe.flags & FT2Envelope::kLoop,    dontSendNotification);
+    }
+
+    /** Append a sensible new point at xMax+20, y = previous point's y.
+     *  Mirrors FT2's "Add" button — extends the envelope tail. */
+    void addEnvPoint (bool isVol)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length >= 12) return;
+        if (e.length == 0)
+        {
+            e.points[0] = { 0, 64 };
+            e.length = 1;
+        }
+        const int prevX = e.points[e.length - 1].x;
+        const int prevY = e.points[e.length - 1].y;
+        const int newX  = juce::jmin (324, prevX + 20);
+        e.points[e.length] = { (int16_t) newX, (int16_t) prevY };
+        e.length = (uint8_t) (e.length + 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
+    }
+    /** Remove the trailing point.  FT2's "Del". */
+    void delLastEnvPoint (bool isVol)
+    {
+        auto inst = getInst();
+        if (inst == nullptr) return;
+        FT2Envelope& e = isVol ? inst->volumeEnv : inst->panEnv;
+        if (e.length <= 2) return;     /* keep at least 2 (degenerate avoided) */
+        e.length = (uint8_t) (e.length - 1);
+        if (e.sustainPoint >= e.length) e.sustainPoint = (uint8_t) (e.length - 1);
+        if (e.loopStart   >= e.length) e.loopStart   = (uint8_t) (e.length - 1);
+        if (e.loopEnd     >= e.length) e.loopEnd     = (uint8_t) (e.length - 1);
+        if (volEnvView) volEnvView->repaint();
+        if (panEnvView) panEnvView->repaint();
     }
 
     void nudgeEnvPoint (bool isVol, int delta, bool /*loopMode*/)
@@ -1733,8 +1877,13 @@ private:
     }
 
     GetInstrument getInst;
+    GetActiveSlot getActiveSlot;
+    SetActiveSlot setActiveSlot;
     SamplerKeymap keymap;
     std::unique_ptr<FT2EnvelopeView> volEnvView, panEnvView;
+
+    Label slotPickLbl, slotPickValue;
+    TextButton slotDownBtn, slotUpBtn;
 
     OwnedArray<TextButton> predefBtns;
     Label predefLbl, keymapLbl;
@@ -1743,6 +1892,7 @@ private:
 
     TextButton volEnabledBtn, volSustainBtn, volLoopBtn;
     TextButton panEnabledBtn, panSustainBtn, panLoopBtn;
+    TextButton volAddBtn, volDelBtn, panAddBtn, panDelBtn;
     TextButton volSusUp,  volSusDn,  panSusUp,  panSusDn;
     TextButton volLoopStartUp, volLoopStartDn, volLoopEndUp, volLoopEndDn;
     TextButton panLoopStartUp, panLoopStartDn, panLoopEndUp, panLoopEndDn;
@@ -1801,7 +1951,12 @@ public:
                           return node.collectPlayheadsForSlot (slot);
                       }),
         instPage_   ([this] { return node.getInstrument (activeInstrument); },
-                     [this] { return activeSlot; }),
+                     [this] { return activeSlot; },
+                     [this] (int s) {
+                         activeSlot = juce::jlimit (0, SamplerInstrument::kNumSlots - 1, s);
+                         slotList.selectRow (activeSlot, true, false);
+                         refresh();
+                     }),
         samplePage_ (true),
         fxPage_     (false)
     {
