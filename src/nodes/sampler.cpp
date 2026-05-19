@@ -1304,10 +1304,11 @@ public:
                                           true,false,true,false,true };
         static const int blackOffsetPC[12] = { -1, 0, -1, 1, -1, -1, 3, -1, 4, -1, 5, -1 };
 
-        /* Pass 1: whites — gray base, slot-color tint over the whole
-         * key when assigned, big bold white slot number. */
-        const Colour grayWhite  { 0xff'6a'6a'6a };   /* theme-fit gray */
-        const Colour grayBlack  { 0xff'1a'1a'1a };
+        /* Pass 1: whites — gray base, faint slot-color tint, big bold
+         * white slot number.  Vivid colour lives only in the 6 px
+         * top stripe. */
+        const Colour grayWhite  { 0xff'5a'5a'5a };   /* darker gray base */
+        const Colour grayBlack  { 0xff'18'18'18 };
         int whiteIdx = 0;
         for (int n = 0; n < 24; ++n)
         {
@@ -1320,13 +1321,13 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            /* Mostly gray, just a subtle slot tint baked in (~22%) so
-             * eye still groups same-slot keys.  Full colour lives in
-             * the 6 px stripe at the top. */
+            /* Mostly the gray base; slot tint is desaturated + dim so
+             * the blend barely shifts brightness.  Full slot colour is
+             * reserved for the 6 px top stripe. */
             const Colour base = hasAssign
                               ? grayWhite.interpolatedWith (
-                                    slotPaletteColour (assignedSlot, 0.55f, 0.75f),
-                                    0.22f)
+                                    slotPaletteColour (assignedSlot, 0.4f, 0.4f),
+                                    0.18f)
                               : grayWhite;
             g.setColour (base);
             g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
@@ -1338,7 +1339,7 @@ public:
                 g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 6.0f);
             }
 
-            g.setColour (Colour { 0xff'2a'2a'2a });
+            g.setColour (Colour { 0xff'1a'1a'1a });
             g.drawRect (x, bounds.getY(), whiteW, whiteH, 1.0f);
 
             /* Slot # — big bold white centred. */
@@ -1384,12 +1385,20 @@ public:
 
             const Colour base = hasAssign
                               ? grayBlack.interpolatedWith (
-                                    slotPaletteColour (assignedSlot, 0.7f, 0.55f),
-                                    0.7f)
+                                    slotPaletteColour (assignedSlot, 0.55f, 0.35f),
+                                    0.30f)
                               : grayBlack;
             g.setColour (base);
             g.fillRect (x, bounds.getY(), blackW, blackH);
-            g.setColour (Colour { 0xff'10'10'10 });
+
+            /* Top colour stripe on black keys too, slimmer (4 px). */
+            if (hasAssign)
+            {
+                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.8f));
+                g.fillRect (x, bounds.getY(), blackW, 4.0f);
+            }
+
+            g.setColour (Colour { 0xff'08'08'08 });
             g.drawRect (x, bounds.getY(), blackW, blackH, 1.0f);
 
             if (hasAssign)
