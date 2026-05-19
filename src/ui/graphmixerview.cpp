@@ -1,6 +1,7 @@
 // Copyright 2019-2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <element/engine.hpp>
 #include <element/services.hpp>
 #include <element/tags.hpp>
 #include <element/ui/style.hpp>
@@ -292,6 +293,18 @@ public:
             attachToActiveGraph();
             model->refreshNodes();
             model->setNode (session->getActiveGraph());
+        }));
+
+        /* sigNodeRemoved is the authoritative signal for node removal —
+         * the ValueTree listener path doesn't always fire here (e.g. when
+         * the removed node wasn't the selected one + the listener gets
+         * stranded on a stale graph tree), leading to a stale strip
+         * sticking around after remove + re-add.  Mirror what
+         * GraphEditorView does and refresh on sigNodeRemoved unconditionally. */
+        auto& eng = *gui.sibling<EngineService>();
+        _conns.push_back (eng.sigNodeRemoved.connect ([this] (const Node&) {
+            attachToActiveGraph();
+            stabilize();
         }));
 
         attachToActiveGraph();
