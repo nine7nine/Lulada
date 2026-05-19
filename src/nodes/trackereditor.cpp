@@ -186,6 +186,77 @@ public:
             setSize (w, h);
     }
 
+    /** Cheap UI tick — read just the playhead + structural state under
+     *  lock and repaint only what changed.  Replaces the previous
+     *  blanket repaint() at 30 Hz that was burning CPU on every frame. */
+    void tickRepaint()
+    {
+        if (trackerNode == nullptr) return;
+
+        int playheadRow = -1;
+        int patternIndex = 0;
+        int rows = 16, ntrk = 1;
+        bool playing = false;
+        {
+            juce::ScopedLock sl (trackerNode->engineLock());
+            if (auto* mod = trackerNode->modulePtr())
+            {
+                if (auto* seq = mod->curr_seq)
+                {
+                    rows = seq->length;
+                    ntrk = seq->ntrk;
+                    if (mod->playing)
+                    {
+                        int p = (int) seq->pos;
+                        if (p < 0) p = 0;
+                        if (p >= seq->length) p = seq->length - 1;
+                        playheadRow = p;
+                    }
+                    playing = mod->playing != 0;
+                }
+                for (int p = 0; p < mod->nseq; ++p)
+                    if (mod->seq[p] == mod->curr_seq) { patternIndex = p; break; }
+            }
+        }
+
+        const bool structuralChange =
+            (rows != lastRows_ || ntrk != lastNtrk_ || patternIndex != lastPatternIndex_);
+
+        if (structuralChange)
+        {
+            const int w = desiredWidth (ntrk);
+            const int h = desiredHeight (rows);
+            if (getWidth() != w || getHeight() != h)
+                setSize (w, h);
+            repaint();
+        }
+        else if (playheadRow != lastPlayheadRow_)
+        {
+            /* Partial repaint: erase old row, paint new row.  This is the
+             *  whole UI-perf budget every tracker frame — must stay tight. */
+            const int gridW = getWidth();
+            if (lastPlayheadRow_ >= 0)
+            {
+                const int y = kTrackHeaderH + lastPlayheadRow_ * kRowHeight;
+                repaint (0, y, gridW, kRowHeight);
+            }
+            if (playheadRow >= 0)
+            {
+                const int y = kTrackHeaderH + playheadRow * kRowHeight;
+                repaint (0, y, gridW, kRowHeight);
+            }
+        }
+
+        if (playing && playheadRow >= 0)
+            ensurePlayheadVisible (playheadRow);
+
+        lastRows_         = rows;
+        lastNtrk_         = ntrk;
+        lastPatternIndex_ = patternIndex;
+        lastPlayheadRow_  = playheadRow;
+        lastPlaying_      = playing;
+    }
+
     bool keyPressed (const juce::KeyPress& kp) override
     {
         const int kc = kp.getKeyCode();
@@ -1664,6 +1735,14 @@ private:
     bool editMode    = false;
     bool showHelp    = false;
     bool followPlayhead = true; // scroll viewport with the playhead during playback
+
+    /* UI-tick diff state — see tickRepaint().  Sentinel values force an
+     * initial paint on the first tick. */
+    int  lastPlayheadRow_  = -2;
+    int  lastPatternIndex_ = -1;
+    int  lastNtrk_         = -1;
+    int  lastRows_         = -1;
+    bool lastPlaying_      = false;
 };
 
 
@@ -1859,12 +1938,31 @@ void TrackerEditor::resized()
 
 void TrackerEditor::timerCallback()
 {
+    /* Pattern grid: cheap diff-driven repaint — full only on structural
+     * change, partial only on playhead-row move.  Idle frames cost
+     * one lock + a handful of integer compares. */
     if (patternView)
+        patternView->tickRepaint();
+
+    /* Toolbar: only refresh when transport / pattern state actually
+     * differs from last frame, so the 30Hz tick doesn't keep rebuilding
+     * label strings + repainting buttons on idle. */
+    int   newPatternIndex = patternView ? patternView->getPatternIndex() : 0;
+    int   newPatternCount = patternView ? patternView->getPatternCount() : 1;
+    float newBpm          = patternView ? patternView->getBPM() : 120.f;
+    bool  newEditMode     = patternView ? patternView->getEditMode() : false;
+
+    if (newPatternIndex != lastToolbarPatternIndex_
+        || newPatternCount != lastToolbarPatternCount_
+        || std::abs (newBpm - lastToolbarBpm_) > 0.01f
+        || newEditMode != lastToolbarEditMode_)
     {
-        patternView->updateGridSize();
-        patternView->repaint();
+        refreshToolbar();
+        lastToolbarPatternIndex_ = newPatternIndex;
+        lastToolbarPatternCount_ = newPatternCount;
+        lastToolbarBpm_          = newBpm;
+        lastToolbarEditMode_     = newEditMode;
     }
-    refreshToolbar();
 }
 
 void TrackerEditor::refreshToolbar()
