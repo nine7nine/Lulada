@@ -1469,6 +1469,8 @@ void track_resize(track *trk, int size) {
 			trk->rows[c][n].velocity_range = 0;
 			trk->rows[c][n].delay_range = 0;
 			trk->rows[c][n].clt = trk->clt;
+			trk->rows[c][n].fx[0] = trk->rows[c][n].fx[1] = 0;
+			trk->rows[c][n].fxParam[0] = trk->rows[c][n].fxParam[1] = 0;
 		}
 	}
 
