@@ -37,7 +37,7 @@ constexpr int interpOffset (int interpMode)
     }
 }
 
-/** Convert float[] (mono) → int16[]. */
+/** Convert one channel of float audio → int16[]. */
 std::unique_ptr<int16_t[]> convertFloatToInt16 (const float* src, int n)
 {
     std::unique_ptr<int16_t[]> out (new int16_t[(size_t) n]);
@@ -80,21 +80,20 @@ bool SamplerInstrument::loadSampleToSlot (int slot, const File& file,
 
     const int64_t maxLen = (int64_t) 10 * 60 * (int64_t) reader->sampleRate;
     const int n = (int) std::min ((int64_t) reader->lengthInSamples, maxLen);
+    const bool stereo = reader->numChannels >= 2;
 
     AudioBuffer<float> tmp ((int) reader->numChannels, n);
     reader->read (&tmp, 0, n, 0, true, true);
-    if (tmp.getNumChannels() > 1)
-        for (int i = 0; i < n; ++i)
-            tmp.setSample (0, i, 0.5f * (tmp.getSample (0, i) + tmp.getSample (1, i)));
 
     auto s = std::make_unique<SamplerSampleSlot>();
     s->name             = file.getFileNameWithoutExtension();
-    s->data16           = convertFloatToInt16 (tmp.getReadPointer (0), n);
     s->numSamples       = n;
     s->sourceSampleRate = reader->sampleRate;
-    /* Heuristic: assume root note follows slot's default position in the
-     * spread, but leave at C4 for slot 0 by default. */
-    s->rootNote = 60;
+    s->rootNote         = 60;
+    s->isStereo         = stereo;
+    s->data16L          = convertFloatToInt16 (tmp.getReadPointer (0), n);
+    if (stereo)
+        s->data16R = convertFloatToInt16 (tmp.getReadPointer (1), n);
 
     slots[(size_t) slot] = std::move (s);
     if (! keymapUserModified) autoSpreadKeymap();
@@ -191,6 +190,14 @@ public:
         return dynamic_cast<Ft2SamplerSound*> (s) != nullptr;
     }
 
+    /** Read-only state queries for the waveform-view playhead overlay.
+     *  Audio thread writes voice.position; GUI thread reads.  int32 is
+     *  atomic on every platform we care about; an occasional torn read
+     *  is fine for a visual indicator. */
+    int  getCurrentSamplePos() const noexcept { return voice.position; }
+    bool isPlayingActive() const noexcept     { return voice.active; }
+    const SamplerSampleSlot* getCurrentSlot() const noexcept { return slotPtr; }
+
     void startNote (int midiNote, float velocity,
                     SynthesiserSound* sound, int /*pitchWheel*/) override
     {
@@ -204,14 +211,35 @@ public:
         const auto* slot = inst->getSlot (slotIdx);
         if (slot == nullptr || ! slot->isLoaded()) { clearCurrentNote(); return; }
 
+        slotPtr      = slot;
+        slotIsStereo = slot->isStereo && slot->data16R != nullptr;
+
+        const bool loopRequested = (slot->loopMode == SamplerLoopMode::kForward)
+                                || (slot->loopMode == SamplerLoopMode::kPingpong);
+        /* Loop is only active if there's a positive loop length AND
+         * loopStart is in-range. Otherwise fall back to no-loop. */
+        const bool loopActive = loopRequested
+                               && slot->loopLength > 0
+                               && slot->loopStart >= 0
+                               && slot->loopStart < slot->numSamples;
+        const bool loop     = loopActive && slot->loopMode == SamplerLoopMode::kForward;
+        const bool pingpong = loopActive && slot->loopMode == SamplerLoopMode::kPingpong;
+
         voice = {};
-        voice.base16     = slot->data16.get();
+        voice.base16     = slot->data16L.get();
         voice.sampleEnd  = slot->numSamples;
+        if (loopActive)
+        {
+            voice.loopStart  = jlimit (0, slot->numSamples - 1, slot->loopStart);
+            voice.loopLength = jlimit (1, slot->numSamples - voice.loopStart,
+                                         slot->loopLength);
+            voice.sampleEnd  = voice.loopStart + voice.loopLength;
+            voice.loopType   = pingpong ? 2 : 1;
+        }
         voice.position   = 0;
         voice.positionFrac = 0;
-        voice.loopType   = 0;
         voice.active     = true;
-        voice.mixFuncOffset = (uint8_t) owner.getMixFuncIndexForCurrentMode (false, false);
+        voice.mixFuncOffset = (uint8_t) owner.getMixFuncIndexForCurrentMode (loop, pingpong);
 
         /* Pitch: 12tet semitones + fine-tune (128 = half-semitone). */
         const double semis    = (double)(midiNote - slot->rootNote) + (double) slot->finetune / 128.0;
@@ -219,12 +247,29 @@ public:
         const double playRate = pitchMul * slot->sourceSampleRate / getSampleRate();
         voice.delta = (uint64_t) jlimit (0.0, 1e18, playRate * 4294967296.0);
 
-        const float vel    = juce::jlimit (0.0f, 1.0f, velocity);
-        const float gain   = vel * slot->volume;
-        const float pan    = jlimit (0.0f, 1.0f, slot->panning);
-        voice.fVolume        = gain;
-        voice.fCurrVolumeL   = gain * (1.0f - pan);
-        voice.fCurrVolumeR   = gain *         pan;
+        const float vel  = juce::jlimit (0.0f, 1.0f, velocity);
+        const float gain = vel * slot->volume;
+        const float pan  = jlimit (0.0f, 1.0f, slot->panning);
+        voice.fVolume = gain;
+        if (slotIsStereo)
+        {
+            /* Stereo pan: at centre (0.5), L→L, R→R unchanged. At hard
+             * left, both L+R sum into L. At hard right, both → R. */
+            const float r = jmax (0.0f, 2.0f * (pan - 0.5f));      // ≥0 only when pan > 0.5
+            const float l = jmax (0.0f, 2.0f * (0.5f - pan));      // ≥0 only when pan < 0.5
+            gLL = gain * (1.0f - r);   // L data → L out
+            gRR = gain * (1.0f - l);   // R data → R out
+            gLR = gain * r;            // L data → R out (when panned right)
+            gRL = gain * l;            // R data → L out (when panned left)
+            voice.fCurrVolumeL = gLL;
+            voice.fCurrVolumeR = gLR;
+        }
+        else
+        {
+            /* Mono: linear pan. */
+            voice.fCurrVolumeL = gain * (1.0f - pan);
+            voice.fCurrVolumeR = gain *          pan;
+        }
         voice.fTargetVolumeL = voice.fCurrVolumeL;
         voice.fTargetVolumeR = voice.fCurrVolumeR;
         voice.fVolumeLDelta  = 0.0f;
@@ -263,9 +308,6 @@ public:
         if (out.getNumChannels() < 2)            return;
         if (numSamples <= 0)                     return;
 
-        /* Render the ft2 mixer into a scratch stereo accumulator first
-         * so we can multiply by the ADSR per-sample without disturbing
-         * other voices' contributions. */
         AudioBuffer<float> scratch (2, numSamples);
         scratch.clear();
 
@@ -273,10 +315,43 @@ public:
         audio.fMixBufferR = scratch.getWritePointer (1);
 
         if (voice.active)
-            mixFuncTab[voice.mixFuncOffset] (&voice, 0u, (uint32_t) numSamples);
+        {
+            if (slotIsStereo && slotPtr != nullptr)
+            {
+                /* Stereo: two mixer passes, each with one channel of
+                 * the sample. Both passes use the same delta + start
+                 * position, so they advance identically; we capture
+                 * state after the first pass and restore for the
+                 * second so the second runs with the same input
+                 * position. After both, voice state matches one
+                 * advance step. */
+                voice_t snap = voice;
+                voice.fCurrVolumeL   = gLL;
+                voice.fCurrVolumeR   = gLR;
+                voice.fTargetVolumeL = gLL;
+                voice.fTargetVolumeR = gLR;
+                voice.base16 = slotPtr->data16L.get();
+                mixFuncTab[voice.mixFuncOffset] (&voice, 0u, (uint32_t) numSamples);
 
-        /* Multiply by per-sample ADSR envelope, then accumulate into the
-         * synth's shared output buffer at (startSample, numSamples). */
+                voice_t afterFirst = voice;
+
+                voice = snap;
+                voice.fCurrVolumeL   = gRL;
+                voice.fCurrVolumeR   = gRR;
+                voice.fTargetVolumeL = gRL;
+                voice.fTargetVolumeR = gRR;
+                voice.base16 = slotPtr->data16R.get();
+                mixFuncTab[voice.mixFuncOffset] (&voice, 0u, (uint32_t) numSamples);
+
+                /* If either pass ran out of sample, mark voice inactive. */
+                voice.active = voice.active && afterFirst.active;
+            }
+            else
+            {
+                mixFuncTab[voice.mixFuncOffset] (&voice, 0u, (uint32_t) numSamples);
+            }
+        }
+
         auto* outL = out.getWritePointer (0) + startSample;
         auto* outR = out.getWritePointer (1) + startSample;
         const auto* sL = scratch.getReadPointer (0);
@@ -288,8 +363,6 @@ public:
             outR[i] += sR[i] * env;
         }
 
-        /* HANDLE_SAMPLE_END flips voice.active to false on sample end.
-         * Also kill the voice when ADSR fully releases. */
         if (! voice.active || ! adsr.isActive())
         {
             voice.active = false;
@@ -301,6 +374,16 @@ private:
     SamplerNode& owner;
     voice_t voice {};
     ADSR adsr;
+
+    /* Stereo state: per-voice cached gains so the two render passes can
+     * use the right per-channel volumes without recomputing.
+     *   gLL  L data → L out
+     *   gLR  L data → R out   (when panned right of centre)
+     *   gRL  R data → L out   (when panned left  of centre)
+     *   gRR  R data → R out   */
+    const SamplerSampleSlot* slotPtr = nullptr;
+    bool slotIsStereo = false;
+    float gLL = 1.0f, gLR = 0.0f, gRL = 0.0f, gRR = 1.0f;
 };
 
 
@@ -316,6 +399,177 @@ static String midiNoteName (int n)
     };
     return String (names[n % 12]) + String ((n / 12) - 1);
 }
+
+/* ===========================================================================
+ * SampleWaveformView — renders the active slot's waveform with draggable
+ * loop markers (FT2-style sample editor mini).  Click+drag the markers
+ * to set loop start / end.
+ * ========================================================================*/
+class SamplerNode;
+class SamplerInstrument;
+struct SamplerSampleSlot;
+
+class SampleWaveformView : public Component,
+                           private Timer
+{
+public:
+    using PlayheadQuery = std::function<std::vector<int> (const SamplerSampleSlot*)>;
+
+    SampleWaveformView (std::function<SamplerSampleSlot*()> getSlot_,
+                        PlayheadQuery playheadsFor_)
+        : getSlot     (std::move (getSlot_)),
+          playheadsFor (std::move (playheadsFor_))
+    {
+        startTimerHz (30); // smooth playhead chase
+    }
+
+    ~SampleWaveformView() override { stopTimer(); }
+
+    void paint (Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        g.setColour (Colour { 0xff'10'10'10 });
+        g.fillRect (bounds);
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawRect (bounds, 1.0f);
+
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded())
+        {
+            g.setColour (Colour { 0xff'5a'5a'5a });
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+            g.drawText ("(load a sample to set loop points)",
+                        bounds.toFloat(), Justification::centred);
+            return;
+        }
+
+        const int   w = juce::roundToInt (bounds.getWidth());
+        const int   n = slot->numSamples;
+        const float h = bounds.getHeight();
+        const float midY = bounds.getCentreY();
+        const float halfH = h * 0.45f;
+        const auto* d = slot->data16L.get();
+        if (n <= 0 || w <= 0 || d == nullptr) return;
+
+        /* Min/max envelope per pixel column. */
+        g.setColour (Colour { 0xff'5a'a5'd0 });
+        for (int x = 0; x < w; ++x)
+        {
+            const int s0 = (int) ((int64_t) x * n / w);
+            const int s1 = (int) std::max ((int64_t) s0 + 1, (int64_t) (x + 1) * n / w);
+            int mn = INT16_MAX, mx = INT16_MIN;
+            for (int i = s0; i < s1 && i < n; ++i)
+            {
+                const int v = d[i];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            const float yMin = midY - (mn / 32768.0f) * halfH;
+            const float yMax = midY - (mx / 32768.0f) * halfH;
+            g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
+        }
+
+        /* Loop region + draggable markers. */
+        if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
+        {
+            const float x0 = bounds.getX() + (float) bounds.getWidth() * slot->loopStart / (float) n;
+            const float x1 = bounds.getX() + (float) bounds.getWidth() * (slot->loopStart + slot->loopLength) / (float) n;
+            g.setColour (Colour { 0x33'ff'a0'40 });
+            g.fillRect (x0, bounds.getY(), x1 - x0, bounds.getHeight());
+            g.setColour (Colour { 0xff'ff'a0'40 });
+            g.fillRect (x0 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+            g.fillRect (x1 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+            /* Small handles top + bottom for grab affordance. */
+            g.fillEllipse (x0 - 4.0f, bounds.getY() - 0.0f, 8.0f, 8.0f);
+            g.fillEllipse (x1 - 4.0f, bounds.getBottom() - 8.0f, 8.0f, 8.0f);
+        }
+
+        /* Live playheads — one vertical line per active voice playing
+         * this slot.  Drawn over the waveform + loop overlay. */
+        if (playheadsFor)
+        {
+            const auto positions = playheadsFor (slot);
+            g.setColour (Colour { 0xff'40'ff'80 }); // green
+            for (int pos : positions)
+            {
+                if (pos < 0 || pos >= n) continue;
+                const float x = bounds.getX() + (float) bounds.getWidth() * pos / (float) n;
+                g.fillRect (x - 0.5f, bounds.getY(), 1.5f, bounds.getHeight());
+            }
+        }
+    }
+
+private:
+    void timerCallback() override { repaint(); }
+
+public:
+
+    void mouseDown (const MouseEvent& e) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        if (slot->loopMode == SamplerLoopMode::kNone || slot->loopLength <= 0)
+        {
+            /* Auto-activate forward loop covering [start..end] on first
+             * click+drag.  start anchored at the click, length = 1 (user
+             * drags right to extend). */
+            slot->loopMode   = SamplerLoopMode::kForward;
+            slot->loopStart  = pixelToSample (e.x, slot->numSamples);
+            slot->loopLength = juce::jmax (1, slot->numSamples - slot->loopStart);
+            draggingMarker   = 1; /* end */
+            repaint();
+            return;
+        }
+        /* Pick the closer of the two markers. */
+        const int x0 = sampleToPixel (slot->loopStart, slot->numSamples);
+        const int x1 = sampleToPixel (slot->loopStart + slot->loopLength, slot->numSamples);
+        draggingMarker = (std::abs (e.x - x0) < std::abs (e.x - x1)) ? 0 : 1;
+    }
+
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (draggingMarker < 0) return;
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+
+        const int newPos = pixelToSample (e.x, slot->numSamples);
+        if (draggingMarker == 0)
+        {
+            const int oldEnd = slot->loopStart + slot->loopLength;
+            slot->loopStart  = juce::jlimit (0, oldEnd - 1, newPos);
+            slot->loopLength = oldEnd - slot->loopStart;
+        }
+        else
+        {
+            slot->loopLength = juce::jlimit (1, slot->numSamples - slot->loopStart,
+                                              newPos - slot->loopStart);
+        }
+        repaint();
+    }
+
+    void mouseUp (const MouseEvent&) override { draggingMarker = -1; }
+
+private:
+    int pixelToSample (int x, int n) const
+    {
+        const auto bounds = getLocalBounds().reduced (2);
+        const int w = bounds.getWidth();
+        if (w <= 0) return 0;
+        return (int) juce::jlimit ((int64_t) 0, (int64_t) n,
+                                    (int64_t) (x - bounds.getX()) * n / w);
+    }
+    int sampleToPixel (int s, int n) const
+    {
+        const auto bounds = getLocalBounds().reduced (2);
+        if (n <= 0) return bounds.getX();
+        return bounds.getX() + (int) ((int64_t) bounds.getWidth() * s / n);
+    }
+
+    std::function<SamplerSampleSlot*()> getSlot;
+    PlayheadQuery playheadsFor;
+    int draggingMarker = -1; /* -1 none; 0 = loopStart; 1 = loopEnd */
+};
+
 
 class AdsrCurveComponent : public Component
 {
@@ -465,7 +719,11 @@ class SamplerNodeEditor : public AudioProcessorEditor,
 {
 public:
     explicit SamplerNodeEditor (SamplerNode& s) : AudioProcessorEditor (s), node (s),
-        adsrView (s.getAdsr(), [this] (SamplerNode::AdsrParams p) { node.setAdsr (p); })
+        adsrView (s.getAdsr(), [this] (SamplerNode::AdsrParams p) { node.setAdsr (p); }),
+        waveformView ([this] { return currentSlot(); },
+                      [this] (const SamplerSampleSlot* slot) {
+                          return node.collectPlayheadsForSlot (slot);
+                      })
     {
         slotList.setModel (this);
         slotList.setRowHeight (24);
@@ -500,6 +758,17 @@ public:
         configureParamSlider (panSlider, "Pan",   0.0, 1.0, 0.001,
             [this](double v) { if (auto* s = currentSlot()) s->panning = (float) v; });
 
+        loopCombo.addItem ("Loop: Off",      1);
+        loopCombo.addItem ("Loop: Forward",  2);
+        loopCombo.addItem ("Loop: Ping-pong", 3);
+        loopCombo.onChange = [this] {
+            if (auto* s = currentSlot())
+                s->loopMode = (SamplerLoopMode) (loopCombo.getSelectedId() - 1);
+            waveformView.repaint();
+        };
+        addAndMakeVisible (loopCombo);
+
+        addAndMakeVisible (waveformView);
         addAndMakeVisible (adsrView);
 
         interpCombo.addItem ("None",   1);
@@ -549,9 +818,12 @@ public:
         rootSlider.setBounds (r.removeFromTop (rowH)); r.removeFromTop (2);
         fineSlider.setBounds (r.removeFromTop (rowH)); r.removeFromTop (2);
         volSlider .setBounds (r.removeFromTop (rowH)); r.removeFromTop (2);
-        panSlider .setBounds (r.removeFromTop (rowH)); r.removeFromTop (8);
+        panSlider .setBounds (r.removeFromTop (rowH)); r.removeFromTop (4);
 
-        adsrView.setBounds (r.removeFromTop (120)); r.removeFromTop (8);
+        loopCombo.setBounds (r.removeFromTop (rowH));  r.removeFromTop (4);
+        waveformView.setBounds (r.removeFromTop (90)); r.removeFromTop (8);
+
+        adsrView.setBounds (r.removeFromTop (90)); r.removeFromTop (6);
 
         auto interpRow = r.removeFromTop (28);
         interpCombo.setBounds (interpRow.removeFromLeft (160));
@@ -667,6 +939,7 @@ private:
     {
         auto inst = node.getInstrument();
         slotList.updateContent();
+        slotList.repaint();
         if (slotList.getSelectedRow() != activeSlot)
             slotList.selectRow (activeSlot, true, false);
 
@@ -676,7 +949,9 @@ private:
             fineSlider.setValue ((double) slot->finetune, dontSendNotification);
             volSlider .setValue ((double) slot->volume,   dontSendNotification);
             panSlider .setValue ((double) slot->panning,  dontSendNotification);
+            loopCombo.setSelectedId ((int) slot->loopMode + 1, dontSendNotification);
         }
+        waveformView.repaint();
 
         adsrView.setParams (node.getAdsr());
         interpCombo.setSelectedId ((int) node.getInterpMode() + 1, dontSendNotification);
@@ -699,6 +974,8 @@ private:
     TextButton loadBtn, clearBtn;
 
     Slider rootSlider, fineSlider, volSlider, panSlider;
+    ComboBox loopCombo;
+    SampleWaveformView waveformView;
     AdsrCurveComponent adsrView;
     ComboBox interpCombo;
     Label status;
@@ -809,10 +1086,32 @@ void SamplerNode::setAdsr (AdsrParams p)
     adsrParams.release = jlimit (0.f, 30.f, adsrParams.release);
 }
 
+std::vector<int> SamplerNode::collectPlayheadsForSlot (const SamplerSampleSlot* slot) const
+{
+    std::vector<int> out;
+    if (slot == nullptr) return out;
+    auto& s = const_cast<Synthesiser&> (synth);
+    const int nv = s.getNumVoices();
+    out.reserve ((size_t) nv);
+    for (int i = 0; i < nv; ++i)
+    {
+        if (auto* v = dynamic_cast<Ft2SamplerVoice*> (s.getVoice (i)))
+        {
+            if (v->isPlayingActive() && v->getCurrentSlot() == slot)
+                out.push_back (v->getCurrentSamplePos());
+        }
+    }
+    return out;
+}
+
 int SamplerNode::getMixFuncIndexForCurrentMode (bool loop, bool pingpong) const
 {
-    const int base   = kBase16NoRamp; /* always ramped versions used? for v1 no-ramp */
-    const int interp = interpOffset ((int) interpMode);
+    /* Use ramped 16-bit mix funcs so the mixer's internal volume ramp
+     * smooths any mid-block parameter changes (eliminates click
+     * artefacts on velocity / pan tweaks even when ADSR is the macro
+     * envelope). */
+    const int base    = kBase16Ramped;
+    const int interp  = interpOffset ((int) interpMode);
     const int loopOff = pingpong ? 2 : (loop ? 1 : 0);
     return base + interp + loopOff;
 }
@@ -840,6 +1139,9 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
             slotTree.setProperty ("finetune", slot->finetune,    nullptr);
             slotTree.setProperty ("volume",   slot->volume,      nullptr);
             slotTree.setProperty ("pan",      slot->panning,     nullptr);
+            slotTree.setProperty ("loopMode",   (int) slot->loopMode, nullptr);
+            slotTree.setProperty ("loopStart",  slot->loopStart,      nullptr);
+            slotTree.setProperty ("loopLength", slot->loopLength,     nullptr);
             /* Note: raw sample data is not persisted to the session blob
              * (would bloat); user should keep sample files on disk and
              * rely on the per-slot path saved separately. v2 todo: save
@@ -880,6 +1182,9 @@ void SamplerNode::setStateInformation (const void* data, int size)
                 slot->finetune = (int) slotTree.getProperty ("finetune", 0);
                 slot->volume   = (float) (double) slotTree.getProperty ("volume", 1.0);
                 slot->panning  = (float) (double) slotTree.getProperty ("pan",    0.5);
+                slot->loopMode   = (SamplerLoopMode) (int) slotTree.getProperty ("loopMode", 0);
+                slot->loopStart  = (int) slotTree.getProperty ("loopStart",  0);
+                slot->loopLength = (int) slotTree.getProperty ("loopLength", 0);
             }
         }
     }

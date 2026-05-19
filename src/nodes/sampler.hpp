@@ -8,21 +8,33 @@
 
 namespace element {
 
-/** One sample slot within an Instrument.  Holds the loaded WAV's int16
- *  data, source sample rate, and per-sample play parameters (root note,
- *  fine tune, volume, pan).  Mono only for v1; stereo is summed at load. */
+/** Loop mode for sample playback. */
+enum class SamplerLoopMode { kNone = 0, kForward = 1, kPingpong = 2 };
+
+/** One sample slot within an Instrument.  Holds int16 sample data
+ *  (mono OR stereo — data16R is null for mono), source sample rate,
+ *  per-sample play params (root note, fine tune, volume, pan), and
+ *  loop state (mode + start + length in samples). */
 struct SamplerSampleSlot
 {
     String  name;
-    std::unique_ptr<int16_t[]> data16;
+    /* data16L holds either the mono sample or the LEFT channel of a
+     * stereo sample.  data16R is non-null only when isStereo == true. */
+    std::unique_ptr<int16_t[]> data16L;
+    std::unique_ptr<int16_t[]> data16R;
+    bool    isStereo = false;
     int     numSamples = 0;
     double  sourceSampleRate = 48000.0;
-    int     rootNote = 60;       // MIDI note at which sample plays at native pitch
-    int     finetune = 0;        // -128..127 (cents/2 fine offset)
-    float   volume   = 1.0f;     // 0..1
-    float   panning  = 0.5f;     // 0=L  0.5=centre  1=R
+    int     rootNote = 60;
+    int     finetune = 0;          // -128..127 (cents/2 fine offset)
+    float   volume   = 1.0f;
+    float   panning  = 0.5f;
 
-    bool isLoaded() const noexcept { return data16 != nullptr && numSamples > 0; }
+    SamplerLoopMode loopMode = SamplerLoopMode::kNone;
+    int     loopStart  = 0;
+    int     loopLength = 0;        // 0 = end at sample end (when looping)
+
+    bool isLoaded() const noexcept { return data16L != nullptr && numSamples > 0; }
 };
 
 /** Instrument = up to 16 sample slots + a 128-entry MIDI keymap that
@@ -120,6 +132,11 @@ public:
 
     /** Mix-func index for current interpolation mode.  Used by voices. */
     int getMixFuncIndexForCurrentMode (bool loop, bool pingpong) const;
+
+    /** Editor query: return the int32 sample positions of every voice
+     *  currently playing the given slot.  Drawn as playheads in the
+     *  waveform view. */
+    std::vector<int> collectPlayheadsForSlot (const SamplerSampleSlot* slot) const;
 
     AudioFormatManager& getFormatManager() { return formatManager; }
 
