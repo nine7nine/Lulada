@@ -13,13 +13,11 @@ enum class SamplerLoopMode { kNone = 0, kForward = 1, kPingpong = 2 };
 
 /** One sample slot within an Instrument.  Holds int16 sample data
  *  (mono OR stereo — data16R is null for mono), source sample rate,
- *  per-sample play params (root note, fine tune, volume, pan), and
- *  loop state (mode + start + length in samples). */
+ *  per-sample play params (root note, fine tune, volume, pan, relativeNote
+ *  XM-style semitone offset), and loop state. */
 struct SamplerSampleSlot
 {
     String  name;
-    /* data16L holds either the mono sample or the LEFT channel of a
-     * stereo sample.  data16R is non-null only when isStereo == true. */
     std::unique_ptr<int16_t[]> data16L;
     std::unique_ptr<int16_t[]> data16R;
     bool    isStereo = false;
@@ -27,19 +25,45 @@ struct SamplerSampleSlot
     double  sourceSampleRate = 48000.0;
     int     rootNote = 60;
     int     finetune = 0;          // -128..127 (cents/2 fine offset)
+    int     relativeNote = 0;      // -96..96 (XM semitone offset)
     float   volume   = 1.0f;
     float   panning  = 0.5f;
 
     SamplerLoopMode loopMode = SamplerLoopMode::kNone;
     int     loopStart  = 0;
-    int     loopLength = 0;        // 0 = end at sample end (when looping)
+    int     loopLength = 0;
 
     bool isLoaded() const noexcept { return data16L != nullptr && numSamples > 0; }
 };
 
-/** Instrument = up to 16 sample slots + a 128-entry MIDI keymap that
- *  maps each MIDI note to a slot index.  Default keymap spreads loaded
- *  slots evenly across the keyboard.  Renoise / FT2 model. */
+/** FT2-style 12-point envelope.  point.x = tick offset 0..324, point.y =
+ *  0..64.  Shape matches instr_t::volEnvPoints in ft2-clone.  Flags use
+ *  ENV_ENABLED / ENV_SUSTAIN / ENV_LOOP from ft2_replayer.h. */
+struct FT2Envelope
+{
+    enum Flag { kEnabled = 1, kSustain = 2, kLoop = 4 };
+    struct Point { int16_t x; int16_t y; };
+
+    Point   points[12] {};
+    uint8_t length = 0;
+    uint8_t flags = 0;           // bitmask of Flag
+    uint8_t sustainPoint = 0;
+    uint8_t loopStart = 0;
+    uint8_t loopEnd = 0;
+};
+
+/** FT2 auto-vibrato instrument parameters.  Matches instr_t::autoVib*. */
+struct AutoVibParams
+{
+    uint8_t type  = 0;  // 0=sine, 1=square, 2=ramp-up, 3=ramp-down
+    uint8_t sweep = 0;  // ramp-in time
+    uint8_t depth = 0;  // 0..15
+    uint8_t rate  = 0;  // 0..63
+};
+
+/** Instrument = up to 16 sample slots + a 128-entry MIDI keymap +
+ *  per-instrument FT2 envelopes / fadeout / auto-vibrato.  FT2/Renoise
+ *  model. */
 class SamplerInstrument : public ReferenceCountedObject
 {
 public:
@@ -48,15 +72,11 @@ public:
 
     SamplerInstrument();
 
-    /** Load a WAV (or AudioFormatManager-supported file) into slot. */
     bool loadSampleToSlot (int slot, const File& file, AudioFormatManager& fmt);
     void clearSlot (int slot);
 
     int  slotForNote (int midiNote) const noexcept;
     void setSlotForNote (int midiNote, int slot);
-
-    /** Spread currently-loaded slots evenly across the keyboard.
-     *  Called automatically on load when keymap is in default state. */
     void autoSpreadKeymap();
 
     SamplerSampleSlot*       getSlot (int slot);
@@ -64,22 +84,30 @@ public:
     int firstLoadedSlot() const noexcept;
     int numLoaded() const noexcept;
 
-    String name;
+    String        name;
+    FT2Envelope   volumeEnv;
+    FT2Envelope   panEnv;
+    uint16_t      fadeoutRate = 0;   // 0 = no fadeout (sample plays out)
+    AutoVibParams autoVib;
 
 private:
     std::array<std::unique_ptr<SamplerSampleSlot>, kNumSlots> slots;
-    uint8_t noteToSlot[128] {};  // default all 0
+    uint8_t noteToSlot[128] {};
     bool keymapUserModified = false;
 };
 
 /** Sample-based instrument node.  MIDI-in / stereo audio-out.
  *
- *  Multi-sample instrument model (up to 16 sample slots + keymap).
- *  Per-voice DSP via vendored ft2-clone mixer.  ADSR envelope + several
- *  interpolation modes.  */
+ *  Up to 128 instruments, FT2-style.  MIDI channel → instrument mapping
+ *  (default: channel N → instrument N; updated by MIDI program-change).
+ *  Per-voice DSP via vendored ft2-clone mixer.  Each instrument carries
+ *  its own FT2 vol+pan envelopes, fadeout, and auto-vibrato.  */
 class SamplerNode : public BaseProcessor
 {
 public:
+    static constexpr int kMaxInstruments = 128;
+    static constexpr int kEnvTickRateHz  = 50;   // FT2 nominal tick rate
+
     SamplerNode();
     ~SamplerNode() override;
 
@@ -110,35 +138,57 @@ public:
     AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    /** Load a WAV into a specific slot of the active instrument. */
-    bool loadSampleToSlot (int slot, const File& file);
+    /* --- multi-instrument access --------------------------------------- */
+    int  getNumInstruments() const;
+    SamplerInstrument::Ptr getInstrument (int index) const;
+    SamplerInstrument::Ptr addInstrument();
+    void removeInstrument (int index);
 
-    SamplerInstrument::Ptr getInstrument() const { return instrument; }
-    void rebuildInstrument(); /* clear all slots */
+    /** Look up the currently-routed instrument for a MIDI channel (1..16).
+     *  Returns null if no instrument is bound. */
+    SamplerInstrument::Ptr getInstrumentForChannel (int channel1to16) const;
 
+    /** Bind a channel (1..16) to an instrument index.  -1 unbinds. */
+    void bindChannelToInstrument (int channel1to16, int instrumentIndex);
+    int  getChannelBinding (int channel1to16) const;
+
+    /** Convenience: load a WAV into a slot of the active editor instrument. */
+    bool loadSampleToSlot (int instrumentIndex, int slot, const File& file);
+
+    /** Clear all instruments + (re-)create one default empty instrument. */
+    void rebuildInstrument();
+
+    /* --- voice / quality params --------------------------------------- */
     int  getNumVoices() const noexcept { return numVoices; }
     void setNumVoices (int n);
 
-    /** Interpolation quality. */
     enum InterpMode { kInterpNone = 0, kInterpLinear = 1, kInterpCubic = 2, kInterpSinc16 = 3 };
     InterpMode getInterpMode() const noexcept { return interpMode; }
     void       setInterpMode (InterpMode m);
 
-    /** Instrument-global ADSR.  Seconds for A/D/R; 0..1 for sustain. */
+    /** Global ADSR — applied as a fallback shape when an instrument has no
+     *  volume envelope enabled.  When the instrument's volEnv.kEnabled
+     *  flag is set, the ADSR is bypassed in favour of the FT2 envelope. */
     struct AdsrParams { float attack = 0.005f; float decay = 0.05f;
                         float sustain = 1.0f;  float release = 0.10f; };
     AdsrParams getAdsr() const { return adsrParams; }
     void setAdsr (AdsrParams p);
 
-    /** Mix-func index for current interpolation mode.  Used by voices. */
     int getMixFuncIndexForCurrentMode (bool loop, bool pingpong) const;
 
-    /** Editor query: return the int32 sample positions of every voice
-     *  currently playing the given slot.  Drawn as playheads in the
-     *  waveform view. */
     std::vector<int> collectPlayheadsForSlot (const SamplerSampleSlot* slot) const;
 
     AudioFormatManager& getFormatManager() { return formatManager; }
+
+    /** Samples per FT2 envelope tick at the current sample rate. */
+    int getSamplesPerEnvTick() const noexcept;
+
+    /** Last MIDI channel observed in noteOn — used by voices during
+     *  startNote() to pick the right instrument. */
+    int getLastNoteChannel() const noexcept { return lastNoteChannel; }
+
+    /** Called by the channel-tracking synth shim on every noteOn. */
+    void setLastNoteChannel (int ch) noexcept { lastNoteChannel = ch; }
 
 protected:
     bool isBusesLayoutSupported (const BusesLayout&) const override;
@@ -146,15 +196,18 @@ protected:
 private:
     void rebuildVoicePool();
 
-    Synthesiser synth;
+    std::unique_ptr<Synthesiser> synth;
     AudioFormatManager formatManager;
 
     CriticalSection sampleLock;
-    SamplerInstrument::Ptr instrument;
+    std::vector<SamplerInstrument::Ptr> instruments;
+    std::array<int8_t, 16> channelBinding {};   // -1 = default (channel N → instrument N)
+
     int numVoices = 16;
     double currentSampleRate = 48000.0;
     InterpMode interpMode = kInterpLinear;
     AdsrParams adsrParams;
+    int lastNoteChannel = 1;
 };
 
 } // namespace element
