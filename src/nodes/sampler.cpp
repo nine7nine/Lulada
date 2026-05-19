@@ -3,6 +3,189 @@
 
 #include "nodes/sampler.hpp"
 
+/* Vendored ft2-clone mixer (BSD-3-Clause). Sinc / cubic / linear /
+ * no-interp variants; per-voice volume ramp; ping-pong + forward loops.
+ * Activated as the per-voice DSP via Ft2SamplerVoice below.
+ *
+ * Stage 2 swap: juce::SamplerVoice → Ft2SamplerVoice.  The
+ * juce::Synthesiser voice-pool + MIDI dispatch stay in place. */
+extern "C" {
+#include "engine/sampler/ft2_audio.h"
+#include "engine/sampler/ft2_mix.h"
+#include "engine/sampler/ft2_mix_interpolation.h"
+}
+
+namespace element {
+
+namespace {
+
+/* mixFunc indices into mixFuncTab (see ft2_mix.c bottom).
+ * Layout: [no-ramp][8bit then 16bit][no-loop/loop/pingpong]×[no-intrp/s8/lin/s16/cubic]
+ * Then [ramp][...same...]. Total 60 entries.
+ *
+ * For Stage 2 first cut we use 16-bit no-loop linear no-ramp = 21. */
+constexpr int kMixFnIdx_16b_NoLoop_Linear_NoRamp = 21;
+
+/** Convert float[] (mono) → int16[] for ft2's int16 mixer paths. */
+std::unique_ptr<int16_t[]> convertFloatToInt16 (const float* src, int n)
+{
+    std::unique_ptr<int16_t[]> out (new int16_t[(size_t) n]);
+    for (int i = 0; i < n; ++i)
+    {
+        float v = src[i] * 32767.0f;
+        if (v >  32767.f) v =  32767.f;
+        if (v < -32767.f) v = -32767.f;
+        out[(size_t) i] = (int16_t) v;
+    }
+    return out;
+}
+
+/** One-time init of the interpolation LUTs.  Safe to call multiple
+ *  times (it's idempotent on the C side but we gate just in case). */
+void ensureMixerInterpolationTablesReady()
+{
+    static std::once_flag flag;
+    std::call_once (flag, [] { setupMixerInterpolationTables(); });
+}
+
+} // anonymous namespace
+
+
+/* ===========================================================================
+ * Ft2SamplerSound — owns int16 sample data + original sample rate.
+ * Visible to all Ft2SamplerVoices via the juce::Synthesiser sound pool.
+ * ========================================================================*/
+class Ft2SamplerSound : public SynthesiserSound
+{
+public:
+    Ft2SamplerSound (const String& name_, AudioFormatReader& reader,
+                     int rootMidiNote)
+        : name (name_),
+          rootNote (rootMidiNote),
+          sourceSampleRate (reader.sampleRate)
+    {
+        const int64_t maxLen = (int64_t) 10 * 60 * (int64_t) reader.sampleRate;
+        const int n = (int) std::min ((int64_t) reader.lengthInSamples, maxLen);
+        AudioBuffer<float> tmp ((int) reader.numChannels, n);
+        reader.read (&tmp, 0, n, 0, true, true);
+
+        /* Mono only for v1 — sum stereo down. */
+        if (tmp.getNumChannels() > 1)
+        {
+            for (int i = 0; i < n; ++i)
+                tmp.setSample (0, i, 0.5f * (tmp.getSample (0, i) + tmp.getSample (1, i)));
+        }
+
+        numSamples = n;
+        data16 = convertFloatToInt16 (tmp.getReadPointer (0), n);
+    }
+
+    bool appliesToNote    (int) override { return true; }
+    bool appliesToChannel (int) override { return true; }
+
+    const int16_t* getData()         const noexcept { return data16.get(); }
+    int            getNumSamples()   const noexcept { return numSamples; }
+    int            getRootNote()     const noexcept { return rootNote; }
+    double         getSourceRate()   const noexcept { return sourceSampleRate; }
+    const String&  getDisplayName()  const noexcept { return name; }
+
+private:
+    String name;
+    int rootNote = 60;
+    double sourceSampleRate = 48000.0;
+    int numSamples = 0;
+    std::unique_ptr<int16_t[]> data16;
+};
+
+
+/* ===========================================================================
+ * Ft2SamplerVoice — per-voice DSP via the vendored ft2 mixer.
+ * One voice_t per JUCE voice; startNote configures it, renderNextBlock
+ * dispatches via mixFuncTab.
+ * ========================================================================*/
+class Ft2SamplerVoice : public SynthesiserVoice
+{
+public:
+    Ft2SamplerVoice() = default;
+
+    bool canPlaySound (SynthesiserSound* s) override
+    {
+        return dynamic_cast<Ft2SamplerSound*> (s) != nullptr;
+    }
+
+    void startNote (int midiNote, float velocity,
+                    SynthesiserSound* sound, int /*pitchWheel*/) override
+    {
+        auto* s = dynamic_cast<Ft2SamplerSound*> (sound);
+        if (s == nullptr) return;
+
+        voice = {};
+        voice.base16     = s->getData();
+        voice.sampleEnd  = s->getNumSamples();
+        voice.position   = 0;
+        voice.positionFrac = 0;
+        voice.loopType   = 0;
+        voice.active     = true;
+        voice.mixFuncOffset = (uint8_t) kMixFnIdx_16b_NoLoop_Linear_NoRamp;
+
+        const double semis     = (double) midiNote - (double) s->getRootNote();
+        const double pitchMul  = std::pow (2.0, semis / 12.0);
+        const double playRate  = pitchMul * s->getSourceRate() / getSampleRate();
+        /* delta is sample-step per output-sample, 32.32 fixed-point
+         * (MIXER_FRAC_BITS=32). */
+        const double scaled = playRate * 4294967296.0; // 2^32
+        voice.delta = (uint64_t) jlimit (0.0, 1e18, scaled);
+
+        const float v = juce::jlimit (0.0f, 1.0f, velocity);
+        voice.fVolume        = v;
+        voice.fCurrVolumeL   = v * 0.5f; // pan-centre, full-rms
+        voice.fCurrVolumeR   = v * 0.5f;
+        voice.fTargetVolumeL = voice.fCurrVolumeL;
+        voice.fTargetVolumeR = voice.fCurrVolumeR;
+        voice.fVolumeLDelta  = 0.0f;
+        voice.fVolumeRDelta  = 0.0f;
+        voice.volumeRampLength = 0;
+    }
+
+    void stopNote (float /*velocity*/, bool /*allowTailOff*/) override
+    {
+        /* v1: instant note-off.  Tail-off / fadeout via ramped mix
+         * functions is Stage-2.5 polish. */
+        voice.active = false;
+        clearCurrentNote();
+    }
+
+    void pitchWheelMoved (int)            override {}
+    void controllerMoved (int, int)       override {}
+
+    void renderNextBlock (AudioBuffer<float>& out,
+                          int startSample, int numSamples) override
+    {
+        if (! voice.active) return;
+        if (out.getNumChannels() < 2) return;
+
+        /* Point ft2's globals at the JUCE output buffer's L/R channels.
+         * Mixer accumulates (+=) at audio.fMixBufferL[bufferPos + i] so
+         * the base ptr is the buffer start, bufferPos = startSample. */
+        audio.fMixBufferL = out.getWritePointer (0);
+        audio.fMixBufferR = out.getWritePointer (1);
+
+        mixFuncTab[voice.mixFuncOffset] (&voice,
+                                         (uint32_t) startSample,
+                                         (uint32_t) numSamples);
+
+        /* HANDLE_SAMPLE_END in the mixer flips active=false when the
+         * playhead crosses sampleEnd; reflect that to JUCE. */
+        if (! voice.active)
+            clearCurrentNote();
+    }
+
+private:
+    voice_t voice {};
+};
+
+} // namespace element
+
 namespace element {
 
 /* ===========================================================================
@@ -111,6 +294,7 @@ SamplerNode::SamplerNode()
     : BaseProcessor (BusesProperties()
                        .withOutput ("Output", AudioChannelSet::stereo(), true))
 {
+    ensureMixerInterpolationTablesReady();
     formatManager.registerBasicFormats();
     rebuildVoicePool();
 }
@@ -165,7 +349,7 @@ void SamplerNode::rebuildVoicePool()
 {
     synth.clearVoices();
     for (int i = 0; i < numVoices; ++i)
-        synth.addVoice (new SamplerVoice());
+        synth.addVoice (new Ft2SamplerVoice());
 }
 
 bool SamplerNode::loadSample (const File& file)
@@ -175,17 +359,10 @@ bool SamplerNode::loadSample (const File& file)
     std::unique_ptr<AudioFormatReader> reader (formatManager.createReaderFor (file));
     if (reader == nullptr) return false;
 
-    BigInteger allNotes;
-    allNotes.setRange (0, 128, true);
-
-    auto* sound = new SamplerSound (
-        file.getFileNameWithoutExtension(),   // name
-        *reader,                              // reader
-        allNotes,                             // midi notes covered
-        rootNote,                             // root note
-        0.01,                                 // attack (seconds)
-        0.5,                                  // release (seconds)
-        30.0);                                // max sample length (seconds)
+    auto* sound = new Ft2SamplerSound (
+        file.getFileNameWithoutExtension(),
+        *reader,
+        rootNote);
 
     {
         ScopedLock sl (sampleLock);
