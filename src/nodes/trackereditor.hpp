@@ -75,6 +75,13 @@ private:
     int   lastToolbarPatternCount_ = -1;
     float lastToolbarBpm_          = -1.0f;
     bool  lastToolbarEditMode_     = false;
+    int   lastToolbarOctave_       = -1;
+    int   lastToolbarEditStep_     = -1;
+    int   lastToolbarPatternLength_= -1;
+    int   lastToolbarTrackCount_   = -1;
+    bool  lastToolbarFollow_       = false;
+    bool  lastToolbarCanUndo_      = false;
+    bool  lastToolbarCanRedo_      = false;
 };
 
 } // namespace element

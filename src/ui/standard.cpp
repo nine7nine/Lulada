@@ -21,6 +21,7 @@
 #include "ui/arrangementview.hpp"
 #include "ui/controllersview.hpp"
 #include "ui/trackerhostview.hpp"
+#include "ui/diskopview.hpp"
 #include "ui/datapathbrowser.hpp"
 #include "ui/emptyview.hpp"
 #include "ui/grapheditorview.hpp"
@@ -594,6 +595,10 @@ void StandardContent::setMainView (const String& name)
     {
         setContentView (new TrackerHostView());
     }
+    else if (name == EL_VIEW_DISK_OP)
+    {
+        setContentView (new DiskOpContentView());
+    }
     else
     {
         if (auto s = context().session())
@@ -993,6 +998,7 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::showConsole,
         Commands::showArrangement,
         Commands::showTrackerHost,
+        Commands::showDiskOp,
         Commands::toggleVirtualKeyboard,
         Commands::toggleMeterBridge,
         Commands::toggleChannelStrip,
@@ -1096,6 +1102,14 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
             result.setInfo ("Trackers", "Show the tabbed tracker editors", "UI", flags);
             break;
         }
+        case Commands::showDiskOp: {
+            int flags = 0;
+            if (getMainViewName() == EL_VIEW_DISK_OP)
+                flags |= Info::isTicked;
+            result.addDefaultKeypress (KeyPress::F5Key, 0);
+            result.setInfo ("Disk Op", "Show the embedded Disk Op file page", "UI", flags);
+            break;
+        }
         //======================================================================
         case Commands::toggleVirtualKeyboard: {
             result.addDefaultKeypress ('k', ModifierKeys::altModifier);
@@ -1151,6 +1165,9 @@ bool StandardContent::perform (const InvocationInfo& info)
             break;
         case Commands::showPluginManager:
             setMainView (EL_VIEW_PLUGIN_MANAGER);
+            break;
+        case Commands::showDiskOp:
+            setMainView (EL_VIEW_DISK_OP);
             break;
             //===
         case Commands::showSessionConfig:

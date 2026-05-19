@@ -458,7 +458,9 @@ public:
         /* Click in track header (top band):
          *   plain                  → toggle mute
          *   Shift+click            → solo (mute others; re-solo cancels)
-         *   click in channel pill  → cycle channel (right-click reverses) */
+         *   click in channel pill  → cycle channel (right-click reverses)
+         *   click in inst chip     → cycle program 0..127 (right reverses)
+         *   right-click on header  → popup (program picker + actions) */
         if (y >= 0 && y < kTrackHeaderH)
         {
             const int trk = (x - kRowGutterWidth) / kTrackWidth;
@@ -467,13 +469,23 @@ public:
                 const int trkXBase = kRowGutterWidth + trk * kTrackWidth;
                 const int pillRight = trkXBase + kTrackWidth - 8;
                 const int pillLeft  = trkXBase + kTrackWidth - 36;
-                const bool inPill = (x >= pillLeft && x <= pillRight && y <= 22);
-                if (inPill)
+                const bool inChanPill = (x >= pillLeft && x <= pillRight && y <= 22);
+                const bool inInstChip = (x >= pillLeft && x <= pillRight
+                                          && y >= 20 && y <= 32);
+
+                if (e.mods.isRightButtonDown())
                 {
-                    /* Cycle channel; jump cursor to this track first
-                     * so cycleCursorTrackChannel acts on the clicked one. */
+                    showHeaderPopup (trk, e);
+                }
+                else if (inInstChip)
+                {
                     cursorTrack = trk;
-                    cycleCursorTrackChannel (e.mods.isRightButtonDown() ? -1 : 1);
+                    cycleCursorTrackProgram (1);
+                }
+                else if (inChanPill)
+                {
+                    cursorTrack = trk;
+                    cycleCursorTrackChannel (1);
                 }
                 else if (e.mods.isShiftDown())
                 {
@@ -531,6 +543,7 @@ private:
     };
     struct TrackS {
         int port = 0, channel = 0, ncols = 1;
+        int program = -1;       /* -1 = no PC emitted; 0..127 = inst index */
         bool muted = false;
         std::vector<Cell> cells;
     };
@@ -574,6 +587,7 @@ private:
             s.tracks[(size_t) t].port    = trk->port;
             s.tracks[(size_t) t].channel = trk->channel;
             s.tracks[(size_t) t].ncols   = trk->ncols;
+            s.tracks[(size_t) t].program = trk->prog;
             s.tracks[(size_t) t].muted   = (trk->playing == 0);
             s.tracks[(size_t) t].cells.resize ((size_t) seq->length);
             for (int r = 0; r < seq->length; ++r)
@@ -644,6 +658,19 @@ private:
             g.drawText (juce::String::formatted ("ch%02d", chan),
                         x + kTrackWidth - 36, 6, 28, 14,
                         juce::Justification::centredRight);
+
+            /* Instrument / program chip — visible only when a program is
+             * bound (vht trk->prog ≥ 0).  Right-click the header opens a
+             * picker; engine emits MIDI PC at row 0 / on prog change. */
+            const int prog = (size_t) t < s.tracks.size()
+                                ? s.tracks[(size_t) t].program : -1;
+            if (prog >= 0)
+            {
+                g.setColour (juce::Colour { 0xff'8a'd0'4a }.withAlpha (0.85f));
+                g.drawText (juce::String::formatted ("i%03d", prog + 1),
+                            x + kTrackWidth - 36, 20, 28, 12,
+                            juce::Justification::centredRight);
+            }
 
             /* Bottom sub-label: M indicator when muted, else "Note  Vel". */
             if (muted)
@@ -1570,6 +1597,92 @@ public:
         repaint();
     }
 
+    /** Cycle the focused track's program (vht prog field).  Engine sends
+     *  a MIDI PC at row 0 + on change via track_fix_program_change.
+     *  -1 = off, 0..127 = instrument index. */
+    void cycleCursorTrackProgram (int delta = 1)
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk) return;
+        int p = trk->prog + delta;
+        if (p < -1)   p = 127;
+        if (p > 127)  p = -1;
+        trk->prog = p;
+        trk->prog_send = 1;     /* engine emits PC at next row trigger */
+        trk->prog_sent = 0;
+        repaint();
+    }
+
+    /** Right-click on a track header — popup menu for destination /
+     *  program / mute actions. */
+    void showHeaderPopup (int trk, const juce::MouseEvent& e)
+    {
+        if (trackerNode == nullptr) return;
+        if (trk < 0) return;
+
+        cursorTrack = trk;
+
+        juce::PopupMenu m;
+        m.addSectionHeader ("Track " + juce::String (trk + 1));
+        m.addItem (1, "Mute / unmute");
+        m.addItem (2, "Solo");
+        m.addSeparator();
+        m.addItem (3, "Inst +1");
+        m.addItem (4, "Inst -1");
+        m.addItem (5, "Inst off");
+        m.addSeparator();
+        juce::PopupMenu progSub;
+        for (int i = 1; i <= 16; ++i)
+            progSub.addItem (100 + i, "Instrument " + juce::String (i));
+        m.addSubMenu ("Set instrument...", progSub);
+        m.addSeparator();
+        m.addItem (6, "Channel +1");
+        m.addItem (7, "Channel -1");
+
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
+            [this, trk] (int sel) {
+                switch (sel)
+                {
+                    case 0:  return;
+                    case 1:  toggleTrackMute (trk); break;
+                    case 2:  soloTrack (trk); break;
+                    case 3:  cursorTrack = trk; cycleCursorTrackProgram ( 1); break;
+                    case 4:  cursorTrack = trk; cycleCursorTrackProgram (-1); break;
+                    case 5:  setTrackProgram (trk, -1); break;
+                    case 6:  cursorTrack = trk; cycleCursorTrackChannel ( 1); break;
+                    case 7:  cursorTrack = trk; cycleCursorTrackChannel (-1); break;
+                    default:
+                        if (sel >= 101 && sel <= 116)
+                            setTrackProgram (trk, sel - 101);
+                        break;
+                }
+            });
+        juce::ignoreUnused (e);
+    }
+
+    void setTrackProgram (int t, int prog)
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        if (t < 0 || t >= mod->curr_seq->ntrk) return;
+        auto* trk = mod->curr_seq->trk[t];
+        if (! trk) return;
+        trk->prog = juce::jlimit (-1, 127, prog);
+        trk->prog_send = 1;
+        trk->prog_sent = 0;
+        repaint();
+    }
+
     /* === Edit-mode + octave + edit-step toggles ====================== */
 
     bool getEditMode() const noexcept { return editMode; }
@@ -1947,21 +2060,42 @@ void TrackerEditor::timerCallback()
     /* Toolbar: only refresh when transport / pattern state actually
      * differs from last frame, so the 30Hz tick doesn't keep rebuilding
      * label strings + repainting buttons on idle. */
-    int   newPatternIndex = patternView ? patternView->getPatternIndex() : 0;
-    int   newPatternCount = patternView ? patternView->getPatternCount() : 1;
-    float newBpm          = patternView ? patternView->getBPM() : 120.f;
-    bool  newEditMode     = patternView ? patternView->getEditMode() : false;
+    int   newPatternIndex  = patternView ? patternView->getPatternIndex() : 0;
+    int   newPatternCount  = patternView ? patternView->getPatternCount() : 1;
+    float newBpm           = patternView ? patternView->getBPM() : 120.f;
+    bool  newEditMode      = patternView ? patternView->getEditMode() : false;
+    int   newOctave        = patternView ? patternView->getOctave() : 4;
+    int   newEditStep      = patternView ? patternView->getEditStep() : 1;
+    int   newPatternLength = patternView ? patternView->getPatternLength() : 0;
+    int   newTrackCount    = patternView ? patternView->getTrackCount() : 0;
+    bool  newFollow        = patternView ? patternView->getFollowPlayhead() : false;
+    bool  newCanUndo       = canUndo();
+    bool  newCanRedo       = canRedo();
 
-    if (newPatternIndex != lastToolbarPatternIndex_
-        || newPatternCount != lastToolbarPatternCount_
+    if (newPatternIndex  != lastToolbarPatternIndex_
+        || newPatternCount  != lastToolbarPatternCount_
         || std::abs (newBpm - lastToolbarBpm_) > 0.01f
-        || newEditMode != lastToolbarEditMode_)
+        || newEditMode      != lastToolbarEditMode_
+        || newOctave        != lastToolbarOctave_
+        || newEditStep      != lastToolbarEditStep_
+        || newPatternLength != lastToolbarPatternLength_
+        || newTrackCount    != lastToolbarTrackCount_
+        || newFollow        != lastToolbarFollow_
+        || newCanUndo       != lastToolbarCanUndo_
+        || newCanRedo       != lastToolbarCanRedo_)
     {
         refreshToolbar();
-        lastToolbarPatternIndex_ = newPatternIndex;
-        lastToolbarPatternCount_ = newPatternCount;
-        lastToolbarBpm_          = newBpm;
-        lastToolbarEditMode_     = newEditMode;
+        lastToolbarPatternIndex_  = newPatternIndex;
+        lastToolbarPatternCount_  = newPatternCount;
+        lastToolbarBpm_           = newBpm;
+        lastToolbarEditMode_      = newEditMode;
+        lastToolbarOctave_        = newOctave;
+        lastToolbarEditStep_      = newEditStep;
+        lastToolbarPatternLength_ = newPatternLength;
+        lastToolbarTrackCount_    = newTrackCount;
+        lastToolbarFollow_        = newFollow;
+        lastToolbarCanUndo_       = newCanUndo;
+        lastToolbarCanRedo_       = newCanRedo;
     }
 }
 
