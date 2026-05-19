@@ -819,22 +819,57 @@ public:
         }
         const int vRange = viewEnd_ - viewStart_;
 
+        /* Two render modes:
+         *   - Envelope mode (vRange > w): per-pixel min/max envelope.
+         *   - Sample-line mode (vRange <= w, deep zoom): connect each
+         *     sample at its exact subpixel position with a line plot,
+         *     and dot each sample when spacing exceeds 4 px.
+         * The earlier int-truncated envelope collapsed at high zoom
+         * because (vRange / w) → 0 → adjacent pixels sampled the same
+         * index, leaving the waveform spiky / broken. */
         g.setColour (Colour { 0xff'5a'a5'd0 });
-        for (int x = 0; x < w; ++x)
+        if (vRange > w)
         {
-            const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
-            const int64_t s1 = juce::jmax (s0 + 1,
-                                            (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
-            int mn = INT16_MAX, mx = INT16_MIN;
-            for (int64_t i = s0; i < s1 && i < n; ++i)
+            for (int x = 0; x < w; ++x)
             {
-                const int v = d[i];
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
+                const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
+                const int64_t s1 = juce::jmax (s0 + 1,
+                                                (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
+                int mn = INT16_MAX, mx = INT16_MIN;
+                for (int64_t i = s0; i < s1 && i < n; ++i)
+                {
+                    const int v = d[i];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                const float yMin = midY - (mn / 32768.0f) * halfH;
+                const float yMax = midY - (mx / 32768.0f) * halfH;
+                g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
             }
-            const float yMin = midY - (mn / 32768.0f) * halfH;
-            const float yMax = midY - (mx / 32768.0f) * halfH;
-            g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
+        }
+        else
+        {
+            const double pxPerSample = (double) w / (double) juce::jmax (1, vRange);
+            Path linePath;
+            bool started = false;
+            for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+            {
+                const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                if (! started) { linePath.startNewSubPath (xpx, ypx); started = true; }
+                else            linePath.lineTo (xpx, ypx);
+            }
+            g.strokePath (linePath, PathStrokeType (1.2f));
+
+            if (pxPerSample >= 4.0)
+            {
+                for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+                {
+                    const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                    const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                    g.fillEllipse (xpx - 1.5f, ypx - 1.5f, 3.0f, 3.0f);
+                }
+            }
         }
 
         if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
@@ -2138,22 +2173,57 @@ public:
         g.drawHorizontalLine ((int) midY, bounds.getX(), bounds.getRight());
 
         /* Min/max envelope per pixel column. */
+        /* Two render modes:
+         *   - Envelope mode (vRange > w): per-pixel min/max envelope.
+         *   - Sample-line mode (vRange <= w, deep zoom): connect each
+         *     sample at its exact subpixel position with a line plot,
+         *     and dot each sample when spacing exceeds 4 px.
+         * The earlier int-truncated envelope collapsed at high zoom
+         * because (vRange / w) → 0 → adjacent pixels sampled the same
+         * index, leaving the waveform spiky / broken. */
         g.setColour (Colour { 0xff'5a'a5'd0 });
-        for (int x = 0; x < w; ++x)
+        if (vRange > w)
         {
-            const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
-            const int64_t s1 = juce::jmax (s0 + 1,
-                                            (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
-            int mn = INT16_MAX, mx = INT16_MIN;
-            for (int64_t i = s0; i < s1 && i < n; ++i)
+            for (int x = 0; x < w; ++x)
             {
-                const int v = d[i];
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
+                const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
+                const int64_t s1 = juce::jmax (s0 + 1,
+                                                (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
+                int mn = INT16_MAX, mx = INT16_MIN;
+                for (int64_t i = s0; i < s1 && i < n; ++i)
+                {
+                    const int v = d[i];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                const float yMin = midY - (mn / 32768.0f) * halfH;
+                const float yMax = midY - (mx / 32768.0f) * halfH;
+                g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
             }
-            const float yMin = midY - (mn / 32768.0f) * halfH;
-            const float yMax = midY - (mx / 32768.0f) * halfH;
-            g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
+        }
+        else
+        {
+            const double pxPerSample = (double) w / (double) juce::jmax (1, vRange);
+            Path linePath;
+            bool started = false;
+            for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+            {
+                const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                if (! started) { linePath.startNewSubPath (xpx, ypx); started = true; }
+                else            linePath.lineTo (xpx, ypx);
+            }
+            g.strokePath (linePath, PathStrokeType (1.2f));
+
+            if (pxPerSample >= 4.0)
+            {
+                for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+                {
+                    const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                    const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                    g.fillEllipse (xpx - 1.5f, ypx - 1.5f, 3.0f, 3.0f);
+                }
+            }
         }
 
         /* Selection edge markers. */
