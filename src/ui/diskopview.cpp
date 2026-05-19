@@ -268,7 +268,8 @@ private:
  *     grows when the user actually uses a bank.
  * ========================================================================*/
 class SampleBankPane : public Component,
-                       private Timer
+                       private Timer,
+                       private ChangeListener
 {
 public:
     static constexpr int kNumBanks         = SamplerNode::kMaxInstruments;   /* 128 */
@@ -292,7 +293,7 @@ public:
 
         configureBtn (addSamplerBtn_, "+ Sampler", [this] { addSamplerToGraph(); });
         configureBtn (refreshBtn_, "Refresh",     [this] { rebuildSamplerList(); });
-        configureBtn (loadBtn_,    "Load → slot", [this] { loadIntoSelectedSlot(); });
+        configureBtn (loadBtn_,    "Load to slot", [this] { loadIntoSelectedSlot(); });
         configureBtn (loadBankBtn_, "Fill bank (dir)", [this] { fillBankFromDirectory(); });
 
         instrumentList_.model = this;
@@ -321,10 +322,22 @@ public:
             addAndMakeVisible (*l);
         }
 
+        DiskOpService::get().activations.addChangeListener (this);
         startTimerHz (2);
     }
 
-    ~SampleBankPane() override { stopTimer(); }
+    ~SampleBankPane() override
+    {
+        DiskOpService::get().activations.removeChangeListener (this);
+        stopTimer();
+    }
+
+    /** Activation listener — double-click in the file browser. */
+    void changeListenerCallback (ChangeBroadcaster*) override
+    {
+        if (! isShowing()) return;
+        loadIntoSelectedSlot();
+    }
 
     void connect (Services* services)
     {
@@ -474,8 +487,20 @@ public:
 private:
     void timerCallback() override
     {
+        /* Skip work entirely when the pane isn't visible — the Disk Op
+         * page only renders this in Sample mode.  Saves a graph walk
+         * + ListBox repaint pair every 500ms while the user is in
+         * Plugin Paths / Session mode or has the whole Disk Op view
+         * hidden behind another nav page. */
+        if (! isShowing()) return;
+
         const int curCount = countSamplerNodes();
         if (curCount != lastSamplerCount_) rebuildSamplerList();
+
+        /* Cache invalidation only when graph state actually shifts.
+         * Idle-tick paint cost goes from ~128 graph walks (one per
+         * row's paintListBoxItem) to 0. */
+        cachedNode_ = nullptr;
         instrumentList_.list.repaint();
         slotList_.list.repaint();
     }
@@ -492,6 +517,14 @@ private:
 
     SamplerNode* getSamplerProcessor (int index) const
     {
+        /* Cached for the duration of one Timer-tick burst of paints —
+         * walking the active graph hundreds of times per frame chokes
+         * winelib wineserver round-trips.  The cache is invalidated in
+         * timerCallback when sampler count changes, and once per 500ms
+         * tick anyway to pick up other graph mutations. */
+        if (cachedNode_ && cachedSamplerIdx_ == index)
+            return cachedNode_;
+
         if (services_ == nullptr) return nullptr;
         const auto session = services_->context().session();
         if (session == nullptr) return nullptr;
@@ -508,7 +541,11 @@ private:
             if (hit != index) continue;
             if (auto* obj = n.getObject())
                 if (auto* sp = dynamic_cast<SamplerNode*> (obj->getAudioProcessor()))
+                {
+                    cachedNode_ = sp;
+                    cachedSamplerIdx_ = index;
                     return sp;
+                }
         }
         return nullptr;
     }
@@ -636,6 +673,8 @@ private:
     int activeSampler_    = 0;
     int activeInstrument_ = 0;
     int lastSamplerCount_ = -1;
+    mutable SamplerNode* cachedNode_ = nullptr;
+    mutable int          cachedSamplerIdx_ = -1;
 
     Label title_, instrumentLabel_, slotsLabel_;
     ComboBox samplerCombo_;
@@ -893,11 +932,17 @@ public:
     void fileDoubleClicked (const File& f) override
     {
         if (f.isDirectory())
+        {
             DiskOpService::get().setCurrentDirectory (f);
-        else if (f.existsAsFile())
+            return;
+        }
+        if (f.existsAsFile())
         {
             DiskOpService::get().setSelectedFile (f);
             statusLabel_.setText ("Selected: " + f.getFileName(), dontSendNotification);
+            /* Fire activation — Sample mode listens and loads into
+             * the currently focused slot. */
+            DiskOpService::get().fireActivation();
         }
     }
     void browserRootChanged (const File& newRoot) override

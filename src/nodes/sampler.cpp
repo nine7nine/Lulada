@@ -984,6 +984,7 @@ public:
 private:
     void timerCallback() override
     {
+        if (! isShowing()) return;     /* free CPU when off-screen */
         auto* slot = getSlot ? getSlot() : nullptr;
         std::vector<int> cur = slot != nullptr ? playheadsFor (slot) : std::vector<int>();
         if (cur == lastPlayheads_)
@@ -1319,14 +1320,24 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            /* Base gray, then overlay slot tint at ~55% if assigned. */
+            /* Mostly gray, just a subtle slot tint baked in (~22%) so
+             * eye still groups same-slot keys.  Full colour lives in
+             * the 6 px stripe at the top. */
             const Colour base = hasAssign
                               ? grayWhite.interpolatedWith (
-                                    slotPaletteColour (assignedSlot, 0.65f, 0.75f),
-                                    0.55f)
+                                    slotPaletteColour (assignedSlot, 0.55f, 0.75f),
+                                    0.22f)
                               : grayWhite;
             g.setColour (base);
             g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
+
+            /* Top colour stripe — small, vivid. */
+            if (hasAssign)
+            {
+                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.85f));
+                g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 6.0f);
+            }
+
             g.setColour (Colour { 0xff'2a'2a'2a });
             g.drawRect (x, bounds.getY(), whiteW, whiteH, 1.0f);
 
