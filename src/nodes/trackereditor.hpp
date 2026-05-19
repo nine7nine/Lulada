@@ -9,18 +9,16 @@ namespace element {
 
 class TrackerNode;
 
-/** Pattern grid editor for the Tracker node. Renoise-style:
- *  - Dark monospace grid
- *  - Hex row numbers in left gutter
- *  - Colored track header bars
- *  - Beat-highlight every 4 rows
- *  - Cells render as `C-5 64` (note + velocity); empty = `--- --`
- *  - Playhead row highlighted while transport is playing
- *  - Edit cursor with arrow-key navigation
- *  - QWERTY note input (tracker piano layout) when edit mode is on
+/** Pattern grid editor for the Tracker node.  Renoise-style:
+ *  - Dark monospace grid + hex row numbers
+ *  - Coloured track header bars w/ MIDI channel + click-to-mute
+ *  - Playhead row highlight while transport plays
+ *  - Edit cursor (sub-column-aware: note / vel-hi / vel-lo)
+ *  - QWERTY note input + hex velocity input
+ *  - Multi-pattern: Ctrl+N adds, Ctrl+PageUp/Dn switches
+ *  - Top toolbar exposes the keyboard ops as visible buttons
  *
- *  Caps Lock toggles edit mode. Arrows move the cursor; PageUp/PageDown
- *  jump 16 rows. 1-9 set octave. Delete clears the cell at cursor. */
+ *  ESC toggles edit mode.  F1 shows full keybindings. */
 class TrackerEditor : public NodeEditor,
                       private juce::Timer
 {
@@ -31,12 +29,36 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
 
+    /* Bridge methods used by the toolbar.  Delegate to PatternView /
+     * TrackerNode under engineLock_. */
+    bool  isEditMode() const;
+    void  toggleEditMode();
+    int   getOctave() const;
+    void  changeOctave (int delta);
+    int   getEditStep() const;
+    void  changeEditStep (int delta);
+    int   getPatternLength() const;
+    void  changePatternLength (int delta);
+    int   getTrackCount() const;
+    void  addTrack();
+    void  deleteCurrentTrack();
+    int   getPatternIndex() const;
+    int   getPatternCount() const;
+    void  newPattern();
+    void  switchPattern (int delta);
+    float getBPM() const;
+    void  toggleHelp();
+
 private:
     void timerCallback() override;
+    void refreshToolbar();
 
     class PatternView;
+    class Toolbar;
+
     std::unique_ptr<PatternView> patternView;
     std::unique_ptr<juce::Viewport> viewport;
+    std::unique_ptr<Toolbar> toolbar;
 };
 
 } // namespace element

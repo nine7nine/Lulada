@@ -196,6 +196,11 @@ public:
                 { changePatternLength (shift ?  16 :  1); return true; }
             if (kc == juce::KeyPress::downKey)
                 { changePatternLength (shift ? -16 : -1); return true; }
+            if (kc == juce::KeyPress::pageUpKey)
+                { switchPattern (-1); return true; }
+            if (kc == juce::KeyPress::pageDownKey)
+                { switchPattern ( 1); return true; }
+            if (kc == 'N' || kc == 'n') { newPattern();          return true; }
             if (kc == 'T' || kc == 't') { addTrack();            return true; }
             if (kc == 'W' || kc == 'w') { deleteCurrentTrack();  return true; }
         }
@@ -284,14 +289,23 @@ public:
     {
         grabKeyboardFocus();
 
-        // Click in a cell -> jump cursor there.
         Snapshot s;
         snapshot (s);
 
         const int x = e.x;
         const int y = e.y;
-        if (y < kTrackHeaderH || x < kRowGutterWidth) return;
+        if (x < kRowGutterWidth) return;
 
+        /* Click in track header (top band) → toggle mute. */
+        if (y >= 0 && y < kTrackHeaderH)
+        {
+            const int trk = (x - kRowGutterWidth) / kTrackWidth;
+            if (trk >= 0 && trk < s.ntrk)
+                toggleTrackMute (trk);
+            return;
+        }
+
+        /* Click in cell → jump cursor there. */
         const int row = (y - kTrackHeaderH) / kRowHeight;
         const int trk = (x - kRowGutterWidth) / kTrackWidth;
 
@@ -303,10 +317,15 @@ public:
 
 private:
     struct Cell { int type = 0; int note = 0; int velocity = 0; };
-    struct TrackS { int port = 0, channel = 0, ncols = 1; std::vector<Cell> cells; };
+    struct TrackS {
+        int port = 0, channel = 0, ncols = 1;
+        bool muted = false;
+        std::vector<Cell> cells;
+    };
     struct Snapshot {
         int rows = 16, ntrk = 1, rpb = 4;
         int playheadRow = -1;   // -1 = not playing
+        int patternIndex = 0, patternCount = 1;
         std::vector<TrackS> tracks;
     };
 
@@ -330,6 +349,11 @@ private:
             s.playheadRow = p;
         }
 
+        /* Pattern N / M — find index of curr_seq in mod->seq[]. */
+        s.patternCount = mod->nseq;
+        for (int p = 0; p < mod->nseq; ++p)
+            if (mod->seq[p] == seq) { s.patternIndex = p; break; }
+
         s.tracks.resize ((size_t) seq->ntrk);
         for (int t = 0; t < seq->ntrk; ++t)
         {
@@ -338,6 +362,7 @@ private:
             s.tracks[(size_t) t].port    = trk->port;
             s.tracks[(size_t) t].channel = trk->channel;
             s.tracks[(size_t) t].ncols   = trk->ncols;
+            s.tracks[(size_t) t].muted   = (trk->playing == 0);
             s.tracks[(size_t) t].cells.resize ((size_t) seq->length);
             for (int r = 0; r < seq->length; ++r)
             {
@@ -377,7 +402,10 @@ private:
         for (int t = 0; t < s.ntrk; ++t)
         {
             const int x = kRowGutterWidth + t * kTrackWidth;
-            const auto tint = trackTint (t);
+            const auto fullTint = trackTint (t);
+            const bool muted = (size_t) t < s.tracks.size() && s.tracks[(size_t) t].muted;
+            const auto tint = muted ? fullTint.withSaturation (0.2f).withBrightness (0.4f)
+                                    : fullTint;
 
             g.setColour (tint);
             g.fillRect (x, 0, kTrackWidth - 1, 6);
@@ -387,15 +415,35 @@ private:
 
             g.setColour (tint);
             g.drawText (juce::String::formatted ("Track%02d", t),
-                        x + 6, 8, kTrackWidth - 12, 16,
+                        x + 6, 6, kTrackWidth - 28, 14,
                         juce::Justification::centredLeft);
 
-            g.setColour (juce::Colours::white.withAlpha (0.45f));
+            /* Channel pill (top-right of track header). */
+            const int chan = (size_t) t < s.tracks.size()
+                                ? s.tracks[(size_t) t].channel + 1
+                                : t + 1;
+            g.setColour (juce::Colours::white.withAlpha (0.55f));
             g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                           kHeaderFontSize - 2.0f, juce::Font::plain));
-            g.drawText ("Note  Vel",
-                        x + 6, kTrackHeaderH - 14, kTrackWidth - 12, 12,
-                        juce::Justification::centredLeft);
+            g.drawText (juce::String::formatted ("ch%02d", chan),
+                        x + kTrackWidth - 36, 6, 28, 14,
+                        juce::Justification::centredRight);
+
+            /* Bottom sub-label: M indicator when muted, else "Note  Vel". */
+            if (muted)
+            {
+                g.setColour (juce::Colours::red.withAlpha (0.85f));
+                g.drawText ("MUTE",
+                            x + 6, kTrackHeaderH - 14, kTrackWidth - 12, 12,
+                            juce::Justification::centredLeft);
+            }
+            else
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.45f));
+                g.drawText ("Note  Vel",
+                            x + 6, kTrackHeaderH - 14, kTrackWidth - 12, 12,
+                            juce::Justification::centredLeft);
+            }
             g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                           kHeaderFontSize, juce::Font::bold));
         }
@@ -587,8 +635,11 @@ private:
             track_set_row (trk, 0, cursorRow, 1, midiNote, 100, 0);
         }
 
-        const int next = cursorRow + 1;
-        cursorRow = next < seq->length ? next : 0;
+        if (editStep > 0)
+        {
+            const int next = cursorRow + editStep;
+            cursorRow = (next < seq->length) ? next : (next % seq->length);
+        }
         ensureCursorVisible();
         repaint();
     }
@@ -629,12 +680,18 @@ private:
         else
         {
             cursorSubCol = 0;
-            const int next = cursorRow + 1;
-            cursorRow = next < seq->length ? next : 0;
+            if (editStep > 0)
+            {
+                const int next = cursorRow + editStep;
+                cursorRow = (next < seq->length) ? next : (next % seq->length);
+            }
             ensureCursorVisible();
         }
         repaint();
     }
+
+public:
+    /* === Public mutation / accessor surface for the toolbar.       === */
 
     void changePatternLength (int delta)
     {
@@ -657,8 +714,8 @@ private:
         auto* mod = trackerNode->modulePtr();
         if (mod == nullptr || mod->curr_seq == nullptr) return;
         auto* seq = mod->curr_seq;
-        if (seq->ntrk >= 16) return; // soft cap; engine has no hard limit
-        const int newCh = seq->ntrk; // simplest scheme — channel == track idx
+        if (seq->ntrk >= 16) return;
+        const int newCh = seq->ntrk;
         track* trk = track_new (0 /*port*/, newCh, seq->length, seq->length, TRACK_DEF_CTRLPR);
         sequence_add_track (seq, trk);
         cursorTrack = seq->ntrk - 1;
@@ -672,13 +729,159 @@ private:
         auto* mod = trackerNode->modulePtr();
         if (mod == nullptr || mod->curr_seq == nullptr) return;
         auto* seq = mod->curr_seq;
-        if (seq->ntrk <= 1) return; // keep at least one track
+        if (seq->ntrk <= 1) return;
         if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
         sequence_del_track (seq, cursorTrack);
         if (cursorTrack >= seq->ntrk) cursorTrack = seq->ntrk - 1;
         repaint();
     }
 
+    /** Add a new empty pattern (same length as current). Engine
+     *  advances all sequences in mod->seq[], but only those with
+     *  playing=1 emit MIDI — we keep one-pattern-at-a-time semantics
+     *  by gating playing across the curr_seq pointer. */
+    void newPattern()
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr) return;
+        const int len = mod->curr_seq ? mod->curr_seq->length : 16;
+
+        sequence* seq = sequence_new (len);
+        /* Mirror the test pattern's defaults: 1 track. */
+        track* trk = track_new (0, 0, len, len, TRACK_DEF_CTRLPR);
+        sequence_add_track (seq, trk);
+        module_add_sequence (mod, seq);
+
+        /* Pause all sequences except the new one. */
+        for (int i = 0; i < mod->nseq; ++i)
+            sequence_set_playing (mod->seq[i], 0);
+        sequence_set_playing (seq, 1);
+        mod->curr_seq = seq;
+
+        cursorRow = 0;
+        cursorTrack = 0;
+        cursorSubCol = 0;
+        repaint();
+    }
+
+    /** Switch the active pattern by delta (+1 / -1). */
+    void switchPattern (int delta)
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->nseq == 0) return;
+
+        int idx = 0;
+        for (int i = 0; i < mod->nseq; ++i)
+            if (mod->seq[i] == mod->curr_seq) { idx = i; break; }
+
+        idx = (idx + delta + mod->nseq) % mod->nseq;
+        auto* target = mod->seq[idx];
+
+        for (int i = 0; i < mod->nseq; ++i)
+            sequence_set_playing (mod->seq[i], 0);
+        sequence_set_playing (target, 1);
+        mod->curr_seq = target;
+
+        /* Clamp cursor into new pattern bounds. */
+        if (cursorRow >= target->length) cursorRow = target->length - 1;
+        if (cursorTrack >= target->ntrk) cursorTrack = target->ntrk - 1;
+        cursorSubCol = 0;
+        repaint();
+    }
+
+    /** Toggle mute on track index t (sets trk->playing). When muting,
+     *  kill currently-ringing notes so no stuck notes remain. */
+    void toggleTrackMute (int t)
+    {
+        if (trackerNode == nullptr) return;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (t < 0 || t >= seq->ntrk) return;
+        auto* trk = seq->trk[t];
+        if (! trk) return;
+
+        if (trk->playing)
+        {
+            track_kill_notes (trk);
+            trk->playing = 0;
+        }
+        else
+        {
+            trk->playing = 1;
+        }
+        repaint();
+    }
+
+    /* === Edit-mode + octave + edit-step toggles ====================== */
+
+    bool getEditMode() const noexcept { return editMode; }
+    void toggleEditMode() { editMode = ! editMode; repaint(); }
+
+    int  getOctave() const noexcept { return octave; }
+    void changeOctave (int delta)
+    {
+        octave = juce::jlimit (0, 8, octave + delta);
+        repaint();
+    }
+
+    int  getEditStep() const noexcept { return editStep; }
+    void changeEditStep (int delta)
+    {
+        editStep = juce::jlimit (0, 16, editStep + delta);
+        repaint();
+    }
+
+    bool getHelpVisible() const noexcept { return showHelp; }
+    void toggleHelp() { showHelp = ! showHelp; repaint(); }
+
+    /* === Read-only accessors for the toolbar status display ========== */
+
+    int getPatternLength() const
+    {
+        if (trackerNode == nullptr) return 0;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        return (mod && mod->curr_seq) ? mod->curr_seq->length : 0;
+    }
+    int getTrackCount() const
+    {
+        if (trackerNode == nullptr) return 0;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        return (mod && mod->curr_seq) ? mod->curr_seq->ntrk : 0;
+    }
+    int getPatternIndex() const
+    {
+        if (trackerNode == nullptr) return 0;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (! mod) return 0;
+        for (int i = 0; i < mod->nseq; ++i)
+            if (mod->seq[i] == mod->curr_seq) return i;
+        return 0;
+    }
+    int getPatternCount() const
+    {
+        if (trackerNode == nullptr) return 0;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        return mod ? mod->nseq : 0;
+    }
+    float getBPM() const
+    {
+        if (trackerNode == nullptr) return 120.f;
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        return mod ? mod->bpm : 120.f;
+    }
+
+private:
     void paintHelp (juce::Graphics& g)
     {
         if (auto* vp = findParentComponentOfClass<juce::Viewport>())
@@ -708,17 +911,20 @@ private:
                 "  PgUp / PgDn  jump 16 rows",
                 "  Home / End   first / last row",
                 "  Click        jump cursor to cell",
+                "  Click header toggle track mute",
                 "",
-                "PATTERN",
+                "PATTERN / TRACKS",
                 "  Ctrl+Up/Dn   pattern length -/+ 1",
                 "  Ctrl+Shift+Up/Dn   length -/+ 16",
                 "  Ctrl+T       add track",
                 "  Ctrl+W       remove cursor track (keeps last)",
+                "  Ctrl+N       new pattern",
+                "  Ctrl+PgUp/Dn switch pattern -/+ (wraps)",
                 "",
                 "  F1 / ?       toggle this help",
                 "",
                 "(transport via Element's main play/stop;",
-                " BPM follows Element)"
+                " BPM follows Element. Edit step + UI on toolbar)"
             };
 
             const int lineHeight = 18;
@@ -737,8 +943,127 @@ private:
     int cursorTrack  = 0;
     int cursorSubCol = 0; // 0 = note, 1 = vel-hi, 2 = vel-lo
     int octave       = 4;
+    int editStep     = 1; // auto-advance amount after a write (0 = no advance)
     bool editMode    = false;
     bool showHelp    = false;
+};
+
+
+/* ===========================================================================
+ * Toolbar — top strip of buttons + status labels.  All actions delegate
+ * back to the owning TrackerEditor (which then calls into PatternView /
+ * TrackerNode under engineLock_).
+ * =========================================================================*/
+class TrackerEditor::Toolbar : public juce::Component
+{
+public:
+    explicit Toolbar (TrackerEditor& ed) : editor (ed)
+    {
+        configureButton (editBtn,   "EDIT", [this]{ editor.toggleEditMode(); });
+        editBtn.setClickingTogglesState (true);
+
+        configureButton (helpBtn,   "?",    [this]{ editor.toggleHelp(); });
+        configureButton (octMinusBtn,  "<", [this]{ editor.changeOctave (-1); });
+        configureButton (octPlusBtn,   ">", [this]{ editor.changeOctave ( 1); });
+        configureButton (stepMinusBtn, "<", [this]{ editor.changeEditStep (-1); });
+        configureButton (stepPlusBtn,  ">", [this]{ editor.changeEditStep ( 1); });
+        configureButton (lenMinusBtn,  "-", [this]{ editor.changePatternLength (-1); });
+        configureButton (lenPlusBtn,   "+", [this]{ editor.changePatternLength ( 1); });
+        configureButton (trkRemoveBtn, "-", [this]{ editor.deleteCurrentTrack(); });
+        configureButton (trkAddBtn,    "+", [this]{ editor.addTrack(); });
+        configureButton (patPrevBtn,   "<", [this]{ editor.switchPattern (-1); });
+        configureButton (patNextBtn,   ">", [this]{ editor.switchPattern ( 1); });
+        configureButton (patNewBtn,   "NEW",[this]{ editor.newPattern(); });
+
+        configureLabel (octLabel);
+        configureLabel (stepLabel);
+        configureLabel (lenLabel);
+        configureLabel (trkLabel);
+        configureLabel (patLabel);
+        configureLabel (bpmLabel);
+
+        refresh();
+    }
+
+    /** Pull state from the editor and update widget text. Cheap; called
+     *  from the editor's 30 Hz timer. */
+    void refresh()
+    {
+        editBtn.setToggleState (editor.isEditMode(), juce::dontSendNotification);
+        editBtn.setColour (juce::TextButton::buttonOnColourId,
+                           juce::Colour { 0xff'c0'30'30 });
+
+        octLabel .setText (juce::String::formatted ("OCT %d",   editor.getOctave()),       juce::dontSendNotification);
+        stepLabel.setText (juce::String::formatted ("STEP %d",  editor.getEditStep()),     juce::dontSendNotification);
+        lenLabel .setText (juce::String::formatted ("LEN %d",   editor.getPatternLength()),juce::dontSendNotification);
+        trkLabel .setText (juce::String::formatted ("TRK %d",   editor.getTrackCount()),   juce::dontSendNotification);
+        patLabel .setText (juce::String::formatted ("PAT %d/%d", editor.getPatternIndex() + 1,
+                                                                 juce::jmax (1, editor.getPatternCount())),
+                           juce::dontSendNotification);
+        bpmLabel .setText (juce::String::formatted ("BPM %.1f", editor.getBPM()),          juce::dontSendNotification);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour { 0xff'24'24'24 });
+        g.setColour (juce::Colour { 0xff'35'35'35 });
+        g.drawHorizontalLine (getHeight() - 1, 0.0f, (float) getWidth());
+    }
+
+    void resized() override
+    {
+        int x = 6;
+        const int y = 4;
+        const int h = getHeight() - 8;
+        const int btnW  = 24;
+        const int lblW  = 64;
+        const int wideW = 48;
+
+        auto place = [&] (juce::Component& c, int w) {
+            c.setBounds (x, y, w, h);
+            x += w + 2;
+        };
+        auto sep = [&] { x += 8; };
+
+        place (editBtn, wideW); sep();
+        place (octMinusBtn, btnW);  place (octLabel, lblW);  place (octPlusBtn, btnW);  sep();
+        place (stepMinusBtn, btnW); place (stepLabel, lblW); place (stepPlusBtn, btnW); sep();
+        place (lenMinusBtn, btnW);  place (lenLabel, lblW);  place (lenPlusBtn, btnW);  sep();
+        place (trkRemoveBtn, btnW); place (trkLabel, lblW);  place (trkAddBtn, btnW);   sep();
+        place (patPrevBtn, btnW);   place (patLabel, 72);    place (patNextBtn, btnW);
+        place (patNewBtn, 44); sep();
+        place (bpmLabel, 80); sep();
+        place (helpBtn, btnW);
+    }
+
+private:
+    void configureButton (juce::TextButton& b, const juce::String& text,
+                          std::function<void()> on)
+    {
+        b.setButtonText (text);
+        b.onClick = std::move (on);
+        b.setColour (juce::TextButton::buttonColourId,  juce::Colour { 0xff'2c'2c'2c });
+        b.setColour (juce::TextButton::textColourOffId, juce::Colour { 0xff'd0'd0'd0 });
+        b.setColour (juce::TextButton::textColourOnId,  juce::Colours::white);
+        addAndMakeVisible (b);
+    }
+    void configureLabel (juce::Label& l)
+    {
+        l.setJustificationType (juce::Justification::centred);
+        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      12.0f, juce::Font::plain));
+        l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
+        addAndMakeVisible (l);
+    }
+
+    TrackerEditor& editor;
+    juce::TextButton editBtn, helpBtn;
+    juce::TextButton octMinusBtn,   octPlusBtn;
+    juce::TextButton stepMinusBtn,  stepPlusBtn;
+    juce::TextButton lenMinusBtn,   lenPlusBtn;
+    juce::TextButton trkRemoveBtn,  trkAddBtn;
+    juce::TextButton patPrevBtn,    patNextBtn, patNewBtn;
+    juce::Label octLabel, stepLabel, lenLabel, trkLabel, patLabel, bpmLabel;
 };
 
 
@@ -757,19 +1082,23 @@ TrackerEditor::TrackerEditor (const Node& n)
     viewport->setWantsKeyboardFocus (false);  // forward to PatternView
     addAndMakeVisible (viewport.get());
 
+    toolbar.reset (new Toolbar (*this));
+    addAndMakeVisible (toolbar.get());
+
     patternView->grabKeyboardFocus();
 
     setResizable (true);
-    /* Default: ~24 rows visible × first 4 tracks visible (gutter +
-     * 4 track widths + scrollbar) + header. Resizable beyond. */
-    setSize (kRowGutterWidth + 4 * kTrackWidth + 16,
-             kTrackHeaderH + 24 * kRowHeight + 4);
+    /* Toolbar is ~36 tall; default body fits ~24 rows × 4 tracks. */
+    constexpr int kToolbarH = 36;
+    setSize (juce::jmax (760, kRowGutterWidth + 4 * kTrackWidth + 16),
+             kToolbarH + kTrackHeaderH + 24 * kRowHeight + 4);
     startTimerHz (30);
 }
 
 TrackerEditor::~TrackerEditor()
 {
     stopTimer();
+    toolbar.reset();
     viewport.reset();
     patternView.reset();
 }
@@ -781,10 +1110,12 @@ void TrackerEditor::paint (juce::Graphics& g)
 
 void TrackerEditor::resized()
 {
+    constexpr int kToolbarH = 36;
+    auto r = getLocalBounds();
+    if (toolbar)
+        toolbar->setBounds (r.removeFromTop (kToolbarH));
     if (viewport)
-        viewport->setBounds (getLocalBounds());
-    /* PatternView::resized will fire next via the viewport; it sizes
-     * itself to the engine pattern's full extent. */
+        viewport->setBounds (r);
     if (patternView)
         patternView->updateGridSize();
 }
@@ -796,6 +1127,32 @@ void TrackerEditor::timerCallback()
         patternView->updateGridSize();
         patternView->repaint();
     }
+    refreshToolbar();
 }
+
+void TrackerEditor::refreshToolbar()
+{
+    if (toolbar) toolbar->refresh();
+}
+
+/* === Bridge methods ====================================================== */
+
+bool  TrackerEditor::isEditMode() const    { return patternView ? patternView->getEditMode() : false; }
+void  TrackerEditor::toggleEditMode()      { if (patternView) patternView->toggleEditMode(); }
+int   TrackerEditor::getOctave() const     { return patternView ? patternView->getOctave() : 4; }
+void  TrackerEditor::changeOctave (int d)  { if (patternView) patternView->changeOctave (d); }
+int   TrackerEditor::getEditStep() const   { return patternView ? patternView->getEditStep() : 1; }
+void  TrackerEditor::changeEditStep (int d){ if (patternView) patternView->changeEditStep (d); }
+int   TrackerEditor::getPatternLength() const { return patternView ? patternView->getPatternLength() : 0; }
+void  TrackerEditor::changePatternLength (int d) { if (patternView) patternView->changePatternLength (d); }
+int   TrackerEditor::getTrackCount() const { return patternView ? patternView->getTrackCount() : 0; }
+void  TrackerEditor::addTrack()            { if (patternView) patternView->addTrack(); }
+void  TrackerEditor::deleteCurrentTrack()  { if (patternView) patternView->deleteCurrentTrack(); }
+int   TrackerEditor::getPatternIndex() const { return patternView ? patternView->getPatternIndex() : 0; }
+int   TrackerEditor::getPatternCount() const { return patternView ? patternView->getPatternCount() : 1; }
+void  TrackerEditor::newPattern()          { if (patternView) patternView->newPattern(); }
+void  TrackerEditor::switchPattern (int d) { if (patternView) patternView->switchPattern (d); }
+float TrackerEditor::getBPM() const        { return patternView ? patternView->getBPM() : 120.f; }
+void  TrackerEditor::toggleHelp()          { if (patternView) patternView->toggleHelp(); }
 
 } // namespace element
