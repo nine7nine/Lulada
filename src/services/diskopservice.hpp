@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <functional>
+#include <optional>
 #include <element/juce.hpp>
 
 namespace element {
@@ -173,6 +175,70 @@ public:
         }
     }
 
+    /* --- One-shot file requests --------------------------------------- *
+     * Open / Save dialog replacement.  Callers arm a request describing
+     * what they want (title, wildcard, starting dir, save-vs-open) plus
+     * a callback that fires on Confirm.  The DiskOp page replaces its
+     * right pane with a "Request" overlay that shows the title plus
+     * Confirm/Cancel buttons; the user navigates the file browser as
+     * normal and clicks Confirm.  Activations (double-click on a file)
+     * also complete an open request directly.
+     *
+     * One request at a time — arming a second one cancels the first.
+     * Caller is responsible for navigating the user to the DiskOp page
+     * after arming (see GuiService::requestFile, which bundles both). */
+    struct Request {
+        juce::String title;
+        juce::String wildcard;          ///< overrides mode wildcard while active
+        juce::File   startingDirectory; ///< pre-positions cwd if directory
+        juce::String initialFilename;   ///< pre-fills filename field
+        Mode         modeHint { Mode::kSession };
+        bool         isSave { false };
+        std::function<void(const juce::File&)> onAccept;
+        std::function<void()>                  onCancel;
+    };
+
+    bool hasPendingRequest() const noexcept { return pending_.has_value(); }
+    const Request* getPendingRequest() const noexcept
+        { return pending_.has_value() ? &pending_.value() : nullptr; }
+
+    void armRequest (Request r)
+    {
+        /* Cancel any in-flight request before swapping. */
+        if (pending_.has_value() && pending_->onCancel) pending_->onCancel();
+        pending_ = std::move (r);
+
+        /* Side-effects: switch mode, jump to starting dir, prefill name. */
+        setMode (pending_->modeHint);
+        if (pending_->startingDirectory.isDirectory())
+            setCurrentDirectory (pending_->startingDirectory);
+        if (pending_->initialFilename.isNotEmpty())
+            setFilename (pending_->initialFilename);
+
+        sendChangeMessage();
+    }
+
+    /** Fire the request's accept callback with the chosen file and
+     *  clear pending state.  No-op if no request armed. */
+    void completeRequest (const juce::File& chosen)
+    {
+        if (! pending_.has_value()) return;
+        auto cb = std::move (pending_->onAccept);
+        pending_.reset();
+        sendChangeMessage();
+        if (cb) cb (chosen);
+    }
+
+    /** Cancel the pending request — fires onCancel if set. */
+    void cancelRequest()
+    {
+        if (! pending_.has_value()) return;
+        auto cb = std::move (pending_->onCancel);
+        pending_.reset();
+        sendChangeMessage();
+        if (cb) cb();
+    }
+
     /* --- Wine drive enumeration --------------------------------------- *
      * Lists ~/.wine/dosdevices/ entries to surface Wine drive letters
      * (Z:, C:, etc.) as quick-nav targets.  Each entry resolves to the
@@ -215,6 +281,7 @@ private:
     juce::File   selection_;
     juce::String filename_;
     std::array<juce::FileSearchPath, kNumPluginFormats> pluginPaths_;
+    std::optional<Request> pending_;
 };
 
 } // namespace element
