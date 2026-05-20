@@ -2854,6 +2854,18 @@ public:
         repaint();
     }
 
+    /** Tell the preview what the waveshaper would do.  When `kind`
+     *  is > 0 the canvas overlays a second trace showing the
+     *  generator output after passing through the shaper. */
+    void setShaperParams (int kind, double drive, double mix)
+    {
+        if (kind == shaperKind_ && std::abs (drive - shaperDrive_) < 1e-6
+            && std::abs (mix - shaperMix_) < 1e-6)
+            return;
+        shaperKind_ = kind; shaperDrive_ = drive; shaperMix_ = mix;
+        repaint();
+    }
+
     void paint (Graphics& g) override
     {
         const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
@@ -2870,26 +2882,55 @@ public:
         const int w = juce::roundToInt (bounds.getWidth());
         if (w <= 0 || cycles_ <= 0.0) return;
 
-        Path path;
         const float gain = juce::jlimit (0.0f, 1.0f, (float) amp_);
+        const bool shaperOn = shaperKind_ > 0 && shaperMix_ > 0.0;
+
+        /* Pass 1: raw generator trace.  Faint when the shaper is on
+         * (acts as a reference), full when it's off. */
+        Path raw;
         bool started = false;
         for (int x = 0; x < w; ++x)
         {
             const double phase = double (x) / double (w) * cycles_;
             const double frac  = phase - std::floor (phase);
-            double y = genWaveSample (kind_, frac);
-            const float ypx = midY - (float) y * halfH * gain;
-            if (! started) { path.startNewSubPath (bounds.getX() + x, ypx); started = true; }
-            else            path.lineTo            (bounds.getX() + x, ypx);
+            const double y = genWaveSample (kind_, frac) * gain;
+            const float ypx = midY - (float) y * halfH;
+            if (! started) { raw.startNewSubPath (bounds.getX() + x, ypx); started = true; }
+            else            raw.lineTo            (bounds.getX() + x, ypx);
         }
-        g.setColour (Colour { 0xff'5a'a5'd0 });
-        g.strokePath (path, PathStrokeType (1.5f));
+        g.setColour (shaperOn
+                       ? Colour { 0xff'5a'a5'd0 }.withAlpha (0.35f)
+                       : Colour { 0xff'5a'a5'd0 });
+        g.strokePath (raw, PathStrokeType (1.5f));
+
+        /* Pass 2: post-shaper trace (only when shaper engaged). */
+        if (shaperOn)
+        {
+            Path shaped;
+            started = false;
+            for (int x = 0; x < w; ++x)
+            {
+                const double phase = double (x) / double (w) * cycles_;
+                const double frac  = phase - std::floor (phase);
+                const double rawY  = genWaveSample (kind_, frac) * gain;
+                const double shapedY = waveShaperSample (shaperKind_, shaperDrive_, rawY);
+                const double mixed = rawY * (1.0 - shaperMix_) + shapedY * shaperMix_;
+                const float ypx = midY - (float) mixed * halfH;
+                if (! started) { shaped.startNewSubPath (bounds.getX() + x, ypx); started = true; }
+                else            shaped.lineTo            (bounds.getX() + x, ypx);
+            }
+            g.setColour (Colour { 0xff'd0'80'40 });
+            g.strokePath (shaped, PathStrokeType (1.8f));
+        }
     }
 
 private:
     int    kind_   = 1;
     double cycles_ = 1.0;
     double amp_    = 1.0;
+    int    shaperKind_  = 0;     /* 0 = no shaper overlay */
+    double shaperDrive_ = 1.0;
+    double shaperMix_   = 0.0;
 };
 
 
@@ -2993,6 +3034,7 @@ public:
         addAndMakeVisible (shaperCombo);
 
         shaperDriveSlider.onValueChange = [this] { refreshShaperPreview(); };
+        shaperMixSlider  .onValueChange = [this] { refreshShaperPreview(); };
         addAndMakeVisible (shaperPreview_);
         refreshShaperPreview();
 
@@ -3333,14 +3375,19 @@ private:
 
     void refreshWavePreview()
     {
+        const double drive = 1.0 + shaperDriveSlider.getValue() / 100.0 * 40.0;
+        const double mix   = shaperMixSlider.getValue() / 100.0;
         wavePreview_.setParams (genWaveCombo.getSelectedId(),
                                 cyclesSlider.getValue(),
                                 amplitudeSlider.getValue() / 100.0);
+        wavePreview_.setShaperParams (shaperCombo.getSelectedId(), drive, mix);
     }
     void refreshShaperPreview()
     {
         const double drive = 1.0 + shaperDriveSlider.getValue() / 100.0 * 40.0;
         shaperPreview_.setParams (shaperCombo.getSelectedId(), drive);
+        /* Shaper changes also reshape the generator preview output. */
+        refreshWavePreview();
     }
 
     /** Apply the selected waveshaper to the active range. */
