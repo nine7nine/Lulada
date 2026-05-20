@@ -1145,7 +1145,14 @@ void track_emit_voice_fx_block(track *trk, int frame_offset, int nframes) {
 
 	const int kSubsteps = 4;
 
-	for (int c = 0; c < trk->ncols; c++) {
+	/* Snapshot ncols at the top so a UI-side track_add_col / track_del_col
+	 * running concurrently can't change our loop bound mid-iteration.
+	 * Doesn't eliminate the underlying vht ncols++-before-realloc race
+	 * (audio still reads trk->fx[c] without trk->excl), but bounds it
+	 * to one observation per block. */
+	const int ncols = trk->ncols;
+
+	for (int c = 0; c < ncols; c++) {
 		track_fx_state *fx_st = &trk->fx[c];
 		const int has_vib   = (fx_st->vib_depth > 0 && fx_st->vib_speed > 0);
 		const int has_trem  = (fx_st->trem_depth > 0 && fx_st->trem_speed > 0);
