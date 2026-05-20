@@ -186,6 +186,12 @@ public:
     /** Rebuild rendering ops immediately. */
     void rebuild() noexcept;
 
+    /** Enable / disable parallel layer dispatch.  Read from the
+        ELEMENT_GRAPH_MT env var at prepareToRender; tests may toggle
+        directly. */
+    void setParallelExecutionEnabled (bool enabled) noexcept { parallelEnabled = enabled; }
+    bool isParallelExecutionEnabled() const noexcept { return parallelEnabled.load(); }
+
 protected:
     //==========================================================================
     virtual void preRenderNodes() {}
@@ -216,6 +222,10 @@ private:
     OwnedArray<MidiBuffer> midiBuffers;
     Array<void*> renderingOps;
     Array<Array<int>> renderingLayers; // layered schedule: layer[L] = op indices runnable in parallel within layer L
+    Array<int> expensiveOpCountPerLayer; // count of ProcessBufferOp per layer (parallel-dispatch gate)
+    struct WorkerPool;
+    std::unique_ptr<WorkerPool> workerPool;
+    std::atomic<bool> parallelEnabled { false };
     bool _prepared = false;
 
     AudioSampleBuffer* currentAudioInputBuffer;

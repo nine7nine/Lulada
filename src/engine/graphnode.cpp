@@ -12,11 +12,113 @@
 #include "nodes/audioprocessor.hpp"
 #include "engine/graphnode.hpp"
 
+#include <pthread.h>
+#include <sched.h>
+#include <thread>
+
 #ifndef EL_GRAPH_NODE_NAME
 #define EL_GRAPH_NODE_NAME "Graph"
 #endif
 
 namespace element {
+
+/* GraphWorker: SCHED_FIFO 70 self-promote, WaitableEvent sync, no
+ * allocations on render path.  Modelled on SamplerWorker in
+ * src/nodes/sampler.cpp.  Receives raw pointers into renderingOps and
+ * layerIndices arrays — never holds a reference to GraphNode itself, so
+ * the seqLock invariant (held by main throughout the op walk) is
+ * preserved trivially.  Workers run one rung below the NSPA audio
+ * thread (which sits at FIFO 80) so they cannot starve it. */
+class GraphWorker : public juce::Thread
+{
+public:
+    explicit GraphWorker (const String& threadName) : juce::Thread (threadName) {}
+
+    void postJob (void* const* opsArray,
+                  const int* indices,
+                  int start, int end,
+                  AudioSampleBuffer* audio,
+                  const OwnedArray<MidiBuffer>* midi,
+                  int n) noexcept
+    {
+        ops        = opsArray;
+        layerIdx   = indices;
+        jobStart   = start;
+        jobEnd     = end;
+        audioBuf   = audio;
+        midiBufs   = midi;
+        numSamples = n;
+        workReady.signal();
+    }
+
+    void waitForJobCompletion() noexcept { jobCompleted.wait (-1); }
+
+    void requestStop() noexcept
+    {
+        signalThreadShouldExit();
+        workReady.signal();
+    }
+
+    void run() override
+    {
+        /* Best-effort RT promotion — if the user lacks RTPRIO capability
+         * the call fails and the worker runs at SCHED_OTHER.  Functionally
+         * still correct, just less RT-tight. */
+        sched_param p{};
+        p.sched_priority = 70;
+        pthread_setschedparam (pthread_self(), SCHED_FIFO, &p);
+
+        while (! threadShouldExit())
+        {
+            workReady.wait (-1);
+            if (threadShouldExit()) break;
+
+            for (int k = jobStart; k < jobEnd; ++k)
+            {
+                const int opIdx = layerIdx[k];
+                auto* op = static_cast<GraphOp*> (ops[opIdx]);
+                op->perform (*audioBuf, *midiBufs, numSamples);
+            }
+
+            jobCompleted.signal();
+        }
+    }
+
+private:
+    juce::WaitableEvent workReady, jobCompleted;
+    void* const* ops      = nullptr;
+    const int*   layerIdx = nullptr;
+    int jobStart = 0, jobEnd = 0;
+    AudioSampleBuffer* audioBuf = nullptr;
+    const OwnedArray<MidiBuffer>* midiBufs = nullptr;
+    int numSamples = 0;
+};
+
+struct GraphNode::WorkerPool
+{
+    std::vector<std::unique_ptr<GraphWorker>> workers;
+
+    void prepare (int desired)
+    {
+        if ((int) workers.size() == desired) return;
+        stop();
+        for (int i = 0; i < desired; ++i)
+        {
+            auto w = std::make_unique<GraphWorker> ("GraphWorker" + String (i));
+            w->startThread();
+            workers.push_back (std::move (w));
+        }
+    }
+
+    void stop()
+    {
+        for (auto& w : workers) w->requestStop();
+        for (auto& w : workers) w->stopThread (2000);
+        workers.clear();
+    }
+
+    ~WorkerPool() { stop(); }
+};
 
 GraphNode::Connection::Connection (const uint32 sourceNode_, const uint32 sourcePort_, const uint32 destNode_, const uint32 destPort_) noexcept
     : Arc (sourceNode_, sourcePort_, destNode_, destPort_) {}
@@ -369,6 +471,7 @@ void GraphNode::clearRenderingSequence()
         const ScopedLock sl (seqLock);
         renderingOps.swapWith (oldOps);
         renderingLayers.clearQuick();
+        expensiveOpCountPerLayer.clearQuick();
     }
 
     deleteRenderOpArray (oldOps);
@@ -398,6 +501,7 @@ void GraphNode::buildRenderingSequence()
 {
     Array<void*> newRenderingOps;
     Array<Array<int>> newRenderingLayers;
+    Array<int> newExpensiveOpCountPerLayer;
     int numRenderingBuffersNeeded = 2;
     int numMidiBuffersNeeded = 1;
     int numAtomBuffersNeeded = 1;
@@ -428,13 +532,20 @@ void GraphNode::buildRenderingSequence()
         setLatencySamples (builder.getTotalLatencySamples());
 
         GraphBuilder::computeRenderingLayers (newRenderingOps, newRenderingLayers);
+        GraphBuilder::countExpensiveOpsPerLayer (newRenderingOps, newRenderingLayers, newExpensiveOpCountPerLayer);
 
        #if JUCE_DEBUG
         int maxLayerSize = 0;
+        int parallelCandidateLayers = 0;
         for (int i = 0; i < newRenderingLayers.size(); ++i)
+        {
             maxLayerSize = jmax (maxLayerSize, newRenderingLayers.getReference (i).size());
+            if (newExpensiveOpCountPerLayer.getUnchecked (i) >= 2)
+                ++parallelCandidateLayers;
+        }
         DBG ("[GraphMT] " << newRenderingOps.size() << " ops in "
-             << newRenderingLayers.size() << " layers (max layer size " << maxLayerSize << ")");
+             << newRenderingLayers.size() << " layers (max layer size " << maxLayerSize
+             << ", parallel-candidate layers " << parallelCandidateLayers << ")");
        #endif
     }
 
@@ -455,6 +566,7 @@ void GraphNode::buildRenderingSequence()
         ScopedLock sl (seqLock);
         renderingOps.swapWith (newRenderingOps);
         renderingLayers.swapWith (newRenderingLayers);
+        expensiveOpCountPerLayer.swapWith (newExpensiveOpCountPerLayer);
     }
 
     // delete the old ones..
@@ -509,6 +621,26 @@ void GraphNode::prepareToRender (double sampleRate, int estimatedSamplesPerBlock
     for (int i = 0; i < nodes.size(); ++i)
         nodes.getUnchecked (i)->prepare (sampleRate, estimatedSamplesPerBlock, this);
 
+    /* Worker-pool prepare.  Pool size = min(4, hwc - 2): reserve a core
+     * for the audio main thread + one for the UI message thread.  hwc==0
+     * (unknowable) → no pool.  Env-var ELEMENT_GRAPH_MT=1 opts in. */
+    {
+        const int hwc = (int) std::thread::hardware_concurrency();
+        const int desired = jmax (0, jmin (4, hwc - 2));
+        if (desired > 0)
+        {
+            if (! workerPool) workerPool = std::make_unique<WorkerPool>();
+            workerPool->prepare (desired);
+        }
+        else if (workerPool)
+        {
+            workerPool->stop();
+        }
+
+        const auto env = juce::SystemStats::getEnvironmentVariable ("ELEMENT_GRAPH_MT", String());
+        parallelEnabled.store (desired > 0 && env == "1");
+    }
+
     buildRenderingSequence();
 }
 
@@ -516,6 +648,9 @@ void GraphNode::releaseResources()
 {
     if (! prepared())
         return;
+
+    if (workerPool) workerPool->stop();
+    parallelEnabled.store (false);
 
     for (int i = 0; i < nodes.size(); ++i)
         nodes.getUnchecked (i)->unprepare();
@@ -580,10 +715,79 @@ void GraphNode::render (RenderContext& rc)
 
     {
         ScopedLock sl (seqLock);
-        for (auto ptr : renderingOps)
+
+        /* Gate the parallel path: env-var-enabled + pool prepared +
+         * worth-it block size + multi-layer schedule.  Anything else
+         * falls through to the linear op walk. */
+        const bool useParallel = parallelEnabled.load()
+                              && workerPool && ! workerPool->workers.empty()
+                              && numSamples >= 64
+                              && renderingLayers.size() > 1;
+
+        if (! useParallel)
         {
-            GraphOp* const op = static_cast<GraphOp*> (ptr);
-            op->perform (renderingBuffers, midiBuffers, numSamples);
+            for (auto ptr : renderingOps)
+            {
+                GraphOp* const op = static_cast<GraphOp*> (ptr);
+                op->perform (renderingBuffers, midiBuffers, numSamples);
+            }
+        }
+        else
+        {
+            void* const* opsArray = renderingOps.getRawDataPointer();
+            const int numWorkers = (int) workerPool->workers.size();
+
+            for (int L = 0; L < renderingLayers.size(); ++L)
+            {
+                const auto& layer = renderingLayers.getReference (L);
+                const int layerSize = layer.size();
+
+                /* Per-layer gate: parallelise only when 2+ expensive
+                 * (ProcessBufferOp) ops sit in the layer.  Trivial
+                 * Clear/Copy/Add ops are too cheap to amortise dispatch
+                 * cost; run them sequentially. */
+                const int expensive = expensiveOpCountPerLayer.getUnchecked (L);
+                if (layerSize <= 1 || expensive < 2)
+                {
+                    for (int k = 0; k < layerSize; ++k)
+                    {
+                        const int opIdx = layer.getUnchecked (k);
+                        auto* op = static_cast<GraphOp*> (opsArray[opIdx]);
+                        op->perform (renderingBuffers, midiBuffers, numSamples);
+                    }
+                    continue;
+                }
+
+                /* Contiguous chunking across (numWorkers + main) units.
+                 * Workers grab their slices from the front, main drains
+                 * the tail, everyone meets at jobCompleted. */
+                const int totalUnits = numWorkers + 1;
+                const int base       = layerSize / totalUnits;
+                const int extra      = layerSize % totalUnits;
+                const int* const idx = layer.begin();
+
+                int start = 0;
+                int workersUsed = 0;
+                for (int w = 0; w < numWorkers; ++w)
+                {
+                    const int chunk = base + (w < extra ? 1 : 0);
+                    if (chunk <= 0) break;
+                    workerPool->workers[(size_t) w]->postJob (opsArray, idx,
+                                                              start, start + chunk,
+                                                              &renderingBuffers, &midiBuffers,
+                                                              numSamples);
+                    start += chunk;
+                    ++workersUsed;
+                }
+                for (int k = start; k < layerSize; ++k)
+                {
+                    const int opIdx = idx[k];
+                    auto* op = static_cast<GraphOp*> (opsArray[opIdx]);
+                    op->perform (renderingBuffers, midiBuffers, numSamples);
+                }
+                for (int w = 0; w < workersUsed; ++w)
+                    workerPool->workers[(size_t) w]->waitForJobCompletion();
+            }
         }
     }
 

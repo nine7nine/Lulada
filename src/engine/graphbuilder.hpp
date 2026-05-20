@@ -53,6 +53,13 @@ public:
     static void computeRenderingLayers (const Array<void*>& renderingOps,
                                         Array<Array<int>>& renderingLayers);
 
+    /** Count "expensive" ops (ProcessBufferOp — i.e. real plugin processBlock
+        calls) per layer.  Cheap copy/clear/delay ops are not worth
+        parallelising on their own; this drives the parallel-dispatch gate. */
+    static void countExpensiveOpsPerLayer (const Array<void*>& renderingOps,
+                                           const Array<Array<int>>& renderingLayers,
+                                           Array<int>& counts);
+
 private:
     //==============================================================================
     GraphNode& graph;

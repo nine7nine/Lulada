@@ -597,6 +597,28 @@ void GraphBuilder::computeRenderingLayers (const Array<void*>& renderingOps,
     }
 }
 
+void GraphBuilder::countExpensiveOpsPerLayer (const Array<void*>& renderingOps,
+                                              const Array<Array<int>>& renderingLayers,
+                                              Array<int>& counts)
+{
+    counts.clearQuick();
+    counts.resize (renderingLayers.size());
+
+    for (int L = 0; L < renderingLayers.size(); ++L)
+    {
+        const auto& layer = renderingLayers.getReference (L);
+        int n = 0;
+        for (int k = 0; k < layer.size(); ++k)
+        {
+            const int idx = layer.getUnchecked (k);
+            auto* op = static_cast<GraphOp*> (renderingOps.getUnchecked (idx));
+            if (dynamic_cast<ProcessBufferOp*> (op) != nullptr)
+                ++n;
+        }
+        counts.set (L, n);
+    }
+}
+
 int GraphBuilder::buffersNeeded (PortType type) { return allNodes[type.id()].size(); }
 int GraphBuilder::getNodeDelay (const uint32 nodeID) const { return nodeDelays[nodeDelayIDs.indexOf (nodeID)]; }
 
