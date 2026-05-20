@@ -767,7 +767,8 @@ static String midiNoteName (int n)
  * SampleWaveformView — waveform + draggable loop markers + live playheads.
  * ========================================================================*/
 class SampleWaveformView : public Component,
-                           private Timer
+                           private Timer,
+                           private juce::ScrollBar::Listener
 {
 public:
     using PlayheadQuery = std::function<std::vector<int> (const SamplerSampleSlot*)>;
@@ -775,16 +776,32 @@ public:
     SampleWaveformView (std::function<SamplerSampleSlot*()> getSlot_,
                         PlayheadQuery playheadsFor_)
         : getSlot     (std::move (getSlot_)),
-          playheadsFor (std::move (playheadsFor_))
+          playheadsFor (std::move (playheadsFor_)),
+          hScroll_     (false)
     {
+        hScroll_.addListener (this);
+        hScroll_.setAutoHide (false);
+        addAndMakeVisible (hScroll_);
         startTimerHz (30);
     }
 
-    ~SampleWaveformView() override { stopTimer(); }
+    ~SampleWaveformView() override
+    {
+        hScroll_.removeListener (this);
+        stopTimer();
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        hScroll_.setBounds (r.removeFromBottom (kScrollH));
+    }
 
     void paint (Graphics& g) override
     {
-        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        auto fullBounds = getLocalBounds().toFloat();
+        fullBounds.removeFromBottom ((float) kScrollH);
+        const auto bounds = fullBounds.reduced (2.0f);
         g.setColour (Colour { 0xff'10'10'10 });
         g.fillRect (bounds);
         g.setColour (Colour { 0xff'2a'2a'2a });
@@ -816,19 +833,22 @@ public:
             viewStart_ = 0;
             viewEnd_   = n;
             lastSeenN_ = n;
+            syncScrollBar();
         }
         const int vRange = viewEnd_ - viewStart_;
 
         /* Two render modes:
-         *   - Envelope mode (vRange > w): per-pixel min/max envelope.
-         *   - Sample-line mode (vRange <= w, deep zoom): connect each
-         *     sample at its exact subpixel position with a line plot,
-         *     and dot each sample when spacing exceeds 4 px.
-         * The earlier int-truncated envelope collapsed at high zoom
-         * because (vRange / w) → 0 → adjacent pixels sampled the same
-         * index, leaving the waveform spiky / broken. */
+         *   - Envelope mode (vRange > 4*w): per-pixel min/max envelope.
+         *   - Sample-line mode (vRange <= 4*w, moderate-to-deep zoom):
+         *     connect each sample at its exact subpixel position with
+         *     a line plot, dotting each sample once spacing > 4 px.
+         *
+         * Threshold is 4× pixel count rather than 1× — at moderate
+         * zooms with smooth content the envelope's per-pixel scan
+         * produced visible moiré against the pixel grid.  Line mode
+         * handles 4 samples/pixel cleanly via path stroking. */
         g.setColour (Colour { 0xff'5a'a5'd0 });
-        if (vRange > w)
+        if (vRange > 4 * w)
         {
             for (int x = 0; x < w; ++x)
             {
@@ -976,6 +996,7 @@ public:
                                           viewStart_ + shift);
             viewStart_ = newStart;
             viewEnd_   = newStart + range;
+            syncScrollBar();
             repaint();
         }
         else if (std::abs (w.deltaY) > 0.001f)
@@ -992,6 +1013,7 @@ public:
         {
             viewStart_ = 0;
             viewEnd_   = slot->numSamples;
+            syncScrollBar();
             repaint();
         }
     }
@@ -1012,6 +1034,7 @@ private:
         newStart = juce::jlimit (0, juce::jmax (0, n - newRange), newStart);
         viewStart_ = newStart;
         viewEnd_   = newStart + newRange;
+        syncScrollBar();
         repaint();
     }
 public:
@@ -1060,6 +1083,35 @@ private:
     /* Viewport state — defaults reset whenever slot length changes. */
     int viewStart_ = 0, viewEnd_ = 0;
     int lastSeenN_ = 0;
+
+    /* Horizontal scroll bar — fallback for trackpad/pinch users when
+     * winelib doesn't forward XInput2 horizontal-scroll / magnify
+     * events through to JUCE.  Visible regardless. */
+    static constexpr int kScrollH = 12;
+    juce::ScrollBar hScroll_;
+
+    void syncScrollBar()
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        const int n = (slot && slot->isLoaded()) ? slot->numSamples : 0;
+        if (n <= 0) { hScroll_.setRangeLimits (0.0, 1.0); hScroll_.setCurrentRange (0.0, 1.0); return; }
+        hScroll_.setRangeLimits (0.0, (double) n);
+        hScroll_.setCurrentRange ((double) viewStart_,
+                                   (double) (viewEnd_ - viewStart_),
+                                   dontSendNotification);
+    }
+
+    void scrollBarMoved (juce::ScrollBar*, double newStart) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        const int range = viewEnd_ - viewStart_;
+        const int newS = juce::jlimit (0, juce::jmax (0, n - range), (int) newStart);
+        viewStart_ = newS;
+        viewEnd_   = newS + range;
+        repaint();
+    }
 };
 
 
@@ -2082,18 +2134,33 @@ private:
  * Range selection: [selStart_..selEnd_) — half-open.  Viewport:
  * [viewStart_..viewEnd_).  Renders only the visible window.
  * ========================================================================*/
-class SampleEditCanvas : public Component
+class SampleEditCanvas : public Component,
+                         private juce::ScrollBar::Listener
 {
 public:
     using GetSlot = std::function<SamplerSampleSlot*()>;
     using RangeChangedCb = std::function<void()>;
 
     explicit SampleEditCanvas (GetSlot gs, RangeChangedCb cb = {})
-        : getSlot (std::move (gs)), onRangeChanged (std::move (cb)) {}
+        : getSlot (std::move (gs)), onRangeChanged (std::move (cb)),
+          hScroll_ (false)
+    {
+        hScroll_.addListener (this);
+        hScroll_.setAutoHide (false);
+        addAndMakeVisible (hScroll_);
+    }
+    ~SampleEditCanvas() override { hScroll_.removeListener (this); }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        hScroll_.setBounds (r.removeFromBottom (kScrollH));
+    }
 
     void setViewport (int s, int e)
     {
         viewStart_ = s; viewEnd_ = e;
+        syncScrollBar();
         repaint();
     }
     void setSelection (int s, int e)
@@ -2112,7 +2179,9 @@ public:
 
     void paint (Graphics& g) override
     {
-        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        auto fullBounds = getLocalBounds().toFloat();
+        fullBounds.removeFromBottom ((float) kScrollH);
+        const auto bounds = fullBounds.reduced (2.0f);
         g.setColour (Colour { 0xff'0c'0c'0c });
         g.fillRect (bounds);
         g.setColour (Colour { 0xff'2a'2a'2a });
@@ -2174,15 +2243,17 @@ public:
 
         /* Min/max envelope per pixel column. */
         /* Two render modes:
-         *   - Envelope mode (vRange > w): per-pixel min/max envelope.
-         *   - Sample-line mode (vRange <= w, deep zoom): connect each
-         *     sample at its exact subpixel position with a line plot,
-         *     and dot each sample when spacing exceeds 4 px.
-         * The earlier int-truncated envelope collapsed at high zoom
-         * because (vRange / w) → 0 → adjacent pixels sampled the same
-         * index, leaving the waveform spiky / broken. */
+         *   - Envelope mode (vRange > 4*w): per-pixel min/max envelope.
+         *   - Sample-line mode (vRange <= 4*w, moderate-to-deep zoom):
+         *     connect each sample at its exact subpixel position with
+         *     a line plot, dotting each sample once spacing > 4 px.
+         *
+         * Threshold is 4× pixel count rather than 1× — at moderate
+         * zooms with smooth content the envelope's per-pixel scan
+         * produced visible moiré against the pixel grid.  Line mode
+         * handles 4 samples/pixel cleanly via path stroking. */
         g.setColour (Colour { 0xff'5a'a5'd0 });
-        if (vRange > w)
+        if (vRange > 4 * w)
         {
             for (int x = 0; x < w; ++x)
             {
@@ -2331,6 +2402,33 @@ private:
         const int vRange = viewEnd_ - viewStart_;
         if (vRange <= 0 || w <= 0) return 0.0f;
         return (float) ((int64_t) (s - viewStart_) * w / vRange);
+    }
+
+    /* Horizontal scrollbar — same fallback story as SampleWaveformView. */
+    static constexpr int kScrollH = 12;
+    juce::ScrollBar hScroll_;
+
+    void syncScrollBar()
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        const int n = (slot && slot->isLoaded()) ? slot->numSamples : 0;
+        if (n <= 0) { hScroll_.setRangeLimits (0.0, 1.0); hScroll_.setCurrentRange (0.0, 1.0); return; }
+        hScroll_.setRangeLimits (0.0, (double) n);
+        hScroll_.setCurrentRange ((double) viewStart_,
+                                   (double) (viewEnd_ - viewStart_),
+                                   dontSendNotification);
+    }
+
+    void scrollBarMoved (juce::ScrollBar*, double newStart) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        const int range = viewEnd_ - viewStart_;
+        const int newS = juce::jlimit (0, juce::jmax (0, n - range), (int) newStart);
+        viewStart_ = newS;
+        viewEnd_   = newS + range;
+        repaint();
     }
 
     GetSlot getSlot;
