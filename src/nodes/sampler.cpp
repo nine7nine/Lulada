@@ -2598,6 +2598,22 @@ public:
         {
             if (canvas.getViewEnd() <= 0 || canvas.getViewEnd() > s->numSamples)
                 canvas.setViewport (0, s->numSamples);
+
+            /* Selection persists across slot changes (so a Sample-page
+             * range edit on slot N keeps that range as you flip back).
+             * But if the new slot is SHORTER than the old selection
+             * endpoints, downstream Cut / Paste / Crop would read past
+             * the new buffer.  Clamp / drop. */
+            const int n  = s->numSamples;
+            const int ss = canvas.getSelStart();
+            const int se = canvas.getSelEnd();
+            if (ss >= 0 && se > ss)
+            {
+                const int newSS = juce::jmin (ss, n);
+                const int newSE = juce::jmin (se, n);
+                if (newSE > newSS) canvas.setSelection (newSS, newSE);
+                else                canvas.clearSelection();
+            }
         }
         else
         {
@@ -4567,6 +4583,15 @@ void SamplerNode::setStateInformation (const void* data, int size)
     if (data == nullptr || size <= 0) return;
     const auto tree = ValueTree::readFromGZIPData (data, (size_t) size);
     if (! tree.isValid() || tree.getType() != Identifier ("sampler")) return;
+
+    /* The audio thread reads instruments[] without locking — clearing
+     * + repopulating the vector here can otherwise expose torn state
+     * (0-size window, in-flight reallocation moving Ptr storage) to
+     * a voice startNote call.  Hold sampleLock around the structural
+     * mutation; the empty() guard inside getInstrumentForChannel is
+     * the belt-and-suspenders fallback when this lock isn't held
+     * (e.g., legacy callers). */
+    ScopedLock sl (sampleLock);
 
     numVoices  = (int) tree.getProperty ("numVoices", 16);
     interpMode = (InterpMode) (int) tree.getProperty ("interpMode", (int) kInterpLinear);
