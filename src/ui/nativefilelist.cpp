@@ -37,9 +37,16 @@ NativeDirCache::NativeDirCache()
 
 NativeDirCache::~NativeDirCache()
 {
+    /* Worker thread holds references to cache_ / queue_ / lock_ which
+     * are about to be destroyed after this dtor returns.  Give the
+     * thread enough budget to wake from wakeup_.wait, drain whatever
+     * scan it was on (each readdir iteration checks threadShouldExit),
+     * and exit before any member is freed.  2 s was tight on slow
+     * media — 4 s removes the post-stopThread-timeout dangling-thread
+     * risk. */
     signalThreadShouldExit();
     wakeup_.signal();
-    stopThread (2000);
+    stopThread (4000);
 }
 
 NativeDirCache::Snapshot NativeDirCache::get (const File& dir, const String& wildcard)

@@ -534,6 +534,10 @@ private:
     void mixChunk (AudioBuffer<float>& scratch, int startInScratch, int count)
     {
         if (count <= 0 || slotPtr == nullptr) return;
+        /* base16 is re-validated each renderNextBlock entry, but stay
+         * defensive — never hand a null buffer to the ft2 mixer kernels
+         * (which read base + position with no NULL guard of their own). */
+        if (voice.base16 == nullptr) return;
         const uint32_t soff = (uint32_t) startInScratch;
         const uint32_t cnt  = (uint32_t) count;
 
@@ -4592,11 +4596,20 @@ void SamplerNode::setStateInformation (const void* data, int size)
 
         auto readEnv = [&](FT2Envelope& e, const String& prefix)
         {
-            e.length       = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Len"),     0);
-            e.flags        = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Flags"),   0);
-            e.sustainPoint = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Sus"),     0);
-            e.loopStart    = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "LoopS"),   0);
-            e.loopEnd      = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "LoopE"),   0);
+            /* All envelope indices are clamped to the points[] capacity
+             * (12 slots, see FT2Envelope) on load so a corrupt session
+             * file can't push later paint / tick code past the array. */
+            const int rawLen  = (int) instTree.getProperty (Identifier (prefix + "Len"),   0);
+            const int rawSus  = (int) instTree.getProperty (Identifier (prefix + "Sus"),   0);
+            const int rawLoS  = (int) instTree.getProperty (Identifier (prefix + "LoopS"), 0);
+            const int rawLoE  = (int) instTree.getProperty (Identifier (prefix + "LoopE"), 0);
+            e.length       = (uint8_t) juce::jlimit (0, 12, rawLen);
+            e.flags        = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Flags"), 0);
+            e.sustainPoint = (uint8_t) juce::jlimit (0, juce::jmax (0, (int) e.length - 1), rawSus);
+            e.loopStart    = (uint8_t) juce::jlimit (0, juce::jmax (0, (int) e.length - 1), rawLoS);
+            e.loopEnd      = (uint8_t) juce::jlimit ((int) e.loopStart,
+                                                       juce::jmax (0, (int) e.length - 1), rawLoE);
+
             const String pts = instTree.getProperty (Identifier (prefix + "Pts"), "").toString();
             const auto parts = StringArray::fromTokens (pts, ";", "");
             int n = 0;
@@ -4609,7 +4622,8 @@ void SamplerNode::setStateInformation (const void* data, int size)
                 e.points[n].y = (int16_t) xy[1].getIntValue();
                 ++n;
             }
-            if (e.length == 0 && n > 0) e.length = (uint8_t) n;
+            if (e.length == 0 && n > 0) e.length = (uint8_t) juce::jmin (12, n);
+            if (e.length > (uint8_t) n) e.length = (uint8_t) n;   /* don't outrun parsed points */
         };
         readEnv (inst->volumeEnv, "ve");
         readEnv (inst->panEnv,    "pe");
