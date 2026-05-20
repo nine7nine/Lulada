@@ -225,8 +225,6 @@ ScriptNodeEditor::ScriptNodeEditor (ScriptingEngine& scripts, const Node& node)
     lua = getNodeObjectOfType<ScriptNode>();
     jassert (lua);
 
-    chooser.reset (new FileChooser ("Script", ScriptManager::getUserScriptsDir(), "*.lua", false, false, this));
-
     addAndMakeVisible (paramsButton);
     paramsButton.setButtonText ("Params");
     paramsButton.setColour (TextButton::buttonOnColourId, Colors::toggleBlue);

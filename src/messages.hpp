@@ -277,6 +277,17 @@ struct RefreshControllerMessage : public AppMessage
     const Controller device;
 };
 
+/** Request the FXB/FXP load/save flow.  Routed through the Disk Op
+ *  page's RequestPane (no juce::FileChooser).  Handled in services.cpp. */
+struct FxbPresetMessage : public AppMessage
+{
+    FxbPresetMessage (const Node& n, bool isLoad)
+        : node (n), load (isLoad) {}
+    ~FxbPresetMessage() noexcept {}
+    const Node node;
+    const bool load;
+};
+
 struct AddControllerMessage : public AppMessage
 {
     AddControllerMessage (const Controller& d)

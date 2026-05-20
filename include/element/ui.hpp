@@ -144,6 +144,21 @@ public:
     using RecentFiles = juce::RecentlyOpenedFilesList;
     RecentFiles& recentFiles();
 
+    /** Arm a one-shot DiskOpService::Request AND navigate the main view
+        to the Disk Op page.  Caller-facing convenience for replacing
+        juce::FileChooser sites — the DiskOp's RequestPane overlay
+        handles Confirm/Cancel and fires the request's onAccept callback
+        with the chosen file.  Forward-declared as a juce::File-keyed
+        struct in `services/diskopservice.hpp`; the impl pulls that
+        header. */
+    void requestFile (juce::String title,
+                      juce::String wildcard,
+                      juce::File   startingDirectory,
+                      juce::String initialFilename,
+                      bool         isSave,
+                      std::function<void(const juce::File&)> onAccept,
+                      std::function<void()> onCancel = {});
+
     void saveSettings() override;
 
 private:

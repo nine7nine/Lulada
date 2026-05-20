@@ -497,69 +497,18 @@ private:
             : node (n), load (isLoad) {}
         const Node node;
         const bool load;
-        bool perform() override
+
+        /* Hand the request off to Services::handleMessage; the actual
+         * file IO happens in the Disk Op RequestPane's onAccept callback.
+         * No juce::FileChooser ever surfaces from this menu. */
+        Message* createMessage() override
         {
-#if JUCE_PLUGINHOST_VST
-            const auto format = node.getProperty (tags::format).toString();
-            if (format != "VST")
-                return false;
-
-            auto gn = node.getObject();
-            auto* const proc = (gn) ? gn->getAudioPluginInstance() : nullptr;
-
-            if (! proc)
-                return false;
-
-            if (load)
-            {
-                DataPath dataPath;
-                const auto file = dataPath.getRootDir().getChildFile ("Presets");
-                FileChooser chooser ("Open FXB/FXP Preset", File(), "*.fxb;*.fxp", true);
-                bool wasOk = true;
-                if (chooser.browseForFileToOpen())
-                {
-                    FileInputStream stream (chooser.getResult());
-                    MemoryBlock block;
-                    stream.readIntoMemoryBlock (block);
-                    if (block.getSize() > 0)
-                        wasOk = VSTPluginFormat::loadFromFXBFile (proc, block.getData(), block.getSize());
-                }
-
-                if (! wasOk)
-                {
-                    // TODO: alert
-                }
-            }
-            else
-            {
-                DataPath dataPath;
-                String path = "Presets/";
-                path << proc->getName();
-                const auto file = dataPath.getRootDir().getChildFile (path).withFileExtension ("fxp").getNonexistentSibling();
-                FileChooser chooser ("Save FXB/FXP Preset", file, "*.fxb;*.fxp", true);
-                if (chooser.browseForFileToSave (true))
-                {
-                    const File f (chooser.getResult());
-                    MemoryBlock block;
-                    if (VSTPluginFormat::saveToFXBFile (proc, block, f.hasFileExtension ("fxb")))
-                    {
-                        FileOutputStream stream (f);
-                        stream.write (block.getData(), block.getSize());
-                        stream.flush();
-                    }
-                    else
-                    {
-                        // TODO: alert
-                    }
-                }
-            }
-
-            return true;
-
-#else
+           #if JUCE_PLUGINHOST_VST
+            return new FxbPresetMessage (node, load);
+           #else
             DBG ("[element] FXB/FXP presets not yet supported on this platform.");
-            return true;
-#endif
+            return nullptr;
+           #endif
         }
     };
 
