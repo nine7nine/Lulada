@@ -42,6 +42,7 @@ public:
         desc.numOutputChannels = 0;
         desc.hasSharedContainer = false;
         desc.isInstrument = false;
+        desc.category          = "MIDI";
         desc.manufacturerName = EL_NODE_FORMAT_AUTHOR;
         desc.pluginFormatName = EL_NODE_FORMAT_NAME;
         desc.version = "1.0.0";

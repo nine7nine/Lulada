@@ -4250,6 +4250,7 @@ void SamplerNode::fillInPluginDescription (PluginDescription& desc) const
     desc.numOutputChannels  = 2;
     desc.hasSharedContainer = false;
     desc.isInstrument       = true;
+    desc.category           = "Instrument";
     desc.manufacturerName   = EL_NODE_FORMAT_AUTHOR;
     desc.pluginFormatName   = EL_NODE_FORMAT_NAME;
     desc.version            = "0.3.0";

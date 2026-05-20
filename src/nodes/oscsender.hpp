@@ -31,6 +31,7 @@ public:
         desc.numOutputChannels = 0;
         desc.hasSharedContainer = false;
         desc.isInstrument = false;
+        desc.category          = "Control";
         desc.manufacturerName = EL_NODE_FORMAT_AUTHOR;
         desc.pluginFormatName = "Element";
         desc.version = "1.0.0";

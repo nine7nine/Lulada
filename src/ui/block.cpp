@@ -23,6 +23,77 @@
 
 namespace element {
 
+namespace {
+
+/** Map a plugin's category string to a default block colour.  Used
+ *  when no user-set "color" UI property exists.
+ *
+ *  VST / VST3 / CLAP plugins set categories like "Instrument",
+ *  "Fx", "Synth", "Effect|Reverb", "Instrument|u-he" etc.  Split on
+ *  '|' and match the first token to a known bucket; unknown buckets
+ *  fall through to a desaturated default so something always shows.
+ *
+ *  Element internal plugins populate `desc.category` directly (see
+ *  fillInPluginDescription / getPluginDescription in src/nodes/*). */
+inline juce::Colour defaultColorForCategory (const juce::String& category)
+{
+    if (category.isEmpty()) return juce::Colour (0x00000000);
+    const auto first = category.upToFirstOccurrenceOf ("|", false, true).trim().toLowerCase();
+
+    /* Instruments — warm purples / violets. */
+    if (first == "instrument"
+        || first == "synth"
+        || first == "sampler"
+        || first.endsWith ("instrument"))
+        return juce::Colour { 0xff'8a'5a'c0 };
+    /* Sequencers / arpeggiators / pattern sources — teal / aqua. */
+    if (first == "sequencer"
+        || first == "tracker"
+        || first == "arpeggiator")
+        return juce::Colour { 0xff'40'a0'a0 };
+    /* MIDI utilities — orange. */
+    if (first == "midi"
+        || first.startsWith ("midi"))
+        return juce::Colour { 0xff'd0'80'40 };
+    /* Effects / filters — green. */
+    if (first == "effect"
+        || first == "fx"
+        || first == "filter"
+        || first.endsWith ("effect"))
+        return juce::Colour { 0xff'5a'a5'5a };
+    /* Mixers / routing — slate blue. */
+    if (first == "mixer"
+        || first == "router"
+        || first == "routing")
+        return juce::Colour { 0xff'5a'7a'a0 };
+    /* Audio I/O + playback — blue. */
+    if (first == "audio"
+        || first == "player"
+        || first == "media")
+        return juce::Colour { 0xff'4a'90'd0 };
+    /* Control / OSC / scripting — gold. */
+    if (first == "control"
+        || first == "osc"
+        || first == "script"
+        || first == "automation")
+        return juce::Colour { 0xff'c0'a0'40 };
+    /* Generators / visualisers — magenta. */
+    if (first == "generator"
+        || first == "visualiser"
+        || first == "visualizer")
+        return juce::Colour { 0xff'b0'5a'a0 };
+    /* Reverbs explicitly callout — teal-green. */
+    if (first == "reverb")
+        return juce::Colour { 0xff'4a'a0'80 };
+
+    /* Anything else → neutral desaturated.  Distinct from "no
+     * colour at all" so the user can still tell the block has a
+     * category, just one we didn't map. */
+    return juce::Colour { 0xff'70'70'70 };
+}
+
+} // namespace
+
 namespace detail {
 inline static Context* context (juce::Component* comp)
 {
@@ -1180,7 +1251,12 @@ void BlockComponent::update (const bool doPosition, const bool forcePins)
     }
     else
     {
-        color = Colour (0x00000000);
+        /* No user-set color → derive from the plugin's category.  For
+         * VST/CLAP/etc. plugins this picks up the vendor-set category
+         * ("Instrument", "Fx|u-he", "Synth", etc.).  Element internal
+         * plugins set their own category in fillInPluginDescription. */
+        color = defaultColorForCategory (
+            node.getProperty (tags::category).toString());
     }
 
     repaint();
