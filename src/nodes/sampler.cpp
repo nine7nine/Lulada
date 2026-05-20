@@ -290,6 +290,7 @@ public:
         if (slot == nullptr || ! slot->isLoaded()) { clearCurrentNote(); return; }
 
         slotPtr      = slot;
+        slotIdx_     = slotIdx;
         slotIsStereo = slot->isStereo && slot->data16R != nullptr;
         playedNote   = midiNote;
         velocityLin  = juce::jlimit (0.0f, 1.0f, velocity);
@@ -313,6 +314,18 @@ public:
                                          slot->loopLength);
             voice.sampleEnd  = voice.loopStart + voice.loopLength;
             voice.loopType   = pingpong ? 2 : 1;
+
+            /* Pingpong needs revBase16 set up — ft2-clone formula:
+             * revBase16 = &base16[loopStart + loopEnd] where
+             * loopEnd = loopStart + loopLength.  When sampling
+             * backwards the mixer reads via revBase[-position], so
+             * revBase16 must point past the loop end.  We never set
+             * this before → null deref on the first backward pass. */
+            if (pingpong)
+            {
+                voice.revBase16 = slot->data16L.get()
+                                  + (voice.loopStart * 2) + voice.loopLength;
+            }
         }
         voice.position   = 0;
         voice.positionFrac = 0;
@@ -392,6 +405,30 @@ public:
         if (! voice.active && ! adsr.isActive()) return;
         if (out.getNumChannels() < 2)            return;
         if (numSamples <= 0)                     return;
+
+        /* Re-validate the slot every block.  The slot's data16L
+         * unique_ptr can be replaced from the UI thread (loadSampleToSlot
+         * / clearSlot / FX-page cut/paste/crop) — if that happens while
+         * a voice is playing the old slot, voice.base16 dangles.  Re-
+         * fetch by index every block; if it changed or is no longer
+         * loaded, end the voice gracefully instead of reading freed
+         * memory. */
+        if (instrument == nullptr) { voice.active = false; clearCurrentNote(); return; }
+        const auto* curSlot = instrument->getSlot (slotIdx_);
+        if (curSlot == nullptr || ! curSlot->isLoaded() || curSlot != slotPtr)
+        {
+            voice.active = false;
+            clearCurrentNote();
+            return;
+        }
+        /* Slot pointer matches our cached one — but data16L's underlying
+         * unique_ptr may have been swapped out in place (resizing edits
+         * keep the SamplerSampleSlot object alive while replacing its
+         * buffers).  Re-pull the base pointer from the slot every
+         * block so we always read from the live buffer. */
+        voice.base16 = curSlot->data16L.get();
+        if (voice.base16 == nullptr) { voice.active = false; clearCurrentNote(); return; }
+        slotIsStereo = curSlot->isStereo && curSlot->data16R != nullptr;
 
         const int samplesPerTick = owner.getSamplesPerEnvTick();
 
@@ -507,7 +544,10 @@ private:
             voice.fCurrVolumeR   = gLR;
             voice.fTargetVolumeL = gLL;
             voice.fTargetVolumeR = gLR;
-            voice.base16 = slotPtr->data16L.get();
+            voice.base16    = slotPtr->data16L.get();
+            voice.revBase16 = voice.loopType == 2
+                                ? slotPtr->data16L.get() + (voice.loopStart * 2) + voice.loopLength
+                                : nullptr;
             mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
 
             voice_t afterFirst = voice;
@@ -517,7 +557,10 @@ private:
             voice.fCurrVolumeR   = gRR;
             voice.fTargetVolumeL = gRL;
             voice.fTargetVolumeR = gRR;
-            voice.base16 = slotPtr->data16R.get();
+            voice.base16    = slotPtr->data16R.get();
+            voice.revBase16 = voice.loopType == 2
+                                ? slotPtr->data16R.get() + (voice.loopStart * 2) + voice.loopLength
+                                : nullptr;
             mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
 
             voice.active = voice.active && afterFirst.active;
@@ -736,6 +779,7 @@ private:
 
     /* Static (per-note) state. */
     const SamplerSampleSlot* slotPtr = nullptr;
+    int   slotIdx_    = -1;             /* re-validated each render block */
     bool slotIsStereo = false;
     int   playedNote = 60;
     float velocityLin = 1.0f;
