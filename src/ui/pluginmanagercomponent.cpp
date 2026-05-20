@@ -331,10 +331,15 @@ public:
          * block outline shows in the graph.  Falls back to the
          * plugin format accent when the plugin advertises no
          * category (typical for ill-tagged old VST2s). */
+        /* getTypes() returns an Array<PluginDescription> by VALUE; the
+         * temporary dies at the end of the statement.  Store it in a
+         * local first or any references into it dangle.  Same pattern
+         * paintCell uses below. */
         juce::String category, format;
         if (isPositiveAndBelow (rowNumber, list.getNumTypes()))
         {
-            const auto& desc = list.getTypes().getReference (rowNumber);
+            const auto types = list.getTypes();
+            const auto& desc = types.getReference (rowNumber);
             category = desc.category;
             format   = desc.pluginFormatName;
         }
