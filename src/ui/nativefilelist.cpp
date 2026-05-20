@@ -385,6 +385,20 @@ void NativeFileListComponent::listBoxItemDoubleClicked (int row, const MouseEven
         listeners_.call ([&] (Listener& l) { l.fileActivated (f); });
 }
 
+void NativeFileListComponent::returnKeyPressed (int row)
+{
+    /* Enter activates the highlighted row exactly like a double-click:
+     * directory → descend, file → fileActivated (which in the Disk Op
+     * page broadcasts on DiskOpService::activations → load-to-slot or
+     * load-session, depending on mode). */
+    if (row < 0 || row >= entries_.size()) return;
+    const auto f = root_.getChildFile (entries_[row].name);
+    if (entries_[row].isDir)
+        setRoot (f);
+    else
+        listeners_.call ([&] (Listener& l) { l.fileActivated (f); });
+}
+
 void NativeFileListComponent::changeListenerCallback (ChangeBroadcaster*)
 {
     /* Cache reported new data for some directory.  Cheaply re-pull;

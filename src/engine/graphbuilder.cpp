@@ -54,6 +54,8 @@ public:
         sharedBufferChans.clear (channelNum, 0, numSamples);
     }
 
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (channelNum); }
+
 private:
     const int channelNum;
 
@@ -73,6 +75,9 @@ public:
     {
         sharedBufferChans.copyFrom (dstChannelNum, 0, sharedBufferChans, srcChannelNum, 0, numSamples);
     }
+
+    void getReadAudioBuffers  (Array<int>& out) const override { out.add (srcChannelNum); }
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (dstChannelNum); }
 
 private:
     const int srcChannelNum, dstChannelNum;
@@ -94,6 +99,9 @@ public:
         sharedBufferChans.addFrom (dstChannelNum, 0, sharedBufferChans, srcChannelNum, 0, numSamples);
     }
 
+    void getReadAudioBuffers  (Array<int>& out) const override { out.add (srcChannelNum); out.add (dstChannelNum); }
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (dstChannelNum); }
+
 private:
     const int srcChannelNum, dstChannelNum;
 
@@ -112,6 +120,8 @@ public:
     {
         sharedMidiBuffers.getUnchecked (bufferNum)->clear();
     }
+
+    void getWriteMidiBuffers (Array<int>& out) const override { out.add (bufferNum); }
 
 private:
     const int bufferNum;
@@ -133,6 +143,9 @@ public:
         *sharedMidiBuffers.getUnchecked (dstBufferNum) = *sharedMidiBuffers.getUnchecked (srcBufferNum);
     }
 
+    void getReadMidiBuffers  (Array<int>& out) const override { out.add (srcBufferNum); }
+    void getWriteMidiBuffers (Array<int>& out) const override { out.add (dstBufferNum); }
+
 private:
     const int srcBufferNum, dstBufferNum;
 
@@ -153,6 +166,9 @@ public:
         sharedMidiBuffers.getUnchecked (dstBufferNum)
             ->addEvents (*sharedMidiBuffers.getUnchecked (srcBufferNum), 0, numSamples, 0);
     }
+
+    void getReadMidiBuffers  (Array<int>& out) const override { out.add (srcBufferNum); out.add (dstBufferNum); }
+    void getWriteMidiBuffers (Array<int>& out) const override { out.add (dstBufferNum); }
 
 private:
     const int srcBufferNum, dstBufferNum;
@@ -187,6 +203,9 @@ public:
                 writeIndex = 0;
         }
     }
+
+    void getReadAudioBuffers  (Array<int>& out) const override { out.add (channel); }
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (channel); }
 
 private:
     HeapBlock<float> buffer;
@@ -451,6 +470,27 @@ public:
             node->setOutputRMS (i, buffer.getRMSLevel (i, 0, numSamples));
     }
 
+    void getReadAudioBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < audioChannelsToUse.size(); ++i)
+            out.add (audioChannelsToUse.getUnchecked (i));
+    }
+    void getWriteAudioBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < audioChannelsToUse.size(); ++i)
+            out.add (audioChannelsToUse.getUnchecked (i));
+    }
+    void getReadMidiBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < midiChannelsToUse.size(); ++i)
+            out.add (midiChannelsToUse.getUnchecked (i));
+    }
+    void getWriteMidiBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < midiChannelsToUse.size(); ++i)
+            out.add (midiChannelsToUse.getUnchecked (i));
+    }
+
     const ProcessorPtr node;
     AudioProcessor* const processor;
 
@@ -490,6 +530,92 @@ GraphBuilder::GraphBuilder (GraphNode& graph_,
                                    renderingOps,
                                    i);
         markUnusedBuffersFree (i);
+    }
+}
+
+namespace {
+
+bool buffersOverlap (const Array<int>& a, const Array<int>& b) noexcept
+{
+    for (int i = 0; i < a.size(); ++i)
+    {
+        const int x = a.getUnchecked (i);
+        for (int j = 0; j < b.size(); ++j)
+            if (x == b.getUnchecked (j))
+                return true;
+    }
+    return false;
+}
+
+} // namespace
+
+void GraphBuilder::computeRenderingLayers (const Array<void*>& renderingOps,
+                                           Array<Array<int>>& renderingLayers)
+{
+    renderingLayers.clearQuick();
+
+    const int n = renderingOps.size();
+    if (n == 0)
+        return;
+
+    Array<Array<int>> readsA, writesA, readsM, writesM;
+    readsA.resize (n);  writesA.resize (n);
+    readsM.resize (n);  writesM.resize (n);
+
+    for (int i = 0; i < n; ++i)
+    {
+        auto* op = static_cast<GraphOp*> (renderingOps.getUnchecked (i));
+        op->getReadAudioBuffers  (readsA.getReference  (i));
+        op->getWriteAudioBuffers (writesA.getReference (i));
+        op->getReadMidiBuffers   (readsM.getReference  (i));
+        op->getWriteMidiBuffers  (writesM.getReference (i));
+    }
+
+    Array<int> layerOf;
+    layerOf.resize (n);
+
+    for (int i = 0; i < n; ++i)
+    {
+        int minLayer = 0;
+        for (int j = 0; j < i; ++j)
+        {
+            const bool conflict =
+                buffersOverlap (writesA.getReference (i), readsA.getReference  (j))
+             || buffersOverlap (readsA.getReference  (i), writesA.getReference (j))
+             || buffersOverlap (writesA.getReference (i), writesA.getReference (j))
+             || buffersOverlap (writesM.getReference (i), readsM.getReference  (j))
+             || buffersOverlap (readsM.getReference  (i), writesM.getReference (j))
+             || buffersOverlap (writesM.getReference (i), writesM.getReference (j));
+
+            if (conflict)
+                minLayer = jmax (minLayer, layerOf.getUnchecked (j) + 1);
+        }
+        layerOf.set (i, minLayer);
+        while (renderingLayers.size() <= minLayer)
+            renderingLayers.add (Array<int>());
+        renderingLayers.getReference (minLayer).add (i);
+    }
+}
+
+void GraphBuilder::countExpensiveOpsPerLayer (const Array<void*>& renderingOps,
+                                              const Array<Array<int>>& renderingLayers,
+                                              Array<int>& counts)
+{
+    counts.clearQuick();
+    counts.resize (renderingLayers.size());
+
+    for (int L = 0; L < renderingLayers.size(); ++L)
+    {
+        const auto& layer = renderingLayers.getReference (L);
+        int n = 0;
+        for (int k = 0; k < layer.size(); ++k)
+        {
+            const int idx = layer.getUnchecked (k);
+            auto* op = static_cast<GraphOp*> (renderingOps.getUnchecked (idx));
+            if (dynamic_cast<ProcessBufferOp*> (op) != nullptr)
+                ++n;
+        }
+        counts.set (L, n);
     }
 }
 

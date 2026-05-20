@@ -145,6 +145,7 @@ public:
     void paintListBoxItem (int row, juce::Graphics& g, int w, int h, bool sel) override;
     void listBoxItemClicked (int row, const juce::MouseEvent&) override;
     void listBoxItemDoubleClicked (int row, const juce::MouseEvent&) override;
+    void returnKeyPressed (int row) override;
 
     /* === ChangeListener (cache → UI) ============================ */
     void changeListenerCallback (juce::ChangeBroadcaster*) override;

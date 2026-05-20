@@ -15,6 +15,13 @@ target_compile_definitions(test_element
     PRIVATE
         EL_TEST_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
 
+# Winelib host: JUCE's WineWin32Dispatcher::workerEntry calls
+# OleInitialize() — mirror the element_app linkage so the test target
+# resolves under winelib too.
+if(DEFINED __WINE__ OR CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
+    target_link_libraries(test_element PRIVATE ole32)
+endif()
+
 # Register all test suites with CTest
 add_test(NAME "AtomicValueTests" COMMAND test_element --run_test=AtomicValueTests)
 add_test(NAME "AtomicLockTests" COMMAND test_element --run_test=AtomicLockTests)
@@ -25,6 +32,7 @@ add_test(NAME "DataPathTests" COMMAND test_element --run_test=DataPathTests)
 add_test(NAME "DSPScriptTest" COMMAND test_element --run_test=DSPScriptTest)
 add_test(NAME "Element" COMMAND test_element --run_test=Element)
 add_test(NAME "GraphNodeTests" COMMAND test_element --run_test=GraphNodeTests)
+add_test(NAME "GraphRenderGolden" COMMAND test_element --run_test=GraphRenderGolden)
 add_test(NAME "GzipTests" COMMAND test_element --run_test=GzipTests)
 add_test(NAME "IONodeTests" COMMAND test_element --run_test=IONodeTests)
 add_test(NAME "LinearFadeTest" COMMAND test_element --run_test=LinearFadeTest)
