@@ -270,6 +270,43 @@ void SessionService::saveSession (const bool saveAs, const bool askForFile, cons
     }
 }
 
+bool SessionService::saveSessionTo (const File& target)
+{
+    jassert (document && currentSession);
+    if (target == File()) return false;
+
+    auto& gui = *sibling<GuiService>();
+    if (auto* cc = gui.content())
+    {
+        String state;
+        cc->getSessionState (state);
+        auto ui = currentSession->data().getOrCreateChildWithName (tags::ui, nullptr);
+        ui.setProperty ("content", state, nullptr);
+    }
+
+    sigWillSave();
+
+    /* Normalize extension — same fixup the FileChooser-driven path does
+     * after the user picks. */
+    File chosen = (target.getFileExtension() == ".els")
+                      ? target
+                      : target.withFileExtension (".els");
+
+    const auto result = document->saveAs (chosen, true, true, true);
+    if (result != FileBasedDocument::savedOk) return false;
+
+    currentSession->dispatchPendingMessages();
+    document->setChangedFlag (false);
+    if (auto* us = context().settings().getUserSettings())
+        us->setValue (Settings::lastSessionKey, document->getFile().getFullPathName());
+
+    sibling<UI>()->recentFiles().addFile (document->getFile());
+    currentSession->data().setProperty (tags::name,
+                                        document->getFile().getFileNameWithoutExtension(),
+                                        nullptr);
+    return true;
+}
+
 void SessionService::newSession()
 {
     jassert (document && currentSession);
