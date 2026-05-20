@@ -472,16 +472,22 @@ public:
         editor->addTextEditor ("name", inst->name);
         editor->addButton ("OK",     1, KeyPress (KeyPress::returnKey));
         editor->addButton ("Cancel", 0, KeyPress (KeyPress::escapeKey));
+
+        /* SafePointer guards against the SampleBankPane (and its
+         * surrounding DiskOpContentView) being destroyed while the
+         * modal is still open — closing Disk Op or quitting the app
+         * before the rename is confirmed would otherwise leave the
+         * lambda's `this` capture dangling. */
+        Component::SafePointer<SampleBankPane> safeThis (this);
         editor->enterModalState (true,
-            ModalCallbackFunction::create ([this, row, editor] (int r) {
-                if (r == 1)
-                {
-                    if (auto* sn2 = getSamplerProcessor (activeSampler_))
-                        if (auto inst2 = sn2->getInstrument (row))
-                            inst2->name = editor->getTextEditorContents ("name");
-                    instrumentList_.list.repaint();
-                }
-                delete editor;
+            ModalCallbackFunction::create ([row, editor, safeThis] (int r) mutable {
+                std::unique_ptr<AlertWindow> ownEditor (editor);   /* always delete */
+                if (! safeThis) return;                              /* we died — bail */
+                if (r != 1)    return;
+                if (auto* sn2 = safeThis->getSamplerProcessor (safeThis->activeSampler_))
+                    if (auto inst2 = sn2->getInstrument (row))
+                        inst2->name = ownEditor->getTextEditorContents ("name");
+                safeThis->instrumentList_.list.repaint();
             }), false);
     }
 

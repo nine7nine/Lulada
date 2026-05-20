@@ -119,17 +119,19 @@ SamplerInstrument::SamplerInstrument()
     panEnv.flags = 0;
 }
 
-bool SamplerInstrument::loadSampleToSlot (int slot, const File& file,
-                                          AudioFormatManager& fmt)
+std::unique_ptr<SamplerSampleSlot>
+SamplerInstrument::prepareSlot (const File& file, AudioFormatManager& fmt)
 {
-    if (slot < 0 || slot >= kNumSlots) return false;
-    if (! file.existsAsFile()) return false;
+    /* Pure file I/O + decode → memory allocation.  No mutation of any
+     * SamplerInstrument state.  Safe to run with no lock held. */
+    if (! file.existsAsFile()) return nullptr;
 
     std::unique_ptr<AudioFormatReader> reader (fmt.createReaderFor (file));
-    if (reader == nullptr) return false;
+    if (reader == nullptr) return nullptr;
 
     const int64_t maxLen = (int64_t) 10 * 60 * (int64_t) reader->sampleRate;
     const int n = (int) std::min ((int64_t) reader->lengthInSamples, maxLen);
+    if (n <= 0) return nullptr;
     const bool stereo = reader->numChannels >= 2;
 
     AudioBuffer<float> tmp ((int) reader->numChannels, n);
@@ -145,10 +147,23 @@ bool SamplerInstrument::loadSampleToSlot (int slot, const File& file,
     s->data16L          = convertFloatToInt16 (tmp.getReadPointer (0), n);
     if (stereo)
         s->data16R = convertFloatToInt16 (tmp.getReadPointer (1), n);
+    return s;
+}
 
-    slots[(size_t) slot] = std::move (s);
+bool SamplerInstrument::commitSlot (int slot, std::unique_ptr<SamplerSampleSlot> data)
+{
+    if (slot < 0 || slot >= kNumSlots) return false;
+    if (data == nullptr) return false;
+    slots[(size_t) slot] = std::move (data);
     if (! keymapUserModified) autoSpreadKeymap();
     return true;
+}
+
+bool SamplerInstrument::loadSampleToSlot (int slot, const File& file,
+                                          AudioFormatManager& fmt)
+{
+    auto s = prepareSlot (file, fmt);
+    return commitSlot (slot, std::move (s));
 }
 
 void SamplerInstrument::clearSlot (int slot)
@@ -4382,13 +4397,33 @@ void SamplerNode::rebuildVoicePool()
         synth->addVoice (new Ft2SamplerVoice (*this));
 }
 
+/* ----- sampleLock discipline ------------------------------------------ *
+ *
+ *  All reads + writes of `instruments` and `channelBinding` go through
+ *  sampleLock — INCLUDING the audio thread.  Without this, a UI-side
+ *  mutation (addInstrument / removeInstrument / setStateInformation)
+ *  races against a voice note-on reading the vector → torn Ptr / dead
+ *  storage.  See [[bulletproof-audit-after-changes]].
+ *
+ *  Audio-thread contention is bounded because every UI-side mutation
+ *  is short — file I/O for loadSampleToSlot happens via prepareSlot()
+ *  BEFORE the lock is taken; only the buffer-swap commitSlot() runs
+ *  inside.  Other mutations are O(n) over ≤128 entries with no
+ *  allocation in the hot path.
+ *
+ *  UI accessor variants (getInstrument, getNumInstruments) lock too
+ *  so editor reads see consistent state during the same broadcast.
+ */
+
 int SamplerNode::getNumInstruments() const
 {
+    const ScopedLock sl (sampleLock);
     return (int) instruments.size();
 }
 
 SamplerInstrument::Ptr SamplerNode::getInstrument (int index) const
 {
+    const ScopedLock sl (sampleLock);
     if (index < 0 || index >= (int) instruments.size()) return nullptr;
     return instruments[(size_t) index];
 }
@@ -4418,12 +4453,11 @@ void SamplerNode::removeInstrument (int index)
 
 SamplerInstrument::Ptr SamplerNode::getInstrumentForChannel (int channel1to16) const
 {
-    /* Audio-thread accessor.  Defensive: instruments[] should always
-     * contain ≥1 entry (constructor + rebuild + setStateInformation
-     * fallback all guarantee it), but if a race between this read and
-     * setStateInformation's clear() ever exposes a 0-size window we
-     * must not deref instruments[0].  Return null and let the voice
-     * gracefully decline the note rather than SIGSEGV. */
+    /* Audio-thread read — short critical section, uncontended 99.9%
+     * of the time.  Returns a Ptr by value (refcount bumped under
+     * the lock), so the caller holds a live instrument even after
+     * we release. */
+    const ScopedLock sl (sampleLock);
     if (instruments.empty()) return nullptr;
 
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
@@ -4436,6 +4470,7 @@ SamplerInstrument::Ptr SamplerNode::getInstrumentForChannel (int channel1to16) c
 
 void SamplerNode::bindChannelToInstrument (int channel1to16, int instrumentIndex)
 {
+    const ScopedLock sl (sampleLock);
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
     if (instrumentIndex < 0 || instrumentIndex >= (int) instruments.size())
         channelBinding[(size_t) ch] = -1;
@@ -4445,15 +4480,32 @@ void SamplerNode::bindChannelToInstrument (int channel1to16, int instrumentIndex
 
 int SamplerNode::getChannelBinding (int channel1to16) const
 {
+    const ScopedLock sl (sampleLock);
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
     return (int) channelBinding[(size_t) ch];
 }
 
 bool SamplerNode::loadSampleToSlot (int instrumentIndex, int slot, const File& file)
 {
-    ScopedLock sl (sampleLock);
-    if (instrumentIndex < 0 || instrumentIndex >= (int) instruments.size()) return false;
-    return instruments[(size_t) instrumentIndex]->loadSampleToSlot (slot, file, formatManager);
+    /* Two-phase: read+decode the file (potentially seconds for big
+     * WAVs) WITHOUT holding sampleLock — only the final commit
+     * touches the instrument slot under the lock.  Keeps the audio
+     * thread's critical sections short. */
+    SamplerInstrument::Ptr inst;
+    {
+        const ScopedLock sl (sampleLock);
+        if (instrumentIndex < 0
+            || instrumentIndex >= (int) instruments.size())
+            return false;
+        inst = instruments[(size_t) instrumentIndex];
+    }
+    if (inst == nullptr) return false;
+
+    auto loaded = inst->prepareSlot (file, formatManager);
+    if (loaded == nullptr) return false;
+
+    const ScopedLock sl (sampleLock);
+    return inst->commitSlot (slot, std::move (loaded));
 }
 
 void SamplerNode::rebuildInstrument()
