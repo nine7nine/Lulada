@@ -20,6 +20,14 @@ public:
                           const OwnedArray<MidiBuffer>& sharedMidiBuffers,
                           const int numSamples) = 0;
 
+    /** Dependency declaration for layered scheduling.  Default empty;
+        ops that touch shared buffers override.  In-place ops declare the
+        same slot as both read and write. */
+    virtual void getReadAudioBuffers  (Array<int>&) const {}
+    virtual void getWriteAudioBuffers (Array<int>&) const {}
+    virtual void getReadMidiBuffers   (Array<int>&) const {}
+    virtual void getWriteMidiBuffers  (Array<int>&) const {}
+
 private:
     JUCE_LEAK_DETECTOR (GraphOp)
 };

@@ -54,6 +54,8 @@ public:
         sharedBufferChans.clear (channelNum, 0, numSamples);
     }
 
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (channelNum); }
+
 private:
     const int channelNum;
 
@@ -73,6 +75,9 @@ public:
     {
         sharedBufferChans.copyFrom (dstChannelNum, 0, sharedBufferChans, srcChannelNum, 0, numSamples);
     }
+
+    void getReadAudioBuffers  (Array<int>& out) const override { out.add (srcChannelNum); }
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (dstChannelNum); }
 
 private:
     const int srcChannelNum, dstChannelNum;
@@ -94,6 +99,9 @@ public:
         sharedBufferChans.addFrom (dstChannelNum, 0, sharedBufferChans, srcChannelNum, 0, numSamples);
     }
 
+    void getReadAudioBuffers  (Array<int>& out) const override { out.add (srcChannelNum); out.add (dstChannelNum); }
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (dstChannelNum); }
+
 private:
     const int srcChannelNum, dstChannelNum;
 
@@ -112,6 +120,8 @@ public:
     {
         sharedMidiBuffers.getUnchecked (bufferNum)->clear();
     }
+
+    void getWriteMidiBuffers (Array<int>& out) const override { out.add (bufferNum); }
 
 private:
     const int bufferNum;
@@ -133,6 +143,9 @@ public:
         *sharedMidiBuffers.getUnchecked (dstBufferNum) = *sharedMidiBuffers.getUnchecked (srcBufferNum);
     }
 
+    void getReadMidiBuffers  (Array<int>& out) const override { out.add (srcBufferNum); }
+    void getWriteMidiBuffers (Array<int>& out) const override { out.add (dstBufferNum); }
+
 private:
     const int srcBufferNum, dstBufferNum;
 
@@ -153,6 +166,9 @@ public:
         sharedMidiBuffers.getUnchecked (dstBufferNum)
             ->addEvents (*sharedMidiBuffers.getUnchecked (srcBufferNum), 0, numSamples, 0);
     }
+
+    void getReadMidiBuffers  (Array<int>& out) const override { out.add (srcBufferNum); out.add (dstBufferNum); }
+    void getWriteMidiBuffers (Array<int>& out) const override { out.add (dstBufferNum); }
 
 private:
     const int srcBufferNum, dstBufferNum;
@@ -187,6 +203,9 @@ public:
                 writeIndex = 0;
         }
     }
+
+    void getReadAudioBuffers  (Array<int>& out) const override { out.add (channel); }
+    void getWriteAudioBuffers (Array<int>& out) const override { out.add (channel); }
 
 private:
     HeapBlock<float> buffer;
@@ -449,6 +468,27 @@ public:
 
         for (int i = 0; i < numAudioOuts; ++i)
             node->setOutputRMS (i, buffer.getRMSLevel (i, 0, numSamples));
+    }
+
+    void getReadAudioBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < audioChannelsToUse.size(); ++i)
+            out.add (audioChannelsToUse.getUnchecked (i));
+    }
+    void getWriteAudioBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < audioChannelsToUse.size(); ++i)
+            out.add (audioChannelsToUse.getUnchecked (i));
+    }
+    void getReadMidiBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < midiChannelsToUse.size(); ++i)
+            out.add (midiChannelsToUse.getUnchecked (i));
+    }
+    void getWriteMidiBuffers (Array<int>& out) const override
+    {
+        for (int i = 0; i < midiChannelsToUse.size(); ++i)
+            out.add (midiChannelsToUse.getUnchecked (i));
     }
 
     const ProcessorPtr node;
