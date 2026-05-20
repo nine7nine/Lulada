@@ -43,6 +43,7 @@ public:
         desc.numOutputChannels = 0;
         desc.hasSharedContainer = false;
         desc.isInstrument      = false;
+        desc.category          = "Sequencer";
         desc.manufacturerName  = EL_NODE_FORMAT_AUTHOR;
         desc.pluginFormatName  = EL_NODE_FORMAT_NAME;
         desc.version           = "0.1.0";

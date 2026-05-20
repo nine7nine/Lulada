@@ -334,14 +334,20 @@ void NativeFileListComponent::paintListBoxItem (int row, Graphics& g, int w, int
      * sampler keymap + tracker grid where character alignment matters. */
     g.setFont (FontOptions (13.0f, Font::plain));
 
-    /* Icon glyph: directories get a folder mark, files get a dot. */
+    /* Icon glyph — distinct UTF-8 marks for dir vs file.  Both string
+     * literals MUST go through CharPointer_UTF8 — JUCE's String(const
+     * char*) treats raw bytes as the platform default, not UTF-8, so
+     * a bare "\xe2\x80\xa2" comes out as garbled "âç". */
     g.setColour (e.isDir ? kDirColour : kMutedText);
-    g.drawText (e.isDir ? String (CharPointer_UTF8 ("\xe2\x96\xb8"))   /* small triangle */
-                        : String ("\xe2\x80\xa2"),
+    g.drawText (e.isDir ? String (CharPointer_UTF8 ("\xe2\x96\xb8"))   /* ▸ small triangle */
+                        : String (CharPointer_UTF8 ("\xe2\x80\xa2")),  /* • bullet */
                 6, 0, 18, h, Justification::centred);
 
-    g.setColour (e.isDir ? kDirColour : kTextColour);
-    g.drawText (e.name, 28, 0, w - 110, h, Justification::centredLeft);
+    /* Name in white for both dirs + files — icon alone tells you the
+     * type, no need to repeat that as a colour code. */
+    g.setColour (kTextColour);
+    g.drawText (e.name, 28, 0, w - 110, h,
+                Justification::centredLeft);
 
     if (! e.isDir && e.size > 0)
     {

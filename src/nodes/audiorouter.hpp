@@ -61,6 +61,7 @@ public:
         desc.numOutputChannels = numSources;
         desc.hasSharedContainer = false;
         desc.isInstrument = false;
+        desc.category          = "Mixer";
         desc.manufacturerName = EL_NODE_FORMAT_AUTHOR;
         desc.pluginFormatName = "Element";
         desc.version = "1.0.0";
