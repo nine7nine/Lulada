@@ -176,6 +176,14 @@ void SamplerInstrument::clearSlot (int slot)
     if (! keymapUserModified) autoSpreadKeymap();
 }
 
+void SamplerInstrument::clear()
+{
+    for (auto& s : slots) s.reset();
+    name = String();
+    keymapUserModified = false;
+    autoSpreadKeymap();
+}
+
 int SamplerInstrument::slotForNote (int midiNote) const noexcept
 {
     if (midiNote < 0 || midiNote > 127) return -1;

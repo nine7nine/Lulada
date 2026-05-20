@@ -359,6 +359,8 @@ public:
             { if (model) model->onInstrumentSelected (sel); }
         void listBoxItemDoubleClicked (int row, const MouseEvent&) override
             { if (model) model->renameInstrument (row); }
+        void deleteKeyPressed (int lastRow) override
+            { if (model) model->clearInstrumentInPlace (lastRow); }
     } instrumentList_;
 
     struct SlotAdapter : public ListBoxModel {
@@ -370,6 +372,8 @@ public:
         void listBoxItemDoubleClicked (int row, const MouseEvent&) override
             { if (model) { model->slotList_.list.selectRow (row);
                            model->loadIntoSelectedSlot(); } }
+        void deleteKeyPressed (int lastRow) override
+            { if (model) model->clearSlotInPlace (lastRow); }
     } slotList_;
 
     void resized() override
@@ -675,6 +679,40 @@ private:
         slotList_.list.selectRow (slotRow);
         instrumentList_.list.repaint();
         slotList_.list.repaint();
+    }
+
+    /** Delete-key handler on the slot list.  Empties the selected slot
+     *  without disturbing other slots in the bank. */
+    void clearSlotInPlace (int row)
+    {
+        if (row < 0 || row >= kNumSlotsPerBank) return;
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        auto inst = sn->getInstrument (activeInstrument_);
+        if (inst == nullptr) return;
+        inst->clearSlot (row);
+        instrumentList_.list.repaint();
+        slotList_.list.repaint();
+    }
+
+    /** Delete-key handler on the instrument list.  Wipes the bank's 32
+     *  sample slots + clears the user-set name.  Uses
+     *  SamplerInstrument::clear() rather than SamplerNode::
+     *  removeInstrument so the 128-row table indices stay stable. */
+    void clearInstrumentInPlace (int row)
+    {
+        if (row < 0 || row >= kNumBanks) return;
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        auto inst = sn->getInstrument (row);
+        if (inst == nullptr) return;        /* row past lazy alloc — nothing to clear */
+        inst->clear();
+        instrumentList_.list.repaint();
+        if (row == activeInstrument_)
+        {
+            slotList_.list.updateContent();
+            slotList_.list.repaint();
+        }
     }
 
     /** Fill the active bank's 16 slots with audio files from the

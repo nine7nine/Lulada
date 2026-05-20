@@ -83,6 +83,12 @@ public:
 
     void clearSlot (int slot);
 
+    /** Wipe every slot + reset the name, in place.  Used by the Disk Op
+        Sample Bank pane's delete-key handler — the pane displays a fixed
+        128-row table and needs index-stable "empty this bank" semantics
+        without the shift that `SamplerNode::removeInstrument` performs. */
+    void clear();
+
     int  slotForNote (int midiNote) const noexcept;
     void setSlotForNote (int midiNote, int slot);
     void autoSpreadKeymap();
