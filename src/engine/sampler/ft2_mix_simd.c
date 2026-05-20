@@ -20,6 +20,18 @@
  * Pingpong / cubic / sinc / 8-bit paths keep their scalar entries — only
  * the most common path (16-bit + linear interp) is SIMD-accelerated.
  * Adding more later is mechanical.
+ *
+ * Future: SSE4.1 path
+ * ~~~~~~~~~~~~~~~~~~~
+ * SSE4.1 has _mm_mullo_epi32 + _mm_srai_epi32 so the integer
+ * (s1-s0)*frac>>15 + add s0 part vectorizes the same way at 4-lane width.
+ * The blocker is that SSE has NO gather instruction — _mm_i32gather_*
+ * arrived with AVX2 — so each 4-lane chunk would need 4 scalar loads to
+ * fetch (s0, s1) pairs.  That kills most of the speedup on a SSE-only
+ * CPU.  Cubic / sinc are still pure scalar even on AVX2 hosts so they
+ * are higher-leverage SIMD targets than an SSE backport.  Revisit
+ * if/when sustained pre-AVX2 hardware (e.g. Bulldozer / pre-Haswell)
+ * shows up as a real load.
  */
 
 #include <stdint.h>
@@ -137,7 +149,7 @@ void simd_mix8_16bit_lintrp (const int16_t *smpPtr,
 /* ----------------------------------------------------------------------- */
 
 __attribute__((target("avx2,fma")))
-static void mix16bNoLoopLIntrp_AVX2 (voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bNoLoopLIntrp_AVX2 (voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
     const int16_t *base, *smpPtr;
     float fSample, *fMixBufferL, *fMixBufferR;
@@ -189,7 +201,7 @@ static void mix16bNoLoopLIntrp_AVX2 (voice_t *v, uint32_t bufferPos, uint32_t nu
 }
 
 __attribute__((target("avx2,fma")))
-static void mix16bLoopLIntrp_AVX2 (voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bLoopLIntrp_AVX2 (voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
     const int16_t *base, *smpPtr;
     float fSample, *fMixBufferL, *fMixBufferR;
@@ -245,7 +257,7 @@ static void mix16bLoopLIntrp_AVX2 (voice_t *v, uint32_t bufferPos, uint32_t numS
 /* ----------------------------------------------------------------------- */
 
 __attribute__((target("avx2,fma")))
-static void mix16bRampNoLoopLIntrp_AVX2 (voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampNoLoopLIntrp_AVX2 (voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
     const int16_t *base, *smpPtr;
     float fSample, *fMixBufferL, *fMixBufferR;
@@ -310,7 +322,7 @@ static void mix16bRampNoLoopLIntrp_AVX2 (voice_t *v, uint32_t bufferPos, uint32_
 }
 
 __attribute__((target("avx2,fma")))
-static void mix16bRampLoopLIntrp_AVX2 (voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampLoopLIntrp_AVX2 (voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
     const int16_t *base, *smpPtr;
     float fSample, *fMixBufferL, *fMixBufferR;

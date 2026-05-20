@@ -450,9 +450,6 @@ public:
         AudioBuffer<float> scratch (2, numSamples);
         scratch.clear();
 
-        audio.fMixBufferL = scratch.getWritePointer (0);
-        audio.fMixBufferR = scratch.getWritePointer (1);
-
         /* Walk the block in tick-aligned chunks.  Each chunk: tick
          * envelope state once (if a tick boundary fell inside), then
          * mix sample. */
@@ -556,6 +553,14 @@ private:
         const uint32_t soff = (uint32_t) startInScratch;
         const uint32_t cnt  = (uint32_t) count;
 
+        /* Per-call audio_t — was a global in upstream ft2-clone (DOS-era
+         * single output).  Stack-local here so parallel voice-pool / graph
+         * mixing can each carry their own scratch target without races. */
+        audio_t mixCtx;
+        mixCtx.fMixBufferL = scratch.getWritePointer (0);
+        mixCtx.fMixBufferR = scratch.getWritePointer (1);
+        mixCtx.fQuickVolRampSamplesMul = 0.0f;
+
         if (slotIsStereo)
         {
             voice_t snap = voice;
@@ -567,7 +572,7 @@ private:
             voice.revBase16 = voice.loopType == 2
                                 ? slotPtr->data16L.get() + (voice.loopStart * 2) + voice.loopLength
                                 : nullptr;
-            mixFuncDispatch[voice.mixFuncOffset] (&voice, soff, cnt);
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, &mixCtx, soff, cnt);
 
             voice_t afterFirst = voice;
 
@@ -580,13 +585,13 @@ private:
             voice.revBase16 = voice.loopType == 2
                                 ? slotPtr->data16R.get() + (voice.loopStart * 2) + voice.loopLength
                                 : nullptr;
-            mixFuncDispatch[voice.mixFuncOffset] (&voice, soff, cnt);
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, &mixCtx, soff, cnt);
 
             voice.active = voice.active && afterFirst.active;
         }
         else
         {
-            mixFuncDispatch[voice.mixFuncOffset] (&voice, soff, cnt);
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, &mixCtx, soff, cnt);
         }
     }
 

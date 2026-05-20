@@ -32,7 +32,7 @@
 /*                          8-BIT MIXING ROUTINES                          */
 /* ----------------------------------------------------------------------- */
 
-static void mix8bNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bNoLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -62,7 +62,7 @@ static void mix8bNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -92,7 +92,7 @@ static void mix8bLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bPingpongLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -123,7 +123,7 @@ static void mix8bPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numSample
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bNoLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -153,7 +153,7 @@ static void mix8bNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSampl
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	int8_t *smpTapPtr;
@@ -196,7 +196,7 @@ static void mix8bLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bPingpongLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	int8_t *smpTapPtr;
@@ -241,7 +241,7 @@ static void mix8bPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t nu
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bNoLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -271,7 +271,7 @@ static void mix8bNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSample
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -301,7 +301,7 @@ static void mix8bLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bPingpongLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -333,7 +333,7 @@ static void mix8bPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t num
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bNoLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -363,7 +363,7 @@ static void mix8bNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamp
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	int8_t *smpTapPtr;
@@ -406,7 +406,7 @@ static void mix8bLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSample
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bPingpongLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	int8_t *smpTapPtr;
@@ -451,7 +451,7 @@ static void mix8bPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t n
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bNoLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -481,7 +481,7 @@ static void mix8bNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSample
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	int8_t *smpTapPtr;
@@ -524,7 +524,7 @@ static void mix8bLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bPingpongLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bPingpongLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	int8_t *smpTapPtr;
@@ -569,7 +569,7 @@ static void mix8bPingpongLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t num
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampNoLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -603,7 +603,7 @@ static void mix8bRampNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -637,7 +637,7 @@ static void mix8bRampLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampPingpongLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -673,7 +673,7 @@ static void mix8bRampPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numSa
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampNoLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -707,7 +707,7 @@ static void mix8bRampNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numS
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	int8_t *smpTapPtr;
@@ -755,7 +755,7 @@ static void mix8bRampLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSam
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampPingpongLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	int8_t *smpTapPtr;
@@ -805,7 +805,7 @@ static void mix8bRampPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampNoLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -839,7 +839,7 @@ static void mix8bRampNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSa
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -873,7 +873,7 @@ static void mix8bRampLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamp
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampPingpongLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -909,7 +909,7 @@ static void mix8bRampPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampNoLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -943,7 +943,7 @@ static void mix8bRampNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t num
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	int8_t *smpTapPtr;
@@ -991,7 +991,7 @@ static void mix8bRampLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSa
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampPingpongLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	int8_t *smpTapPtr;
@@ -1041,7 +1041,7 @@ static void mix8bRampPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampNoLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1075,7 +1075,7 @@ static void mix8bRampNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSa
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *smpPtr;
 	int8_t *smpTapPtr;
@@ -1123,7 +1123,7 @@ static void mix8bRampLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamp
 	SET_BACK_MIXER_POS
 }
 
-static void mix8bRampPingpongLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix8bRampPingpongLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int8_t *base, *revBase, *smpPtr;
 	int8_t *smpTapPtr;
@@ -1177,7 +1177,7 @@ static void mix8bRampPingpongLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t
 /*                          16-BIT MIXING ROUTINES                         */
 /* ----------------------------------------------------------------------- */
 
-static void mix16bNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bNoLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1207,7 +1207,7 @@ static void mix16bNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1237,7 +1237,7 @@ static void mix16bLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bPingpongLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1269,7 +1269,7 @@ static void mix16bPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numSampl
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bNoLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1299,7 +1299,7 @@ static void mix16bNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamp
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1342,7 +1342,7 @@ static void mix16bLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSample
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bPingpongLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1387,7 +1387,7 @@ static void mix16bPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t n
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bNoLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1417,7 +1417,7 @@ static void mix16bNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSampl
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1447,7 +1447,7 @@ static void mix16bLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bPingpongLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1479,7 +1479,7 @@ static void mix16bPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t nu
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bNoLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1509,7 +1509,7 @@ static void mix16bNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSam
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1552,7 +1552,7 @@ static void mix16bLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSampl
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bPingpongLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1597,7 +1597,7 @@ static void mix16bPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t 
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bNoLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1627,7 +1627,7 @@ static void mix16bNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSampl
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1670,7 +1670,7 @@ static void mix16bLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bPingpongLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bPingpongLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1715,7 +1715,7 @@ static void mix16bPingpongLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t nu
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampNoLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1749,7 +1749,7 @@ static void mix16bRampNoLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1783,7 +1783,7 @@ static void mix16bRampLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampPingpongLoop(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1819,7 +1819,7 @@ static void mix16bRampPingpongLoop(voice_t *v, uint32_t bufferPos, uint32_t numS
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampNoLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1853,7 +1853,7 @@ static void mix16bRampNoLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t num
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1901,7 +1901,7 @@ static void mix16bRampLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSa
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampPingpongLoopS8Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	int16_t *smpTapPtr;
@@ -1951,7 +1951,7 @@ static void mix16bRampPingpongLoopS8Intrp(voice_t *v, uint32_t bufferPos, uint32
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampNoLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -1985,7 +1985,7 @@ static void mix16bRampNoLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numS
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -2019,7 +2019,7 @@ static void mix16bRampLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSam
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampPingpongLoopLIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -2055,7 +2055,7 @@ static void mix16bRampPingpongLoopLIntrp(voice_t *v, uint32_t bufferPos, uint32_
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampNoLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -2089,7 +2089,7 @@ static void mix16bRampNoLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t nu
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	int16_t *smpTapPtr;
@@ -2137,7 +2137,7 @@ static void mix16bRampLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numS
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampPingpongLoopS16Intrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	int16_t *smpTapPtr;
@@ -2187,7 +2187,7 @@ static void mix16bRampPingpongLoopS16Intrp(voice_t *v, uint32_t bufferPos, uint3
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampNoLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	float fSample, *fMixBufferL, *fMixBufferR;
@@ -2221,7 +2221,7 @@ static void mix16bRampNoLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numS
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *smpPtr;
 	int16_t *smpTapPtr;
@@ -2269,7 +2269,7 @@ static void mix16bRampLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSam
 	SET_BACK_MIXER_POS
 }
 
-static void mix16bRampPingpongLoopCIntrp(voice_t *v, uint32_t bufferPos, uint32_t numSamples)
+static void mix16bRampPingpongLoopCIntrp(voice_t *v, audio_t *audio, uint32_t bufferPos, uint32_t numSamples)
 {
 	const int16_t *base, *revBase, *smpPtr;
 	int16_t *smpTapPtr;
