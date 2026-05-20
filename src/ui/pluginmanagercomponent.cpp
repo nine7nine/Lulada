@@ -8,6 +8,7 @@
 
 #include "ui/guicommon.hpp"
 #include "ui/pluginmanagercomponent.hpp"
+#include "ui/categorycolors.hpp"
 #include "utils.hpp"
 
 namespace element {
@@ -319,36 +320,29 @@ public:
 
     void paintRowBackground (Graphics& g, int rowNumber, int width, int height, bool rowIsSelected) override
     {
-        // Per-row type tint — same recipe as the mixer / strip dock:
-        // darkened gray base interpolated a low % toward the format
-        // accent so the row carries a subtle visual cue without
-        // turning the table into stripes.  Selection is signalled by
-        // a stronger tint of the same accent so the highlight still
-        // matches the row's type.
-        const juce::String format = (! isPositiveAndBelow (rowNumber, list.getNumTypes()))
-                                        ? juce::String()
-                                        : list.getTypes().getReference (rowNumber).pluginFormatName;
+        /* Per-row category tint.  Same recipe as the mixer / strip dock:
+         * darkened gray base interpolated a low % toward the per-row
+         * accent so the row carries a subtle visual cue without turning
+         * the table into stripes.  Accent comes from the shared
+         * defaultColorForCategory palette (ui/categorycolors.hpp) —
+         * same palette block.cpp uses for graph node outlines, so
+         * the app feels colour-consistent: "Reverb" rows in the
+         * manager tint with the same teal-green that the Reverb
+         * block outline shows in the graph.  Falls back to the
+         * plugin format accent when the plugin advertises no
+         * category (typical for ill-tagged old VST2s). */
+        juce::String category, format;
+        if (isPositiveAndBelow (rowNumber, list.getNumTypes()))
+        {
+            const auto& desc = list.getTypes().getReference (rowNumber);
+            category = desc.category;
+            format   = desc.pluginFormatName;
+        }
 
-        const auto accent = formatAccent (format);
+        const auto accent = colorForCategoryOrFormat (category, format);
         const auto base   = Colors::contentBackgroundColor;
         g.setColour (base.interpolatedWith (accent, rowIsSelected ? 0.20f : 0.05f));
         g.fillRect (0, 0, width, height);
-    }
-
-    /* Plugin-format → accent colour.  Mirrors the block / strip
-     * palette in nodechannelstrip.hpp + block.cpp; kept duplicated
-     * here because this site works on raw format strings (no Node)
-     * and has no Audio / MIDI / JACK-MIDI cases (those aren't
-     * loadable plugin formats). */
-    static juce::Colour formatAccent (const juce::String& f) noexcept
-    {
-        if (f == "VST")       return juce::Colour (0xff3d5afe);  // indigo A400 — VST2
-        if (f == "VST3")      return juce::Colour (0xffd500f9);  // purple A400 — VST3
-        if (f == "CLAP")      return juce::Colour (0xff00e5ff);  // cyan   A400 — CLAP
-        if (f == "LV2")       return juce::Colour (0xffff1744);  // red    A400 — LV2
-        if (f == "AudioUnit") return juce::Colour (0xffff9100);  // orange A400 — AU
-        if (f == "Element")   return juce::Colour (0xffff4081);  // pink   A400 — Element internal
-        return juce::Colour (0xffbdbdbd);                         // gray 400 fallback
     }
 
     enum

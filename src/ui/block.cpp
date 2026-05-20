@@ -20,98 +20,9 @@
 #include "ui/blockutils.hpp"
 
 #include "scopedflag.hpp"
+#include "ui/categorycolors.hpp"
 
 namespace element {
-
-namespace {
-
-/** Map a plugin's category string to a default block colour.  Used
- *  when no user-set "color" UI property exists.
- *
- *  VST / VST3 / CLAP plugins set categories like "Instrument",
- *  "Fx", "Synth", "Effect|Reverb", "Instrument|u-he" etc.  Split on
- *  '|' and match the first token to a known bucket; unknown buckets
- *  fall through to a desaturated default so something always shows.
- *
- *  Element internal plugins populate `desc.category` directly (see
- *  fillInPluginDescription / getPluginDescription in src/nodes/*). */
-inline juce::Colour defaultColorForCategory (const juce::String& category)
-{
-    if (category.isEmpty()) return juce::Colour (0x00000000);
-
-    /* Lowercase + whitespace-normalised tokens for both halves of a
-     * potential vendor-style "X|Y" tag.  Plugins are inconsistent
-     * about whether the bucket is in the first or second slot
-     * (e.g. CLAP uses "delay" / VST3 uses "Fx|Delay") so we match
-     * the more specific token first across both. */
-    const auto first  = category.upToFirstOccurrenceOf ("|", false, true).trim().toLowerCase();
-    const auto second = category.fromFirstOccurrenceOf ("|", false, true).trim().toLowerCase();
-    auto matchAny = [&] (std::initializer_list<const char*> patterns) {
-        for (auto* p : patterns)
-        {
-            if (first == p || second == p
-                || first.contains (p) || second.contains (p))
-                return true;
-        }
-        return false;
-    };
-
-    /* === Most-specific effect buckets first (so an "Fx|Reverb"
-         lands on "reverb" rather than the generic "effect" bucket). */
-    if (matchAny ({ "reverb" }))             return juce::Colour { 0xff'4a'a8'8c };  /* teal-green */
-    if (matchAny ({ "delay", "echo" }))      return juce::Colour { 0xff'5a'b0'b0 };  /* aqua */
-    if (matchAny ({ "eq", "equalizer", "equaliser" }))
-                                              return juce::Colour { 0xff'9a'c0'4a };  /* lime */
-    if (matchAny ({ "dynamics", "compressor", "limiter", "gate",
-                    "expander", "mastering" }))
-                                              return juce::Colour { 0xff'c0'b0'40 };  /* mustard */
-    if (matchAny ({ "distortion", "saturation", "amp", "amplifier" }))
-                                              return juce::Colour { 0xff'd0'60'40 };  /* burnt orange */
-    if (matchAny ({ "modulation", "chorus", "flanger", "phaser",
-                    "tremolo", "vibrato" }))
-                                              return juce::Colour { 0xff'a0'5a'c0 };  /* lavender */
-    if (matchAny ({ "filter", "wah" }))      return juce::Colour { 0xff'5a'c0'a0 };  /* mint */
-    if (matchAny ({ "pitch", "pitch-shift", "pitch-shifter",
-                    "pitch-correction", "vocoder" }))
-                                              return juce::Colour { 0xff'b0'9a'c0 };  /* dusty purple */
-    if (matchAny ({ "spatial", "stereo", "surround", "panner" }))
-                                              return juce::Colour { 0xff'5a'7a'c0 };  /* sky blue */
-    if (matchAny ({ "analyzer", "analyser", "meter", "spectrum" }))
-                                              return juce::Colour { 0xff'40'a0'c0 };  /* steel blue */
-    if (matchAny ({ "drum", "drum-machine", "percussion" }))
-                                              return juce::Colour { 0xff'e0'70'4a };  /* terracotta */
-
-    /* === Broad family buckets. */
-    if (matchAny ({ "instrument", "synth", "synthesizer", "synthesiser",
-                    "sampler", "rom-sampler", "monosynth", "multivoice",
-                    "virtual-instrument", "piano", "strings", "brass",
-                    "winds", "ensemble", "external" }))
-        return juce::Colour { 0xff'8a'5a'c0 };                                       /* warm purple */
-    if (matchAny ({ "sequencer", "tracker", "arpeggiator",
-                    "step-sequencer", "pattern" }))
-        return juce::Colour { 0xff'40'a0'a0 };                                       /* teal */
-    if (matchAny ({ "midi" }))
-        return juce::Colour { 0xff'd0'80'40 };                                       /* orange */
-    if (matchAny ({ "effect", "fx", "multi-effects", "tools",
-                    "utility" }))
-        return juce::Colour { 0xff'5a'a5'5a };                                       /* green */
-    if (matchAny ({ "mixer", "mixing", "router", "routing", "channel" }))
-        return juce::Colour { 0xff'5a'7a'a0 };                                       /* slate blue */
-    if (matchAny ({ "audio", "player", "media", "playback" }))
-        return juce::Colour { 0xff'4a'90'd0 };                                       /* blue */
-    if (matchAny ({ "control", "osc", "script", "automation",
-                    "control-surface" }))
-        return juce::Colour { 0xff'c0'a0'40 };                                       /* gold */
-    if (matchAny ({ "generator", "visualiser", "visualizer", "scope",
-                    "noise" }))
-        return juce::Colour { 0xff'b0'5a'a0 };                                       /* magenta */
-
-    /* Unknown but non-empty — neutral desaturated.  Different from
-     * "no colour" so the user can still tell the block was tagged. */
-    return juce::Colour { 0xff'70'70'70 };
-}
-
-} // namespace
 
 namespace detail {
 inline static Context* context (juce::Component* comp)
@@ -981,23 +892,23 @@ void BlockComponent::paint (Graphics& g)
             if (node.isMidiInputNode() || node.isMidiOutputNode())
                 return Colour (0xffffa726);      // orange 400 — matches MIDI wire
 
-            const auto category = node.getProperty (tags::category).toString();
-            if (category.isNotEmpty())
+            /* Prefer the ValueTree property when it's there (set in
+             * graphmanager when a node is freshly added).  Sessions
+             * saved before tags::category existed won't have it on
+             * restore — fall back to the live Processor's
+             * PluginDescription so the block still gets a colour
+             * (e.g. JACK MIDI nodes loaded from an old session). */
+            auto category = node.getProperty (tags::category).toString();
+            if (category.isEmpty())
             {
-                const auto c = defaultColorForCategory (category);
-                if (c != Colour (0x00000000))
-                    return c;
+                if (auto obj = node.getObject())
+                {
+                    juce::PluginDescription pd;
+                    obj->getPluginDescription (pd);
+                    category = pd.category;
+                }
             }
-
-            const auto format = node.getFormat().toString();
-            if (format == "VST")       return Colour (0xff3d5afe);  // indigo A400 — VST2
-            if (format == "VST3")      return Colour (0xffd500f9);  // purple A400 — VST3
-            if (format == "CLAP")      return Colour (0xff00e5ff);  // cyan   A400 — CLAP
-            if (format == "LV2")       return Colour (0xffff1744);  // red    A400 — LV2
-            if (format == "AudioUnit") return Colour (0xffff9100);  // orange A400 — AudioUnit
-            if (format == EL_NODE_FORMAT_NAME)
-                return Colour (0xffff4081);                          // pink A400 — internal w/o category
-            return Colour (0xffbdbdbd);                              // gray 400 fallback
+            return colorForCategoryOrFormat (category, node.getFormat().toString());
         }();
 
         g.setColour (typeColor);
