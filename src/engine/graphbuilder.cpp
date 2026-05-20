@@ -533,6 +533,70 @@ GraphBuilder::GraphBuilder (GraphNode& graph_,
     }
 }
 
+namespace {
+
+bool buffersOverlap (const Array<int>& a, const Array<int>& b) noexcept
+{
+    for (int i = 0; i < a.size(); ++i)
+    {
+        const int x = a.getUnchecked (i);
+        for (int j = 0; j < b.size(); ++j)
+            if (x == b.getUnchecked (j))
+                return true;
+    }
+    return false;
+}
+
+} // namespace
+
+void GraphBuilder::computeRenderingLayers (const Array<void*>& renderingOps,
+                                           Array<Array<int>>& renderingLayers)
+{
+    renderingLayers.clearQuick();
+
+    const int n = renderingOps.size();
+    if (n == 0)
+        return;
+
+    Array<Array<int>> readsA, writesA, readsM, writesM;
+    readsA.resize (n);  writesA.resize (n);
+    readsM.resize (n);  writesM.resize (n);
+
+    for (int i = 0; i < n; ++i)
+    {
+        auto* op = static_cast<GraphOp*> (renderingOps.getUnchecked (i));
+        op->getReadAudioBuffers  (readsA.getReference  (i));
+        op->getWriteAudioBuffers (writesA.getReference (i));
+        op->getReadMidiBuffers   (readsM.getReference  (i));
+        op->getWriteMidiBuffers  (writesM.getReference (i));
+    }
+
+    Array<int> layerOf;
+    layerOf.resize (n);
+
+    for (int i = 0; i < n; ++i)
+    {
+        int minLayer = 0;
+        for (int j = 0; j < i; ++j)
+        {
+            const bool conflict =
+                buffersOverlap (writesA.getReference (i), readsA.getReference  (j))
+             || buffersOverlap (readsA.getReference  (i), writesA.getReference (j))
+             || buffersOverlap (writesA.getReference (i), writesA.getReference (j))
+             || buffersOverlap (writesM.getReference (i), readsM.getReference  (j))
+             || buffersOverlap (readsM.getReference  (i), writesM.getReference (j))
+             || buffersOverlap (writesM.getReference (i), writesM.getReference (j));
+
+            if (conflict)
+                minLayer = jmax (minLayer, layerOf.getUnchecked (j) + 1);
+        }
+        layerOf.set (i, minLayer);
+        while (renderingLayers.size() <= minLayer)
+            renderingLayers.add (Array<int>());
+        renderingLayers.getReference (minLayer).add (i);
+    }
+}
+
 int GraphBuilder::buffersNeeded (PortType type) { return allNodes[type.id()].size(); }
 int GraphBuilder::getNodeDelay (const uint32 nodeID) const { return nodeDelays[nodeDelayIDs.indexOf (nodeID)]; }
 

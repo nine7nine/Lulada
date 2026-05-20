@@ -368,6 +368,7 @@ void GraphNode::clearRenderingSequence()
     {
         const ScopedLock sl (seqLock);
         renderingOps.swapWith (oldOps);
+        renderingLayers.clearQuick();
     }
 
     deleteRenderOpArray (oldOps);
@@ -396,6 +397,7 @@ bool GraphNode::isAnInputTo (const uint32 possibleInputId,
 void GraphNode::buildRenderingSequence()
 {
     Array<void*> newRenderingOps;
+    Array<Array<int>> newRenderingLayers;
     int numRenderingBuffersNeeded = 2;
     int numMidiBuffersNeeded = 1;
     int numAtomBuffersNeeded = 1;
@@ -424,6 +426,16 @@ void GraphNode::buildRenderingSequence()
         numMidiBuffersNeeded = builder.buffersNeeded (PortType::Midi);
         numAtomBuffersNeeded = builder.buffersNeeded (PortType::Atom);
         setLatencySamples (builder.getTotalLatencySamples());
+
+        GraphBuilder::computeRenderingLayers (newRenderingOps, newRenderingLayers);
+
+       #if JUCE_DEBUG
+        int maxLayerSize = 0;
+        for (int i = 0; i < newRenderingLayers.size(); ++i)
+            maxLayerSize = jmax (maxLayerSize, newRenderingLayers.getReference (i).size());
+        DBG ("[GraphMT] " << newRenderingOps.size() << " ops in "
+             << newRenderingLayers.size() << " layers (max layer size " << maxLayerSize << ")");
+       #endif
     }
 
     {
@@ -442,6 +454,7 @@ void GraphNode::buildRenderingSequence()
 
         ScopedLock sl (seqLock);
         renderingOps.swapWith (newRenderingOps);
+        renderingLayers.swapWith (newRenderingLayers);
     }
 
     // delete the old ones..

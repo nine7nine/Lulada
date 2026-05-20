@@ -215,6 +215,7 @@ private:
     AudioSampleBuffer renderingBuffers;
     OwnedArray<MidiBuffer> midiBuffers;
     Array<void*> renderingOps;
+    Array<Array<int>> renderingLayers; // layered schedule: layer[L] = op indices runnable in parallel within layer L
     bool _prepared = false;
 
     AudioSampleBuffer* currentAudioInputBuffer;
