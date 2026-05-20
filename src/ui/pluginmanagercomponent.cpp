@@ -346,7 +346,12 @@ public:
 
         const auto accent = colorForCategoryOrFormat (category, format);
         const auto base   = Colors::contentBackgroundColor;
-        g.setColour (base.interpolatedWith (accent, rowIsSelected ? 0.20f : 0.05f));
+        /* Mix toward the accent enough that the category is visible at
+         * a glance.  Base stays dark so the table never turns into a
+         * stripe-fest, but the colour is clearly readable per row.
+         * 0.18 unselected / 0.40 selected gives a clear cue without
+         * drowning the text below it. */
+        g.setColour (base.interpolatedWith (accent, rowIsSelected ? 0.40f : 0.18f));
         g.fillRect (0, 0, width, height);
     }
 
