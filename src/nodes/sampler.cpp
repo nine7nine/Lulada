@@ -473,7 +473,21 @@ public:
         return dynamic_cast<Ft2SamplerSound*> (s) != nullptr;
     }
 
-    int  getCurrentSamplePos() const noexcept { return voice.position; }
+    int  getCurrentSamplePos() const noexcept
+    {
+        /* During pingpong's backward sweep, the ft2 mixer stores position
+         * as the bit-inverse of (smpPtr - revBase) where revBase = base +
+         * loopStart + loopEnd.  That gives smpPtr-base = loopStart + loopEnd
+         * - 1 - position — the actual sample-array index the playhead
+         * should render at.  Forward sweep stores position == (smpPtr -
+         * base) directly, so the no-encoding case stays trivial. */
+        if (voice.samplingBackwards)
+        {
+            const int32_t loopEnd = voice.loopStart + voice.loopLength;
+            return voice.loopStart + loopEnd - 1 - voice.position;
+        }
+        return voice.position;
+    }
     bool isPlayingActive() const noexcept     { return voice.active; }
     const SamplerSampleSlot* getCurrentSlot() const noexcept { return slotPtr; }
 
