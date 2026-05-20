@@ -567,7 +567,7 @@ private:
             voice.revBase16 = voice.loopType == 2
                                 ? slotPtr->data16L.get() + (voice.loopStart * 2) + voice.loopLength
                                 : nullptr;
-            mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, soff, cnt);
 
             voice_t afterFirst = voice;
 
@@ -580,13 +580,13 @@ private:
             voice.revBase16 = voice.loopType == 2
                                 ? slotPtr->data16R.get() + (voice.loopStart * 2) + voice.loopLength
                                 : nullptr;
-            mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, soff, cnt);
 
             voice.active = voice.active && afterFirst.active;
         }
         else
         {
-            mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, soff, cnt);
         }
     }
 
@@ -4317,6 +4317,11 @@ SamplerNode::SamplerNode()
                        .withOutput ("Output", AudioChannelSet::stereo(), true))
 {
     ensureMixerInterpolationTablesReady();
+    /* mixFuncDispatch[] is patched with SIMD variants on CPUs that support
+     * them; ft2_mix_init is idempotent so multiple SamplerNode ctors are
+     * safe.  Single global state, but only write-once writes (memcpy +
+     * fixed function pointers), so the second/Nth call is a no-op. */
+    ft2_mix_init();
     formatManager.registerBasicFormats();
     channelBinding.fill (-1);
 

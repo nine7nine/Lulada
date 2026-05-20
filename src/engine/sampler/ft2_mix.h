@@ -27,4 +27,19 @@ enum
 
 typedef void (*mixFunc)(void *, uint32_t, uint32_t);
 
-extern const mixFunc mixFuncTab[]; // ft2_mix.c
+extern const mixFunc mixFuncTab[];      // ft2_mix.c — scalar variants only
+extern       mixFunc mixFuncDispatch[]; // ft2_mix_simd.c — SIMD overrides applied at init
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Initialise the dispatch table.  Copies scalar mixFuncTab entries into
+ * mixFuncDispatch then patches in SIMD variants where the host CPU
+ * supports the required ISA (currently AVX2+FMA for 16-bit linear).  Safe
+ * to call multiple times — idempotent. */
+void ft2_mix_init (void);
+
+#ifdef __cplusplus
+}
+#endif
