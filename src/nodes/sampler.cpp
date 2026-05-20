@@ -4,6 +4,9 @@
 #include "nodes/sampler.hpp"
 #include "services/diskopservice.hpp"
 
+#include <pthread.h>
+#include <sched.h>
+
 /* Vendored ft2-clone mixer (BSD-3-Clause). See src/engine/sampler/. */
 extern "C" {
 #include "engine/sampler/ft2_audio.h"
@@ -248,11 +251,89 @@ private:
  * playing MIDI channel, but we need it for multi-instrument routing.
  * Forward the channel to the owning SamplerNode before invoking noteOn,
  * where voices read it back during startNote().
+ *
+ * Also hosts the voice-pool worker dispatch: when active voice count and
+ * sub-block size both exceed a threshold, renderVoices fans the voice
+ * loop out to per-worker scratch buffers (parallel) and sums the result
+ * back into the output buffer.  Workers run at SCHED_FIFO 70 (one rung
+ * below NSPA's audio-thread priority 80) so the main audio thread always
+ * preempts them.  Below threshold the base scalar path is preserved
+ * verbatim — small voice loads see zero behaviour change.
  * ========================================================================*/
+
+/* Single worker thread owned by ChannelTrackingSynth.  Waits on workReady,
+ * renders its assigned voice range into its own scratch, signals
+ * jobCompleted.  Stack-shaped sync via juce::WaitableEvent (futex-backed
+ * on Linux); no allocations after prepare(). */
+class SamplerWorker : public juce::Thread
+{
+public:
+    explicit SamplerWorker (const String& threadName) : juce::Thread (threadName) {}
+
+    void prepare (int channels, int maxSamples)
+    {
+        workerScratch.setSize (channels, maxSamples, false, true, true);
+    }
+
+    void postJob (juce::SynthesiserVoice** vs, int s, int e, int subNum, int channels)
+    {
+        voices         = vs;
+        jobStart       = s;
+        jobEnd         = e;
+        renderSubNum   = subNum;
+        workerScratch.clear (0, 0, subNum);
+        if (channels > 1) workerScratch.clear (1, 0, subNum);
+        workReady.signal();
+    }
+
+    void waitForJobCompletion() { jobCompleted.wait (-1); }
+
+    void requestStop()
+    {
+        signalThreadShouldExit();
+        workReady.signal();
+    }
+
+    void run() override
+    {
+        /* Promote to SCHED_FIFO 70 — best-effort.  If the user lacks
+         * RTPRIO capability the call just fails and the worker runs at
+         * SCHED_OTHER.  Functionally still correct, just less RT-tight. */
+        sched_param p{};
+        p.sched_priority = 70;
+        pthread_setschedparam (pthread_self(), SCHED_FIFO, &p);
+
+        while (! threadShouldExit())
+        {
+            workReady.wait (-1);
+            if (threadShouldExit()) break;
+
+            for (int i = jobStart; i < jobEnd; ++i)
+            {
+                if (auto* v = voices[i])
+                    v->renderNextBlock (workerScratch, 0, renderSubNum);
+            }
+
+            jobCompleted.signal();
+        }
+    }
+
+    juce::AudioBuffer<float> workerScratch;
+
+private:
+    juce::WaitableEvent      workReady, jobCompleted;
+    juce::SynthesiserVoice** voices       = nullptr;
+    int                      jobStart     = 0;
+    int                      jobEnd       = 0;
+    int                      renderSubNum = 0;
+};
+
 class ChannelTrackingSynth : public Synthesiser
 {
 public:
     explicit ChannelTrackingSynth (SamplerNode& owner) : node (owner) {}
+    ~ChannelTrackingSynth() override { stopWorkers(); }
+
     void noteOn (int midiChannel, int midiNoteNumber, float velocity) override
     {
         node.setLastNoteChannel (midiChannel);
@@ -261,8 +342,114 @@ public:
     /* JUCE's Synthesiser swallows program-change events without exposing
      * an override hook — we run our own MIDI scan in SamplerNode::processBlock
      * before renderNextBlock to handle them.  See SamplerNode::processBlock. */
+
+    /* Lazy worker-pool init.  Called from SamplerNode::prepareToPlay.
+     * 2 workers is the sweet spot — bigger pools hurt due to scratch-
+     * summing overhead in the main thread (Amdahl); 1 worker is no win
+     * over scalar.  GUI must stay fast (memory rule), so we cap. */
+    void prepareWorkers (int numCh, int maxSamples)
+    {
+        constexpr int kNumWorkers = 2;
+        if ((int) workers.size() == kNumWorkers)
+        {
+            for (auto& w : workers) w->prepare (numCh, maxSamples);
+            return;
+        }
+        stopWorkers();
+        workers.clear();
+        for (int i = 0; i < kNumWorkers; ++i)
+        {
+            auto w = std::make_unique<SamplerWorker> ("SamplerWorker" + String (i));
+            w->prepare (numCh, maxSamples);
+            w->startThread();
+            workers.push_back (std::move (w));
+        }
+    }
+
+    void stopWorkers()
+    {
+        for (auto& w : workers) w->requestStop();
+        for (auto& w : workers) w->stopThread (500);
+        workers.clear();
+    }
+
+protected:
+    /* Parallel renderVoices: dispatch voice range to N workers when
+     * load justifies the dispatch overhead.  Below threshold (few
+     * voices OR small sub-block), fall through to base Synthesiser
+     * path verbatim — zero overhead for typical light usage. */
+    void renderVoices (juce::AudioBuffer<float>& outputAudio,
+                       int startSample, int numSamples) override
+    {
+        /* kMinVoices: dispatch cost ~1-5µs per worker; only worth it
+         *             when per-worker payload dwarfs that overhead.
+         * kMinSamples: dense MIDI fragments the sub-block; parallel
+         *              overhead would dominate for tiny ranges. */
+        constexpr int kMinVoices  = 16;
+        constexpr int kMinSamples = 64;
+
+        if (workers.empty() || numSamples < kMinSamples)
+        {
+            Synthesiser::renderVoices (outputAudio, startSample, numSamples);
+            return;
+        }
+
+        const int totalVoices = getNumVoices();
+        int activeCount = 0;
+        for (int i = 0; i < totalVoices; ++i)
+            if (auto* v = getVoice (i); v != nullptr && v->isVoiceActive())
+                ++activeCount;
+
+        if (activeCount < kMinVoices)
+        {
+            Synthesiser::renderVoices (outputAudio, startSample, numSamples);
+            return;
+        }
+
+        /* Snapshot the voice pointer list.  voicePtrs is owned by this
+         * synth (main audio thread); workers only read it during the
+         * postJob → waitForJobCompletion window where this thread is
+         * blocked, so no race. */
+        voicePtrs.clearQuick();
+        for (int i = 0; i < totalVoices; ++i)
+            if (auto* v = getVoice (i))
+                voicePtrs.add (v);
+
+        const int N = voicePtrs.size();
+        if (N == 0) return;
+
+        const int  nWorkers = (int) workers.size();
+        const int  per      = (N + nWorkers - 1) / nWorkers;
+        const int  channels = outputAudio.getNumChannels();
+
+        for (int w = 0; w < nWorkers; ++w)
+        {
+            const int s = w * per;
+            const int e = juce::jmin ((w + 1) * per, N);
+            if (s >= e) continue;
+            workers[(size_t) w]->postJob (voicePtrs.getRawDataPointer(),
+                                          s, e, numSamples, channels);
+        }
+
+        for (int w = 0; w < nWorkers; ++w)
+            if (w * per < N)
+                workers[(size_t) w]->waitForJobCompletion();
+
+        /* Sum worker scratches into output.  outputAudio is the same
+         * buffer the scalar path would have written voice contributions
+         * into; addFrom does +=, matching scalar's semantics. */
+        for (auto& w : workers)
+        {
+            outputAudio.addFrom (0, startSample, w->workerScratch, 0, 0, numSamples);
+            if (channels > 1)
+                outputAudio.addFrom (1, startSample, w->workerScratch, 1, 0, numSamples);
+        }
+    }
+
 private:
-    SamplerNode& node;
+    SamplerNode&                                 node;
+    std::vector<std::unique_ptr<SamplerWorker>>  workers;
+    juce::Array<juce::SynthesiserVoice*>         voicePtrs;
 };
 
 
@@ -4361,15 +4548,23 @@ void SamplerNode::fillInPluginDescription (PluginDescription& desc) const
     desc.uniqueId           = EL_NODE_UID_SAMPLER;
 }
 
-void SamplerNode::prepareToPlay (double sampleRate, int)
+void SamplerNode::prepareToPlay (double sampleRate, int maxBlockSize)
 {
     currentSampleRate = sampleRate;
     synth->setCurrentPlaybackSampleRate (sampleRate);
+    /* Worker scratch buffers are sized to maxBlockSize so a render in a
+     * single sub-block fits without further allocation.  ChannelTrackingSynth
+     * downcast: SamplerNode owns the synth and only ever constructs a
+     * ChannelTrackingSynth in its ctor — see SamplerNode(). */
+    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+        cts->prepareWorkers (2, juce::jmax (64, maxBlockSize));
 }
 
 void SamplerNode::releaseResources()
 {
     synth->allNotesOff (0, true);
+    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+        cts->stopWorkers();
 }
 
 void SamplerNode::processBlock (AudioBuffer<float>& audio_, MidiBuffer& midi)
