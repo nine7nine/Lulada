@@ -623,7 +623,7 @@ void GraphNode::prepareToRender (double sampleRate, int estimatedSamplesPerBlock
 
     /* Worker-pool prepare.  Pool size = min(4, hwc - 2): reserve a core
      * for the audio main thread + one for the UI message thread.  hwc==0
-     * (unknowable) → no pool.  Env-var ELEMENT_GRAPH_MT=1 opts in. */
+     * (unknowable) → no pool, parallel stays off. */
     {
         const int hwc = (int) std::thread::hardware_concurrency();
         const int desired = jmax (0, jmin (4, hwc - 2));
@@ -637,8 +637,7 @@ void GraphNode::prepareToRender (double sampleRate, int estimatedSamplesPerBlock
             workerPool->stop();
         }
 
-        const auto env = juce::SystemStats::getEnvironmentVariable ("ELEMENT_GRAPH_MT", String());
-        parallelEnabled.store (desired > 0 && env == "1");
+        parallelEnabled.store (desired > 0);
     }
 
     buildRenderingSequence();
@@ -716,9 +715,9 @@ void GraphNode::render (RenderContext& rc)
     {
         ScopedLock sl (seqLock);
 
-        /* Gate the parallel path: env-var-enabled + pool prepared +
-         * worth-it block size + multi-layer schedule.  Anything else
-         * falls through to the linear op walk. */
+        /* Gate the parallel path: pool prepared + worth-it block size
+         * + multi-layer schedule.  Anything else falls through to the
+         * linear op walk. */
         const bool useParallel = parallelEnabled.load()
                               && workerPool && ! workerPool->workers.empty()
                               && numSamples >= 64

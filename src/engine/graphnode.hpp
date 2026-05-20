@@ -186,9 +186,9 @@ public:
     /** Rebuild rendering ops immediately. */
     void rebuild() noexcept;
 
-    /** Enable / disable parallel layer dispatch.  Read from the
-        ELEMENT_GRAPH_MT env var at prepareToRender; tests may toggle
-        directly. */
+    /** Enable / disable parallel layer dispatch.  Defaults to enabled
+        whenever the worker pool was successfully prepared (hwc >= 3);
+        tests may toggle directly. */
     void setParallelExecutionEnabled (bool enabled) noexcept { parallelEnabled = enabled; }
     bool isParallelExecutionEnabled() const noexcept { return parallelEnabled.load(); }
 
