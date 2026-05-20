@@ -1145,7 +1145,14 @@ void track_emit_voice_fx_block(track *trk, int frame_offset, int nframes) {
 
 	const int kSubsteps = 4;
 
-	for (int c = 0; c < trk->ncols; c++) {
+	/* Snapshot ncols at the top so a UI-side track_add_col / track_del_col
+	 * running concurrently can't change our loop bound mid-iteration.
+	 * Doesn't eliminate the underlying vht ncols++-before-realloc race
+	 * (audio still reads trk->fx[c] without trk->excl), but bounds it
+	 * to one observation per block. */
+	const int ncols = trk->ncols;
+
+	for (int c = 0; c < ncols; c++) {
 		track_fx_state *fx_st = &trk->fx[c];
 		const int has_vib   = (fx_st->vib_depth > 0 && fx_st->vib_speed > 0);
 		const int has_trem  = (fx_st->trem_depth > 0 && fx_st->trem_speed > 0);
@@ -1548,28 +1555,44 @@ void track_ctrl_refresh_envelope(track *trk, int c) {
 
 void track_add_col(track *trk) {
 	pthread_mutex_lock(&trk->excl);
-	trk->ncols++;
 
-	trk->rows = realloc(trk->rows, sizeof(row*) * trk->ncols);
-	trk->rows[trk->ncols -1] = malloc(sizeof(row) * trk->arows);
-	trk->ring = realloc(trk->ring, sizeof(int) * trk->ncols);
-	trk->lplayed = realloc(trk->lplayed, sizeof(int) * trk->ncols);
-	trk->lsounded = realloc(trk->lsounded, sizeof(int) * trk->ncols);
-	trk->mand_qnt = realloc(trk->mand_qnt, sizeof(int) * trk->ncols);
-	trk->fx = realloc(trk->fx, sizeof(track_fx_state) * trk->ncols);
+	/* Element-NSPA: increment ncols LAST after all reallocs +
+	 * inits land.  Upstream vht does `trk->ncols++` first which
+	 * exposes a window where audio-thread track_advance /
+	 * track_emit_voice_fx_block sees the new count before the
+	 * arrays have been resized — torn read off the end of rows /
+	 * fx / etc.  Atomic-ish publish via the int store keeps the
+	 * audio side consistent (x86-TSO orders the realloc/init
+	 * writes before this final store; readers without a fence
+	 * just observe the old size for one extra block, which is
+	 * harmless). */
+	const int new_ncols = trk->ncols + 1;
+	const int new_idx   = new_ncols - 1;
 
-	trk->ring[trk->ncols - 1] = -1;
-	trk->lplayed[trk->ncols - 1] = -1;
-	trk->lsounded[trk->ncols - 1] = -1;
-	trk->mand_qnt[trk->ncols - 1] = -1;
-	memset(&trk->fx[trk->ncols - 1], 0, sizeof(track_fx_state));
-	trk->fx[trk->ncols - 1].slide_vol  = -1;
-	trk->fx[trk->ncols - 1].pitch_bend = 0;
+	trk->rows     = realloc(trk->rows,     sizeof(row*)              * new_ncols);
+	trk->rows[new_idx] = malloc(sizeof(row) * trk->arows);
+	trk->ring     = realloc(trk->ring,     sizeof(int)               * new_ncols);
+	trk->lplayed  = realloc(trk->lplayed,  sizeof(int)               * new_ncols);
+	trk->lsounded = realloc(trk->lsounded, sizeof(int)               * new_ncols);
+	trk->mand_qnt = realloc(trk->mand_qnt, sizeof(int)               * new_ncols);
+	trk->fx       = realloc(trk->fx,       sizeof(track_fx_state)    * new_ncols);
+
+	trk->ring    [new_idx] = -1;
+	trk->lplayed [new_idx] = -1;
+	trk->lsounded[new_idx] = -1;
+	trk->mand_qnt[new_idx] = -1;
+	memset(&trk->fx[new_idx], 0, sizeof(track_fx_state));
+	trk->fx[new_idx].slide_vol  = -1;
+	trk->fx[new_idx].pitch_bend = 0;
+
+	/* Publish.  Backing arrays + new-index inits all written above. */
+	trk->ncols = new_ncols;
+
 	trk->dirty = 1;
 	trk_should_save(trk);
 	pthread_mutex_unlock(&trk->excl);
 
-	track_clear_rows(trk, trk->ncols - 1);
+	track_clear_rows(trk, new_idx);
 }
 
 void track_add_ctrl(track *trk, int c) {

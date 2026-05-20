@@ -44,14 +44,21 @@ typedef struct
     float fVolumeLDelta, fVolumeRDelta, fTargetVolumeL, fTargetVolumeR;
 } voice_t;
 
-/* === audio_t — thinned to just the output bus pointers + ramp const === */
+/* === audio_t — per-call mix-buffer context ===========================
+ *
+ * Threaded through every mix function (was a single global in upstream
+ * ft2-clone — fine for a single-output DOS tracker, breaks for parallel
+ * voice-pool / graph mixing where each worker needs its own scratch).
+ * Callers stack-allocate one per mix-buffer site and point its fields at
+ * the destination float[].  fQuickVolRampSamplesMul is the legacy ramp
+ * scaler from upstream — unused by our mix funcs (we recompute via
+ * fVolumeLDelta / fVolumeRDelta on the voice) but kept for header
+ * compatibility. */
 typedef struct
 {
     float *fMixBufferL, *fMixBufferR;
     float fQuickVolRampSamplesMul; /* unused by no-ramp mix funcs */
 } audio_t;
-
-extern audio_t audio;
 
 #ifdef __cplusplus
 }

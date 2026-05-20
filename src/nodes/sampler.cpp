@@ -4,6 +4,9 @@
 #include "nodes/sampler.hpp"
 #include "services/diskopservice.hpp"
 
+#include <pthread.h>
+#include <sched.h>
+
 /* Vendored ft2-clone mixer (BSD-3-Clause). See src/engine/sampler/. */
 extern "C" {
 #include "engine/sampler/ft2_audio.h"
@@ -119,17 +122,19 @@ SamplerInstrument::SamplerInstrument()
     panEnv.flags = 0;
 }
 
-bool SamplerInstrument::loadSampleToSlot (int slot, const File& file,
-                                          AudioFormatManager& fmt)
+std::unique_ptr<SamplerSampleSlot>
+SamplerInstrument::prepareSlot (const File& file, AudioFormatManager& fmt)
 {
-    if (slot < 0 || slot >= kNumSlots) return false;
-    if (! file.existsAsFile()) return false;
+    /* Pure file I/O + decode → memory allocation.  No mutation of any
+     * SamplerInstrument state.  Safe to run with no lock held. */
+    if (! file.existsAsFile()) return nullptr;
 
     std::unique_ptr<AudioFormatReader> reader (fmt.createReaderFor (file));
-    if (reader == nullptr) return false;
+    if (reader == nullptr) return nullptr;
 
     const int64_t maxLen = (int64_t) 10 * 60 * (int64_t) reader->sampleRate;
     const int n = (int) std::min ((int64_t) reader->lengthInSamples, maxLen);
+    if (n <= 0) return nullptr;
     const bool stereo = reader->numChannels >= 2;
 
     AudioBuffer<float> tmp ((int) reader->numChannels, n);
@@ -145,10 +150,23 @@ bool SamplerInstrument::loadSampleToSlot (int slot, const File& file,
     s->data16L          = convertFloatToInt16 (tmp.getReadPointer (0), n);
     if (stereo)
         s->data16R = convertFloatToInt16 (tmp.getReadPointer (1), n);
+    return s;
+}
 
-    slots[(size_t) slot] = std::move (s);
+bool SamplerInstrument::commitSlot (int slot, std::unique_ptr<SamplerSampleSlot> data)
+{
+    if (slot < 0 || slot >= kNumSlots) return false;
+    if (data == nullptr) return false;
+    slots[(size_t) slot] = std::move (data);
     if (! keymapUserModified) autoSpreadKeymap();
     return true;
+}
+
+bool SamplerInstrument::loadSampleToSlot (int slot, const File& file,
+                                          AudioFormatManager& fmt)
+{
+    auto s = prepareSlot (file, fmt);
+    return commitSlot (slot, std::move (s));
 }
 
 void SamplerInstrument::clearSlot (int slot)
@@ -233,11 +251,89 @@ private:
  * playing MIDI channel, but we need it for multi-instrument routing.
  * Forward the channel to the owning SamplerNode before invoking noteOn,
  * where voices read it back during startNote().
+ *
+ * Also hosts the voice-pool worker dispatch: when active voice count and
+ * sub-block size both exceed a threshold, renderVoices fans the voice
+ * loop out to per-worker scratch buffers (parallel) and sums the result
+ * back into the output buffer.  Workers run at SCHED_FIFO 70 (one rung
+ * below NSPA's audio-thread priority 80) so the main audio thread always
+ * preempts them.  Below threshold the base scalar path is preserved
+ * verbatim — small voice loads see zero behaviour change.
  * ========================================================================*/
+
+/* Single worker thread owned by ChannelTrackingSynth.  Waits on workReady,
+ * renders its assigned voice range into its own scratch, signals
+ * jobCompleted.  Stack-shaped sync via juce::WaitableEvent (futex-backed
+ * on Linux); no allocations after prepare(). */
+class SamplerWorker : public juce::Thread
+{
+public:
+    explicit SamplerWorker (const String& threadName) : juce::Thread (threadName) {}
+
+    void prepare (int channels, int maxSamples)
+    {
+        workerScratch.setSize (channels, maxSamples, false, true, true);
+    }
+
+    void postJob (juce::SynthesiserVoice** vs, int s, int e, int subNum, int channels)
+    {
+        voices         = vs;
+        jobStart       = s;
+        jobEnd         = e;
+        renderSubNum   = subNum;
+        workerScratch.clear (0, 0, subNum);
+        if (channels > 1) workerScratch.clear (1, 0, subNum);
+        workReady.signal();
+    }
+
+    void waitForJobCompletion() { jobCompleted.wait (-1); }
+
+    void requestStop()
+    {
+        signalThreadShouldExit();
+        workReady.signal();
+    }
+
+    void run() override
+    {
+        /* Promote to SCHED_FIFO 70 — best-effort.  If the user lacks
+         * RTPRIO capability the call just fails and the worker runs at
+         * SCHED_OTHER.  Functionally still correct, just less RT-tight. */
+        sched_param p{};
+        p.sched_priority = 70;
+        pthread_setschedparam (pthread_self(), SCHED_FIFO, &p);
+
+        while (! threadShouldExit())
+        {
+            workReady.wait (-1);
+            if (threadShouldExit()) break;
+
+            for (int i = jobStart; i < jobEnd; ++i)
+            {
+                if (auto* v = voices[i])
+                    v->renderNextBlock (workerScratch, 0, renderSubNum);
+            }
+
+            jobCompleted.signal();
+        }
+    }
+
+    juce::AudioBuffer<float> workerScratch;
+
+private:
+    juce::WaitableEvent      workReady, jobCompleted;
+    juce::SynthesiserVoice** voices       = nullptr;
+    int                      jobStart     = 0;
+    int                      jobEnd       = 0;
+    int                      renderSubNum = 0;
+};
+
 class ChannelTrackingSynth : public Synthesiser
 {
 public:
     explicit ChannelTrackingSynth (SamplerNode& owner) : node (owner) {}
+    ~ChannelTrackingSynth() override { stopWorkers(); }
+
     void noteOn (int midiChannel, int midiNoteNumber, float velocity) override
     {
         node.setLastNoteChannel (midiChannel);
@@ -246,8 +342,114 @@ public:
     /* JUCE's Synthesiser swallows program-change events without exposing
      * an override hook — we run our own MIDI scan in SamplerNode::processBlock
      * before renderNextBlock to handle them.  See SamplerNode::processBlock. */
+
+    /* Lazy worker-pool init.  Called from SamplerNode::prepareToPlay.
+     * 2 workers is the sweet spot — bigger pools hurt due to scratch-
+     * summing overhead in the main thread (Amdahl); 1 worker is no win
+     * over scalar.  GUI must stay fast (memory rule), so we cap. */
+    void prepareWorkers (int numCh, int maxSamples)
+    {
+        constexpr int kNumWorkers = 2;
+        if ((int) workers.size() == kNumWorkers)
+        {
+            for (auto& w : workers) w->prepare (numCh, maxSamples);
+            return;
+        }
+        stopWorkers();
+        workers.clear();
+        for (int i = 0; i < kNumWorkers; ++i)
+        {
+            auto w = std::make_unique<SamplerWorker> ("SamplerWorker" + String (i));
+            w->prepare (numCh, maxSamples);
+            w->startThread();
+            workers.push_back (std::move (w));
+        }
+    }
+
+    void stopWorkers()
+    {
+        for (auto& w : workers) w->requestStop();
+        for (auto& w : workers) w->stopThread (500);
+        workers.clear();
+    }
+
+protected:
+    /* Parallel renderVoices: dispatch voice range to N workers when
+     * load justifies the dispatch overhead.  Below threshold (few
+     * voices OR small sub-block), fall through to base Synthesiser
+     * path verbatim — zero overhead for typical light usage. */
+    void renderVoices (juce::AudioBuffer<float>& outputAudio,
+                       int startSample, int numSamples) override
+    {
+        /* kMinVoices: dispatch cost ~1-5µs per worker; only worth it
+         *             when per-worker payload dwarfs that overhead.
+         * kMinSamples: dense MIDI fragments the sub-block; parallel
+         *              overhead would dominate for tiny ranges. */
+        constexpr int kMinVoices  = 16;
+        constexpr int kMinSamples = 64;
+
+        if (workers.empty() || numSamples < kMinSamples)
+        {
+            Synthesiser::renderVoices (outputAudio, startSample, numSamples);
+            return;
+        }
+
+        const int totalVoices = getNumVoices();
+        int activeCount = 0;
+        for (int i = 0; i < totalVoices; ++i)
+            if (auto* v = getVoice (i); v != nullptr && v->isVoiceActive())
+                ++activeCount;
+
+        if (activeCount < kMinVoices)
+        {
+            Synthesiser::renderVoices (outputAudio, startSample, numSamples);
+            return;
+        }
+
+        /* Snapshot the voice pointer list.  voicePtrs is owned by this
+         * synth (main audio thread); workers only read it during the
+         * postJob → waitForJobCompletion window where this thread is
+         * blocked, so no race. */
+        voicePtrs.clearQuick();
+        for (int i = 0; i < totalVoices; ++i)
+            if (auto* v = getVoice (i))
+                voicePtrs.add (v);
+
+        const int N = voicePtrs.size();
+        if (N == 0) return;
+
+        const int  nWorkers = (int) workers.size();
+        const int  per      = (N + nWorkers - 1) / nWorkers;
+        const int  channels = outputAudio.getNumChannels();
+
+        for (int w = 0; w < nWorkers; ++w)
+        {
+            const int s = w * per;
+            const int e = juce::jmin ((w + 1) * per, N);
+            if (s >= e) continue;
+            workers[(size_t) w]->postJob (voicePtrs.getRawDataPointer(),
+                                          s, e, numSamples, channels);
+        }
+
+        for (int w = 0; w < nWorkers; ++w)
+            if (w * per < N)
+                workers[(size_t) w]->waitForJobCompletion();
+
+        /* Sum worker scratches into output.  outputAudio is the same
+         * buffer the scalar path would have written voice contributions
+         * into; addFrom does +=, matching scalar's semantics. */
+        for (auto& w : workers)
+        {
+            outputAudio.addFrom (0, startSample, w->workerScratch, 0, 0, numSamples);
+            if (channels > 1)
+                outputAudio.addFrom (1, startSample, w->workerScratch, 1, 0, numSamples);
+        }
+    }
+
 private:
-    SamplerNode& node;
+    SamplerNode&                                 node;
+    std::vector<std::unique_ptr<SamplerWorker>>  workers;
+    juce::Array<juce::SynthesiserVoice*>         voicePtrs;
 };
 
 
@@ -271,7 +473,21 @@ public:
         return dynamic_cast<Ft2SamplerSound*> (s) != nullptr;
     }
 
-    int  getCurrentSamplePos() const noexcept { return voice.position; }
+    int  getCurrentSamplePos() const noexcept
+    {
+        /* During pingpong's backward sweep, the ft2 mixer stores position
+         * as the bit-inverse of (smpPtr - revBase) where revBase = base +
+         * loopStart + loopEnd.  That gives smpPtr-base = loopStart + loopEnd
+         * - 1 - position — the actual sample-array index the playhead
+         * should render at.  Forward sweep stores position == (smpPtr -
+         * base) directly, so the no-encoding case stays trivial. */
+        if (voice.samplingBackwards)
+        {
+            const int32_t loopEnd = voice.loopStart + voice.loopLength;
+            return voice.loopStart + loopEnd - 1 - voice.position;
+        }
+        return voice.position;
+    }
     bool isPlayingActive() const noexcept     { return voice.active; }
     const SamplerSampleSlot* getCurrentSlot() const noexcept { return slotPtr; }
 
@@ -290,6 +506,7 @@ public:
         if (slot == nullptr || ! slot->isLoaded()) { clearCurrentNote(); return; }
 
         slotPtr      = slot;
+        slotIdx_     = slotIdx;
         slotIsStereo = slot->isStereo && slot->data16R != nullptr;
         playedNote   = midiNote;
         velocityLin  = juce::jlimit (0.0f, 1.0f, velocity);
@@ -313,6 +530,18 @@ public:
                                          slot->loopLength);
             voice.sampleEnd  = voice.loopStart + voice.loopLength;
             voice.loopType   = pingpong ? 2 : 1;
+
+            /* Pingpong needs revBase16 set up — ft2-clone formula:
+             * revBase16 = &base16[loopStart + loopEnd] where
+             * loopEnd = loopStart + loopLength.  When sampling
+             * backwards the mixer reads via revBase[-position], so
+             * revBase16 must point past the loop end.  We never set
+             * this before → null deref on the first backward pass. */
+            if (pingpong)
+            {
+                voice.revBase16 = slot->data16L.get()
+                                  + (voice.loopStart * 2) + voice.loopLength;
+            }
         }
         voice.position   = 0;
         voice.positionFrac = 0;
@@ -393,23 +622,60 @@ public:
         if (out.getNumChannels() < 2)            return;
         if (numSamples <= 0)                     return;
 
+        /* Re-validate the slot every block.  The slot's data16L
+         * unique_ptr can be replaced from the UI thread (loadSampleToSlot
+         * / clearSlot / FX-page cut/paste/crop) — if that happens while
+         * a voice is playing the old slot, voice.base16 dangles.  Re-
+         * fetch by index every block; if it changed or is no longer
+         * loaded, end the voice gracefully instead of reading freed
+         * memory. */
+        if (instrument == nullptr) { voice.active = false; clearCurrentNote(); return; }
+        const auto* curSlot = instrument->getSlot (slotIdx_);
+        if (curSlot == nullptr || ! curSlot->isLoaded() || curSlot != slotPtr)
+        {
+            voice.active = false;
+            clearCurrentNote();
+            return;
+        }
+        /* Slot pointer matches our cached one — but data16L's underlying
+         * unique_ptr may have been swapped out in place (resizing edits
+         * keep the SamplerSampleSlot object alive while replacing its
+         * buffers).  Re-pull the base pointer from the slot every
+         * block so we always read from the live buffer. */
+        voice.base16 = curSlot->data16L.get();
+        if (voice.base16 == nullptr) { voice.active = false; clearCurrentNote(); return; }
+        slotIsStereo = curSlot->isStereo && curSlot->data16R != nullptr;
+
         const int samplesPerTick = owner.getSamplesPerEnvTick();
 
         AudioBuffer<float> scratch (2, numSamples);
         scratch.clear();
 
-        audio.fMixBufferL = scratch.getWritePointer (0);
-        audio.fMixBufferR = scratch.getWritePointer (1);
-
         /* Walk the block in tick-aligned chunks.  Each chunk: tick
          * envelope state once (if a tick boundary fell inside), then
          * mix sample. */
         int pos = 0;
+        int safetyIters = 0;
+        const int safetyCap = numSamples * 8 + 16;  /* worst-case bound */
         while (pos < numSamples && voice.active)
         {
+            if (++safetyIters > safetyCap) break;   /* never spin forever */
+
+            /* If the accumulator already crossed a tick boundary (e.g.,
+             * carry from a previous block), fire the tick immediately
+             * BEFORE asking for a mixChunk — chunk would be ≤ 0 here
+             * and the old code spun on ++envSampleAccum. */
+            if (envSampleAccum >= samplesPerTick)
+            {
+                envSampleAccum -= samplesPerTick;
+                tickEnvelopes();
+                applyEnvelopeToVoice();
+                continue;
+            }
+
             const int chunk = juce::jmin (numSamples - pos,
                                           samplesPerTick - envSampleAccum);
-            if (chunk <= 0) { ++envSampleAccum; continue; }
+            if (chunk <= 0) break;                  /* defensive — shouldn't reach */
 
             mixChunk (scratch, pos, chunk);
             pos += chunk;
@@ -418,7 +684,6 @@ public:
             {
                 envSampleAccum -= samplesPerTick;
                 tickEnvelopes();
-                /* Refresh voice volumes/pitch from envelope outputs. */
                 applyEnvelopeToVoice();
             }
         }
@@ -482,8 +747,20 @@ private:
     void mixChunk (AudioBuffer<float>& scratch, int startInScratch, int count)
     {
         if (count <= 0 || slotPtr == nullptr) return;
+        /* base16 is re-validated each renderNextBlock entry, but stay
+         * defensive — never hand a null buffer to the ft2 mixer kernels
+         * (which read base + position with no NULL guard of their own). */
+        if (voice.base16 == nullptr) return;
         const uint32_t soff = (uint32_t) startInScratch;
         const uint32_t cnt  = (uint32_t) count;
+
+        /* Per-call audio_t — was a global in upstream ft2-clone (DOS-era
+         * single output).  Stack-local here so parallel voice-pool / graph
+         * mixing can each carry their own scratch target without races. */
+        audio_t mixCtx;
+        mixCtx.fMixBufferL = scratch.getWritePointer (0);
+        mixCtx.fMixBufferR = scratch.getWritePointer (1);
+        mixCtx.fQuickVolRampSamplesMul = 0.0f;
 
         if (slotIsStereo)
         {
@@ -492,8 +769,11 @@ private:
             voice.fCurrVolumeR   = gLR;
             voice.fTargetVolumeL = gLL;
             voice.fTargetVolumeR = gLR;
-            voice.base16 = slotPtr->data16L.get();
-            mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
+            voice.base16    = slotPtr->data16L.get();
+            voice.revBase16 = voice.loopType == 2
+                                ? slotPtr->data16L.get() + (voice.loopStart * 2) + voice.loopLength
+                                : nullptr;
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, &mixCtx, soff, cnt);
 
             voice_t afterFirst = voice;
 
@@ -502,14 +782,17 @@ private:
             voice.fCurrVolumeR   = gRR;
             voice.fTargetVolumeL = gRL;
             voice.fTargetVolumeR = gRR;
-            voice.base16 = slotPtr->data16R.get();
-            mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
+            voice.base16    = slotPtr->data16R.get();
+            voice.revBase16 = voice.loopType == 2
+                                ? slotPtr->data16R.get() + (voice.loopStart * 2) + voice.loopLength
+                                : nullptr;
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, &mixCtx, soff, cnt);
 
             voice.active = voice.active && afterFirst.active;
         }
         else
         {
-            mixFuncTab[voice.mixFuncOffset] (&voice, soff, cnt);
+            mixFuncDispatch[voice.mixFuncOffset] (&voice, &mixCtx, soff, cnt);
         }
     }
 
@@ -721,6 +1004,7 @@ private:
 
     /* Static (per-note) state. */
     const SamplerSampleSlot* slotPtr = nullptr;
+    int   slotIdx_    = -1;             /* re-validated each render block */
     bool slotIsStereo = false;
     int   playedNote = 60;
     float velocityLin = 1.0f;
@@ -2535,6 +2819,22 @@ public:
         {
             if (canvas.getViewEnd() <= 0 || canvas.getViewEnd() > s->numSamples)
                 canvas.setViewport (0, s->numSamples);
+
+            /* Selection persists across slot changes (so a Sample-page
+             * range edit on slot N keeps that range as you flip back).
+             * But if the new slot is SHORTER than the old selection
+             * endpoints, downstream Cut / Paste / Crop would read past
+             * the new buffer.  Clamp / drop. */
+            const int n  = s->numSamples;
+            const int ss = canvas.getSelStart();
+            const int se = canvas.getSelEnd();
+            if (ss >= 0 && se > ss)
+            {
+                const int newSS = juce::jmin (ss, n);
+                const int newSE = juce::jmin (se, n);
+                if (newSE > newSS) canvas.setSelection (newSS, newSE);
+                else                canvas.clearSelection();
+            }
         }
         else
         {
@@ -4223,6 +4523,11 @@ SamplerNode::SamplerNode()
                        .withOutput ("Output", AudioChannelSet::stereo(), true))
 {
     ensureMixerInterpolationTablesReady();
+    /* mixFuncDispatch[] is patched with SIMD variants on CPUs that support
+     * them; ft2_mix_init is idempotent so multiple SamplerNode ctors are
+     * safe.  Single global state, but only write-once writes (memcpy +
+     * fixed function pointers), so the second/Nth call is a no-op. */
+    ft2_mix_init();
     formatManager.registerBasicFormats();
     channelBinding.fill (-1);
 
@@ -4257,15 +4562,23 @@ void SamplerNode::fillInPluginDescription (PluginDescription& desc) const
     desc.uniqueId           = EL_NODE_UID_SAMPLER;
 }
 
-void SamplerNode::prepareToPlay (double sampleRate, int)
+void SamplerNode::prepareToPlay (double sampleRate, int maxBlockSize)
 {
     currentSampleRate = sampleRate;
     synth->setCurrentPlaybackSampleRate (sampleRate);
+    /* Worker scratch buffers are sized to maxBlockSize so a render in a
+     * single sub-block fits without further allocation.  ChannelTrackingSynth
+     * downcast: SamplerNode owns the synth and only ever constructs a
+     * ChannelTrackingSynth in its ctor — see SamplerNode(). */
+    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+        cts->prepareWorkers (2, juce::jmax (64, maxBlockSize));
 }
 
 void SamplerNode::releaseResources()
 {
     synth->allNotesOff (0, true);
+    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+        cts->stopWorkers();
 }
 
 void SamplerNode::processBlock (AudioBuffer<float>& audio_, MidiBuffer& midi)
@@ -4303,13 +4616,33 @@ void SamplerNode::rebuildVoicePool()
         synth->addVoice (new Ft2SamplerVoice (*this));
 }
 
+/* ----- sampleLock discipline ------------------------------------------ *
+ *
+ *  All reads + writes of `instruments` and `channelBinding` go through
+ *  sampleLock — INCLUDING the audio thread.  Without this, a UI-side
+ *  mutation (addInstrument / removeInstrument / setStateInformation)
+ *  races against a voice note-on reading the vector → torn Ptr / dead
+ *  storage.  See [[bulletproof-audit-after-changes]].
+ *
+ *  Audio-thread contention is bounded because every UI-side mutation
+ *  is short — file I/O for loadSampleToSlot happens via prepareSlot()
+ *  BEFORE the lock is taken; only the buffer-swap commitSlot() runs
+ *  inside.  Other mutations are O(n) over ≤128 entries with no
+ *  allocation in the hot path.
+ *
+ *  UI accessor variants (getInstrument, getNumInstruments) lock too
+ *  so editor reads see consistent state during the same broadcast.
+ */
+
 int SamplerNode::getNumInstruments() const
 {
+    const ScopedLock sl (sampleLock);
     return (int) instruments.size();
 }
 
 SamplerInstrument::Ptr SamplerNode::getInstrument (int index) const
 {
+    const ScopedLock sl (sampleLock);
     if (index < 0 || index >= (int) instruments.size()) return nullptr;
     return instruments[(size_t) index];
 }
@@ -4339,6 +4672,13 @@ void SamplerNode::removeInstrument (int index)
 
 SamplerInstrument::Ptr SamplerNode::getInstrumentForChannel (int channel1to16) const
 {
+    /* Audio-thread read — short critical section, uncontended 99.9%
+     * of the time.  Returns a Ptr by value (refcount bumped under
+     * the lock), so the caller holds a live instrument even after
+     * we release. */
+    const ScopedLock sl (sampleLock);
+    if (instruments.empty()) return nullptr;
+
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
     int idx = channelBinding[(size_t) ch];
     if (idx < 0) idx = ch;   /* default mapping */
@@ -4349,6 +4689,7 @@ SamplerInstrument::Ptr SamplerNode::getInstrumentForChannel (int channel1to16) c
 
 void SamplerNode::bindChannelToInstrument (int channel1to16, int instrumentIndex)
 {
+    const ScopedLock sl (sampleLock);
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
     if (instrumentIndex < 0 || instrumentIndex >= (int) instruments.size())
         channelBinding[(size_t) ch] = -1;
@@ -4358,15 +4699,32 @@ void SamplerNode::bindChannelToInstrument (int channel1to16, int instrumentIndex
 
 int SamplerNode::getChannelBinding (int channel1to16) const
 {
+    const ScopedLock sl (sampleLock);
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
     return (int) channelBinding[(size_t) ch];
 }
 
 bool SamplerNode::loadSampleToSlot (int instrumentIndex, int slot, const File& file)
 {
-    ScopedLock sl (sampleLock);
-    if (instrumentIndex < 0 || instrumentIndex >= (int) instruments.size()) return false;
-    return instruments[(size_t) instrumentIndex]->loadSampleToSlot (slot, file, formatManager);
+    /* Two-phase: read+decode the file (potentially seconds for big
+     * WAVs) WITHOUT holding sampleLock — only the final commit
+     * touches the instrument slot under the lock.  Keeps the audio
+     * thread's critical sections short. */
+    SamplerInstrument::Ptr inst;
+    {
+        const ScopedLock sl (sampleLock);
+        if (instrumentIndex < 0
+            || instrumentIndex >= (int) instruments.size())
+            return false;
+        inst = instruments[(size_t) instrumentIndex];
+    }
+    if (inst == nullptr) return false;
+
+    auto loaded = inst->prepareSlot (file, formatManager);
+    if (loaded == nullptr) return false;
+
+    const ScopedLock sl (sampleLock);
+    return inst->commitSlot (slot, std::move (loaded));
 }
 
 void SamplerNode::rebuildInstrument()
@@ -4497,6 +4855,15 @@ void SamplerNode::setStateInformation (const void* data, int size)
     const auto tree = ValueTree::readFromGZIPData (data, (size_t) size);
     if (! tree.isValid() || tree.getType() != Identifier ("sampler")) return;
 
+    /* The audio thread reads instruments[] without locking — clearing
+     * + repopulating the vector here can otherwise expose torn state
+     * (0-size window, in-flight reallocation moving Ptr storage) to
+     * a voice startNote call.  Hold sampleLock around the structural
+     * mutation; the empty() guard inside getInstrumentForChannel is
+     * the belt-and-suspenders fallback when this lock isn't held
+     * (e.g., legacy callers). */
+    ScopedLock sl (sampleLock);
+
     numVoices  = (int) tree.getProperty ("numVoices", 16);
     interpMode = (InterpMode) (int) tree.getProperty ("interpMode", (int) kInterpLinear);
     adsrParams.attack  = (float) (double) tree.getProperty ("adsrAtt", 0.005);
@@ -4525,11 +4892,20 @@ void SamplerNode::setStateInformation (const void* data, int size)
 
         auto readEnv = [&](FT2Envelope& e, const String& prefix)
         {
-            e.length       = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Len"),     0);
-            e.flags        = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Flags"),   0);
-            e.sustainPoint = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Sus"),     0);
-            e.loopStart    = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "LoopS"),   0);
-            e.loopEnd      = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "LoopE"),   0);
+            /* All envelope indices are clamped to the points[] capacity
+             * (12 slots, see FT2Envelope) on load so a corrupt session
+             * file can't push later paint / tick code past the array. */
+            const int rawLen  = (int) instTree.getProperty (Identifier (prefix + "Len"),   0);
+            const int rawSus  = (int) instTree.getProperty (Identifier (prefix + "Sus"),   0);
+            const int rawLoS  = (int) instTree.getProperty (Identifier (prefix + "LoopS"), 0);
+            const int rawLoE  = (int) instTree.getProperty (Identifier (prefix + "LoopE"), 0);
+            e.length       = (uint8_t) juce::jlimit (0, 12, rawLen);
+            e.flags        = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Flags"), 0);
+            e.sustainPoint = (uint8_t) juce::jlimit (0, juce::jmax (0, (int) e.length - 1), rawSus);
+            e.loopStart    = (uint8_t) juce::jlimit (0, juce::jmax (0, (int) e.length - 1), rawLoS);
+            e.loopEnd      = (uint8_t) juce::jlimit ((int) e.loopStart,
+                                                       juce::jmax (0, (int) e.length - 1), rawLoE);
+
             const String pts = instTree.getProperty (Identifier (prefix + "Pts"), "").toString();
             const auto parts = StringArray::fromTokens (pts, ";", "");
             int n = 0;
@@ -4542,7 +4918,8 @@ void SamplerNode::setStateInformation (const void* data, int size)
                 e.points[n].y = (int16_t) xy[1].getIntValue();
                 ++n;
             }
-            if (e.length == 0 && n > 0) e.length = (uint8_t) n;
+            if (e.length == 0 && n > 0) e.length = (uint8_t) juce::jmin (12, n);
+            if (e.length > (uint8_t) n) e.length = (uint8_t) n;   /* don't outrun parsed points */
         };
         readEnv (inst->volumeEnv, "ve");
         readEnv (inst->panEnv,    "pe");

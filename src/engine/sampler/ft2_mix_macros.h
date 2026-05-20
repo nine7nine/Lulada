@@ -21,15 +21,15 @@
 
 #define GET_MIXER_VARS \
 	const uint64_t delta = v->delta; \
-	fMixBufferL = audio.fMixBufferL + bufferPos; \
-	fMixBufferR = audio.fMixBufferR + bufferPos; \
+	fMixBufferL = audio->fMixBufferL + bufferPos; \
+	fMixBufferR = audio->fMixBufferR + bufferPos; \
 	position = v->position; \
 	positionFrac = v->positionFrac;
 
 #define GET_MIXER_VARS_RAMP \
 	const uint64_t delta = v->delta; \
-	fMixBufferL = audio.fMixBufferL + bufferPos; \
-	fMixBufferR = audio.fMixBufferR + bufferPos; \
+	fMixBufferL = audio->fMixBufferL + bufferPos; \
+	fMixBufferR = audio->fMixBufferR + bufferPos; \
 	fVolumeLDelta = v->fVolumeLDelta; \
 	fVolumeRDelta = v->fVolumeRDelta; \
 	position = v->position; \

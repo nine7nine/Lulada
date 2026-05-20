@@ -73,6 +73,14 @@ public:
     SamplerInstrument();
 
     bool loadSampleToSlot (int slot, const File& file, AudioFormatManager& fmt);
+
+    /** Two-phase load — UI thread can do the file I/O (prepareSlot)
+     *  without holding any sampler-side lock, then call commitSlot
+     *  briefly under SamplerNode::sampleLock to publish the result.
+     *  prepareSlot returns null on read failure. */
+    std::unique_ptr<SamplerSampleSlot> prepareSlot (const File& file, AudioFormatManager& fmt);
+    bool commitSlot (int slot, std::unique_ptr<SamplerSampleSlot> data);
+
     void clearSlot (int slot);
 
     int  slotForNote (int midiNote) const noexcept;
