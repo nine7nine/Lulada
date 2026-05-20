@@ -767,7 +767,8 @@ static String midiNoteName (int n)
  * SampleWaveformView — waveform + draggable loop markers + live playheads.
  * ========================================================================*/
 class SampleWaveformView : public Component,
-                           private Timer
+                           private Timer,
+                           private juce::ScrollBar::Listener
 {
 public:
     using PlayheadQuery = std::function<std::vector<int> (const SamplerSampleSlot*)>;
@@ -775,16 +776,32 @@ public:
     SampleWaveformView (std::function<SamplerSampleSlot*()> getSlot_,
                         PlayheadQuery playheadsFor_)
         : getSlot     (std::move (getSlot_)),
-          playheadsFor (std::move (playheadsFor_))
+          playheadsFor (std::move (playheadsFor_)),
+          hScroll_     (false)
     {
+        hScroll_.addListener (this);
+        hScroll_.setAutoHide (false);
+        addAndMakeVisible (hScroll_);
         startTimerHz (30);
     }
 
-    ~SampleWaveformView() override { stopTimer(); }
+    ~SampleWaveformView() override
+    {
+        hScroll_.removeListener (this);
+        stopTimer();
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        hScroll_.setBounds (r.removeFromBottom (kScrollH));
+    }
 
     void paint (Graphics& g) override
     {
-        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        auto fullBounds = getLocalBounds().toFloat();
+        fullBounds.removeFromBottom ((float) kScrollH);
+        const auto bounds = fullBounds.reduced (2.0f);
         g.setColour (Colour { 0xff'10'10'10 });
         g.fillRect (bounds);
         g.setColour (Colour { 0xff'2a'2a'2a });
@@ -816,25 +833,63 @@ public:
             viewStart_ = 0;
             viewEnd_   = n;
             lastSeenN_ = n;
+            syncScrollBar();
         }
         const int vRange = viewEnd_ - viewStart_;
 
+        /* Two render modes:
+         *   - Envelope mode (vRange > 4*w): per-pixel min/max envelope.
+         *   - Sample-line mode (vRange <= 4*w, moderate-to-deep zoom):
+         *     connect each sample at its exact subpixel position with
+         *     a line plot, dotting each sample once spacing > 4 px.
+         *
+         * Threshold is 4× pixel count rather than 1× — at moderate
+         * zooms with smooth content the envelope's per-pixel scan
+         * produced visible moiré against the pixel grid.  Line mode
+         * handles 4 samples/pixel cleanly via path stroking. */
         g.setColour (Colour { 0xff'5a'a5'd0 });
-        for (int x = 0; x < w; ++x)
+        if (vRange > 4 * w)
         {
-            const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
-            const int64_t s1 = juce::jmax (s0 + 1,
-                                            (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
-            int mn = INT16_MAX, mx = INT16_MIN;
-            for (int64_t i = s0; i < s1 && i < n; ++i)
+            for (int x = 0; x < w; ++x)
             {
-                const int v = d[i];
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
+                const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
+                const int64_t s1 = juce::jmax (s0 + 1,
+                                                (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
+                int mn = INT16_MAX, mx = INT16_MIN;
+                for (int64_t i = s0; i < s1 && i < n; ++i)
+                {
+                    const int v = d[i];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                const float yMin = midY - (mn / 32768.0f) * halfH;
+                const float yMax = midY - (mx / 32768.0f) * halfH;
+                g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
             }
-            const float yMin = midY - (mn / 32768.0f) * halfH;
-            const float yMax = midY - (mx / 32768.0f) * halfH;
-            g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
+        }
+        else
+        {
+            const double pxPerSample = (double) w / (double) juce::jmax (1, vRange);
+            Path linePath;
+            bool started = false;
+            for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+            {
+                const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                if (! started) { linePath.startNewSubPath (xpx, ypx); started = true; }
+                else            linePath.lineTo (xpx, ypx);
+            }
+            g.strokePath (linePath, PathStrokeType (1.2f));
+
+            if (pxPerSample >= 4.0)
+            {
+                for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+                {
+                    const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                    const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                    g.fillEllipse (xpx - 1.5f, ypx - 1.5f, 3.0f, 3.0f);
+                }
+            }
         }
 
         if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
@@ -941,6 +996,7 @@ public:
                                           viewStart_ + shift);
             viewStart_ = newStart;
             viewEnd_   = newStart + range;
+            syncScrollBar();
             repaint();
         }
         else if (std::abs (w.deltaY) > 0.001f)
@@ -957,6 +1013,7 @@ public:
         {
             viewStart_ = 0;
             viewEnd_   = slot->numSamples;
+            syncScrollBar();
             repaint();
         }
     }
@@ -977,6 +1034,7 @@ private:
         newStart = juce::jlimit (0, juce::jmax (0, n - newRange), newStart);
         viewStart_ = newStart;
         viewEnd_   = newStart + newRange;
+        syncScrollBar();
         repaint();
     }
 public:
@@ -1025,6 +1083,35 @@ private:
     /* Viewport state — defaults reset whenever slot length changes. */
     int viewStart_ = 0, viewEnd_ = 0;
     int lastSeenN_ = 0;
+
+    /* Horizontal scroll bar — fallback for trackpad/pinch users when
+     * winelib doesn't forward XInput2 horizontal-scroll / magnify
+     * events through to JUCE.  Visible regardless. */
+    static constexpr int kScrollH = 12;
+    juce::ScrollBar hScroll_;
+
+    void syncScrollBar()
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        const int n = (slot && slot->isLoaded()) ? slot->numSamples : 0;
+        if (n <= 0) { hScroll_.setRangeLimits (0.0, 1.0); hScroll_.setCurrentRange (0.0, 1.0); return; }
+        hScroll_.setRangeLimits (0.0, (double) n);
+        hScroll_.setCurrentRange ((double) viewStart_,
+                                   (double) (viewEnd_ - viewStart_),
+                                   dontSendNotification);
+    }
+
+    void scrollBarMoved (juce::ScrollBar*, double newStart) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        const int range = viewEnd_ - viewStart_;
+        const int newS = juce::jlimit (0, juce::jmax (0, n - range), (int) newStart);
+        viewStart_ = newS;
+        viewEnd_   = newS + range;
+        repaint();
+    }
 };
 
 
@@ -1304,11 +1391,12 @@ public:
                                           true,false,true,false,true };
         static const int blackOffsetPC[12] = { -1, 0, -1, 1, -1, -1, 3, -1, 4, -1, 5, -1 };
 
-        /* Pass 1: whites — gray base, faint slot-color tint, big bold
-         * white slot number.  Vivid colour lives only in the 6 px
-         * top stripe. */
-        const Colour grayWhite  { 0xff'5a'5a'5a };   /* darker gray base */
-        const Colour grayBlack  { 0xff'18'18'18 };
+        /* Natural piano-key colours.  Slot tint is laid on top as a
+         * translucent overlay rather than blended into the base, so
+         * the white/black distinction reads independently of the slot
+         * mapping. */
+        const Colour grayWhite  { 0xff'9a'9a'9a };   /* light-gray "white" */
+        const Colour grayBlack  { 0xff'14'14'14 };   /* near-black */
         int whiteIdx = 0;
         for (int n = 0; n < 24; ++n)
         {
@@ -1321,21 +1409,20 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            /* Mostly the gray base; slot tint is desaturated + dim so
-             * the blend barely shifts brightness.  Full slot colour is
-             * reserved for the 6 px top stripe. */
-            const Colour base = hasAssign
-                              ? grayWhite.interpolatedWith (
-                                    slotPaletteColour (assignedSlot, 0.4f, 0.4f),
-                                    0.18f)
-                              : grayWhite;
-            g.setColour (base);
+            /* Base: light-gray "white" key in its natural shade. */
+            g.setColour (grayWhite);
             g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
 
-            /* Top colour stripe — small, vivid. */
+            /* Slot-color translucent overlay covers the entire key,
+             * tinting without losing the gray underneath. */
             if (hasAssign)
             {
-                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.85f));
+                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.85f)
+                               .withAlpha (0.35f));
+                g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, whiteH);
+
+                /* Top stripe — fully opaque slot colour for the eye. */
+                g.setColour (slotPaletteColour (assignedSlot, 0.75f, 0.9f));
                 g.fillRect (x + 1.0f, bounds.getY(), whiteW - 1.0f, 6.0f);
             }
 
@@ -1383,18 +1470,20 @@ public:
                                   && inst->getSlot (assignedSlot)
                                   && inst->getSlot (assignedSlot)->isLoaded();
 
-            const Colour base = hasAssign
-                              ? grayBlack.interpolatedWith (
-                                    slotPaletteColour (assignedSlot, 0.55f, 0.35f),
-                                    0.30f)
-                              : grayBlack;
-            g.setColour (base);
+            /* Base: near-black key. */
+            g.setColour (grayBlack);
             g.fillRect (x, bounds.getY(), blackW, blackH);
 
-            /* Top colour stripe on black keys too, slimmer (4 px). */
+            /* Translucent slot overlay — black-key contrast is harder
+             * to read, so push opacity a bit higher than whites. */
             if (hasAssign)
             {
-                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.8f));
+                g.setColour (slotPaletteColour (assignedSlot, 0.7f, 0.85f)
+                               .withAlpha (0.45f));
+                g.fillRect (x, bounds.getY(), blackW, blackH);
+
+                /* Slim top stripe in full slot colour. */
+                g.setColour (slotPaletteColour (assignedSlot, 0.75f, 0.9f));
                 g.fillRect (x, bounds.getY(), blackW, 4.0f);
             }
 
@@ -2045,18 +2134,33 @@ private:
  * Range selection: [selStart_..selEnd_) — half-open.  Viewport:
  * [viewStart_..viewEnd_).  Renders only the visible window.
  * ========================================================================*/
-class SampleEditCanvas : public Component
+class SampleEditCanvas : public Component,
+                         private juce::ScrollBar::Listener
 {
 public:
     using GetSlot = std::function<SamplerSampleSlot*()>;
     using RangeChangedCb = std::function<void()>;
 
     explicit SampleEditCanvas (GetSlot gs, RangeChangedCb cb = {})
-        : getSlot (std::move (gs)), onRangeChanged (std::move (cb)) {}
+        : getSlot (std::move (gs)), onRangeChanged (std::move (cb)),
+          hScroll_ (false)
+    {
+        hScroll_.addListener (this);
+        hScroll_.setAutoHide (false);
+        addAndMakeVisible (hScroll_);
+    }
+    ~SampleEditCanvas() override { hScroll_.removeListener (this); }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        hScroll_.setBounds (r.removeFromBottom (kScrollH));
+    }
 
     void setViewport (int s, int e)
     {
         viewStart_ = s; viewEnd_ = e;
+        syncScrollBar();
         repaint();
     }
     void setSelection (int s, int e)
@@ -2075,7 +2179,9 @@ public:
 
     void paint (Graphics& g) override
     {
-        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        auto fullBounds = getLocalBounds().toFloat();
+        fullBounds.removeFromBottom ((float) kScrollH);
+        const auto bounds = fullBounds.reduced (2.0f);
         g.setColour (Colour { 0xff'0c'0c'0c });
         g.fillRect (bounds);
         g.setColour (Colour { 0xff'2a'2a'2a });
@@ -2136,22 +2242,59 @@ public:
         g.drawHorizontalLine ((int) midY, bounds.getX(), bounds.getRight());
 
         /* Min/max envelope per pixel column. */
+        /* Two render modes:
+         *   - Envelope mode (vRange > 4*w): per-pixel min/max envelope.
+         *   - Sample-line mode (vRange <= 4*w, moderate-to-deep zoom):
+         *     connect each sample at its exact subpixel position with
+         *     a line plot, dotting each sample once spacing > 4 px.
+         *
+         * Threshold is 4× pixel count rather than 1× — at moderate
+         * zooms with smooth content the envelope's per-pixel scan
+         * produced visible moiré against the pixel grid.  Line mode
+         * handles 4 samples/pixel cleanly via path stroking. */
         g.setColour (Colour { 0xff'5a'a5'd0 });
-        for (int x = 0; x < w; ++x)
+        if (vRange > 4 * w)
         {
-            const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
-            const int64_t s1 = juce::jmax (s0 + 1,
-                                            (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
-            int mn = INT16_MAX, mx = INT16_MIN;
-            for (int64_t i = s0; i < s1 && i < n; ++i)
+            for (int x = 0; x < w; ++x)
             {
-                const int v = d[i];
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
+                const int64_t s0 = viewStart_ + (int64_t) x * vRange / w;
+                const int64_t s1 = juce::jmax (s0 + 1,
+                                                (int64_t) viewStart_ + (int64_t)(x + 1) * vRange / w);
+                int mn = INT16_MAX, mx = INT16_MIN;
+                for (int64_t i = s0; i < s1 && i < n; ++i)
+                {
+                    const int v = d[i];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                const float yMin = midY - (mn / 32768.0f) * halfH;
+                const float yMax = midY - (mx / 32768.0f) * halfH;
+                g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
             }
-            const float yMin = midY - (mn / 32768.0f) * halfH;
-            const float yMax = midY - (mx / 32768.0f) * halfH;
-            g.drawLine (bounds.getX() + x, yMax, bounds.getX() + x, yMin);
+        }
+        else
+        {
+            const double pxPerSample = (double) w / (double) juce::jmax (1, vRange);
+            Path linePath;
+            bool started = false;
+            for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+            {
+                const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                if (! started) { linePath.startNewSubPath (xpx, ypx); started = true; }
+                else            linePath.lineTo (xpx, ypx);
+            }
+            g.strokePath (linePath, PathStrokeType (1.2f));
+
+            if (pxPerSample >= 4.0)
+            {
+                for (int64_t s = viewStart_; s <= viewEnd_ && s < n; ++s)
+                {
+                    const float xpx = bounds.getX() + (float) ((s - viewStart_) * pxPerSample);
+                    const float ypx = midY - (d[s] / 32768.0f) * halfH;
+                    g.fillEllipse (xpx - 1.5f, ypx - 1.5f, 3.0f, 3.0f);
+                }
+            }
         }
 
         /* Selection edge markers. */
@@ -2259,6 +2402,33 @@ private:
         const int vRange = viewEnd_ - viewStart_;
         if (vRange <= 0 || w <= 0) return 0.0f;
         return (float) ((int64_t) (s - viewStart_) * w / vRange);
+    }
+
+    /* Horizontal scrollbar — same fallback story as SampleWaveformView. */
+    static constexpr int kScrollH = 12;
+    juce::ScrollBar hScroll_;
+
+    void syncScrollBar()
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        const int n = (slot && slot->isLoaded()) ? slot->numSamples : 0;
+        if (n <= 0) { hScroll_.setRangeLimits (0.0, 1.0); hScroll_.setCurrentRange (0.0, 1.0); return; }
+        hScroll_.setRangeLimits (0.0, (double) n);
+        hScroll_.setCurrentRange ((double) viewStart_,
+                                   (double) (viewEnd_ - viewStart_),
+                                   dontSendNotification);
+    }
+
+    void scrollBarMoved (juce::ScrollBar*, double newStart) override
+    {
+        auto* slot = getSlot ? getSlot() : nullptr;
+        if (slot == nullptr || ! slot->isLoaded()) return;
+        const int n = slot->numSamples;
+        const int range = viewEnd_ - viewStart_;
+        const int newS = juce::jlimit (0, juce::jmax (0, n - range), (int) newStart);
+        viewStart_ = newS;
+        viewEnd_   = newS + range;
+        repaint();
     }
 
     GetSlot getSlot;
@@ -2641,6 +2811,37 @@ private:
 
 
 /* ===========================================================================
+ * Shared waveshaper transfer function.  x ∈ [-1, +1] → y ∈ [-1, +1].
+ * Shared between SamplerFXPage::applyWaveshaper and the shape preview
+ * canvas so both compute identically. */
+inline double waveShaperSample (int kind, double drive, double x)
+{
+    const double d = juce::jlimit (1.0, 50.0, drive);
+    switch (kind)
+    {
+        case 1: /* Tanh — smooth saturation */
+            return std::tanh (d * x);
+        case 2: /* Soft clip — rational, less harmonic content */
+            return (x * d) / (1.0 + std::abs (x * d));
+        case 3: /* Hard clip — top + bottom snap */
+            return juce::jlimit (-1.0, 1.0, d * x);
+        case 4: /* Wave fold — bouncy reflections, can over-drive into harmonics */
+            return std::sin (d * x * juce::MathConstants<double>::halfPi);
+        case 5: /* Asymmetric — heavy positive drive, light negative (tube-ish) */
+            return x > 0.0 ? std::tanh (d * x)
+                           : std::tanh (d * 0.35 * x);
+        case 6: /* Bit crush — quantise to 2..16 bits */
+            {
+                const int bits = (int) juce::jlimit (1.0, 16.0, 17.0 - d * 0.32);
+                const double levels = std::pow (2.0, bits) - 1.0;
+                return std::round (x * levels) / levels;
+            }
+        default: return x;
+    }
+}
+
+
+/* ===========================================================================
  * Shared generator-wave shape function.  `frac` is the phase ∈ [0,1).
  * Returns y ∈ [-1, +1].  Used by both the FX page's Generate effect
  * and the small live-preview canvas next to the wave combo. */
@@ -2677,6 +2878,64 @@ inline double genWaveSample (int kind, double frac)
 
 
 /* ===========================================================================
+ * WaveShaperCanvas — draws the input→output transfer function of the
+ * currently-selected shaper at the active drive.  Diagonal grid for x=y
+ * reference; the shaped curve drawn over it. */
+class WaveShaperCanvas : public Component
+{
+public:
+    void setParams (int kind, double drive)
+    {
+        if (kind == kind_ && std::abs (drive - drive_) < 1e-6) return;
+        kind_ = kind; drive_ = drive;
+        repaint();
+    }
+
+    void paint (Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat().reduced (2.0f);
+        g.setColour (Colour { 0xff'10'10'10 });
+        g.fillRect (bounds);
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawRect (bounds, 1.0f);
+
+        const float midX = bounds.getCentreX();
+        const float midY = bounds.getCentreY();
+        g.setColour (Colour { 0xff'2a'2a'2a });
+        g.drawHorizontalLine ((int) midY, bounds.getX(), bounds.getRight());
+        g.drawVerticalLine   ((int) midX, bounds.getY(), bounds.getBottom());
+        /* Diagonal x=y reference. */
+        g.setColour (Colour { 0xff'1f'1f'1f });
+        g.drawLine (bounds.getX(), bounds.getBottom(), bounds.getRight(), bounds.getY(), 1.0f);
+
+        const int   w = juce::roundToInt (bounds.getWidth());
+        const float halfW = bounds.getWidth()  * 0.5f;
+        const float halfH = bounds.getHeight() * 0.5f;
+        if (w <= 0) return;
+
+        Path curve;
+        bool started = false;
+        for (int x = 0; x < w; ++x)
+        {
+            const double xn = (x / (double) w) * 2.0 - 1.0;   /* -1..+1 */
+            const double yn = waveShaperSample (kind_, drive_, xn);
+            const float xpx = bounds.getX() + x;
+            const float ypx = midY - (float) yn * halfH;
+            if (! started) { curve.startNewSubPath (xpx, ypx); started = true; }
+            else            curve.lineTo (xpx, ypx);
+        }
+        g.setColour (Colour { 0xff'd0'80'40 });
+        g.strokePath (curve, PathStrokeType (1.5f));
+        juce::ignoreUnused (halfW);
+    }
+
+private:
+    int    kind_ = 1;
+    double drive_ = 1.0;
+};
+
+
+/* ===========================================================================
  * WavePreviewCanvas — small visualisation of the currently-selected
  * generator wave at the chosen cycles + amplitude.  Renders pure DSP
  * — no audio, no sample data — so it's free to repaint cheaply when
@@ -2690,6 +2949,18 @@ public:
             && std::abs (amplitude - amp_) < 1e-6)
             return;
         kind_ = kind; cycles_ = cycles; amp_ = amplitude;
+        repaint();
+    }
+
+    /** Tell the preview what the waveshaper would do.  When `kind`
+     *  is > 0 the canvas overlays a second trace showing the
+     *  generator output after passing through the shaper. */
+    void setShaperParams (int kind, double drive, double mix)
+    {
+        if (kind == shaperKind_ && std::abs (drive - shaperDrive_) < 1e-6
+            && std::abs (mix - shaperMix_) < 1e-6)
+            return;
+        shaperKind_ = kind; shaperDrive_ = drive; shaperMix_ = mix;
         repaint();
     }
 
@@ -2709,26 +2980,55 @@ public:
         const int w = juce::roundToInt (bounds.getWidth());
         if (w <= 0 || cycles_ <= 0.0) return;
 
-        Path path;
         const float gain = juce::jlimit (0.0f, 1.0f, (float) amp_);
+        const bool shaperOn = shaperKind_ > 0 && shaperMix_ > 0.0;
+
+        /* Pass 1: raw generator trace.  Faint when the shaper is on
+         * (acts as a reference), full when it's off. */
+        Path raw;
         bool started = false;
         for (int x = 0; x < w; ++x)
         {
             const double phase = double (x) / double (w) * cycles_;
             const double frac  = phase - std::floor (phase);
-            double y = genWaveSample (kind_, frac);
-            const float ypx = midY - (float) y * halfH * gain;
-            if (! started) { path.startNewSubPath (bounds.getX() + x, ypx); started = true; }
-            else            path.lineTo            (bounds.getX() + x, ypx);
+            const double y = genWaveSample (kind_, frac) * gain;
+            const float ypx = midY - (float) y * halfH;
+            if (! started) { raw.startNewSubPath (bounds.getX() + x, ypx); started = true; }
+            else            raw.lineTo            (bounds.getX() + x, ypx);
         }
-        g.setColour (Colour { 0xff'5a'a5'd0 });
-        g.strokePath (path, PathStrokeType (1.5f));
+        g.setColour (shaperOn
+                       ? Colour { 0xff'5a'a5'd0 }.withAlpha (0.35f)
+                       : Colour { 0xff'5a'a5'd0 });
+        g.strokePath (raw, PathStrokeType (1.5f));
+
+        /* Pass 2: post-shaper trace (only when shaper engaged). */
+        if (shaperOn)
+        {
+            Path shaped;
+            started = false;
+            for (int x = 0; x < w; ++x)
+            {
+                const double phase = double (x) / double (w) * cycles_;
+                const double frac  = phase - std::floor (phase);
+                const double rawY  = genWaveSample (kind_, frac) * gain;
+                const double shapedY = waveShaperSample (shaperKind_, shaperDrive_, rawY);
+                const double mixed = rawY * (1.0 - shaperMix_) + shapedY * shaperMix_;
+                const float ypx = midY - (float) mixed * halfH;
+                if (! started) { shaped.startNewSubPath (bounds.getX() + x, ypx); started = true; }
+                else            shaped.lineTo            (bounds.getX() + x, ypx);
+            }
+            g.setColour (Colour { 0xff'd0'80'40 });
+            g.strokePath (shaped, PathStrokeType (1.8f));
+        }
     }
 
 private:
     int    kind_   = 1;
     double cycles_ = 1.0;
     double amp_    = 1.0;
+    int    shaperKind_  = 0;     /* 0 = no shaper overlay */
+    double shaperDrive_ = 1.0;
+    double shaperMix_   = 0.0;
 };
 
 
@@ -2757,24 +3057,32 @@ public:
         : getSlot (std::move (gs)),
           onChange (std::move (cb))
     {
-        configureBtn (amplifyBtn,  "Amplify",   [this] { applyAmplify(); });
-        configureBtn (normalizeBtn,"Normalize", [this] { applyNormalize(); });
-        configureBtn (reverseBtn,  "Reverse",   [this] { applyReverse(); });
-        configureBtn (lpBtn,       "Low-pass",  [this] { applyFilter (true); });
-        configureBtn (hpBtn,       "High-pass", [this] { applyFilter (false); });
-        configureBtn (genBtn,      "Generate",  [this] { applyGenerator(); });
-        configureBtn (xfadeBtn,    "X-Fade loop", [this] { applyXFade(); });
-
-        configureSlider (gainSlider,   0.0,   400.0, 0.1,  "%");
+        /* === Volume section. */
+        configureSectionHeader (volSection_,  "Volume");
+        configureBtn (amplifyBtn,   "Amplify",   [this] { applyAmplify(); });
+        configureBtn (normalizeBtn, "Normalize", [this] { applyNormalize(); });
+        configureBtn (reverseBtn,   "Reverse",   [this] { applyReverse(); });
+        configureSlider (gainSlider, 0.0, 400.0, 0.1, "%");
         gainSlider.setValue (100.0);
-        configureSlider (cutoffSlider, 0.001, 1.0,   0.001, "norm");
+        configureLabel (gainLbl, "Gain");
+
+        /* === Filter section. */
+        configureSectionHeader (filterSection_, "Filter");
+        configureBtn (lpBtn, "Low-pass",  [this] { applyFilter (true);  });
+        configureBtn (hpBtn, "High-pass", [this] { applyFilter (false); });
+        configureSlider (cutoffSlider, 0.001, 1.0, 0.001, "norm");
         cutoffSlider.setValue (0.25);
-        configureSlider (cyclesSlider, 0.5,   64.0,  0.5,  "cyc");
+        configureLabel (cutoffLbl, "Cutoff");
+
+        /* === Generator section. */
+        configureSectionHeader (genSection_, "Generator");
+        configureBtn (genBtn, "Generate", [this] { applyGenerator(); });
+        configureSlider (cyclesSlider,    0.5, 64.0,  0.5, "cyc");
         cyclesSlider.setValue (1.0);
         configureSlider (amplitudeSlider, 0.0, 100.0, 0.1, "%");
         amplitudeSlider.setValue (100.0);
-        configureSlider (xfadeLenSlider, 1.0,  4096.0, 1.0, "smp");
-        xfadeLenSlider.setValue (64.0);
+        configureLabel (cyclesLbl, "Cycles");
+        configureLabel (amplLbl,   "Amplitude");
 
         genWaveCombo.addItem ("Sine",            1);
         genWaveCombo.addItem ("Square",          2);
@@ -2792,86 +3100,156 @@ public:
         genWaveCombo.onChange = [this] { refreshWavePreview(); };
         addAndMakeVisible (genWaveCombo);
 
-        addAndMakeVisible (wavePreview_);
         cyclesSlider   .onValueChange = [this] { refreshWavePreview(); };
         amplitudeSlider.onValueChange = [this] { refreshWavePreview(); };
+        addAndMakeVisible (wavePreview_);
         refreshWavePreview();
 
         genMixToggle.setButtonText ("Mix (vs replace)");
         genMixToggle.setColour (ToggleButton::textColourId, Colour { 0xff'b0'b0'b0 });
         addAndMakeVisible (genMixToggle);
 
-        for (auto* l : { &gainLbl, &cutoffLbl, &cyclesLbl, &amplLbl, &xfadeLenLbl, &statusLbl })
-        {
-            l->setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
-            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
-            addAndMakeVisible (*l);
-        }
-        gainLbl    .setText ("Gain (%):",   dontSendNotification);
-        cutoffLbl  .setText ("Cutoff:",     dontSendNotification);
-        cyclesLbl  .setText ("Cycles:",     dontSendNotification);
-        amplLbl    .setText ("Amplitude:",  dontSendNotification);
-        xfadeLenLbl.setText ("X-Fade len:", dontSendNotification);
+        /* === Waveshaper section. */
+        configureSectionHeader (shaperSection_, "Waveshaper");
+        configureBtn (shaperBtn, "Apply shape", [this] { applyWaveshaper(); });
+        configureSlider (shaperDriveSlider, 0.0, 100.0, 0.1, "%");
+        shaperDriveSlider.setValue (20.0);
+        configureSlider (shaperMixSlider,   0.0, 100.0, 0.1, "%");
+        shaperMixSlider.setValue (100.0);
+        configureLabel (shaperDriveLbl, "Drive");
+        configureLabel (shaperMixLbl,   "Wet");
 
+        shaperCombo.addItem ("Tanh",       1);
+        shaperCombo.addItem ("Soft clip",  2);
+        shaperCombo.addItem ("Hard clip",  3);
+        shaperCombo.addItem ("Wave fold",  4);
+        shaperCombo.addItem ("Asymmetric", 5);
+        shaperCombo.addItem ("Bit crush",  6);
+        shaperCombo.setSelectedId (1, dontSendNotification);
+        shaperCombo.setColour (ComboBox::backgroundColourId, Colour { 0xff'24'24'24 });
+        shaperCombo.setColour (ComboBox::textColourId,        Colour { 0xff'd0'd0'd0 });
+        shaperCombo.onChange = [this] { refreshShaperPreview(); };
+        addAndMakeVisible (shaperCombo);
+
+        shaperDriveSlider.onValueChange = [this] { refreshShaperPreview(); };
+        shaperMixSlider  .onValueChange = [this] { refreshShaperPreview(); };
+        addAndMakeVisible (shaperPreview_);
+        refreshShaperPreview();
+
+        /* === Loop section. */
+        configureSectionHeader (loopSection_, "Loop");
+        configureBtn (xfadeBtn, "X-Fade loop", [this] { applyXFade(); });
+        configureSlider (xfadeLenSlider, 1.0, 4096.0, 1.0, "smp");
+        xfadeLenSlider.setValue (64.0);
+        configureLabel (xfadeLenLbl, "X-Fade len");
+
+        /* Status footer. */
         statusLbl.setText ("FX operate on the selection (or whole sample if no selection).",
                            dontSendNotification);
         statusLbl.setJustificationType (Justification::centredLeft);
+        statusLbl.setColour (Label::textColourId, Colour { 0xff'7a'7a'7a });
+        statusLbl.setFont (FontOptions (11.0f, Font::italic));
+        addAndMakeVisible (statusLbl);
     }
 
     void resized() override
     {
         auto r = getLocalBounds().reduced (8);
 
-        auto row = [&] (const Label& l, Slider& s, TextButton& btn) {
-            auto rr = r.removeFromTop (28);
-            const_cast<Label&> (l).setBounds (rr.removeFromLeft (110));
-            btn.setBounds (rr.removeFromRight (110));
-            rr.removeFromRight (8);
+        constexpr int kLblW   = 90;
+        constexpr int kBtnW   = 110;
+        constexpr int kRowH   = 26;
+        constexpr int kHdrH   = 18;
+        constexpr int kGap    = 4;
+        constexpr int kSect   = 10;
+        constexpr int kPad    = 6;
+
+        auto slotRow = [&] (const Label& lbl, Slider& s, TextButton& btn) {
+            auto rr = r.removeFromTop (kRowH);
+            const_cast<Label&> (lbl).setBounds (rr.removeFromLeft (kLblW));
+            btn.setBounds (rr.removeFromRight (kBtnW));
+            rr.removeFromRight (kPad);
             s.setBounds (rr);
-            r.removeFromTop (4);
+            r.removeFromTop (kGap);
         };
+        auto buttonRow = [&] (std::initializer_list<TextButton*> btns) {
+            auto rr = r.removeFromTop (kRowH);
+            rr.removeFromLeft (kLblW);
+            for (auto* b : btns) {
+                b->setBounds (rr.removeFromRight (kBtnW));
+                rr.removeFromRight (kPad);
+            }
+            r.removeFromTop (kGap);
+        };
+        auto sectionLayout = [&] (Label& hdr) {
+            hdr.setBounds (r.removeFromTop (kHdrH));
+            r.removeFromTop (2);
+        };
+        auto sectionGap = [&] { r.removeFromTop (kSect); };
 
-        row (gainLbl,        gainSlider,      amplifyBtn);
-        {
-            auto rr = r.removeFromTop (28);
-            rr.removeFromLeft (110);
-            normalizeBtn.setBounds (rr.removeFromRight (110));
-            reverseBtn  .setBounds (rr.removeFromRight (110));
-            r.removeFromTop (4);
-        }
-        row (cutoffLbl,      cutoffSlider,    lpBtn);
-        {
-            auto rr = r.removeFromTop (28);
-            rr.removeFromLeft (110);
-            hpBtn.setBounds (rr.removeFromRight (110));
-            r.removeFromTop (8);
-        }
+        /* === Volume. */
+        sectionLayout (volSection_);
+        slotRow (gainLbl, gainSlider, amplifyBtn);
+        buttonRow ({ &reverseBtn, &normalizeBtn });
+        sectionGap();
 
-        /* Generator block: combo + mix toggle row, then wave preview
-         * canvas spanning the row above the cycles/amplitude sliders. */
+        /* === Filter. */
+        sectionLayout (filterSection_);
+        slotRow (cutoffLbl, cutoffSlider, lpBtn);
+        buttonRow ({ &hpBtn });
+        sectionGap();
+
+        /* === Generator. */
+        sectionLayout (genSection_);
         {
-            auto rr = r.removeFromTop (28);
-            rr.removeFromLeft (110);
+            auto rr = r.removeFromTop (kRowH);
+            rr.removeFromLeft (kLblW);
             genWaveCombo.setBounds (rr.removeFromLeft (140));
             rr.removeFromLeft (8);
             genMixToggle.setBounds (rr.removeFromLeft (160));
-            r.removeFromTop (4);
+            r.removeFromTop (kGap);
         }
-        /* Live wave preview — 110 px label gutter on the left so it
-         * lines up with the slider rows below. */
         {
-            auto rr = r.removeFromTop (60);
-            rr.removeFromLeft (110);
-            rr.removeFromRight (8);
+            const int previewH = juce::jmax (60, r.getHeight() * 16 / 100);
+            auto rr = r.removeFromTop (previewH);
+            rr.removeFromLeft (kLblW);
+            rr.removeFromRight (kBtnW + kPad);
             wavePreview_.setBounds (rr);
-            r.removeFromTop (6);
+            r.removeFromTop (kGap);
         }
-        row (cyclesLbl,    cyclesSlider,    genBtn);
-        row (amplLbl,      amplitudeSlider, xfadeBtn);
-        row (xfadeLenLbl,  xfadeLenSlider,  xfadeBtn);   /* shares button row visually */
+        slotRow (cyclesLbl, cyclesSlider, genBtn);
+        slotRow (amplLbl,   amplitudeSlider, dummyHiddenBtn_);   /* no per-row button */
+        dummyHiddenBtn_.setVisible (false);
+        sectionGap();
 
-        r.removeFromTop (8);
-        statusLbl.setBounds (r.removeFromTop (20));
+        /* === Waveshaper. */
+        sectionLayout (shaperSection_);
+        {
+            auto rr = r.removeFromTop (kRowH);
+            rr.removeFromLeft (kLblW);
+            shaperCombo.setBounds (rr.removeFromLeft (140));
+            r.removeFromTop (kGap);
+        }
+        {
+            const int previewH = juce::jmax (70, r.getHeight() * 22 / 100);
+            auto rr = r.removeFromTop (previewH);
+            rr.removeFromLeft (kLblW);
+            rr.removeFromRight (kBtnW + kPad);
+            shaperPreview_.setBounds (rr);
+            r.removeFromTop (kGap);
+        }
+        slotRow (shaperDriveLbl, shaperDriveSlider, shaperBtn);
+        slotRow (shaperMixLbl,   shaperMixSlider,   dummyHiddenBtn_);
+        sectionGap();
+
+        /* === Loop. */
+        sectionLayout (loopSection_);
+        slotRow (xfadeLenLbl, xfadeLenSlider, xfadeBtn);
+        sectionGap();
+
+        /* === Footer. */
+        auto foot = r.removeFromBottom (20);
+        statusLbl.setBounds (foot);
     }
 
 private:
@@ -3095,17 +3473,76 @@ private:
 
     void refreshWavePreview()
     {
+        const double drive = 1.0 + shaperDriveSlider.getValue() / 100.0 * 40.0;
+        const double mix   = shaperMixSlider.getValue() / 100.0;
         wavePreview_.setParams (genWaveCombo.getSelectedId(),
                                 cyclesSlider.getValue(),
                                 amplitudeSlider.getValue() / 100.0);
+        wavePreview_.setShaperParams (shaperCombo.getSelectedId(), drive, mix);
+    }
+    void refreshShaperPreview()
+    {
+        const double drive = 1.0 + shaperDriveSlider.getValue() / 100.0 * 40.0;
+        shaperPreview_.setParams (shaperCombo.getSelectedId(), drive);
+        /* Shaper changes also reshape the generator preview output. */
+        refreshWavePreview();
     }
 
+    /** Apply the selected waveshaper to the active range. */
+    void applyWaveshaper()
+    {
+        const int kind = shaperCombo.getSelectedId();
+        const double drive = 1.0 + shaperDriveSlider.getValue() / 100.0 * 40.0;
+        const double mix   = shaperMixSlider.getValue() / 100.0;
+        mutateInt16 ([kind, drive, mix] (int16_t v) {
+            const double x = v / 32767.0;
+            const double y = waveShaperSample (kind, drive, x);
+            const double mixed = x * (1.0 - mix) + y * mix;
+            return (int16_t) juce::jlimit (-32768, 32767,
+                                            (int) std::lround (mixed * 32767.0));
+        });
+    }
+
+    /* === look helpers ============================================== */
+    void configureSectionHeader (Label& l, const String& t)
+    {
+        l.setText (t, dontSendNotification);
+        l.setColour (Label::textColourId, Colour { 0xff'8a'b5'd4 });
+        l.setFont (FontOptions (13.0f, Font::bold));
+        addAndMakeVisible (l);
+    }
+    void configureLabel (Label& l, const String& t)
+    {
+        l.setText (t, dontSendNotification);
+        l.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+        l.setFont (FontOptions (12.0f, Font::plain));
+        l.setJustificationType (Justification::centredLeft);
+        addAndMakeVisible (l);
+    }
+
+    /* Section labels. */
+    Label volSection_, filterSection_, genSection_, shaperSection_, loopSection_;
+
+    /* Action buttons. */
     TextButton amplifyBtn, normalizeBtn, reverseBtn, lpBtn, hpBtn, genBtn, xfadeBtn;
+    TextButton shaperBtn;
+    TextButton dummyHiddenBtn_;   /* placeholder for slotRow without a button */
+
+    /* Sliders. */
     Slider     gainSlider, cutoffSlider, cyclesSlider, amplitudeSlider, xfadeLenSlider;
-    ComboBox   genWaveCombo;
+    Slider     shaperDriveSlider, shaperMixSlider;
+
+    /* Combos / toggles. */
+    ComboBox   genWaveCombo, shaperCombo;
     ToggleButton genMixToggle;
-    WavePreviewCanvas wavePreview_;
-    Label      gainLbl, cutoffLbl, cyclesLbl, amplLbl, xfadeLenLbl, statusLbl;
+
+    /* Preview canvases. */
+    WavePreviewCanvas  wavePreview_;
+    WaveShaperCanvas   shaperPreview_;
+
+    /* Labels. */
+    Label gainLbl, cutoffLbl, cyclesLbl, amplLbl, xfadeLenLbl, statusLbl;
+    Label shaperDriveLbl, shaperMixLbl;
 };
 
 
