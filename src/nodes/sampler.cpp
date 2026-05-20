@@ -405,11 +405,27 @@ public:
          * envelope state once (if a tick boundary fell inside), then
          * mix sample. */
         int pos = 0;
+        int safetyIters = 0;
+        const int safetyCap = numSamples * 8 + 16;  /* worst-case bound */
         while (pos < numSamples && voice.active)
         {
+            if (++safetyIters > safetyCap) break;   /* never spin forever */
+
+            /* If the accumulator already crossed a tick boundary (e.g.,
+             * carry from a previous block), fire the tick immediately
+             * BEFORE asking for a mixChunk — chunk would be ≤ 0 here
+             * and the old code spun on ++envSampleAccum. */
+            if (envSampleAccum >= samplesPerTick)
+            {
+                envSampleAccum -= samplesPerTick;
+                tickEnvelopes();
+                applyEnvelopeToVoice();
+                continue;
+            }
+
             const int chunk = juce::jmin (numSamples - pos,
                                           samplesPerTick - envSampleAccum);
-            if (chunk <= 0) { ++envSampleAccum; continue; }
+            if (chunk <= 0) break;                  /* defensive — shouldn't reach */
 
             mixChunk (scratch, pos, chunk);
             pos += chunk;
@@ -418,7 +434,6 @@ public:
             {
                 envSampleAccum -= samplesPerTick;
                 tickEnvelopes();
-                /* Refresh voice volumes/pitch from envelope outputs. */
                 applyEnvelopeToVoice();
             }
         }
@@ -4339,6 +4354,14 @@ void SamplerNode::removeInstrument (int index)
 
 SamplerInstrument::Ptr SamplerNode::getInstrumentForChannel (int channel1to16) const
 {
+    /* Audio-thread accessor.  Defensive: instruments[] should always
+     * contain ≥1 entry (constructor + rebuild + setStateInformation
+     * fallback all guarantee it), but if a race between this read and
+     * setStateInformation's clear() ever exposes a 0-size window we
+     * must not deref instruments[0].  Return null and let the voice
+     * gracefully decline the note rather than SIGSEGV. */
+    if (instruments.empty()) return nullptr;
+
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
     int idx = channelBinding[(size_t) ch];
     if (idx < 0) idx = ch;   /* default mapping */
