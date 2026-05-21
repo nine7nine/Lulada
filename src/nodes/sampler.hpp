@@ -104,6 +104,13 @@ public:
     uint16_t      fadeoutRate = 0;   // 0 = no fadeout (sample plays out)
     AutoVibParams autoVib;
 
+    /** Mono mode: only one voice plays per channel binding at any time;
+     *  re-triggering on a held key glides pitch (last-note priority with
+     *  legato release).  Portamento time is in milliseconds — 0 means
+     *  instantaneous (which is a glissando but mono-stealing only). */
+    bool          mono = false;
+    float         portamentoTimeMs = 80.0f;
+
 private:
     std::array<std::unique_ptr<SamplerSampleSlot>, kNumSlots> slots;
     uint8_t noteToSlot[128] {};

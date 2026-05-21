@@ -336,17 +336,40 @@ private:
     int                      renderSubNum = 0;
 };
 
+class Ft2SamplerVoice;
+
 class ChannelTrackingSynth : public Synthesiser
 {
 public:
     explicit ChannelTrackingSynth (SamplerNode& owner) : node (owner) {}
     ~ChannelTrackingSynth() override { stopWorkers(); }
 
-    void noteOn (int midiChannel, int midiNoteNumber, float velocity) override
+    /** Mono-mode per-instrument tracking.  Held-notes vector holds keys
+     *  in press order for last-note-priority + legato release.  active
+     *  voice is the single sounding voice for this instrument; cleared
+     *  by noteOff once the held set empties (the underlying Synthesiser
+     *  noteOff fades the voice out and we stop tracking it). */
+    struct MonoState
     {
-        node.setLastNoteChannel (midiChannel);
-        Synthesiser::noteOn (midiChannel, midiNoteNumber, velocity);
+        std::vector<int>    heldNotes;
+        Ft2SamplerVoice*    activeVoice = nullptr;
+    };
+
+    /* Bodies defined out-of-line after Ft2SamplerVoice's class — they
+     * need its complete type for dynamic_cast + member access. */
+    void noteOn  (int midiChannel, int midiNoteNumber, float velocity) override;
+    void noteOff (int midiChannel, int midiNoteNumber, float velocity,
+                  bool allowTailOff) override;
+
+    /** Clear mono state for a specific instrument — called from
+     *  SamplerNode::removeInstrument so the raw-pointer key doesn't
+     *  dangle.  Voice pointers in the cleared state are dropped to
+     *  avoid use-after-free if a stale lookup ever fires. */
+    void forgetInstrument (SamplerInstrument* inst) noexcept
+    {
+        monoStates.erase (inst);
     }
+
     /* JUCE's Synthesiser swallows program-change events without exposing
      * an override hook — we run our own MIDI scan in SamplerNode::processBlock
      * before renderNextBlock to handle them.  See SamplerNode::processBlock. */
@@ -458,6 +481,12 @@ private:
     SamplerNode&                                 node;
     std::vector<std::unique_ptr<SamplerWorker>>  workers;
     juce::Array<juce::SynthesiserVoice*>         voicePtrs;
+
+    /* Mono-mode per-instrument state.  Keyed by raw SamplerInstrument*;
+     * forgetInstrument cleans up on removeInstrument so the key never
+     * dangles.  Touched only from the audio thread (noteOn/noteOff fire
+     * from Synthesiser::renderNextBlock). */
+    std::unordered_map<SamplerInstrument*, MonoState> monoStates;
 };
 
 
@@ -556,10 +585,16 @@ public:
         voice.active     = true;
         voice.mixFuncOffset = (uint8_t) owner.getMixFuncIndexForCurrentMode (loop, pingpong);
 
-        /* Pitch: 12tet semitones + slot finetune + slot relativeNote. */
+        /* Pitch: 12tet semitones + slot finetune + slot relativeNote.
+         * currentSemis tracks the live (possibly mid-glide) semitone
+         * offset; beginGlideTo updates targetSemis + glide step. */
         const double semis    = (double) (midiNote - slot->rootNote)
                               + (double) slot->relativeNote
                               + (double) slot->finetune / 128.0;
+        currentSemis  = semis;
+        targetSemis   = semis;
+        glideStepSemisPerTick = 0.0;
+        glideTicksRemaining   = 0;
         basePitchMul = std::pow (2.0, semis / 12.0);
         setVoiceDelta (basePitchMul);
 
@@ -713,6 +748,7 @@ public:
             {
                 envSampleAccum -= samplesPerTick;
                 tickEnvelopes();
+                advanceGlide();
                 applyEnvelopeToVoice();
                 continue;
             }
@@ -728,6 +764,7 @@ public:
             {
                 envSampleAccum -= samplesPerTick;
                 tickEnvelopes();
+                advanceGlide();
                 applyEnvelopeToVoice();
             }
         }
@@ -991,7 +1028,12 @@ private:
          * setVoiceGain doc above. */
         setVoiceGain (gain, pan, /*useRamp=*/true);
 
-        /* autoVib pitch modulation. */
+        /* autoVib pitch modulation.  Always call setVoiceDelta so glide
+         * updates to basePitchMul (mono+portamento) actually reach the
+         * mixer even when autoVib is off — previously the no-autoVib
+         * path left voice.delta stuck at the value last set by
+         * startNote, freezing the pitch mid-glide. */
+        double mult = 1.0;
         if (instrument->autoVib.depth > 0)
         {
             int16_t vibVal;
@@ -1008,10 +1050,70 @@ private:
              * at full depth at the sine peak; scale to cents:
              * cents ≈ scaled * (100/64). */
             const double cents = scaled * (100.0 / 64.0);
-            const double mult  = std::pow (2.0, cents / 1200.0);
-            setVoiceDelta (basePitchMul * mult);
+            mult = std::pow (2.0, cents / 1200.0);
+        }
+        setVoiceDelta (basePitchMul * mult);
+    }
+
+    /* ChannelTrackingSynth.noteOn / .noteOff call the glide helpers + the
+     * voice-status accessors below.  All other callers are inside this
+     * class.  Friend the synth class to keep the helpers private (no
+     * public surface change). */
+    friend class ChannelTrackingSynth;
+
+    /** Begin gliding pitch + velocity toward a new MIDI note over
+     *  @p portamentoMs.  Does NOT reset envelopes / fadeout — the
+     *  voice continues as one continuous note (mono+legato semantics).
+     *  Glide is linear in the semitone domain so the rate is musically
+     *  perceptible (constant cents/sec); basePitchMul is recomputed on
+     *  each tick from currentSemis. */
+    void beginGlideTo (int newMidiNote, float velocity, float portamentoMs)
+    {
+        if (slotPtr == nullptr) return;
+
+        playedNote   = newMidiNote;
+        velocityLin  = juce::jlimit (0.0f, 1.0f, velocity);
+
+        const double newSemis = (double) (newMidiNote - slotPtr->rootNote)
+                              + (double) slotPtr->relativeNote
+                              + (double) slotPtr->finetune / 128.0;
+        targetSemis = newSemis;
+
+        if (portamentoMs <= 0.001f)
+        {
+            currentSemis          = newSemis;
+            glideStepSemisPerTick = 0.0;
+            glideTicksRemaining   = 0;
+            basePitchMul          = std::pow (2.0, currentSemis / 12.0);
+        }
+        else
+        {
+            const double tickRate = (double) SamplerNode::kEnvTickRateHz;
+            const double ticks    = (portamentoMs / 1000.0) * tickRate;
+            glideTicksRemaining   = juce::jmax (1, (int) std::ceil (ticks));
+            glideStepSemisPerTick = (targetSemis - currentSemis)
+                                  / (double) glideTicksRemaining;
         }
     }
+
+    /** Advance the mono-portamento glide by one envelope tick.  Called
+     *  from renderNextBlock's per-tick loop, between tickEnvelopes and
+     *  applyEnvelopeToVoice so the new basePitchMul flows into the
+     *  mixer through applyEnvelopeToVoice's unconditional setVoiceDelta. */
+    void advanceGlide()
+    {
+        if (glideTicksRemaining <= 0) return;
+        --glideTicksRemaining;
+        if (glideTicksRemaining == 0)
+            currentSemis = targetSemis;
+        else
+            currentSemis += glideStepSemisPerTick;
+        basePitchMul = std::pow (2.0, currentSemis / 12.0);
+    }
+
+    /** Read-only access for ChannelTrackingSynth's mono-mode lookup. */
+    const SamplerInstrument*    getInstrumentPtr() const noexcept { return instrument.get(); }
+    float                       getVelocityLin()   const noexcept { return velocityLin; }
 
     void setVoiceDelta (double pitchMul)
     {
@@ -1098,6 +1200,15 @@ private:
     float slotPan = 0.5f;
     double basePitchMul = 1.0;
 
+    /** Glide state for mono+portamento.  semitone-domain so the glide
+     *  is musically linear (constant rate in semis/sec); basePitchMul
+     *  is the live ratio recomputed from currentSemis on each step.
+     *  When glideTicksRemaining == 0 the voice is at its target. */
+    double currentSemis = 0.0;
+    double targetSemis  = 0.0;
+    double glideStepSemisPerTick = 0.0;
+    int    glideTicksRemaining   = 0;
+
     /* Stereo render-gain cache. */
     float gLL = 1.0f, gLR = 0.0f, gRL = 0.0f, gRR = 1.0f;
 
@@ -1119,6 +1230,120 @@ private:
     /* Tick-quantizer: samples since last envelope tick. */
     int       envSampleAccum = 0;
 };
+
+
+/* ===========================================================================
+ * ChannelTrackingSynth out-of-line method bodies.  Defined here so the
+ * Ft2SamplerVoice methods they invoke (beginGlideTo, getInstrumentPtr,
+ * getVelocityLin) see the complete type.
+ * ========================================================================*/
+
+void ChannelTrackingSynth::noteOn (int midiChannel, int midiNoteNumber, float velocity)
+{
+    node.setLastNoteChannel (midiChannel);
+
+    const auto instrument = node.getInstrumentForChannel (midiChannel);
+    const bool monoMode   = (instrument != nullptr) && instrument->mono;
+
+    if (monoMode)
+    {
+        auto& state = monoStates[instrument.get()];
+
+        /* Last-note priority: remove dups, append new key. */
+        state.heldNotes.erase (std::remove (state.heldNotes.begin(),
+                                            state.heldNotes.end(),
+                                            midiNoteNumber),
+                               state.heldNotes.end());
+        state.heldNotes.push_back (midiNoteNumber);
+
+        /* Re-trigger on a held voice: retune in place (glide), keep
+         * envelope / fadeout / autoVib state — mono+legato semantics. */
+        if (state.activeVoice != nullptr
+            && state.activeVoice->isVoiceActive()
+            && state.activeVoice->getInstrumentPtr() == instrument.get())
+        {
+            state.activeVoice->beginGlideTo (midiNoteNumber,
+                                             velocity,
+                                             instrument->portamentoTimeMs);
+            return;
+        }
+
+        /* No live voice — standard noteOn allocates one, then capture it. */
+        Synthesiser::noteOn (midiChannel, midiNoteNumber, velocity);
+
+        for (int i = 0; i < getNumVoices(); ++i)
+        {
+            auto* v = dynamic_cast<Ft2SamplerVoice*> (getVoice (i));
+            if (v == nullptr) continue;
+            if (! v->isVoiceActive()) continue;
+            if (v->getCurrentlyPlayingNote() != midiNoteNumber) continue;
+            if (v->getInstrumentPtr() != instrument.get())      continue;
+            state.activeVoice = v;
+            break;
+        }
+        return;
+    }
+
+    Synthesiser::noteOn (midiChannel, midiNoteNumber, velocity);
+}
+
+void ChannelTrackingSynth::noteOff (int midiChannel, int midiNoteNumber,
+                                    float velocity, bool allowTailOff)
+{
+    const auto instrument = node.getInstrumentForChannel (midiChannel);
+    const bool monoMode   = (instrument != nullptr) && instrument->mono;
+
+    if (monoMode)
+    {
+        auto it = monoStates.find (instrument.get());
+        if (it != monoStates.end())
+        {
+            auto& state = it->second;
+            state.heldNotes.erase (std::remove (state.heldNotes.begin(),
+                                                state.heldNotes.end(),
+                                                midiNoteNumber),
+                                   state.heldNotes.end());
+
+            /* Legato release: glide back to most-recent held key, no
+             * release-envelope, voice keeps sounding. */
+            if (! state.heldNotes.empty()
+                && state.activeVoice != nullptr
+                && state.activeVoice->isVoiceActive())
+            {
+                state.activeVoice->beginGlideTo (state.heldNotes.back(),
+                                                 state.activeVoice->getVelocityLin(),
+                                                 instrument->portamentoTimeMs);
+                return;
+            }
+
+            /* No keys held — stop the active voice DIRECTLY.  We can't
+             * route through Synthesiser::noteOff here: that helper
+             * iterates voices matching on getCurrentlyPlayingNote(),
+             * but our glide updates the voice's pitch + our internal
+             * playedNote without touching JUCE's currentlyPlayingNote
+             * (which stays at the note that started the voice via
+             * Synthesiser::noteOn).  So if the user pressed C then E
+             * and releases E, JUCE looks for a voice playing E, finds
+             * none (the live voice's JUCE-side note is still C), and
+             * the voice runs forever.  We hold the activeVoice ptr
+             * already from noteOn — call stopNote on it directly.
+             *
+             * Trade-off: bypasses Synthesiser's sustain-pedal /
+             * sostenuto bookkeeping for this voice.  Acceptable for
+             * mono lead/bass usage; revisit if sustain-pedal+mono
+             * interaction becomes important. */
+            if (state.activeVoice != nullptr && state.activeVoice->isVoiceActive())
+            {
+                state.activeVoice->stopNote (velocity, allowTailOff);
+                state.activeVoice = nullptr;
+                return;
+            }
+            state.activeVoice = nullptr;
+        }
+    }
+
+    Synthesiser::noteOff (midiChannel, midiNoteNumber, velocity, allowTailOff);
+}
 
 
 /* ===========================================================================
@@ -2152,6 +2377,24 @@ public:
             keymap.setBaseOctave (keymap.getBaseOctave() + 1);
         });
 
+        /* Mono toggle + portamento time.  Mono is a toggle on the Inst
+         * (per-instrument); portamento glides pitch when retriggering a
+         * held mono voice.  Engine: ChannelTrackingSynth + voice
+         * beginGlideTo. */
+        configureFlag (monoBtn, "Mono", [this] (bool v) {
+            if (auto inst = getInst()) inst->mono = v;
+        });
+
+        portaLbl.setText ("Porta", dontSendNotification);
+        portaLbl.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+        portaLbl.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+        addAndMakeVisible (portaLbl);
+
+        configureSlider (portamentoSlider, 0.0, 1000.0, 1.0, [this] (double v) {
+            if (auto inst = getInst()) inst->portamentoTimeMs = (float) v;
+        });
+        portamentoSlider.setTextValueSuffix (" ms");
+
         rebuildEnvViews();
     }
 
@@ -2185,6 +2428,7 @@ public:
             avDepthSlider.setValue ((double) inst->autoVib.depth, dontSendNotification);
             avSweepSlider.setValue ((double) inst->autoVib.sweep, dontSendNotification);
             avTypeCombo  .setSelectedId ((int) inst->autoVib.type + 1, dontSendNotification);
+            portamentoSlider.setValue ((double) inst->portamentoTimeMs, dontSendNotification);
             refreshFlagStates();
         }
         slotPickValue.setText (String::formatted ("%02d", getActiveSlot() + 1),
@@ -2222,15 +2466,18 @@ public:
 
         /* Per-instrument params row. */
         auto row = r.removeFromTop (24);
+        monoBtn      .setBounds (row.removeFromLeft (60));  row.removeFromLeft (8);
+        portaLbl     .setBounds (row.removeFromLeft (40));
+        portamentoSlider.setBounds (row.removeFromLeft (120));  row.removeFromLeft (12);
         fadeLbl    .setBounds (row.removeFromLeft (60));
-        fadeoutSlider.setBounds (row.removeFromLeft (140)); row.removeFromLeft (12);
+        fadeoutSlider.setBounds (row.removeFromLeft (120)); row.removeFromLeft (12);
         avSpeedLbl .setBounds (row.removeFromLeft (70));
-        avRateSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
+        avRateSlider.setBounds (row.removeFromLeft (90));  row.removeFromLeft (12);
         avDepthLbl .setBounds (row.removeFromLeft (80));
-        avDepthSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
+        avDepthSlider.setBounds (row.removeFromLeft (90));  row.removeFromLeft (12);
         avSweepLbl .setBounds (row.removeFromLeft (80));
-        avSweepSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
-        avTypeCombo.setBounds (row.removeFromLeft (90));
+        avSweepSlider.setBounds (row.removeFromLeft (90));  row.removeFromLeft (12);
+        avTypeCombo.setBounds (row.removeFromLeft (80));
         r.removeFromTop (10);
 
         /* Keymap header (label + oct controls). */
@@ -2348,6 +2595,7 @@ private:
         panEnabledBtn.setToggleState (pe.flags & FT2Envelope::kEnabled, dontSendNotification);
         panSustainBtn.setToggleState (pe.flags & FT2Envelope::kSustain, dontSendNotification);
         panLoopBtn   .setToggleState (pe.flags & FT2Envelope::kLoop,    dontSendNotification);
+        monoBtn      .setToggleState (inst->mono,                       dontSendNotification);
     }
 
     /** Append a sensible new point at xMax+20, y = previous point's y.
@@ -2496,6 +2744,13 @@ private:
     Slider fadeoutSlider, avRateSlider, avDepthSlider, avSweepSlider;
     ComboBox avTypeCombo;
     TextButton octDownBtn, octUpBtn;
+
+    /* Mono mode + portamento (Inst-level).  See SamplerInstrument::mono /
+     * portamentoTimeMs + ChannelTrackingSynth::noteOn for the engine
+     * side. */
+    TextButton monoBtn;
+    Label      portaLbl;
+    Slider     portamentoSlider;
 };
 
 
@@ -4748,6 +5003,12 @@ void SamplerNode::removeInstrument (int index)
     ScopedLock sl (sampleLock);
     if (index < 0 || index >= (int) instruments.size()) return;
     if (instruments.size() <= 1) return; /* always keep at least one */
+
+    /* Drop mono-mode state keyed by the about-to-be-freed raw pointer. */
+    SamplerInstrument* doomed = instruments[(size_t) index].get();
+    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+        cts->forgetInstrument (doomed);
+
     instruments.erase (instruments.begin() + index);
     /* Re-map channel bindings that pointed past the removed index. */
     for (auto& b : channelBinding)
@@ -4896,6 +5157,8 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
         instTree.setProperty ("avSweep", (int) inst->autoVib.sweep, nullptr);
         instTree.setProperty ("avDepth", (int) inst->autoVib.depth, nullptr);
         instTree.setProperty ("avRate",  (int) inst->autoVib.rate,  nullptr);
+        instTree.setProperty ("mono",            inst->mono,              nullptr);
+        instTree.setProperty ("portamentoMs",    (double) inst->portamentoTimeMs, nullptr);
 
         auto writeEnv = [&](const FT2Envelope& e, const String& prefix)
         {
@@ -4976,6 +5239,8 @@ void SamplerNode::setStateInformation (const void* data, int size)
         inst->autoVib.sweep = (uint8_t) (int) instTree.getProperty ("avSweep", 0);
         inst->autoVib.depth = (uint8_t) (int) instTree.getProperty ("avDepth", 0);
         inst->autoVib.rate  = (uint8_t) (int) instTree.getProperty ("avRate",  0);
+        inst->mono            = (bool)  instTree.getProperty ("mono", false);
+        inst->portamentoTimeMs = (float) (double) instTree.getProperty ("portamentoMs", 80.0);
 
         auto readEnv = [&](FT2Envelope& e, const String& prefix)
         {
