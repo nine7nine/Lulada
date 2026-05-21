@@ -4320,16 +4320,23 @@ public:
                 s->loopMode = (SamplerLoopMode) (loopCombo.getSelectedId() - 1);
             waveformView.repaint();
         };
-        addAndMakeVisible (loopCombo);
+        /* loopCombo is no longer surfaced on Bank — loop mode + range
+         * editing lives on the Sample page (SamplerSamplePage::loopRadio
+         * + canvas).  Object kept for reuse in case Bank-side quick-loop
+         * comes back; not added to the page. */
 
         addAndMakeVisible (waveformView);
 
-        /* Tab strip: Vol Env / Pan Env / AutoVib+Fadeout. */
+        /* Envelope tabs (Vol / Pan / AutoVib) live on the Inst page
+         * (SamplerInstPage) — the duplicate set on Bank was confusing,
+         * so we leave the tab content components wired (for state
+         * round-trip across page switches) but don't surface the tab
+         * strip on Bank.  Bank focuses on the slot grid + sample
+         * preview waveform; per-slot params row above stays. */
         tabBar.addTab ("Vol",     Colour { 0xff'18'18'18 }, &volEnvWrap,    false);
         tabBar.addTab ("Pan",     Colour { 0xff'18'18'18 }, &panEnvWrap,    false);
         tabBar.addTab ("AutoVib", Colour { 0xff'18'18'18 }, &autoVibWrap,   false);
         tabBar.setTabBarDepth (22);
-        addAndMakeVisible (tabBar);
 
         /* Add / Del envelope-point buttons inside the Bank-page Vol/Pan
          * tabs.  Shared logic with the Inst page so envelopes are
@@ -4479,15 +4486,12 @@ public:
         relSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         fineSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         volSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
-        panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (4);
-        loopCombo.setBounds (bankR.removeFromTop (rowH));   bankR.removeFromTop (6);
+        panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (8);
 
-        /* Remaining vertical splits 55% waveform / 45% tabbed envelope. */
-        const int splitH = bankR.getHeight();
-        const int waveH = juce::jmax (140, (splitH - 8) * 11 / 20);
-        waveformView.setBounds (bankR.removeFromTop (waveH));
-        bankR.removeFromTop (8);
-        tabBar.setBounds (bankR);
+        /* Waveform preview takes the rest of the right column.  Envelope
+         * tabBar + loopCombo are no longer surfaced on Bank — see Inst /
+         * Sample pages. */
+        waveformView.setBounds (bankR);
     }
 
     /** Switch the visible body page and update tab toggle state. */
@@ -4512,11 +4516,11 @@ public:
         fineSlider   .setVisible (bank);
         volSlider    .setVisible (bank);
         panSlider    .setVisible (bank);
-        loopCombo    .setVisible (bank);
         waveformView .setVisible (bank);
-        tabBar       .setVisible (bank);
         interpCombo  .setVisible (bank);
         status       .setVisible (bank);
+        /* loopCombo + tabBar are no longer added to the Bank page — see
+         * note in the ctor where the addAndMakeVisible was removed. */
 
         instPage_   .setVisible (inst);
         samplePage_ .setVisible (sample);
