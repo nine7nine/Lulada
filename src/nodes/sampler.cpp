@@ -569,12 +569,41 @@ public:
         slotPan = pan;
         setVoiceGain (gain, pan);
 
-        /* Reset FT2 envelope + fadeout + autoVib state. */
+        /* Reset FT2 envelope + fadeout + autoVib state.
+         *
+         * Pre-seed the envelope state to "we just arrived at points[0]"
+         * instead of (pos=0, tick=0, value=0).  advanceEnvelope does
+         * ++tick BEFORE the `tick == points[pos].x` check, so the
+         * landing-on-point-0 case (typical: points[0].x == 0) could
+         * never fire and value sat at 0 forever.  Combined with
+         * applyEnvelopeToVoice multiplying fEnvVol(=0) into gain,
+         * the voice played at full baseline gain for one tick then
+         * snapped to zero — audible click on every note when
+         * envelopes were enabled.
+         *
+         * Seeded state: tick = points[0].x, value = points[0].y * 256,
+         * pos = 1 (next target), delta = lerp slope to points[1]
+         * (or 0 if it's a single-point envelope). */
         keyOff = false;
-        volEnvPos = 0;  volEnvTick = 0;  volEnvDelta = 0;
-        panEnvPos = 0;  panEnvTick = 0;  panEnvDelta = 0;
-        volEnvValue = 0;
-        panEnvValue = 0;
+        auto seedEnv = [] (const FT2Envelope& env, uint8_t& pos, uint16_t& tick,
+                           int16_t& value, int16_t& delta)
+        {
+            pos = 0; tick = 0; value = 0; delta = 0;
+            if (! (env.flags & FT2Envelope::kEnabled)) return;
+            if (env.length == 0) return;
+
+            tick  = (uint16_t) env.points[0].x;
+            value = (int16_t) ((int8_t) env.points[0].y << 8);
+            pos   = 1;
+            if (pos < env.length)
+            {
+                const int16_t xDiff = (int16_t) (env.points[1].x - env.points[0].x);
+                const int8_t  yDiff = (int8_t)  (env.points[1].y - env.points[0].y);
+                if (xDiff > 0) delta = (int16_t) ((yDiff << 8) / xDiff);
+            }
+        };
+        seedEnv (instrument->volumeEnv, volEnvPos, volEnvTick, volEnvValue, volEnvDelta);
+        seedEnv (instrument->panEnv,    panEnvPos, panEnvTick, panEnvValue, panEnvDelta);
         fadeoutVol = 32768;
         autoVibPos = 0;  autoVibAmp = 0;  autoVibSweepCounter = 0;
         if (instrument != nullptr && instrument->autoVib.depth > 0)
@@ -601,6 +630,13 @@ public:
         adsr.setParameters (p);
         adsr.reset();
         adsr.noteOn();
+
+        /* Apply envelope multiplier to voice gain BEFORE the first
+         * mixChunk so the initial samples already reflect
+         * points[0].y — otherwise the first tick boundary inside
+         * renderNextBlock would jump from baseline gain to env-scaled
+         * gain, producing a step discontinuity on every note. */
+        applyEnvelopeToVoice();
     }
 
     void stopNote (float /*velocity*/, bool allowTailOff) override
@@ -949,7 +985,11 @@ private:
             pan = juce::jlimit (0.0f, 1.0f, slotPan + delta * panMul);
         }
 
-        setVoiceGain (gain, pan);
+        /* Ramp gain change from current to new target over one
+         * envelope tick — kills the periodic 50 Hz step-discontinuity
+         * buzz that piecewise-constant per-tick gain produces.  See
+         * setVoiceGain doc above. */
+        setVoiceGain (gain, pan, /*useRamp=*/true);
 
         /* autoVib pitch modulation. */
         if (instrument->autoVib.depth > 0)
@@ -979,9 +1019,26 @@ private:
         voice.delta = (uint64_t) jlimit (0.0, 1e18, playRate * 4294967296.0);
     }
 
-    void setVoiceGain (float gain, float pan)
+    /** Update voice L/R gain.  When @p useRamp is true, set fCurrVolume
+     *  alone and configure the ft2 mixer's per-sample ramp (fVolume*Delta
+     *  + volumeRampLength) to glide toward the new fTargetVolume over one
+     *  envelope tick worth of samples.  When false, snap the new gain
+     *  instantly (clear ramp fields).
+     *
+     *  Why: the ft2 mixer's RENDER_*_SMP macros already increment
+     *  fVolumeL/R by fVolume*Delta on every output sample (see
+     *  src/engine/sampler/ft2_mix_macros.h).  By zeroing the ramp fields
+     *  on every gain update we forced piecewise-constant gain — every
+     *  FT2 envelope tick (50 Hz) became a hard step change, producing a
+     *  periodic 50 Hz buzz / clicking train during held notes (worse
+     *  during live envelope edits when the deltas are larger).
+     *  Targeting one-tick rampLength makes the next tick's update land
+     *  right as the previous ramp finishes → continuous gain envelope. */
+    void setVoiceGain (float gain, float pan, bool useRamp = false)
     {
         voice.fVolume = gain;
+
+        float newL, newR;
         if (slotIsStereo)
         {
             const float r = jmax (0.0f, 2.0f * (pan - 0.5f));
@@ -990,19 +1047,41 @@ private:
             gRR = gain * (1.0f - l);
             gLR = gain * r;
             gRL = gain * l;
-            voice.fCurrVolumeL = gLL;
-            voice.fCurrVolumeR = gLR;
+            newL = gLL;
+            newR = gLR;
+
+            /* Stereo path can't honour the per-sample ramp because
+             * mixChunk overwrites voice.fCurrVolume{L,R} from the
+             * per-pass cross-mix terms (gLL/gLR/gRL/gRR) on every
+             * block.  Force instant set here; stereo smoothing would
+             * need per-cross-mix persistent current values + ramped
+             * targets — TODO. */
+            useRamp = false;
         }
         else
         {
-            voice.fCurrVolumeL = gain * (1.0f - pan);
-            voice.fCurrVolumeR = gain *          pan;
+            newL = gain * (1.0f - pan);
+            newR = gain *          pan;
         }
-        voice.fTargetVolumeL = voice.fCurrVolumeL;
-        voice.fTargetVolumeR = voice.fCurrVolumeR;
-        voice.fVolumeLDelta  = 0.0f;
-        voice.fVolumeRDelta  = 0.0f;
-        voice.volumeRampLength = 0;
+
+        voice.fTargetVolumeL = newL;
+        voice.fTargetVolumeR = newR;
+
+        if (useRamp)
+        {
+            const int rampSamples = juce::jmax (1, owner.getSamplesPerEnvTick());
+            voice.volumeRampLength = (uint32_t) rampSamples;
+            voice.fVolumeLDelta = (newL - voice.fCurrVolumeL) / (float) rampSamples;
+            voice.fVolumeRDelta = (newR - voice.fCurrVolumeR) / (float) rampSamples;
+        }
+        else
+        {
+            voice.fCurrVolumeL = newL;
+            voice.fCurrVolumeR = newR;
+            voice.fVolumeLDelta = 0.0f;
+            voice.fVolumeRDelta = 0.0f;
+            voice.volumeRampLength = 0;
+        }
     }
 
     SamplerNode& owner;
