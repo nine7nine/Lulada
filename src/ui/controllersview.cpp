@@ -676,33 +676,43 @@ public:
         {
             auto name = editedDevice.getName().toString();
             if (name.isEmpty())
-                name << "Controller";
-            name << ".xml";
+                name = "Controller";
 
-            FileChooser chooser ("Save Controller Device",
-                                 DataPath::defaultControllersDir().getChildFile (name).getNonexistentSibling(),
-                                 "*.xml",
-                                 true,
-                                 false);
-            if (chooser.browseForFileToSave (true))
-            {
-                DBG ("[element] save device");
-                if (auto xml = editedDevice.data().createXml())
-                    xml->writeTo (chooser.getResult());
-            }
+            auto suggested = DataPath::defaultControllersDir()
+                                .getChildFile (name + ".xml")
+                                .getNonexistentSibling().getFileName();
+
+            auto deviceXml = editedDevice.data().createXml();
+            auto* gui = ViewHelpers::findContentComponent (this)->services().find<GuiService>();
+            if (gui == nullptr || deviceXml == nullptr) return;
+            /* deviceXml is moved into the lambda — capture by shared_ptr so the
+             * callback can outlive this stack frame safely if the user
+             * navigates / waits before clicking Confirm. */
+            std::shared_ptr<juce::XmlElement> xmlShared (std::move (deviceXml));
+            gui->requestFile ("Save Controller Device", "*.xml",
+                              DataPath::defaultControllersDir(),
+                              suggested, /*isSave*/ true,
+                              [xmlShared](const juce::File& f) {
+                                  if (xmlShared) xmlShared->writeTo (f);
+                              });
         }
         else if (button == &openControllerButton)
         {
-            FileChooser chooser ("Open Controller Device",
-                                 DataPath::defaultControllersDir(),
-                                 "*.xml",
-                                 true,
-                                 false);
-            if (chooser.browseForFileToOpen())
-            {
-                ViewHelpers::postMessageFor (this,
-                                             new AddControllerMessage (chooser.getResult()));
-            }
+            auto* cc = ViewHelpers::findContentComponent (this);
+            if (cc == nullptr) return;
+            auto* gui = cc->services().find<GuiService>();
+            if (gui == nullptr) return;
+            /* Capture `this` via SafePointer — the postMessageFor must
+             * route through a live ControllersView. */
+            Component::SafePointer<Component> safeThis (this);
+            gui->requestFile ("Open Controller Device", "*.xml",
+                              DataPath::defaultControllersDir(),
+                              {}, /*isSave*/ false,
+                              [safeThis](const juce::File& f) {
+                                  if (! safeThis) return;
+                                  ViewHelpers::postMessageFor (safeThis.getComponent(),
+                                                               new AddControllerMessage (f));
+                              });
         }
     }
 

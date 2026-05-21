@@ -26,6 +26,14 @@ public:
     void saveSession (const bool saveAs = false,
                       const bool askForFile = true,
                       const bool showError = true);
+
+    /** Save the current session to a specific file, bypassing the
+        FileChooser path entirely.  Used by the Disk Op page which IS
+        the user's file picker — letting saveSession(saveAs=true) pop
+        its own juce::FileChooser there would defeat the point.
+        Returns true on a successful save. */
+    bool saveSessionTo (const File& target);
+
     void newSession();
     bool hasSessionChanged();
 

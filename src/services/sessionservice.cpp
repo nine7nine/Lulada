@@ -213,40 +213,15 @@ void SessionService::saveSession (const bool saveAs, const bool askForFile, cons
 
     sigWillSave();
 
-    // Save-As path: bypass FileBasedDocument::saveAsInteractive — it
-    // forces useOSNativeDialogBox=true on its internal FileChooser,
-    // and Wine's IFileDialog never surfaces under winelib Element
-    // (no zenity / KDE bridge fires either), so the dialog hangs and
-    // the save silently never happens.  Run our own JUCE-internal
-    // chooser instead, then route the chosen file through document
-    // ->saveAs(...) which is the same write path saveAsInteractive
-    // would have used after the picker returned.
-    if (saveAs)
-    {
-        File initial = document->getFile();
-        if (initial == File())
-            initial = document->getSuggestedSaveAsFile (File());
+    /* Save-As path now lives at the call site as a GuiService::requestFile
+     * onAccept that hits saveSessionTo() directly — see the
+     * Commands::sessionSaveAs handler in guiservice.cpp.  Keeping the
+     * `saveAs` param for API stability; callers that pass true must now
+     * route via requestFile + saveSessionTo instead. */
+    jassert (! saveAs);
+    if (saveAs) return;
 
-        // parentComponent = gui.content() — embed the chooser on the
-        // main window so it picks up the same centred / decoration-
-        // free style as the VST-path AlertWindow, instead of opening
-        // as a top-level X11 window with no decoration under winelib.
-        FileChooser chooser (TRANS ("Save Session As"), initial, "*.els",
-                             false /* JUCE internal */, false,
-                             gui.content());
-        if (! chooser.browseForFileToSave (true))
-            return; // user cancelled
-
-        File chosen = chooser.getResult();
-        if (chosen.getFileExtension() != ".els")
-            chosen = chosen.withFileExtension (".els");
-
-        result = document->saveAs (chosen, true, true, true);
-    }
-    else
-    {
-        result = document->save (askForFile, showError);
-    }
+    result = document->save (askForFile, showError);
 
     if (result == FileBasedDocument::userCancelledSave)
         return;
@@ -268,6 +243,43 @@ void SessionService::saveSession (const bool saveAs, const bool askForFile, cons
                                                 nullptr);
         }
     }
+}
+
+bool SessionService::saveSessionTo (const File& target)
+{
+    jassert (document && currentSession);
+    if (target == File()) return false;
+
+    auto& gui = *sibling<GuiService>();
+    if (auto* cc = gui.content())
+    {
+        String state;
+        cc->getSessionState (state);
+        auto ui = currentSession->data().getOrCreateChildWithName (tags::ui, nullptr);
+        ui.setProperty ("content", state, nullptr);
+    }
+
+    sigWillSave();
+
+    /* Normalize extension — same fixup the FileChooser-driven path does
+     * after the user picks. */
+    File chosen = (target.getFileExtension() == ".els")
+                      ? target
+                      : target.withFileExtension (".els");
+
+    const auto result = document->saveAs (chosen, true, true, true);
+    if (result != FileBasedDocument::savedOk) return false;
+
+    currentSession->dispatchPendingMessages();
+    document->setChangedFlag (false);
+    if (auto* us = context().settings().getUserSettings())
+        us->setValue (Settings::lastSessionKey, document->getFile().getFullPathName());
+
+    sibling<UI>()->recentFiles().addFile (document->getFile());
+    currentSession->data().setProperty (tags::name,
+                                        document->getFile().getFileNameWithoutExtension(),
+                                        nullptr);
+    return true;
 }
 
 void SessionService::newSession()

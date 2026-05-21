@@ -95,6 +95,16 @@ private:
     bool allowAsync;
     int numThreads;
 
+    // Inline scan-progress strip, drawn at the bottom of the panel
+    // only while a scan is running.  Replaces the JUCE AlertWindow
+    // popup that rendered without decoration / behind the embedded
+    // content view under winelib X11.
+    double scanProgressValue { 0.0 };
+    bool scanInProgress { false };
+    Label scanLabel;
+    ProgressBar scanProgress { scanProgressValue };
+    TextButton cancelScanButton;
+
     class TableModel;
     std::unique_ptr<TableListBoxModel> tableModel;
 

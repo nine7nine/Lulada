@@ -14,11 +14,13 @@
 #include <element/processor.hpp>
 #include <element/node.h>
 #include <element/engine.hpp>
+#include <element/ui.hpp>
 
 using namespace juce;
 
 #include "ui/pluginmanagercomponent.hpp"  /* uses unqualified juce types */
 #include "nodes/sampler.hpp"
+#include "services/sessionservice.hpp"
 
 namespace element {
 
@@ -333,10 +335,13 @@ public:
         stopTimer();
     }
 
-    /** Activation listener — double-click in the file browser. */
+    /** Activation listener — double-click in the file browser.  Skip
+     *  when a one-shot DiskOpService::Request is in flight; the
+     *  RequestPane handles the activation in that case. */
     void changeListenerCallback (ChangeBroadcaster*) override
     {
         if (! isShowing()) return;
+        if (DiskOpService::get().hasPendingRequest()) return;
         loadIntoSelectedSlot();
     }
 
@@ -359,6 +364,8 @@ public:
             { if (model) model->onInstrumentSelected (sel); }
         void listBoxItemDoubleClicked (int row, const MouseEvent&) override
             { if (model) model->renameInstrument (row); }
+        void deleteKeyPressed (int lastRow) override
+            { if (model) model->clearInstrumentInPlace (lastRow); }
     } instrumentList_;
 
     struct SlotAdapter : public ListBoxModel {
@@ -370,6 +377,8 @@ public:
         void listBoxItemDoubleClicked (int row, const MouseEvent&) override
             { if (model) { model->slotList_.list.selectRow (row);
                            model->loadIntoSelectedSlot(); } }
+        void deleteKeyPressed (int lastRow) override
+            { if (model) model->clearSlotInPlace (lastRow); }
     } slotList_;
 
     void resized() override
@@ -677,6 +686,40 @@ private:
         slotList_.list.repaint();
     }
 
+    /** Delete-key handler on the slot list.  Empties the selected slot
+     *  without disturbing other slots in the bank. */
+    void clearSlotInPlace (int row)
+    {
+        if (row < 0 || row >= kNumSlotsPerBank) return;
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        auto inst = sn->getInstrument (activeInstrument_);
+        if (inst == nullptr) return;
+        inst->clearSlot (row);
+        instrumentList_.list.repaint();
+        slotList_.list.repaint();
+    }
+
+    /** Delete-key handler on the instrument list.  Wipes the bank's 32
+     *  sample slots + clears the user-set name.  Uses
+     *  SamplerInstrument::clear() rather than SamplerNode::
+     *  removeInstrument so the 128-row table indices stay stable. */
+    void clearInstrumentInPlace (int row)
+    {
+        if (row < 0 || row >= kNumBanks) return;
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        auto inst = sn->getInstrument (row);
+        if (inst == nullptr) return;        /* row past lazy alloc — nothing to clear */
+        inst->clear();
+        instrumentList_.list.repaint();
+        if (row == activeInstrument_)
+        {
+            slotList_.list.updateContent();
+            slotList_.list.repaint();
+        }
+    }
+
     /** Fill the active bank's 16 slots with audio files from the
      *  DiskOp's current directory.  Picks the first 16 audio files in
      *  alphabetical order, matching the active mode's wildcard. */
@@ -726,6 +769,429 @@ private:
     Label title_, instrumentLabel_, slotsLabel_;
     ComboBox samplerCombo_;
     TextButton addSamplerBtn_, refreshBtn_, loadBtn_, loadBankBtn_;
+};
+
+
+/* ===========================================================================
+ * SessionPane — Session mode's right-side content.  New / Open / Save /
+ * Save-As + recents list.  Replaces the placeholder text the Disk Op
+ * page used to show in Session mode.
+ *
+ * Design intent: the DiskOp IS the chooser.  No juce::FileChooser
+ * ever surfaces from this pane — Open consumes the file browser's
+ * current selection (or the activation signal from double-click),
+ * Save uses the current document path, Save As uses the typed
+ * filename + current directory.
+ * ========================================================================*/
+class SessionPane : public Component,
+                    private Timer,
+                    private ChangeListener
+{
+public:
+    SessionPane()
+    {
+        title_.setText ("Session", dontSendNotification);
+        title_.setColour (Label::textColourId, kTextColour);
+        title_.setFont (FontOptions (
+                                     kHeaderFontSize, Font::bold));
+        addAndMakeVisible (title_);
+
+        currentLabel_.setColour (Label::textColourId, kMutedText);
+        currentLabel_.setFont (FontOptions ( kFontSize, Font::plain));
+        currentLabel_.setText ("Current: (none)", dontSendNotification);
+        addAndMakeVisible (currentLabel_);
+
+        configureBtn (newBtn_,    "New",     [this] { newSession(); });
+        configureBtn (openBtn_,   "Open",    [this] { openSelected(); });
+        configureBtn (saveBtn_,   "Save",    [this] { saveSession(); });
+        configureBtn (saveAsBtn_, "Save As", [this] { saveAsTypedFilename(); });
+
+        recentsLabel_.setText ("Recent sessions", dontSendNotification);
+        recentsLabel_.setColour (Label::textColourId, kMutedText);
+        recentsLabel_.setFont (FontOptions ( kFontSize, Font::plain));
+        addAndMakeVisible (recentsLabel_);
+
+        recents_.model = this;
+        recents_.list.setModel (&recents_);
+        recents_.list.setRowHeight (20);
+        recents_.list.setColour (ListBox::backgroundColourId, kBgColour);
+        recents_.list.setColour (ListBox::outlineColourId,    kOutlineColour);
+        recents_.list.setOutlineThickness (1);
+        addAndMakeVisible (recents_.list);
+
+        DiskOpService::get().activations.addChangeListener (this);
+        startTimerHz (2);
+    }
+
+    ~SessionPane() override
+    {
+        DiskOpService::get().activations.removeChangeListener (this);
+        stopTimer();
+    }
+
+    void connect (Services* services)
+    {
+        services_ = services;
+        refreshRecents();
+        refreshCurrent();
+    }
+
+    /** File-browser double-click → if Session mode and the activated
+     *  file is an .els, treat as Open.  Skip when a one-shot request
+     *  is in flight (RequestPane handles activation). */
+    void changeListenerCallback (ChangeBroadcaster*) override
+    {
+        if (! isShowing()) return;
+        if (DiskOpService::get().hasPendingRequest()) return;
+        const auto sel = DiskOpService::get().getSelectedFile();
+        if (sel.hasFileExtension ("els"))
+            openFile (sel);
+    }
+
+    struct RecentsAdapter : public ListBoxModel {
+        SessionPane* model = nullptr;
+        ListBox list;
+        int getNumRows() override { return model ? model->recentFiles_.size() : 0; }
+        void paintListBoxItem (int row, Graphics& g, int w, int h, bool sel) override
+            { if (model) model->paintRecentRow (row, g, w, h, sel); }
+        void listBoxItemDoubleClicked (int row, const MouseEvent&) override
+            { if (model && row >= 0 && row < model->recentFiles_.size())
+                  model->openFile (model->recentFiles_[row]); }
+    } recents_;
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (4);
+        title_.setBounds (r.removeFromTop (18));
+        r.removeFromTop (4);
+
+        currentLabel_.setBounds (r.removeFromTop (18));
+        r.removeFromTop (8);
+
+        auto btnRow = r.removeFromTop (26);
+        newBtn_   .setBounds (btnRow.removeFromLeft (62)); btnRow.removeFromLeft (4);
+        openBtn_  .setBounds (btnRow.removeFromLeft (62)); btnRow.removeFromLeft (4);
+        saveBtn_  .setBounds (btnRow.removeFromLeft (62)); btnRow.removeFromLeft (4);
+        saveAsBtn_.setBounds (btnRow.removeFromLeft (82));
+        r.removeFromTop (10);
+
+        recentsLabel_.setBounds (r.removeFromTop (16));
+        r.removeFromTop (2);
+        recents_.list.setBounds (r);
+    }
+
+    void paintRecentRow (int row, Graphics& g, int w, int h, bool sel)
+    {
+        if (sel) { g.setColour (kAccentBlue.withAlpha (0.3f)); g.fillRect (0, 0, w, h); }
+        if (row < 0 || row >= recentFiles_.size()) return;
+        const auto f = recentFiles_[row];
+        g.setColour (kTextColour);
+        g.setFont (FontOptions ( kFontSize, Font::plain));
+        g.drawText (f.getFileNameWithoutExtension(),
+                    6, 0, w - 12, h, Justification::centredLeft);
+    }
+
+private:
+    SessionService* session() const
+    {
+        return services_ ? services_->find<SessionService>() : nullptr;
+    }
+
+    UI* ui() const
+    {
+        return services_ ? services_->find<UI>() : nullptr;
+    }
+
+    void timerCallback() override
+    {
+        if (! isShowing()) return;
+        /* Cheap — recent-files list + the current-file label are small.
+         * Both can change out from under us (Open from menu, Save from
+         * elsewhere) so re-poll at 2Hz with a content-diff cutoff. */
+        const int sizeBefore = recentFiles_.size();
+        refreshRecents();
+        refreshCurrent();
+        if (recentFiles_.size() != sizeBefore)
+            recents_.list.updateContent();
+    }
+
+    void refreshRecents()
+    {
+        recentFiles_.clearQuick();
+        if (auto* u = ui())
+        {
+            auto& list = u->recentFiles();
+            for (int i = 0; i < list.getNumFiles(); ++i)
+                recentFiles_.add (list.getFile (i));
+        }
+        recents_.list.repaint();
+    }
+
+    void refreshCurrent()
+    {
+        const auto cur = currentSessionFile();
+        const String text = cur.existsAsFile()
+                              ? ("Current: " + cur.getFullPathName())
+                              : String ("Current: (unsaved)");
+        if (currentLabel_.getText() != text)
+            currentLabel_.setText (text, dontSendNotification);
+    }
+
+    File currentSessionFile() const
+    {
+        if (auto* s = session()) return s->getSessionFile();
+        return {};
+    }
+
+    void openSelected()
+    {
+        /* Pick the file the browser column has selected, or the
+         * filename field's typed path resolved against cwd. */
+        File f = DiskOpService::get().getSelectedFile();
+        if (! f.existsAsFile())
+        {
+            const auto typed = DiskOpService::get().getFilename();
+            if (typed.isNotEmpty())
+                f = DiskOpService::get().getCurrentDirectory().getChildFile (typed);
+        }
+        openFile (f);
+    }
+
+    void openFile (const File& f)
+    {
+        if (! f.existsAsFile()) return;
+        if (! f.hasFileExtension ("els")) return;
+        if (auto* s = session())
+        {
+            s->openFile (f);
+            refreshCurrent();
+            refreshRecents();
+            recents_.list.updateContent();
+        }
+    }
+
+    void newSession()
+    {
+        if (auto* s = session())
+        {
+            s->newSession();
+            refreshCurrent();
+        }
+    }
+
+    void saveSession()
+    {
+        if (auto* s = session())
+        {
+            const auto cur = s->getSessionFile();
+            if (cur.existsAsFile())
+            {
+                /* Save to existing file — silent, no chooser. */
+                s->saveSession (false, false, true);
+            }
+            else
+            {
+                /* No prior file — fall through to Save As path so the
+                 * user doesn't quietly create a new session somewhere
+                 * unexpected via FileBasedDocument's interactive save. */
+                saveAsTypedFilename();
+            }
+            refreshCurrent();
+            refreshRecents();
+        }
+    }
+
+    void saveAsTypedFilename()
+    {
+        auto* s = session();
+        if (s == nullptr) return;
+
+        const auto dir = DiskOpService::get().getCurrentDirectory();
+        if (! dir.isDirectory()) return;
+
+        String typed = DiskOpService::get().getFilename().trim();
+        if (typed.isEmpty())
+        {
+            /* Use the current session's filename if any, else a
+             * timestamped fallback so the save never silently dumps
+             * into "Untitled.els" overwriting. */
+            const auto cur = s->getSessionFile();
+            typed = cur.existsAsFile()
+                      ? cur.getFileName()
+                      : ("session-" + Time::getCurrentTime().formatted ("%Y%m%d-%H%M%S") + ".els");
+        }
+
+        if (! typed.endsWithIgnoreCase (".els"))
+            typed = typed + ".els";
+
+        File target = dir.getChildFile (typed);
+        if (s->saveSessionTo (target))
+        {
+            refreshCurrent();
+            refreshRecents();
+            recents_.list.updateContent();
+        }
+    }
+
+    void configureBtn (TextButton& b, const String& text,
+                       std::function<void()> on)
+    {
+        b.setButtonText (text);
+        b.onClick = std::move (on);
+        b.setColour (TextButton::buttonColourId, kPanelColour);
+        b.setColour (TextButton::textColourOffId, kTextColour);
+        addAndMakeVisible (b);
+    }
+
+    Services* services_ = nullptr;
+    Label title_, currentLabel_, recentsLabel_;
+    TextButton newBtn_, openBtn_, saveBtn_, saveAsBtn_;
+    Array<File> recentFiles_;
+};
+
+
+/* ===========================================================================
+ * RequestPane — overlay that owns the right pane while a one-shot
+ * DiskOpService::Request is armed (Open / Save dialog replacement).
+ * Shown in place of the SampleBank / Session / PluginPaths pane until
+ * the user clicks Confirm or Cancel, or the request is completed via
+ * file-browser activation (double-click).
+ * ========================================================================*/
+class RequestPane : public Component,
+                    private ChangeListener
+{
+public:
+    RequestPane()
+    {
+        title_.setColour (Label::textColourId, kAccentAmber);
+        title_.setFont (FontOptions (
+                                     kHeaderFontSize, Font::bold));
+        title_.setJustificationType (Justification::centredLeft);
+        addAndMakeVisible (title_);
+
+        prompt_.setColour (Label::textColourId, kMutedText);
+        prompt_.setFont (FontOptions ( kFontSize, Font::plain));
+        addAndMakeVisible (prompt_);
+
+        configureBtn (confirmBtn_, "Confirm", [this] { onConfirm(); });
+        confirmBtn_.setColour (TextButton::buttonColourId, Colour { 0xff'30'4a'30 });
+        confirmBtn_.setColour (TextButton::textColourOffId, kAccentAmber);
+
+        configureBtn (cancelBtn_, "Cancel", [this] { onCancel(); });
+
+        DiskOpService::get().activations.addChangeListener (this);
+        sync();
+    }
+
+    ~RequestPane() override
+    {
+        DiskOpService::get().activations.removeChangeListener (this);
+    }
+
+    /** Re-sync when the service signals a change (request armed / dirty
+     *  filename / selection updated). */
+    void sync()
+    {
+        const auto* req = DiskOpService::get().getPendingRequest();
+        if (req == nullptr) return;
+
+        title_.setText (req->title, dontSendNotification);
+        prompt_.setText (req->isSave
+                           ? String ("Type a filename and press Confirm.")
+                           : String ("Pick a file from the browser and press Confirm,\n"
+                                     "or double-click the file directly."),
+                         dontSendNotification);
+    }
+
+    /** Activation broadcaster — for open requests, treat double-click
+     *  as Confirm.  Save requests ignore activations (just navigation). */
+    void changeListenerCallback (ChangeBroadcaster*) override
+    {
+        const auto* req = DiskOpService::get().getPendingRequest();
+        if (req == nullptr) return;
+        if (req->isSave)   return;
+        const auto sel = DiskOpService::get().getSelectedFile();
+        if (sel.existsAsFile())
+            DiskOpService::get().completeRequest (sel);
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (10);
+        title_ .setBounds (r.removeFromTop (22));
+        r.removeFromTop (4);
+        prompt_.setBounds (r.removeFromTop (44));
+        r.removeFromTop (10);
+
+        auto btnRow = r.removeFromTop (28);
+        confirmBtn_.setBounds (btnRow.removeFromLeft (84)); btnRow.removeFromLeft (6);
+        cancelBtn_ .setBounds (btnRow.removeFromLeft (84));
+    }
+
+private:
+    void onConfirm()
+    {
+        const auto* req = DiskOpService::get().getPendingRequest();
+        if (req == nullptr) return;
+
+        File chosen;
+        if (req->isSave)
+        {
+            const auto dir = DiskOpService::get().getCurrentDirectory();
+            String name = DiskOpService::get().getFilename().trim();
+            if (! dir.isDirectory()) return;
+            if (name.isEmpty()) name = req->initialFilename;
+            if (name.isEmpty()) return;
+
+            /* Normalize extension against the request's wildcard
+             * (e.g. *.els → ".els").  If the wildcard is "*" or
+             * compound, leave the user's input alone. */
+            const auto ext = wildcardToExtension (req->wildcard);
+            if (ext.isNotEmpty() && ! name.endsWithIgnoreCase (ext))
+                name = name + ext;
+
+            chosen = dir.getChildFile (name);
+        }
+        else
+        {
+            chosen = DiskOpService::get().getSelectedFile();
+            if (! chosen.existsAsFile())
+            {
+                /* Fall back to typed-filename path under cwd. */
+                const auto typed = DiskOpService::get().getFilename().trim();
+                if (typed.isNotEmpty())
+                    chosen = DiskOpService::get().getCurrentDirectory().getChildFile (typed);
+            }
+            if (! chosen.existsAsFile()) return;
+        }
+
+        DiskOpService::get().completeRequest (chosen);
+    }
+
+    void onCancel() { DiskOpService::get().cancelRequest(); }
+
+    static String wildcardToExtension (const String& wildcard)
+    {
+        if (wildcard.isEmpty()) return {};
+        if (wildcard == "*")    return {};
+        /* "*.els"  → ".els";  "*.els;*.xml" → "" (ambiguous). */
+        if (wildcard.contains (";")) return {};
+        const int dot = wildcard.indexOf (".");
+        if (dot < 0) return {};
+        return wildcard.substring (dot);
+    }
+
+    void configureBtn (TextButton& b, const String& text, std::function<void()> on)
+    {
+        b.setButtonText (text);
+        b.onClick = std::move (on);
+        b.setColour (TextButton::buttonColourId, kPanelColour);
+        b.setColour (TextButton::textColourOffId, kTextColour);
+        addAndMakeVisible (b);
+    }
+
+    Label title_, prompt_;
+    TextButton confirmBtn_, cancelBtn_;
 };
 
 
@@ -822,12 +1288,14 @@ public:
         sampleBank_ = std::make_unique<SampleBankPane>();
         addChildComponent (*sampleBank_);
 
-        /* Mode-extras placeholder for Session mode (until that wires in). */
-        extrasPlaceholder_.setJustificationType (Justification::centred);
-        extrasPlaceholder_.setColour (Label::textColourId, kMutedText);
-        extrasPlaceholder_.setFont (FontOptions (
-            Font::getDefaultMonospacedFontName(), kFontSize, Font::plain));
-        addChildComponent (extrasPlaceholder_);
+        /* Session pane — visible in Session mode. */
+        sessionPane_ = std::make_unique<SessionPane>();
+        addChildComponent (*sessionPane_);
+
+        /* Request overlay — visible only when DiskOpService has a
+         * one-shot Open/Save request armed. */
+        requestPane_ = std::make_unique<RequestPane>();
+        addChildComponent (*requestPane_);
 
         syncFromService();
     }
@@ -841,7 +1309,8 @@ public:
         auto* propsFile = services.context().settings().getUserSettings();
         for (auto& s : pluginPathsSections_)
             s->connect (&pm, propsFile);
-        if (sampleBank_) sampleBank_->connect (&services);
+        if (sampleBank_)  sampleBank_->connect (&services);
+        if (sessionPane_) sessionPane_->connect (&services);
     }
 
     ~Impl() override { browser_.removeListener (this); }
@@ -931,12 +1400,22 @@ public:
         const auto mode = svc.getMode();
         const bool pluginPaths = mode == DiskOpService::Mode::kPluginPaths;
         const bool sampleMode  = mode == DiskOpService::Mode::kSample;
+        const bool sessionMode = mode == DiskOpService::Mode::kSession;
+        const bool requestActive = svc.hasPendingRequest();
 
-        for (auto& s : pluginPathsSections_) s->setVisible (pluginPaths);
-        if (sampleBank_) sampleBank_->setVisible (sampleMode);
-        extrasPlaceholder_.setVisible (! pluginPaths && ! sampleMode);
+        /* When a one-shot Open/Save request is active, the right pane is
+         * owned by RequestPane — every mode pane hides. */
+        for (auto& s : pluginPathsSections_) s->setVisible (pluginPaths && ! requestActive);
+        if (sampleBank_)  sampleBank_ ->setVisible (sampleMode  && ! requestActive);
+        if (sessionPane_) sessionPane_->setVisible (sessionMode && ! requestActive);
+        if (requestPane_) requestPane_->setVisible (requestActive);
 
-        if (pluginPaths && ! pluginPathsSections_.isEmpty())
+        if (requestActive && requestPane_)
+        {
+            requestPane_->setBounds (r);
+            requestPane_->sync();
+        }
+        else if (pluginPaths && ! pluginPathsSections_.isEmpty())
         {
             auto col = r;
             const int h = juce::jmax (60, col.getHeight() / 3);
@@ -950,9 +1429,9 @@ public:
         {
             sampleBank_->setBounds (r);
         }
-        else
+        else if (sessionMode && sessionPane_)
         {
-            extrasPlaceholder_.setBounds (r);
+            sessionPane_->setBounds (r);
         }
     }
 
@@ -1011,10 +1490,13 @@ public:
             browser_.setRoot (svc.getCurrentDirectory());
         }
 
-        /* Mode changed → re-layout to swap right-pane content. */
-        if (lastMode_ != svc.getMode())
+        /* Mode changed OR request-armed state flipped → re-layout to
+         * swap right-pane content. */
+        const bool reqNow = svc.hasPendingRequest();
+        if (lastMode_ != svc.getMode() || lastRequestActive_ != reqNow)
         {
             lastMode_ = svc.getMode();
+            lastRequestActive_ = reqNow;
             resized();
         }
     }
@@ -1045,9 +1527,15 @@ private:
     void applyWildcard()
     {
         auto& svc = DiskOpService::get();
-        const auto wildcard = allFiles_
-                               ? juce::String ("*")
-                               : DiskOpService::getWildcardForMode (svc.getMode());
+        /* Request-driven wildcard wins over the mode default — e.g.
+         * "Import Graph" wants *.elg even though the request mode hint
+         * is kSession. */
+        juce::String wildcard;
+        if (const auto* req = svc.getPendingRequest(); req != nullptr && req->wildcard.isNotEmpty())
+            wildcard = req->wildcard;
+        else
+            wildcard = allFiles_ ? juce::String ("*")
+                                 : DiskOpService::getWildcardForMode (svc.getMode());
         if (wildcard == currentWildcard_) return;
         currentWildcard_ = wildcard;
         browser_.setWildcard (wildcard);
@@ -1096,17 +1584,21 @@ private:
 
     /* Mode-extras right pane.  Plugin Paths mode shows 3 PluginPathsSection
      * children; Sample mode shows the SampleBankPane mirroring the active
-     * graph's first SamplerNode; Session mode currently shows a
-     * placeholder Label until session save/load wires up. */
+     * graph's first SamplerNode; Session mode shows the SessionPane
+     * (New / Open / Save / Save As + recents).  RequestPane temporarily
+     * replaces all of the above while a one-shot DiskOpService request
+     * is armed. */
     OwnedArray<PluginPathsSection> pluginPathsSections_;
     std::unique_ptr<SampleBankPane> sampleBank_;
-    Label extrasPlaceholder_ { {}, "Session recents — coming next iteration." };
+    std::unique_ptr<SessionPane>    sessionPane_;
+    std::unique_ptr<RequestPane>    requestPane_;
 
     Services* services_ = nullptr;
 
     /* Layout cache. */
     Rectangle<int> sidebarBounds_, toolbarBounds_, extrasBounds_;
     DiskOpService::Mode lastMode_ { (DiskOpService::Mode) -1 };
+    bool                lastRequestActive_ { false };
 };
 
 

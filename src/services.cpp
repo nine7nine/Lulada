@@ -328,6 +328,62 @@ void Services::handleMessage (const Message& msg)
         ec->addJackMidiOutputNode (jmom->portIndex);
     }
 #endif
+    else if (const auto* fxb = dynamic_cast<const FxbPresetMessage*> (&msg))
+    {
+       #if JUCE_PLUGINHOST_VST
+        auto* ui = find<UI>();
+        if (ui == nullptr) return;
+
+        const auto format = fxb->node.getProperty (tags::format).toString();
+        if (format != "VST") return;
+
+        const Node node = fxb->node;
+        if (fxb->load)
+        {
+            ui->requestFile ("Load FXB/FXP Preset", "*.fxb;*.fxp", File(), {},
+                             /*isSave*/ false,
+                             [node](const File& f) {
+                                 auto gn = node.getObject();
+                                 auto* proc = gn ? gn->getAudioPluginInstance() : nullptr;
+                                 if (proc == nullptr || ! f.existsAsFile()) return;
+                                 FileInputStream stream (f);
+                                 MemoryBlock block;
+                                 stream.readIntoMemoryBlock (block);
+                                 if (block.getSize() > 0)
+                                     VSTPluginFormat::loadFromFXBFile (proc, block.getData(), block.getSize());
+                             });
+        }
+        else
+        {
+            auto gn = node.getObject();
+            auto* proc = gn ? gn->getAudioPluginInstance() : nullptr;
+            if (proc == nullptr) return;
+
+            DataPath dataPath;
+            String path = "Presets/";
+            path << proc->getName();
+            const auto suggested = dataPath.getRootDir().getChildFile (path)
+                                          .withFileExtension ("fxp")
+                                          .getNonexistentSibling()
+                                          .getFileName();
+            ui->requestFile ("Save FXB/FXP Preset", "*.fxb;*.fxp",
+                             dataPath.getRootDir().getChildFile ("Presets"),
+                             suggested, /*isSave*/ true,
+                             [node](const File& f) {
+                                 auto gn2 = node.getObject();
+                                 auto* p2  = gn2 ? gn2->getAudioPluginInstance() : nullptr;
+                                 if (p2 == nullptr) return;
+                                 MemoryBlock block;
+                                 if (VSTPluginFormat::saveToFXBFile (p2, block, f.hasFileExtension ("fxb")))
+                                 {
+                                     FileOutputStream stream (f);
+                                     stream.write (block.getData(), block.getSize());
+                                     stream.flush();
+                                 }
+                             });
+        }
+       #endif
+    }
     else if (const auto* removeControllerMessage = dynamic_cast<const RemoveControllerMessage*> (&msg))
     {
         const auto device = removeControllerMessage->device;

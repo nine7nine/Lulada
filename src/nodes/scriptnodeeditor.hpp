@@ -48,7 +48,6 @@ private:
     ScriptNode::Ptr lua;
 
     FileBrowserComponent fileBrowser;
-    std::unique_ptr<FileChooser> chooser;
 
     void updateAll();
     void updatePreview();

@@ -21,9 +21,11 @@
 #include "auth.hpp"
 #include "engine/midipanic.hpp"
 #include "messages.hpp"
+#include "services/diskopservice.hpp"
 #include "services/sessionservice.hpp"
 #include "ui/aboutscreen.hpp"
 #include "ui/capslock.hpp"
+#include "ui/diskopview.hpp"
 #include "ui/pluginwindow.hpp"
 #include "ui/systemtray.hpp"
 #include "ui/virtualkeyboardview.hpp"
@@ -539,6 +541,30 @@ void GuiService::runDialog (Component* c, const String& title)
             windowManager->push (dw);
 }
 
+void GuiService::requestFile (juce::String title,
+                              juce::String wildcard,
+                              juce::File   startingDirectory,
+                              juce::String initialFilename,
+                              bool         isSave,
+                              std::function<void(const juce::File&)> onAccept,
+                              std::function<void()> onCancel)
+{
+    DiskOpService::Request req;
+    req.title             = std::move (title);
+    req.wildcard          = std::move (wildcard);
+    req.startingDirectory = std::move (startingDirectory);
+    req.initialFilename   = std::move (initialFilename);
+    req.modeHint          = DiskOpService::Mode::kSession; /* file-shaped — any mode works */
+    req.isSave            = isSave;
+    req.onAccept          = std::move (onAccept);
+    req.onCancel          = std::move (onCancel);
+    DiskOpService::get().armRequest (std::move (req));
+
+    /* Navigate to the Disk Op page so the user sees the RequestPane. */
+    if (auto* cc = dynamic_cast<StandardContent*> (content()))
+        cc->setMainView (EL_VIEW_DISK_OP);
+}
+
 void GuiService::showSplash() {}
 
 Content* GuiService::content()
@@ -964,24 +990,19 @@ bool GuiService::perform (const InvocationInfo& info)
         }
         //======================================================================
         case Commands::sessionOpen: {
-            // useOSNativeDialogBox = false — Wine's IFileDialog never
-            // surfaces under winelib Element (no zenity / KDE bridge
-            // fires either), so use JUCE's internal portable chooser
-            // for every file dialog in this binary.  Same workaround
-            // we use for the VST plugin-path picker.
-            //
-            // parentComponent = content() — anchors the chooser as a
-            // child of the main window instead of a separate top-
-            // level X11 window.  Top-level non-native dialogs come up
-            // with no decoration under winelib (no titlebar / close
-            // button), so embed centred on the parent for visual
-            // consistency with the VST-path AlertWindow.
-            FileChooser chooser ("Open Session", impl->lastSavedFile, "*.els", false, false, content());
-            if (chooser.browseForFileToOpen())
-            {
-                sibling<SessionService>()->openFile (chooser.getResult());
-                impl->recents.addFile (chooser.getResult());
-            }
+            /* Route through the Disk Op page's RequestPane — IS the
+             * file chooser now.  Earlier this site popped a JUCE
+             * FileChooser because Wine's IFileDialog never surfaces
+             * under winelib; the DiskOp replacement renders the same
+             * surface as every other file IO in the app. */
+            const auto startDir = impl->lastSavedFile.isDirectory()
+                                    ? impl->lastSavedFile
+                                    : impl->lastSavedFile.getParentDirectory();
+            requestFile ("Open Session", "*.els", startDir, {}, /*isSave*/ false,
+                         [this](const juce::File& f) {
+                             sibling<SessionService>()->openFile (f);
+                             impl->recents.addFile (f);
+                         });
             break;
         }
         case Commands::sessionClose: {
@@ -995,9 +1016,26 @@ bool GuiService::perform (const InvocationInfo& info)
         case Commands::sessionSave:
             sibling<SessionService>()->saveSession (false);
             break;
-        case Commands::sessionSaveAs:
-            sibling<SessionService>()->saveSession (true);
+        case Commands::sessionSaveAs: {
+            /* Save As also routes through the Disk Op page so we keep
+             * one consistent file picker.  SessionService::saveSession
+             * (saveAs=true) is still available for any caller that
+             * wants the old FileChooser flow, but no longer reachable
+             * via the menu. */
+            const auto cur = sibling<SessionService>()->getSessionFile();
+            const auto startDir = cur.existsAsFile()
+                                    ? cur.getParentDirectory()
+                                    : impl->lastSavedFile.getParentDirectory();
+            const auto suggested = cur.existsAsFile()
+                                     ? cur.getFileName()
+                                     : juce::String ("session.els");
+            requestFile ("Save Session As", "*.els", startDir, suggested,
+                         /*isSave*/ true,
+                         [this](const juce::File& f) {
+                             sibling<SessionService>()->saveSessionTo (f);
+                         });
             break;
+        }
         case Commands::sessionAddGraph:
             sibling<EngineService>()->addGraph();
             break;
@@ -1012,11 +1050,13 @@ bool GuiService::perform (const InvocationInfo& info)
             break;
         //======================================================================
         case Commands::importGraph: {
-            // JUCE-internal chooser, embedded on main window — see
-            // sessionOpen above for why.
-            FileChooser chooser ("Import Graph", impl->lastExportedGraph, "*.elg", false, false, content());
-            if (chooser.browseForFileToOpen())
-                sibling<SessionService>()->importGraph (chooser.getResult());
+            const auto startDir = impl->lastExportedGraph.isDirectory()
+                                    ? impl->lastExportedGraph
+                                    : impl->lastExportedGraph.getParentDirectory();
+            requestFile ("Import Graph", "*.elg", startDir, {}, /*isSave*/ false,
+                         [this](const juce::File& f) {
+                             sibling<SessionService>()->importGraph (f);
+                         });
             break;
         }
         case Commands::exportGraph: {
@@ -1026,21 +1066,21 @@ bool GuiService::perform (const InvocationInfo& info)
 
             if (! impl->lastExportedGraph.isDirectory())
                 impl->lastExportedGraph = impl->lastExportedGraph.getParentDirectory();
+            juce::String suggestedName = node.getName() + ".elg";
             if (impl->lastExportedGraph.isDirectory())
             {
-                impl->lastExportedGraph = impl->lastExportedGraph.getChildFile (node.getName()).withFileExtension ("elg");
-                impl->lastExportedGraph = impl->lastExportedGraph.getNonexistentSibling();
+                suggestedName = impl->lastExportedGraph
+                                  .getChildFile (suggestedName)
+                                  .getNonexistentSibling().getFileName();
             }
 
-            {
-                // JUCE-internal chooser, embedded on main window — see
-                // sessionOpen above for why.
-                FileChooser chooser (TRANS ("Export Graph"), impl->lastExportedGraph, "*.elg", false, false, content());
-                if (chooser.browseForFileToSave (true))
-                    sibling<SessionService>()->exportGraph (node, chooser.getResult());
-                if (auto* gui = sibling<GuiService>())
-                    gui->stabilizeContent();
-            }
+            requestFile (TRANS ("Export Graph"), "*.elg", impl->lastExportedGraph,
+                         suggestedName, /*isSave*/ true,
+                         [this, node](const juce::File& f) {
+                             sibling<SessionService>()->exportGraph (node, f);
+                             if (auto* gui = sibling<GuiService>())
+                                 gui->stabilizeContent();
+                         });
             break;
         }
         //======================================================================
