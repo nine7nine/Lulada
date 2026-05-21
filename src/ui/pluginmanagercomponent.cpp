@@ -1,6 +1,9 @@
 // Copyright 2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
+#include <thread>
+
 #include <element/plugins.hpp>
 #include <element/context.hpp>
 #include <element/settings.hpp>
@@ -25,13 +28,12 @@ public:
           formatToScan (format),
           propertiesToUse (properties),
           pathChooserWindow (TRANS ("Select folders to scan..."), String(), AlertWindow::NoIcon),
-          progressWindow (title, text, AlertWindow::NoIcon),
-          progress (0.0),
+          initialText (text),
           numThreads (threads),
           allowAsync (allowPluginsWhichRequireAsynchronousInstantiation),
-          finished (false),
           useBackgroundScanner (true)
     {
+        juce::ignoreUnused (title);
         jassert (properties != nullptr);
 
         FileSearchPath path (getLastSearchPath (*properties, formatToScan));
@@ -66,13 +68,12 @@ public:
           formatToScan (*plugins.getAudioPluginFormat ("Element")),
           propertiesToUse (nullptr),
           pathChooserWindow (TRANS ("Select folders to scan..."), String(), AlertWindow::NoIcon),
-          progressWindow (title, text, AlertWindow::NoIcon),
-          progress (0.0),
+          initialText (text),
           numThreads (0),
           allowAsync (false),
-          finished (false),
           useBackgroundScanner (true)
     {
+        juce::ignoreUnused (title);
         scanner.setNonOwned (owner.plugins.getBackgroundAudioPluginScanner());
         startScan();
     }
@@ -82,13 +83,12 @@ public:
           formatToScan (*plugins.getAudioPluginFormat ("Element")),
           propertiesToUse (nullptr),
           pathChooserWindow (TRANS ("Select folders to scan..."), String(), AlertWindow::NoIcon),
-          progressWindow (title, text, AlertWindow::NoIcon),
-          progress (0.0),
+          initialText (text),
           numThreads (0),
           allowAsync (false),
-          finished (false),
           useBackgroundScanner (true)
     {
+        juce::ignoreUnused (title);
         scanner.setNonOwned (owner.plugins.getBackgroundAudioPluginScanner());
         formatsToScan = formats;
         startScan();
@@ -96,6 +96,13 @@ public:
 
     ~Scanner()
     {
+        // Cancel + join FIRST so the bg thread is gone before we touch
+        // any state it might still be looking at.
+        if (scanner)
+            scanner->cancel();
+        if (scanThread.joinable())
+            scanThread.join();
+
         stopTimer();
 
         if (scanner)
@@ -107,6 +114,15 @@ public:
             pool = nullptr;
         }
 
+        // Idempotent: covers the case where Scanner is destroyed mid-
+        // scan (e.g. panel closed) without finishedScan() running.
+        owner.cancelScanButton.onClick = nullptr;
+        owner.scanInProgress = false;
+        owner.scanLabel.setVisible (false);
+        owner.scanProgress.setVisible (false);
+        owner.cancelScanButton.setVisible (false);
+        owner.resized();
+
         scanner.clear();
     }
 
@@ -116,12 +132,15 @@ private:
     PropertiesFile* propertiesToUse;
     OptionalScopedPointer<PluginScanner> scanner;
 
-    AlertWindow pathChooserWindow, progressWindow;
+    AlertWindow pathChooserWindow;
+    String initialText;
     FileSearchPathListComponent pathList;
     String pluginBeingScanned;
-    double progress;
+    juce::CriticalSection labelLock;  // guards pluginBeingScanned (bg writer / message-thread reader)
+    std::thread scanThread;           // runs scanForAudioPlugins so the UI doesn't freeze
     [[maybe_unused]] int numThreads;
-    [[maybe_unused]] bool allowAsync, finished;
+    [[maybe_unused]] bool allowAsync;
+    std::atomic<bool> finished { false };
     std::unique_ptr<ThreadPool> pool;
     [[maybe_unused]] bool useBackgroundScanner = false;
     StringArray formatsToScan;
@@ -212,24 +231,43 @@ private:
             propertiesToUse->saveIfNeeded();
         }
 
-        progressWindow.addButton (TRANS ("Cancel"), 0, KeyPress (KeyPress::escapeKey));
-        progressWindow.getButton (TRANS ("Cancel"))->onClick = [this] {
-            scanner->cancel();
-        };
-        progressWindow.addProgressBarComponent (progress);
-        progress = 0.0;
-        scanner->addListener (this);
-        finished = false;
+        owner.scanProgressValue = 0.0;
+        owner.scanLabel.setText (initialText, dontSendNotification);
+        owner.cancelScanButton.onClick = [this] { scanner->cancel(); };
+        owner.scanInProgress = true;
+        owner.scanLabel.setVisible (true);
+        owner.scanProgress.setVisible (true);
+        owner.cancelScanButton.setVisible (true);
+        owner.resized();
 
-        startTimer (20);
-        progressWindow.setVisible (true);
+        scanner->addListener (this);
+        finished.store (false);
+
+        startTimer (50);
 
         if (! scanner->isScanning())
         {
-            if (formatsToScan.size() > 0)
-                scanner->scanForAudioPlugins (formatsToScan);
-            else
-                scanner->scanForAudioPlugins (formatToScan.getName());
+            // Run the scan on a worker thread.  Under __WINE__, the
+            // CLAP path (and effectively VST/VST3 too via the same
+            // findAllTypesForFile route used by the worker
+            // subprocess that we don't spawn here) runs IN PROCESS —
+            // see pluginmanager.cpp::retrieveDescriptions.  Without a
+            // worker thread, scanForAudioPlugins blocks the message
+            // loop for the entire duration of the scan, freezing the
+            // GUI and preventing the progress strip from painting.
+            //
+            // Listener callbacks (audioPluginScanProgress / Started /
+            // Finished) fire from this thread; pluginBeingScanned is
+            // labelLock-guarded, finished is std::atomic, the Timer
+            // on the message thread polls both for display + tear-
+            // down.  ~Scanner cancels + joins before touching any
+            // state the bg thread might race on.
+            scanThread = std::thread ([this]() {
+                if (formatsToScan.size() > 0)
+                    scanner->scanForAudioPlugins (formatsToScan);
+                else
+                    scanner->scanForAudioPlugins (formatToScan.getName());
+            });
         }
         else
         {
@@ -239,8 +277,14 @@ private:
 
     void finishedScan()
     {
-        progressWindow.getButton (TRANS ("Cancel"))->onClick = nullptr;
         stopTimer();
+
+        // Bg thread may already have returned (the listeners.call
+        // that set finished=true fires near the end of
+        // scanForAudioPlugins) — but make sure we don't outlive a
+        // still-joinable thread before touching shared state.
+        if (scanThread.joinable())
+            scanThread.join();
 
         if (scanner)
         {
@@ -248,21 +292,17 @@ private:
             scanner.reset();
         }
 
-        progressWindow.exitModalState();
-        progressWindow.setVisible (false);
-        progressWindow.removeFromDesktop();
+        owner.cancelScanButton.onClick = nullptr;
+        owner.scanInProgress = false;
+        owner.scanLabel.setVisible (false);
+        owner.scanProgress.setVisible (false);
+        owner.cancelScanButton.setVisible (false);
+        owner.resized();
 
-        /* Was: runDispatchLoopUntil(14) — a paranoia sleep to let the
-         * progress-window destroy events drain before scanFinished
-         * potentially opens another modal.  Recursively pumping the
-         * message loop from inside an event handler causes input-lag
-         * spikes + re-entrancy bugs (see handoff doc item #2).
-         *
-         * Replace with MessageManager::callAsync: the destroy events
-         * already in the queue get processed normally on the way
-         * back to the loop, and scanFinished fires on the very next
-         * iteration with a clean stack.  Same latency profile, no
-         * recursive pumping. */
+        /* MessageManager::callAsync: fires scanFinished on the next
+         * message-loop iteration with a clean stack — avoids the
+         * recursive runDispatchLoopUntil pump that the JUCE upstream
+         * code uses, which caused input-lag spikes + re-entrancy. */
         MessageManager::callAsync ([&owner = owner] {
             StringArray failedFiles; // TODO
             owner.scanFinished (failedFiles);
@@ -271,20 +311,31 @@ private:
 
     void timerCallback() override
     {
-        if (! finished)
+        if (finished.load())
         {
-            progressWindow.setMessage (pluginBeingScanned);
+            finishedScan();
+            return;
         }
+
+        String snapshot;
+        {
+            const ScopedLock sl (labelLock);
+            snapshot = pluginBeingScanned;
+        }
+        owner.scanLabel.setText (snapshot, dontSendNotification);
     }
 
     void audioPluginScanFinished() override
     {
-        finished = true;
-        finishedScan();
+        // May fire from the bg scan thread (listeners.call in
+        // PluginScanner::scanForAudioPlugins).  Defer the UI teardown
+        // to the next Timer tick on the message thread.
+        finished.store (true);
     }
 
     void audioPluginScanStarted (const String& pluginName) override
     {
+        const ScopedLock sl (labelLock);
         pluginBeingScanned = File::createFileWithoutCheckingPath (pluginName.trim())
                                  .getFileName();
         /* Was: runDispatchLoopUntil(14) — recursive message-loop
@@ -301,7 +352,7 @@ private:
 
     void audioPluginScanProgress (const float reportedProgress) override
     {
-        this->progress = reportedProgress;
+        owner.scanProgressValue = (double) reportedProgress;
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Scanner)
@@ -557,6 +608,16 @@ PluginListComponent::PluginListComponent (PluginManager& p, PropertiesFile* prop
     scanButton.setButtonText ("Scan");
     scanButton.addListener (this);
 
+    // Inline progress strip — hidden until Scanner toggles
+    // scanInProgress on.  Label gets the per-plugin filename from
+    // the 50ms Scanner timer; ProgressBar polls scanProgressValue.
+    scanLabel.setColour (Label::textColourId, Colours::white);
+    scanLabel.setJustificationType (Justification::centredLeft);
+    addChildComponent (scanLabel);
+    addChildComponent (scanProgress);
+    cancelScanButton.setButtonText (TRANS ("Cancel"));
+    addChildComponent (cancelScanButton);
+
     setSize (400, 600);
     list.addChangeListener (this);
 
@@ -607,6 +668,18 @@ void PluginListComponent::resized()
     closeButton.setBounds (r2.removeFromRight (closeButton.getWidth()));
     r.removeFromTop (3);
     r.removeFromBottom (3);
+
+    if (scanInProgress)
+    {
+        auto strip = r.removeFromBottom (24).reduced (0, 2);
+        cancelScanButton.setBounds (strip.removeFromRight (72));
+        strip.removeFromRight (6);
+        scanProgress.setBounds (strip.removeFromRight (220));
+        strip.removeFromRight (8);
+        scanLabel.setBounds (strip);
+        r.removeFromBottom (2);
+    }
+
     table.setBounds (r);
 }
 
