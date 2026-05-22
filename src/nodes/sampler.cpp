@@ -3,6 +3,7 @@
 
 #include "nodes/sampler.hpp"
 #include "services/diskopservice.hpp"
+#include "services/samplebankpool.hpp"
 
 #include <pthread.h>
 #include <sched.h>
@@ -4462,7 +4463,7 @@ private:
  *   FX     — sample effects (lp/hp/resonance/generators/normalize). [F3]
  * ========================================================================*/
 class SamplerNodeEditor : public AudioProcessorEditor,
-                          private Timer,
+                          private juce::ChangeListener,
                           private ListBoxModel
 {
 public:
@@ -4515,31 +4516,45 @@ public:
             return node.collectPlayheadsForSlot (slot);
         });
         addChildComponent (fxPage_);
-        instCombo.onChange = [this] {
-            const int sel = instCombo.getSelectedId() - 1;
-            if (sel < 0 || sel >= SamplerNode::kMaxInstruments) return;
-            /* Lazy-allocate any banks the user selects beyond the
-             * current count -- matches Disk Op's
-             * ensureInstrumentExists pattern.  Empty bank gets a
-             * default-constructed SamplerInstrument the user can
-             * load samples into. */
-            while (sel >= node.getNumInstruments())
-            {
+        /* Bank label -- read-only display of "NNN <name>".  Updated
+         * by refreshInstLabel() on every refresh() tick + on nav
+         * presses.  Matches the tracker editor's bank-display pattern. */
+        instLabel.setJustificationType (Justification::centredLeft);
+        instLabel.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        13.0f, Font::plain));
+        instLabel.setColour (Label::backgroundColourId, Colour { 0xff'24'24'24 });
+        instLabel.setColour (Label::textColourId,       Colour { 0xff'd0'd0'd0 });
+        instLabel.setColour (Label::outlineColourId,    Colour { 0xff'3a'3a'3a });
+        instLabel.setBorderSize ({ 0, 6, 0, 6 });
+        addAndMakeVisible (instLabel);
+
+        /* Prev / next nav -- step through the 128-bank grid the same
+         * way Disk Op's instrument list does.  Lazy-allocate when
+         * advancing past the current count so the user can populate
+         * any of the 128 banks. */
+        auto navigate = [this] (int delta) {
+            const int target = juce::jlimit (0, SamplerNode::kMaxInstruments - 1,
+                                             activeInstrument + delta);
+            if (target == activeInstrument) return;
+            while (target >= node.getNumInstruments())
                 if (node.addInstrument() == nullptr) break;
-            }
-            if (sel >= node.getNumInstruments()) return;
-            activeInstrument = sel;
-            rebuildInstCombo();
+            if (target >= node.getNumInstruments()) return;
+            activeInstrument = target;
             rebuildEnvelopeViews();
             refresh();
         };
-        addAndMakeVisible (instCombo);
+        instPrevBtn.setButtonText ("<");
+        instPrevBtn.onClick = [navigate] { navigate (-1); };
+        addAndMakeVisible (instPrevBtn);
+
+        instNextBtn.setButtonText (">");
+        instNextBtn.onClick = [navigate] { navigate (+1); };
+        addAndMakeVisible (instNextBtn);
 
         instAddBtn.setButtonText ("+");
         instAddBtn.onClick = [this] {
             node.addInstrument();
             activeInstrument = node.getNumInstruments() - 1;
-            rebuildInstCombo();
             rebuildEnvelopeViews();
             refresh();
         };
@@ -4551,11 +4566,21 @@ public:
             node.removeInstrument (activeInstrument);
             if (activeInstrument >= node.getNumInstruments())
                 activeInstrument = node.getNumInstruments() - 1;
-            rebuildInstCombo();
             rebuildEnvelopeViews();
             refresh();
         };
         addAndMakeVisible (instDelBtn);
+
+        /* Manual refresh -- explicit re-read of every bank + slot
+         * from the SamplerNode.  Redundant with the
+         * ChangeBroadcaster path under normal operation, but the
+         * user asked for an explicit button so external mutations
+         * the broadcaster doesn't see (e.g. raw memory edits, a
+         * future plugin sideband, debugging) can still be picked
+         * up on demand. */
+        refreshBtn.setButtonText ("Refresh");
+        refreshBtn.onClick = [this] { refreshInstLabel(); refresh(); };
+        addAndMakeVisible (refreshBtn);
 
         slotList.setModel (this);
         slotList.setRowHeight (24);
@@ -4564,9 +4589,10 @@ public:
         slotList.setOutlineThickness (1);
         addAndMakeVisible (slotList);
 
-        loadBtn.setButtonText ("Load from Disk Op");
-        loadBtn.onClick = [this] { onLoad(); };
-        addAndMakeVisible (loadBtn);
+        /* "Load from Disk Op" removed -- it was a one-shot single-
+         * sample loader that didn't surface which file was about to
+         * land, and is redundant with the Disk Op panel's own
+         * load-into-active-slot affordance. */
 
         clearBtn.setButtonText ("Clear");
         clearBtn.onClick = [this] {
@@ -4702,14 +4728,36 @@ public:
 
         setOpaque (true);
         setSize (1040, 600);
-        rebuildInstCombo();
+        refreshInstLabel();
         rebuildEnvelopeViews();
         switchPage (Page::kBank);
         refresh();
-        startTimerHz (8);
+
+        /* Event-driven sync replaces the old 8 Hz polling timer.
+         * SamplerNode is a ChangeBroadcaster -- it sends a change
+         * message on every mutation (addInstrument, loadSampleToSlot,
+         * setStateInformation, etc.).  We refresh on every callback,
+         * AND on visibility change (so re-opening the editor picks
+         * up anything that happened while it was hidden), AND
+         * manually via the Refresh button. */
+        node.addChangeListener (this);
     }
 
-    ~SamplerNodeEditor() override { stopTimer(); }
+    ~SamplerNodeEditor() override { node.removeChangeListener (this); }
+
+    /** ChangeListener -- fires whenever SamplerNode broadcasts a
+     *  bank/slot mutation.  Single refresh call covers label + slot
+     *  list + waveform + status. */
+    void changeListenerCallback (juce::ChangeBroadcaster*) override { refresh(); }
+
+    /** Pick up any state mutations that happened while the editor
+     *  was hidden (the change-listener path will have already fired
+     *  them, but we refresh here too as a belt-and-braces guarantee
+     *  for the user's "when GUI opens it checks" expectation). */
+    void visibilityChanged() override
+    {
+        if (isVisible()) { refreshInstLabel(); refresh(); }
+    }
 
     void paint (Graphics& g) override
     {
@@ -4727,11 +4775,15 @@ public:
         instNavBtn  .setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (2);
         sampleNavBtn.setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (2);
         fxNavBtn    .setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (12);
-        instAddBtn.setBounds (navRow.removeFromRight (24));
+        instAddBtn .setBounds (navRow.removeFromRight (24));
         navRow.removeFromRight (2);
-        instDelBtn.setBounds (navRow.removeFromRight (24));
+        instDelBtn .setBounds (navRow.removeFromRight (24));
+        navRow.removeFromRight (8);
+        instNextBtn.setBounds (navRow.removeFromRight (24));
+        navRow.removeFromRight (2);
+        instPrevBtn.setBounds (navRow.removeFromRight (24));
         navRow.removeFromRight (4);
-        instCombo .setBounds (navRow);
+        instLabel  .setBounds (navRow);
         r.removeFromTop (6);
 
         /* === Body area for the active page. === */
@@ -4755,8 +4807,7 @@ public:
          * (right edge) in addition to slot number + key range + name. */
         auto leftCol = bankR.removeFromLeft (380);
         auto leftFooter = leftCol.removeFromBottom (24);
-        clearBtn.setBounds (leftFooter.removeFromRight (50)); leftFooter.removeFromRight (4);
-        loadBtn .setBounds (leftFooter);
+        clearBtn.setBounds (leftFooter.removeFromRight (50));
         leftCol.removeFromBottom (6);
         slotList.setBounds (leftCol);
 
@@ -4810,7 +4861,6 @@ public:
         fxNavBtn    .setToggleState (fx,     dontSendNotification);
 
         slotList     .setVisible (bank);
-        loadBtn      .setVisible (bank);
         clearBtn     .setVisible (bank);
         rootSlider   .setVisible (bank);
         relSlider    .setVisible (bank);
@@ -4971,7 +5021,8 @@ private:
         void resized() override { if (onResized) onResized(); }
     };
 
-    void timerCallback() override { refresh(); }
+    /* Old 8 Hz Timer poll was dropped in favour of the
+     * ChangeBroadcaster path (see ctor) -- no timerCallback here. */
 
     void configureParamSlider (Slider& s, const String& label, double lo, double hi,
                                double step, std::function<void (double)> on)
@@ -4992,34 +5043,49 @@ private:
         return nullptr;
     }
 
-    void rebuildInstCombo()
+    /** Compose the label shown for `instrumentIndex`.  Reads from the
+     *  live SamplerNode (no caching) so any Disk Op mutation -- a
+     *  bank rename or a slot load -- is reflected the moment this
+     *  is called (see refresh()'s diff-gated dispatch).
+     *
+     *  Display rules:
+     *    - Bank has a user-set name      -> "NNN <bank-name>"
+     *    - Bank has samples but no name  -> "NNN <first-loaded-slot-name>"
+     *    - Bank empty                    -> "NNN (empty)"
+     */
+    String composeInstLabel (int instrumentIndex) const
     {
-        /* Always expose all 128 banks -- the same fixed grid Disk Op's
-         * Sample Bank pane shows -- so the user can switch to any
-         * bank from the sampler editor and see / load samples into
-         * it.  Empty banks lazily allocate on selection (see
-         * onChange handler).  Matches Disk Op's row count
-         * (SampleBankPane::kNumBanks = 128). */
-        instCombo.clear (dontSendNotification);
-        const int n = node.getNumInstruments();
-        for (int i = 0; i < SamplerNode::kMaxInstruments; ++i)
+        String label = String::formatted ("%03d  ", instrumentIndex + 1);
+        if (instrumentIndex < 0 || instrumentIndex >= node.getNumInstruments())
+            return label + "(empty)";
+
+        auto inst = node.getInstrument (instrumentIndex);
+        if (inst == nullptr) return label + "(empty)";
+
+        if (inst->name.isNotEmpty())
+            return label + inst->name;
+
+        /* No bank name set but the user may have loaded samples
+         * directly.  Surface the first loaded slot's name so the
+         * dropdown / nav label isn't misleading. */
+        for (int i = 0; i < SamplerInstrument::kNumSlots; ++i)
         {
-            String label = String::formatted ("%03d ", i + 1);
-            if (i < n)
-            {
-                auto inst = node.getInstrument (i);
-                if (inst != nullptr && inst->name.isNotEmpty())
-                    label += inst->name;
-                else
-                    label += "(empty)";
-            }
-            else
-            {
-                label += "(empty)";
-            }
-            instCombo.addItem (label, i + 1);
+            if (auto* s = inst->getSlot (i))
+                if (s->name.isNotEmpty() || s->isLoaded())
+                    return label + s->name;
         }
-        instCombo.setSelectedId (activeInstrument + 1, dontSendNotification);
+        return label + "(empty)";
+    }
+
+    /** Push the current bank label into the toolbar Label component.
+     *  Cheap; called on every refresh tick after the diff-gate
+     *  decides something changed (count, names, or slot mutations). */
+    void refreshInstLabel()
+    {
+        instLabel.setText (composeInstLabel (activeInstrument),
+                           dontSendNotification);
+        instPrevBtn.setEnabled (activeInstrument > 0);
+        instNextBtn.setEnabled (activeInstrument < SamplerNode::kMaxInstruments - 1);
     }
 
     void rebuildEnvelopeViews()
@@ -5168,37 +5234,19 @@ private:
         if (slotPtr != lastSlotPtr_)
             waveformView.repaint();
 
-        /* Detect external bank changes -- count OR per-row name.
-         * The right-side Sample Bank panel (DiskOpView) can both add
-         * banks (numInst delta) and rename existing banks in place
-         * (no count delta).  Without a name watch, an in-place
-         * rename leaves this editor's combo showing the OLD label
-         * until the editor is closed and reopened.  User-reported
-         * 2026-05-22. */
-        bool comboDirty = (numInst != lastNumInstruments_);
-        if (! comboDirty)
-        {
-            for (int i = 0; i < numInst; ++i)
-            {
-                auto inst = node.getInstrument (i);
-                const String n = (inst != nullptr) ? inst->name : String();
-                if (i >= lastInstNames_.size() || lastInstNames_[i] != n)
-                {
-                    comboDirty = true;
-                    break;
-                }
-            }
-        }
-        if (comboDirty)
-        {
-            rebuildInstCombo();
-            lastInstNames_.clearQuick();
-            for (int i = 0; i < numInst; ++i)
-            {
-                auto inst = node.getInstrument (i);
-                lastInstNames_.add ((inst != nullptr) ? inst->name : String());
-            }
-        }
+        /* Bank label refreshes unconditionally each tick (cheap: one
+         * setText with dontSendNotification on equal text is a no-op
+         * inside juce::Label).  This covers all the live-sync cases
+         * the user listed:
+         *   - Disk Op rename bank -> instLabel picks up new name
+         *   - Disk Op load sample -> first-slot-name surfaces
+         *   - addInstrument / removeInstrument -> activeInstrument
+         *     stays valid + label reflects current bank
+         * The lastInstNames_ array is no longer needed for combo
+         * rebuild gating, but is kept here for the moment in case a
+         * follow-up commit needs it (TODO remove after verification). */
+        juce::ignoreUnused (lastInstNames_, lastNumInstruments_);
+        refreshInstLabel();
 
         const int voices = node.getNumVoices();
         const String slotName = (slot != nullptr) ? slot->name : String ("(empty)");
@@ -5236,11 +5284,19 @@ private:
 
     SamplerNode& node;
 
-    ComboBox     instCombo;
-    TextButton   instAddBtn, instDelBtn;
+    /* Bank navigation -- replaces a ComboBox with a fixed label +
+     * prev/next nudge buttons, matching the tracker editor's OCT /
+     * STEP / TRK / PAT toolbar pattern.  The label shows
+     *   "NNN BankName"  (bank has a user-set name)
+     *   "NNN <first-slot-name>"  (samples loaded but bank not named)
+     *   "NNN (empty)"   (no samples, no name) */
+    Label        instLabel;
+    TextButton   instPrevBtn, instNextBtn;
+    TextButton   instAddBtn,  instDelBtn;
+    TextButton   refreshBtn;   // manual "re-read everything from node"
 
     ListBox      slotList;
-    TextButton   loadBtn, clearBtn;
+    TextButton   clearBtn;
 
     Slider       rootSlider, relSlider, fineSlider, volSlider, panSlider;
     ComboBox     loopCombo;
@@ -5317,10 +5373,14 @@ SamplerNode::SamplerNode()
 
     synth.reset (new ChannelTrackingSynth (*this));
 
-    instruments.reserve (16);
-    instruments.push_back (new SamplerInstrument());
-    rebuildVoicePool();
+    /* Ensure there's at least bank 1 ready to play.  The pool is
+     * session-global so we don't push a per-node bank, but the pool
+     * grows-on-demand to hold bank 0 the first time anything touches
+     * it -- this catches the freshly-instantiated graph case where
+     * no session has been loaded yet. */
+    SampleBankPool::get().ensureInstrumentExists (0);
 
+    rebuildVoicePool();
     synth->addSound (new Ft2SamplerSound (*this));
 }
 
@@ -5390,7 +5450,7 @@ void SamplerNode::processBlock (AudioBuffer<float>& audio_, MidiBuffer& midi)
         if (! msg.isProgramChange()) continue;
         const int ch = msg.getChannel();         /* 1..16 */
         const int pc = msg.getProgramChangeNumber();
-        if (pc >= 0 && pc < (int) instruments.size())
+        if (pc >= 0 && pc < SampleBankPool::get().getNumInstruments())
             bindChannelToInstrument (ch, pc);
         else
             bindChannelToInstrument (ch, -1);   /* default mapping */
@@ -5435,41 +5495,47 @@ void SamplerNode::rebuildVoicePool()
  *  so editor reads see consistent state during the same broadcast.
  */
 
+/* All bank/slot ownership lives in the session-global SampleBankPool
+ * (see services/samplebankpool.hpp).  SamplerNode is a CONSUMER --
+ * its public bank API is a thin forward layer so the node-facing
+ * surface (Disk Op pane, editor, scripting bindings) doesn't change
+ * shape while the underlying storage moves out of the node. */
+
 int SamplerNode::getNumInstruments() const
 {
-    const ScopedLock sl (sampleLock);
-    return (int) instruments.size();
+    return SampleBankPool::get().getNumInstruments();
 }
 
 SamplerInstrument::Ptr SamplerNode::getInstrument (int index) const
 {
-    const ScopedLock sl (sampleLock);
-    if (index < 0 || index >= (int) instruments.size()) return nullptr;
-    return instruments[(size_t) index];
+    return SampleBankPool::get().getInstrument (index);
 }
 
 SamplerInstrument::Ptr SamplerNode::addInstrument()
 {
-    ScopedLock sl (sampleLock);
-    if ((int) instruments.size() >= kMaxInstruments) return nullptr;
-    auto inst = SamplerInstrument::Ptr (new SamplerInstrument());
-    instruments.push_back (inst);
-    return inst;
+    /* Pool fires its own ChangeBroadcaster on mutation; any open
+     * SamplerEditor / DiskOpView listening to the pool sees the
+     * delta.  No node-level broadcast required. */
+    return SampleBankPool::get().addInstrument();
 }
 
 void SamplerNode::removeInstrument (int index)
 {
-    ScopedLock sl (sampleLock);
-    if (index < 0 || index >= (int) instruments.size()) return;
-    if (instruments.size() <= 1) return; /* always keep at least one */
+    /* Drop per-node mono-mode state keyed by the about-to-be-freed
+     * raw SamplerInstrument*.  Must happen BEFORE pool removes the
+     * Ptr -- once the pool drops it, the address is invalid. */
+    if (auto doomedPtr = SampleBankPool::get().getInstrument (index))
+    {
+        SamplerInstrument* doomed = doomedPtr.get();
+        if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+            cts->forgetInstrument (doomed);
+    }
 
-    /* Drop mono-mode state keyed by the about-to-be-freed raw pointer. */
-    SamplerInstrument* doomed = instruments[(size_t) index].get();
-    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
-        cts->forgetInstrument (doomed);
+    SampleBankPool::get().removeInstrument (index);
 
-    instruments.erase (instruments.begin() + index);
-    /* Re-map channel bindings that pointed past the removed index. */
+    /* Re-map per-node channel bindings that pointed past the
+     * removed bank.  Bindings -1 (default) untouched. */
+    const ScopedLock sl (sampleLock);
     for (auto& b : channelBinding)
     {
         if (b == (int8_t) index) b = -1;
@@ -5479,26 +5545,33 @@ void SamplerNode::removeInstrument (int index)
 
 SamplerInstrument::Ptr SamplerNode::getInstrumentForChannel (int channel1to16) const
 {
-    /* Audio-thread read — short critical section, uncontended 99.9%
-     * of the time.  Returns a Ptr by value (refcount bumped under
-     * the lock), so the caller holds a live instrument even after
-     * we release. */
-    const ScopedLock sl (sampleLock);
-    if (instruments.empty()) return nullptr;
-
+    /* Audio-thread read -- pool.getInstrument also takes a short
+     * lock, comparable cost to the previous in-node read.  The
+     * returned Ptr bumps refcount under the pool lock, so the
+     * audio thread keeps the bank alive even if the message
+     * thread later mutates the pool. */
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
-    int idx = channelBinding[(size_t) ch];
-    if (idx < 0) idx = ch;   /* default mapping */
-    if (idx >= (int) instruments.size()) idx = 0;
-    if (idx < 0 || idx >= (int) instruments.size()) return nullptr;
-    return instruments[(size_t) idx];
+
+    int8_t binding;
+    {
+        const ScopedLock sl (sampleLock);
+        binding = channelBinding[(size_t) ch];
+    }
+
+    int idx = (binding < 0) ? ch : (int) binding;   // -1 = default channel->bank
+    auto& pool = SampleBankPool::get();
+    if (idx >= pool.getNumInstruments()) idx = 0;
+    if (idx < 0) return nullptr;
+    return pool.getInstrument (idx);
 }
 
 void SamplerNode::bindChannelToInstrument (int channel1to16, int instrumentIndex)
 {
-    const ScopedLock sl (sampleLock);
     const int ch = juce::jlimit (1, 16, channel1to16) - 1;
-    if (instrumentIndex < 0 || instrumentIndex >= (int) instruments.size())
+    const int n  = SampleBankPool::get().getNumInstruments();
+
+    const ScopedLock sl (sampleLock);
+    if (instrumentIndex < 0 || instrumentIndex >= n)
         channelBinding[(size_t) ch] = -1;
     else
         channelBinding[(size_t) ch] = (int8_t) instrumentIndex;
@@ -5513,33 +5586,28 @@ int SamplerNode::getChannelBinding (int channel1to16) const
 
 bool SamplerNode::loadSampleToSlot (int instrumentIndex, int slot, const File& file)
 {
-    /* Two-phase: read+decode the file (potentially seconds for big
-     * WAVs) WITHOUT holding sampleLock — only the final commit
-     * touches the instrument slot under the lock.  Keeps the audio
-     * thread's critical sections short. */
-    SamplerInstrument::Ptr inst;
-    {
-        const ScopedLock sl (sampleLock);
-        if (instrumentIndex < 0
-            || instrumentIndex >= (int) instruments.size())
-            return false;
-        inst = instruments[(size_t) instrumentIndex];
-    }
+    /* Two-phase load -- prepareSlot does the (native-POSIX) file I/O
+     * and decode WITHOUT touching any sampler lock.  commitSlot
+     * publishes the result; pool's ChangeBroadcaster notifies the UI. */
+    auto inst = SampleBankPool::get().getInstrument (instrumentIndex);
     if (inst == nullptr) return false;
 
     auto loaded = inst->prepareSlot (file, formatManager);
     if (loaded == nullptr) return false;
 
-    const ScopedLock sl (sampleLock);
-    return inst->commitSlot (slot, std::move (loaded));
+    const bool ok = inst->commitSlot (slot, std::move (loaded));
+    if (ok) SampleBankPool::get().sendChangeMessage();
+    return ok;
 }
 
 void SamplerNode::rebuildInstrument()
 {
-    ScopedLock sl (sampleLock);
-    instruments.clear();
-    instruments.push_back (new SamplerInstrument());
-    channelBinding.fill (-1);
+    /* Pool retains bank state across rebuilds -- this node's
+     * channel binding resets to default. */
+    {
+        ScopedLock sl (sampleLock);
+        channelBinding.fill (-1);
+    }
     synth->clearSounds();
     synth->addSound (new Ft2SamplerSound (*this));
 }
@@ -5609,72 +5677,9 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
     for (int b = 0; b < 16; ++b)
         tree.setProperty (Identifier ("bind" + String (b)), (int) channelBinding[(size_t) b], nullptr);
 
-    for (size_t ii = 0; ii < instruments.size(); ++ii)
-    {
-        auto inst = instruments[ii];
-        if (inst == nullptr) continue;
-        ValueTree instTree ("instr");
-        instTree.setProperty ("idx",  (int) ii,        nullptr);
-        instTree.setProperty ("name", inst->name,      nullptr);
-        instTree.setProperty ("fadeout", (int) inst->fadeoutRate, nullptr);
-        instTree.setProperty ("avType",  (int) inst->autoVib.type,  nullptr);
-        instTree.setProperty ("avSweep", (int) inst->autoVib.sweep, nullptr);
-        instTree.setProperty ("avDepth", (int) inst->autoVib.depth, nullptr);
-        instTree.setProperty ("avRate",  (int) inst->autoVib.rate,  nullptr);
-        instTree.setProperty ("mono",            inst->mono,              nullptr);
-        instTree.setProperty ("portamentoMs",    (double) inst->portamentoTimeMs, nullptr);
-        instTree.setProperty ("envSampleRel",    inst->envSampleRelative, nullptr);
-
-        auto writeEnv = [&](const FT2Envelope& e, const String& prefix)
-        {
-            instTree.setProperty (Identifier (prefix + "Len"),     (int) e.length,       nullptr);
-            instTree.setProperty (Identifier (prefix + "Flags"),   (int) e.flags,        nullptr);
-            instTree.setProperty (Identifier (prefix + "Sus"),     (int) e.sustainPoint, nullptr);
-            instTree.setProperty (Identifier (prefix + "LoopS"),   (int) e.loopStart,    nullptr);
-            instTree.setProperty (Identifier (prefix + "LoopE"),   (int) e.loopEnd,      nullptr);
-            String pts;
-            for (int i = 0; i < (int) e.length; ++i)
-                pts += String (e.points[i].x) + ":" + String (e.points[i].y) + ";";
-            instTree.setProperty (Identifier (prefix + "Pts"), pts, nullptr);
-        };
-        writeEnv (inst->volumeEnv, "ve");
-        writeEnv (inst->panEnv,    "pe");
-
-        for (int i = 0; i < SamplerInstrument::kNumSlots; ++i)
-        {
-            const auto* slot = inst->getSlot (i);
-            if (slot == nullptr) continue;
-            ValueTree slotTree ("slot");
-            slotTree.setProperty ("idx",          i,                    nullptr);
-            slotTree.setProperty ("name",         slot->name,           nullptr);
-            slotTree.setProperty ("sourceFile",   String (slot->sourceFile), nullptr);
-            slotTree.setProperty ("rootNote",     slot->rootNote,       nullptr);
-            slotTree.setProperty ("relativeNote", slot->relativeNote,   nullptr);
-            slotTree.setProperty ("finetune",     slot->finetune,       nullptr);
-            slotTree.setProperty ("volume",       slot->volume,         nullptr);
-            slotTree.setProperty ("pan",          slot->panning,        nullptr);
-            slotTree.setProperty ("loopMode",     (int) slot->loopMode, nullptr);
-            slotTree.setProperty ("loopStart",    slot->loopStart,      nullptr);
-            slotTree.setProperty ("loopLength",   slot->loopLength,     nullptr);
-            slotTree.setProperty ("busIndex",     slot->busIndex,           nullptr);
-            instTree.appendChild (slotTree, nullptr);
-        }
-
-        /* Persist the 128-byte MIDI keymap as a CSV of slot indices.
-         * Older saves without this property fall back to autoSpread
-         * during reload. */
-        {
-            String km;
-            for (int n = 0; n < 128; ++n)
-            {
-                if (n > 0) km += ",";
-                km += String ((int) inst->slotForNote (n));
-            }
-            instTree.setProperty ("keymap", km, nullptr);
-        }
-
-        tree.appendChild (instTree, nullptr);
-    }
+    /* NOTE: bank/slot data is no longer persisted per node.  The
+     * session-global SampleBankPool serialises every bank through
+     * Session::writeToFile / restoreSampleBankPool. */
 
     MemoryOutputStream out (dest, false);
     { GZIPCompressorOutputStream gzip (out); tree.writeToStream (gzip); }
@@ -5712,183 +5717,15 @@ void SamplerNode::setStateInformation (const void* data, int size)
     for (int b = 0; b < 16; ++b)
         channelBinding[(size_t) b] = (int8_t) (int) tree.getProperty (Identifier ("bind" + String (b)), -1);
 
-    /* Reset instrument table from saved children. */
-    instruments.clear();
-
-    for (int i = 0; i < tree.getNumChildren(); ++i)
-    {
-        const auto instTree = tree.getChild (i);
-        if (instTree.getType() != Identifier ("instr")) continue;
-        SamplerInstrument::Ptr inst (new SamplerInstrument());
-        inst->name        = instTree.getProperty ("name", "").toString();
-        inst->fadeoutRate = (uint16_t) (int) instTree.getProperty ("fadeout", 0);
-        inst->autoVib.type  = (uint8_t) (int) instTree.getProperty ("avType",  0);
-        inst->autoVib.sweep = (uint8_t) (int) instTree.getProperty ("avSweep", 0);
-        inst->autoVib.depth = (uint8_t) (int) instTree.getProperty ("avDepth", 0);
-        inst->autoVib.rate  = (uint8_t) (int) instTree.getProperty ("avRate",  0);
-        inst->mono            = (bool)  instTree.getProperty ("mono", false);
-        inst->portamentoTimeMs = (float) (double) instTree.getProperty ("portamentoMs", 80.0);
-        /* Default ON for sessions that pre-date this field — matches
-         * the SamplerInstrument ctor default and is the "intended
-         * usage" per the design discussion. */
-        inst->envSampleRelative = (bool) instTree.getProperty ("envSampleRel", true);
-
-        auto readEnv = [&](FT2Envelope& e, const String& prefix)
-        {
-            /* All envelope indices are clamped to the points[] capacity
-             * (12 slots, see FT2Envelope) on load so a corrupt session
-             * file can't push later paint / tick code past the array. */
-            const int rawLen  = (int) instTree.getProperty (Identifier (prefix + "Len"),   0);
-            const int rawSus  = (int) instTree.getProperty (Identifier (prefix + "Sus"),   0);
-            const int rawLoS  = (int) instTree.getProperty (Identifier (prefix + "LoopS"), 0);
-            const int rawLoE  = (int) instTree.getProperty (Identifier (prefix + "LoopE"), 0);
-            e.length       = (uint8_t) juce::jlimit (0, 12, rawLen);
-            e.flags        = (uint8_t) (int) instTree.getProperty (Identifier (prefix + "Flags"), 0);
-            e.sustainPoint = (uint8_t) juce::jlimit (0, juce::jmax (0, (int) e.length - 1), rawSus);
-            e.loopStart    = (uint8_t) juce::jlimit (0, juce::jmax (0, (int) e.length - 1), rawLoS);
-            e.loopEnd      = (uint8_t) juce::jlimit ((int) e.loopStart,
-                                                       juce::jmax (0, (int) e.length - 1), rawLoE);
-
-            const String pts = instTree.getProperty (Identifier (prefix + "Pts"), "").toString();
-            const auto parts = StringArray::fromTokens (pts, ";", "");
-            int n = 0;
-            for (const auto& s : parts)
-            {
-                if (n >= 12) break;
-                const auto xy = StringArray::fromTokens (s, ":", "");
-                if (xy.size() != 2) continue;
-                e.points[n].x = (int16_t) xy[0].getIntValue();
-                e.points[n].y = (int16_t) xy[1].getIntValue();
-                ++n;
-            }
-            if (e.length == 0 && n > 0) e.length = (uint8_t) juce::jmin (12, n);
-            if (e.length > (uint8_t) n) e.length = (uint8_t) n;   /* don't outrun parsed points */
-        };
-        readEnv (inst->volumeEnv, "ve");
-        readEnv (inst->panEnv,    "pe");
-
-        for (int c = 0; c < instTree.getNumChildren(); ++c)
-        {
-            const auto slotTree = instTree.getChild (c);
-            if (slotTree.getType() != Identifier ("slot")) continue;
-            const int idx = (int) slotTree.getProperty ("idx", 0);
-            if (idx < 0 || idx >= SamplerInstrument::kNumSlots) continue;
-
-            /* ALWAYS allocate a slot for any persisted slot tree.
-             * Without this, the old codepath silently dropped saved
-             * slot metadata because SamplerInstrument's slots[] is
-             * default-null after construction, so getSlot(idx)
-             * returned nullptr and the metadata setters never ran.
-             * That's why sessions reloaded with empty banks. */
-            auto fresh = std::make_unique<SamplerSampleSlot>();
-
-            /* If a source path was saved (commits >= 309e5e24, now
-             * re-implemented), check existence with the native POSIX
-             * ::access syscall -- matches Disk Op's own native-path
-             * convention.  juce::File only enters the picture when
-             * we actually need to decode the audio (which goes
-             * through juce::AudioFormatManager either way). */
-            const std::string savedPath =
-                slotTree.getProperty ("sourceFile", "").toString().toRawUTF8();
-
-            /* Native POSIX existence check.  No juce::File ops on the
-             * fs side -- those go through wineserver on winelib.  We
-             * pass the path to prepareSlot which does its own native
-             * ::open/::read for the decode-source bytes. */
-            if (! savedPath.empty() && ::access (savedPath.c_str(), R_OK) == 0)
-            {
-                /* juce::File construction is a pure string wrap (no fs
-                 * call) -- prepareSlot extracts the path string + name
-                 * back out and does all real I/O via ::open. */
-                const File f { String (savedPath) };
-                if (auto loaded = inst->prepareSlot (f, formatManager))
-                {
-                    fresh->data16L          = std::move (loaded->data16L);
-                    fresh->data16R          = std::move (loaded->data16R);
-                    fresh->isStereo         = loaded->isStereo;
-                    fresh->numSamples       = loaded->numSamples;
-                    fresh->sourceSampleRate = loaded->sourceSampleRate;
-                    fresh->sourceFile       = loaded->sourceFile;
-                }
-                else
-                {
-                    fresh->sourceFile = savedPath;   // decode failed -- keep path for diag
-                }
-            }
-            else
-            {
-                fresh->sourceFile = savedPath;   // path tracked even if file missing
-            }
-
-            /* Apply the saved metadata on top of (possibly reloaded) audio. */
-            fresh->name         = slotTree.getProperty ("name", "").toString();
-            fresh->rootNote     = (int) slotTree.getProperty ("rootNote", 60);
-            fresh->relativeNote = (int) slotTree.getProperty ("relativeNote", 0);
-            fresh->finetune     = (int) slotTree.getProperty ("finetune", 0);
-            fresh->volume       = (float) (double) slotTree.getProperty ("volume", 1.0);
-            fresh->panning      = (float) (double) slotTree.getProperty ("pan", 0.5);
-            fresh->loopMode     = (SamplerLoopMode) (int) slotTree.getProperty ("loopMode", 0);
-            fresh->loopStart    = (int) slotTree.getProperty ("loopStart",  0);
-            fresh->loopLength   = (int) slotTree.getProperty ("loopLength", 0);
-
-            /* Bus assignment.  Read busIndex if present; older
-             * intermediate formats (busSend1..N from the multi-
-             * send experiment / busAssign+busWet) get folded into
-             * busIndex with a best-effort mapping.  Default if
-             * none present: Bus 1 (from ctor). */
-            if (slotTree.hasProperty ("busIndex"))
-            {
-                fresh->busIndex = juce::jlimit (0, SamplerNode::kNumBuses - 1,
-                                                (int) slotTree.getProperty ("busIndex", 0));
-            }
-            else if (slotTree.hasProperty ("busSend1"))
-            {
-                float best = 0.0f; int bestIdx = 0;
-                for (int b = 0; b < SamplerNode::kNumBuses; ++b)
-                {
-                    const float s = (float) (double) slotTree.getProperty (
-                        Identifier ("busSend" + String (b + 1)), 0.0);
-                    if (s > best) { best = s; bestIdx = b; }
-                }
-                fresh->busIndex = bestIdx;
-            }
-            else if (slotTree.hasProperty ("busAssign"))
-            {
-                const int oldAssign = (int) slotTree.getProperty ("busAssign", 0);
-                fresh->busIndex = juce::jmax (0, oldAssign - 1);
-            }
-
-            /* commitSlot publishes the slot under the (already held)
-             * sampleLock.  inst is a fresh SamplerInstrument so this
-             * is the first commit -- no audio-thread contention. */
-            inst->commitSlot (idx, std::move (fresh));
-        }
-
-        /* Restore the saved keymap if present, AFTER all slots are
-         * committed (commitSlot auto-spreads on first-load if
-         * !keymapUserModified, so this needs to fire last to override
-         * the auto-spread). */
-        const String savedKeymap = instTree.getProperty ("keymap", "").toString();
-        if (savedKeymap.isNotEmpty())
-        {
-            auto parts = StringArray::fromTokens (savedKeymap, ",", "");
-            const int n = juce::jmin (128, parts.size());
-            for (int k = 0; k < n; ++k)
-            {
-                const int s = juce::jlimit (0, SamplerInstrument::kNumSlots - 1,
-                                            parts[k].getIntValue());
-                inst->setSlotForNote (k, s);
-            }
-        }
-
-        instruments.push_back (inst);
-    }
-
-    if (instruments.empty())
-        instruments.push_back (new SamplerInstrument());
+    /* No bank data here -- the session-global SampleBankPool is
+     * restored by Session::restoreGraphState() BEFORE this method
+     * runs, so the pool is fully populated by the time any
+     * SamplerNode's setStateInformation lands. */
 
     synth->clearSounds();
     synth->addSound (new Ft2SamplerSound (*this));
+
+    notifyBanksChanged();
 }
 
 } // namespace element

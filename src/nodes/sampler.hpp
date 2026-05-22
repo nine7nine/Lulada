@@ -147,9 +147,22 @@ private:
  *  (default: channel N → instrument N; updated by MIDI program-change).
  *  Per-voice DSP via vendored ft2-clone mixer.  Each instrument carries
  *  its own FT2 vol+pan envelopes, fadeout, and auto-vibrato.  */
-class SamplerNode : public BaseProcessor
+class SamplerNode : public BaseProcessor,
+                    public juce::ChangeBroadcaster
 {
 public:
+    /** Notify listeners (editor + Disk Op pane) that instruments[] or
+     *  any slot contents changed.  Cheap, deferred to message thread
+     *  internally by juce::ChangeBroadcaster.  Called from every
+     *  mutation entry point (addInstrument / removeInstrument /
+     *  loadSampleToSlot / setStateInformation / clearSlot wrappers
+     *  / external clears in DiskOpView etc.). */
+    /** Notify the per-node ChangeBroadcaster -- listeners (the
+     *  editor's per-node param sync) get woken up.  Pool-level
+     *  bank/slot changes go through SampleBankPool's own
+     *  ChangeBroadcaster, not this. */
+    void notifyBanksChanged() { sendChangeMessage(); }
+
     static constexpr int kMaxInstruments = 128;
     static constexpr int kEnvTickRateHz  = 50;   // FT2 nominal tick rate
     static constexpr int kNumBuses       = 4;    // stereo aux outputs
@@ -252,8 +265,11 @@ private:
     AudioFormatManager formatManager;
 
     CriticalSection sampleLock;
-    std::vector<SamplerInstrument::Ptr> instruments;
-    std::array<int8_t, 16> channelBinding {};   // -1 = default (channel N → instrument N)
+    /* Instruments live in the SESSION-GLOBAL SampleBankPool (see
+     * services/samplebankpool.hpp + project_sample_bank_pool_architecture
+     * memory note).  This node is a CONSUMER -- it picks which banks
+     * to play via channelBinding[MIDI channel -> bank index]. */
+    std::array<int8_t, 16> channelBinding {};   // -1 = default (channel N -> bank N)
 
     int numVoices = 16;
     double currentSampleRate = 48000.0;

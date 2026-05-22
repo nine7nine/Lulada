@@ -67,6 +67,13 @@ public:
     void saveGraphState();
     void restoreGraphState();
 
+    /** Pull the session-global SampleBankPool out of the persisted
+     *  session ValueTree.  Call AFTER readFromFile / migrate, BEFORE
+     *  restoreGraphState -- SamplerNodes reference banks via the
+     *  pool, so the pool must be populated first.  Idempotent:
+     *  clears the pool at the start. */
+    void restoreSampleBankPool() const;
+
     inline int getNumControllers() const { return getControllersValueTree().getNumChildren(); }
 
     inline juce::ValueTree getControllerValueTree (const int i) const
