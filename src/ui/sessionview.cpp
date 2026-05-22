@@ -1049,16 +1049,23 @@ void SessionView::paint (Graphics& g)
             g.drawHorizontalLine (cell.getBottom() - 1,
                                   (float) cell.getX(),
                                   (float) cell.getRight());
-
-            /* Highlight border on the most-recently launched scene
-             * so the user can see which scene is "current" (Ableton
-             * convention).  Drawn LAST so it sits over everything. */
-            if (r == currentSceneRow_)
-            {
-                g.setColour (kPlayheadAccent);
-                g.drawRect (cell.reduced (1, 1), 2);
-            }
         }
+    }
+
+    /* Active-scene row indicator -- translucent amber overlay across
+     * the entire row (scene label + clip cells + master cell) so the
+     * user can see the whole "current scene" in one visual sweep.
+     * Drawn AFTER all per-cell paint so it tints them uniformly.
+     * Top/bottom edges accented at higher alpha for definition. */
+    if (currentSceneRow_ >= 0 && currentSceneRow_ < scenes_.size())
+    {
+        const auto sl = sceneLabelBounds (currentSceneRow_);
+        const Rectangle<int> rowR (0, sl.getY(), getWidth(), kRowH);
+        g.setColour (kPlayheadAccent.withAlpha (0.10f));
+        g.fillRect (rowR);
+        g.setColour (kPlayheadAccent.withAlpha (0.80f));
+        g.drawHorizontalLine (rowR.getY(),         0.0f, (float) getWidth());
+        g.drawHorizontalLine (rowR.getBottom() - 1, 0.0f, (float) getWidth());
     }
 
     /* Close the scrollable-area clip region -- everything after this
@@ -1697,19 +1704,45 @@ void SessionView::bangScene (int sceneRow)
         ? computeTargetBeat (currentTransportBeat(), slowest)
         : -1.0;
 
+    /* Exclusive scene launch -- stop every clip that's currently
+     * active on a row OTHER than the one we're banging.  Without
+     * this, scene 2's clips keep playing when the user goes back
+     * to scene 1 (since same-column mutual exclusion only catches
+     * the clips that scene 1 ALSO has a slot for).  All stops use
+     * the same targetBeat so the switch is atomic in one audio
+     * block. */
+    for (auto* c : clips_)
+    {
+        if (c->sceneRow == sceneRow) continue;
+        const LiveState s = c->state.load (std::memory_order_relaxed);
+        if (s != LiveState::Playing && s != LiveState::WaitingToStart) continue;
+        if (auto* trk = lookupTracker (c->trackerNodeId))
+            trk->schedulePlaying (c->sequenceIdx, targetBeat, false);
+        c->state.store (targetBeat < 0.0 ? LiveState::Stopped
+                                         : LiveState::WaitingToStop,
+                        std::memory_order_relaxed);
+        repaint (cellBounds (c->sceneRow, c->columnIdx));
+    }
+
     for (auto* c : clips_)
         if (c->sceneRow == sceneRow)
             transitionClip (*c, targetBeat);
 
-    /* Track the most-recently launched scene so the master column
-     * can highlight it.  Repaint old + new cells. */
+    /* Track the most-recently launched scene so the entire row can
+     * be drawn as the "current" scene (Ableton convention).  Repaint
+     * the old + new row strips across the full width. */
     if (currentSceneRow_ != sceneRow)
     {
         const int prev = currentSceneRow_;
         currentSceneRow_ = sceneRow;
-        if (prev >= 0 && prev < scenes_.size())
-            repaint (masterCellBounds (prev));
-        repaint (masterCellBounds (sceneRow));
+        auto repaintRow = [this] (int row)
+        {
+            if (row < 0 || row >= scenes_.size()) return;
+            const auto sl = sceneLabelBounds (row);
+            repaint (Rectangle<int> (0, sl.getY(), getWidth(), kRowH));
+        };
+        repaintRow (prev);
+        repaintRow (sceneRow);
     }
 }
 
