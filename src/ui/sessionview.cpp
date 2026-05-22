@@ -396,22 +396,20 @@ Rectangle<int> SessionView::columnNameLabelBounds (int columnIdx) const noexcept
                            h.getHeight() / 2);
 }
 
-/* Column header bottom-half layout: three equal-width buttons with
- * 2 px gaps.  STOP | MUTE | SOLO. */
+/* Column header bottom-half layout: two equal-width buttons with
+ * a 2 px gap.  MUTE | SOLO.  STOP was dropped (STOP ALL handles the
+ * global case; per-clip click handles individual stops; per-column
+ * STOP was the redundant affordance). */
 static int columnFooterButtonWidth (int innerW) noexcept
 {
-    return (innerW - 4) / 3;   // 2 gaps of 2 px each
+    return (innerW - 2) / 2;   // 1 gap of 2 px
 }
 
-Rectangle<int> SessionView::columnStopButtonBounds (int columnIdx) const noexcept
+Rectangle<int> SessionView::columnStopButtonBounds (int) const noexcept
 {
-    const auto h = columnHeaderBounds (columnIdx);
-    const int topH = h.getHeight() / 2;
-    const int btnAreaH = h.getHeight() - topH - 2;
-    const int btnAreaY = h.getY() + topH;
-    const int innerW = h.getWidth() - 4;
-    const int w = columnFooterButtonWidth (innerW);
-    return Rectangle<int> (h.getX() + 2, btnAreaY, w, btnAreaH);
+    /* STOP no longer has a visible affordance in the column header.
+     * Returned rect is empty so hit-tests fail and paint is skipped. */
+    return {};
 }
 
 Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcept
@@ -422,7 +420,7 @@ Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcep
     const int btnAreaY = h.getY() + topH;
     const int innerW = h.getWidth() - 4;
     const int w = columnFooterButtonWidth (innerW);
-    return Rectangle<int> (h.getX() + 2 + w + 2, btnAreaY, w, btnAreaH);
+    return Rectangle<int> (h.getX() + 2, btnAreaY, w, btnAreaH);
 }
 
 Rectangle<int> SessionView::columnSoloButtonBounds (int columnIdx) const noexcept
@@ -433,7 +431,7 @@ Rectangle<int> SessionView::columnSoloButtonBounds (int columnIdx) const noexcep
     const int btnAreaY = h.getY() + topH;
     const int innerW = h.getWidth() - 4;
     const int w = columnFooterButtonWidth (innerW);
-    return Rectangle<int> (h.getX() + 2 + (w + 2) * 2, btnAreaY, w, btnAreaH);
+    return Rectangle<int> (h.getX() + 2 + w + 2, btnAreaY, w, btnAreaH);
 }
 
 Rectangle<int> SessionView::masterCellBounds (int sceneRow) const noexcept
@@ -648,7 +646,6 @@ void SessionView::paint (Graphics& g)
         const auto h     = columnHeaderBounds (c);
         const auto tint  = columnTint (c);
         const auto nameR = columnNameLabelBounds (c);
-        const auto stopR = columnStopButtonBounds (c);
         const auto muteR = columnMuteButtonBounds (c);
         const auto soloR = columnSoloButtonBounds (c);
 
@@ -670,13 +667,6 @@ void SessionView::paint (Graphics& g)
                     nameR.reduced (8, 0),
                     juce::Justification::centredLeft, true);
 
-        bool active = false;
-        for (auto* clip : clips_)
-            if (clip->columnIdx == c)
-            {
-                const LiveState s = clip->state.load (std::memory_order_relaxed);
-                if (s != LiveState::Stopped) { active = true; break; }
-            }
         const bool muted  = isColumnMuted  (c);
         const bool soloed = isColumnSoloed (c);
         const Colour btnTint = tint.withMultipliedSaturation (0.6f)
@@ -684,16 +674,6 @@ void SessionView::paint (Graphics& g)
 
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       9.0f, juce::Font::bold));
-
-        /* STOP -- lights up brighter when the column has an active
-         * clip; the click stops every active clip on this column. */
-        g.setColour (active ? btnTint.withMultipliedBrightness (1.6f) : btnTint);
-        g.fillRect (stopR);
-        g.setColour (kCellOutlineColour);
-        g.drawRect (stopR, 1);
-        g.setColour (active ? juce::Colours::white
-                            : juce::Colours::white.withAlpha (0.70f));
-        g.drawText ("STOP", stopR, juce::Justification::centred);
 
         /* MUTE -- amber-red when user-muted (NOT when muted by
          * solo elsewhere, since the visual should reflect intent). */
@@ -1231,13 +1211,10 @@ void SessionView::mouseDown (const MouseEvent& e)
         return;
     }
 
-    /* Per-column footer -- STOP / MUTE.  Tested before cell hits
-     * so a click here never stages a drag. */
-    if (hitTestColumnStop (e.getPosition(), col))
-    {
-        stopColumn (col);
-        return;
-    }
+    /* Column-header MUTE / SOLO.  Tested before cell hits so a click
+     * here never stages a clip drag.  STOP is no longer surfaced --
+     * STOP ALL covers the global, per-clip click stops individual
+     * clips, and MUTE silences the column without stopping clips. */
     if (hitTestColumnMute (e.getPosition(), col))
     {
         toggleColumnMute (col);
