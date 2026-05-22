@@ -11,6 +11,7 @@
 #include <element/ui/style.hpp>
 
 #include "nodes/tracker.hpp"
+#include "nodes/trackereditor.hpp"
 
 namespace element {
 
@@ -191,6 +192,20 @@ Rectangle<int> SessionView::columnHeaderBounds (int columnIdx) const noexcept
                            kColW, kHeaderH);
 }
 
+Rectangle<int> SessionView::playButtonBounds (int sceneRow, int columnIdx) const noexcept
+{
+    /* Left ~18px of the inner cell rect — play/stop glyph. */
+    auto inner = cellBounds (sceneRow, columnIdx).reduced (2, 2);
+    return inner.removeFromLeft (18);
+}
+
+Rectangle<int> SessionView::editButtonBounds (int sceneRow, int columnIdx) const noexcept
+{
+    /* Right ~18px of the inner cell rect — opens tracker pattern popup. */
+    auto inner = cellBounds (sceneRow, columnIdx).reduced (2, 2);
+    return inner.removeFromRight (18);
+}
+
 bool SessionView::hitTestCell (Point<int> p, int& outRow, int& outCol) const noexcept
 {
     const auto body = gridBodyBounds();
@@ -207,6 +222,18 @@ bool SessionView::hitTestSceneLabel (Point<int> p, int& outRow) const noexcept
     if (! strip.contains (p)) return false;
     outRow = (p.y - strip.getY()) / kRowH;
     return outRow >= 0 && outRow < scenes_.size();
+}
+
+bool SessionView::hitTestPlayButton (Point<int> p, int& outRow, int& outCol) const noexcept
+{
+    if (! hitTestCell (p, outRow, outCol)) return false;
+    return playButtonBounds (outRow, outCol).contains (p);
+}
+
+bool SessionView::hitTestEditButton (Point<int> p, int& outRow, int& outCol) const noexcept
+{
+    if (! hitTestCell (p, outRow, outCol)) return false;
+    return editButtonBounds (outRow, outCol).contains (p);
 }
 
 /* === Paint ============================================================= */
@@ -289,8 +316,8 @@ void SessionView::paint (Graphics& g)
     {
         for (int c = 0; c < columns_.size(); ++c)
         {
-            const auto cb = cellBounds (r, c);
-            auto inner = cb.reduced (2, 2);  // mutated by removeFromLeft below
+            const auto cb    = cellBounds (r, c);
+            const auto inner = cb.reduced (2, 2);
 
             SessionClip* clip = findClip (r, c);
             if (clip == nullptr)
@@ -306,35 +333,60 @@ void SessionView::paint (Graphics& g)
             const bool playing = clip->state.load (std::memory_order_relaxed)
                                  == LiveState::Playing;
 
-            /* Fill with the clip's colour, brightened when playing. */
-            Colour fill = playing ? clip->color.brighter (0.25f)
-                                  : clip->color.withMultipliedAlpha (0.85f);
+            /* Fill body with the clip's colour, brightened when playing. */
+            const Colour fill = playing ? clip->color.brighter (0.25f)
+                                        : clip->color.withMultipliedAlpha (0.85f);
             g.setColour (fill);
             g.fillRect (inner);
 
-            /* Play / stop glyph + name. */
-            const int glyphW = 14;
-            const auto glyph = inner.removeFromLeft (glyphW);
-            g.setColour (juce::Colours::black.withAlpha (0.65f));
+            const auto playR = playButtonBounds (r, c);
+            const auto editR = editButtonBounds (r, c);
+
+            /* --- Play / stop button (LEFT) --- */
+            g.setColour (juce::Colours::black.withAlpha (0.20f));
+            g.fillRect (playR);
+            g.setColour (juce::Colours::black.withAlpha (0.85f));
             if (playing)
-                g.fillRect (glyph.reduced (4, 6));   // square stop glyph
+            {
+                /* Square stop glyph. */
+                g.fillRect (playR.reduced (5, 7));
+            }
             else
             {
-                /* Right-pointing triangle "▶" via path. */
+                /* Right-pointing play triangle. */
                 juce::Path p;
-                const float gx = (float) glyph.getX() + 4.0f;
-                const float gy = (float) glyph.getY() + 6.0f;
-                const float gh = (float) glyph.getHeight() - 12.0f;
-                const float gw = gh * 0.866f;        // equilateral-ish
-                p.addTriangle (gx,           gy,
-                               gx,           gy + gh,
-                               gx + gw,      gy + gh * 0.5f);
+                const float gx = (float) playR.getX() + 5.0f;
+                const float gy = (float) playR.getY() + 7.0f;
+                const float gh = (float) playR.getHeight() - 14.0f;
+                const float gw = gh * 0.866f;
+                p.addTriangle (gx,      gy,
+                               gx,      gy + gh,
+                               gx + gw, gy + gh * 0.5f);
                 g.fillPath (p);
             }
 
+            /* --- Edit button (RIGHT) — three horizontal lines as a
+             * tracker-pattern hint glyph. */
+            g.setColour (juce::Colours::black.withAlpha (0.18f));
+            g.fillRect (editR);
+            g.setColour (juce::Colours::black.withAlpha (0.80f));
+            {
+                const int cx = editR.getCentreX();
+                const int cy = editR.getCentreY();
+                const int lineW = 9;
+                const int xL = cx - lineW / 2;
+                const int xR = cx + lineW / 2;
+                g.drawHorizontalLine (cy - 4, (float) xL, (float) xR);
+                g.drawHorizontalLine (cy,     (float) xL, (float) xR);
+                g.drawHorizontalLine (cy + 4, (float) xL, (float) xR);
+            }
+
+            /* --- Clip name (middle, between the two buttons) --- */
+            const auto nameR = inner.withTrimmedLeft (playR.getWidth())
+                                    .withTrimmedRight (editR.getWidth());
             g.setColour (juce::Colours::black.withAlpha (0.80f));
             g.drawText (clip->name,
-                        inner.reduced (4, 0),
+                        nameR.reduced (4, 0),
                         juce::Justification::centredLeft, true);
 
             /* Position bar across the bottom when playing. */
@@ -356,7 +408,7 @@ void SessionView::paint (Graphics& g)
 
             /* Outline. */
             g.setColour (kCellOutlineColour);
-            g.drawRect (cb.reduced (2, 2), 1);
+            g.drawRect (inner, 1);
         }
     }
 
@@ -409,7 +461,20 @@ void SessionView::mouseDown (const MouseEvent& e)
         return;
     }
 
-    if (hitTestCell (e.getPosition(), row, col))
+    /* Three click zones on a filled clip cell: edit button (right),
+     * play button (left), and the middle name area which is inert.
+     * Test edit first, then play; if neither is hit, the click was
+     * on the name strip and does nothing. */
+    if (hitTestEditButton (e.getPosition(), row, col))
+    {
+        if (auto* clip = findClip (row, col))
+        {
+            openPatternEditor (*clip);
+            return;
+        }
+    }
+
+    if (hitTestPlayButton (e.getPosition(), row, col))
     {
         if (auto* clip = findClip (row, col))
         {
@@ -417,7 +482,8 @@ void SessionView::mouseDown (const MouseEvent& e)
             return;
         }
     }
-    else if (hitTestSceneLabel (e.getPosition(), row))
+
+    if (hitTestSceneLabel (e.getPosition(), row))
     {
         bangScene (row);
     }
@@ -491,6 +557,44 @@ void SessionView::addClipAt (int sceneRow, int columnIdx)
 
     writeToSession();
     repaint (cellBounds (sceneRow, columnIdx));
+}
+
+void SessionView::openPatternEditor (SessionClip& clip)
+{
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto graph = sess->getActiveGraph();
+    if (! graph.isValid()) return;
+    Node n = graph.getNodeById (clip.trackerNodeId);
+    if (! n.isValid()) return;
+    if (dynamic_cast<TrackerNode*> (n.getObject()) == nullptr) return;
+
+    auto* editor = new TrackerEditor (n);
+    editor->setSize (820, 540);
+
+    /* Jump to the clip's sequence index — TrackerEditor exposes only
+     * a relative switchPattern (delta), so compute the offset from
+     * its current pattern.  Clamp against the live pattern count to
+     * avoid jumping past the end if the sequence vanished. */
+    if (clip.sequenceIdx >= 0)
+    {
+        const int curr  = editor->getPatternIndex();
+        const int total = editor->getPatternCount();
+        const int target = juce::jlimit (0, juce::jmax (0, total - 1), clip.sequenceIdx);
+        const int delta = target - curr;
+        if (delta != 0)
+            editor->switchPattern (delta);
+    }
+
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned (editor);
+    opts.dialogTitle = "Tracker — " + clip.name;
+    opts.dialogBackgroundColour = Colour { 0xff'18'18'18 };
+    opts.escapeKeyTriggersCloseButton = true;
+    opts.useNativeTitleBar = true;
+    opts.resizable = true;
+    opts.launchAsync();
 }
 
 void SessionView::deleteClip (SessionClip& clip)

@@ -94,6 +94,7 @@ private:
     void bangScene  (int sceneRow);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
     void deleteClip (SessionClip&);
+    void openPatternEditor (SessionClip&);  // popup tracker editor at clip's seqIdx
 
     TrackerNode* lookupTracker (juce::uint32 nodeId) const;
     SessionClip* findClip (int sceneRow, int columnIdx) const;
@@ -113,8 +114,12 @@ private:
     juce::Rectangle<int> cellBounds (int sceneRow, int columnIdx) const noexcept;
     juce::Rectangle<int> sceneLabelBounds (int sceneRow) const noexcept;
     juce::Rectangle<int> columnHeaderBounds (int columnIdx) const noexcept;
+    juce::Rectangle<int> playButtonBounds (int sceneRow, int columnIdx) const noexcept;
+    juce::Rectangle<int> editButtonBounds (int sceneRow, int columnIdx) const noexcept;
     bool hitTestCell (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestSceneLabel (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestPlayButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
+    bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
 
     Services* services_ = nullptr;
     Transport::MonitorPtr monitor_;
