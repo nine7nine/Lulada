@@ -988,17 +988,37 @@ void SessionView::paint (Graphics& g)
                 g.fillRect (cell);
             }
 
-            /* Launch button -- gray background by default, amber
-             * when ONE clip in the scene is currently playing.
-             * Waiting-state clips don't light it up so a scene on
-             * its way out doesn't look "active" anymore. */
+            /* Launch button.  Three states:
+             *   - Playing : solid amber bg + amber glyph.
+             *   - WaitingToStart only (no Playing yet) : amber bg +
+             *     glyph pulsed on pulsePhase_ so the user gets
+             *     immediate feedback during the quant gap.
+             *   - else : gray bg + neutral glyph. */
             const bool sceneActive = sceneHasActiveClip (r);
-            g.setColour (sceneActive
-                            ? kPlayheadAccent.withAlpha (0.35f)
-                            : Colour { 0xff'2a'2a'2a });
+            const bool sceneQueued = (! sceneActive) && sceneHasQueuedClip (r);
+
+            float queuedAlpha = 1.0f;
+            if (sceneQueued)
+            {
+                const float t = (float) (pulsePhase_ % 24) / 24.0f;
+                queuedAlpha = 0.50f + 0.45f
+                            * std::sin (t * juce::MathConstants<float>::twoPi);
+            }
+
+            if (sceneActive)
+                g.setColour (kPlayheadAccent.withAlpha (0.35f));
+            else if (sceneQueued)
+                g.setColour (kPlayheadAccent.withAlpha (0.35f * queuedAlpha));
+            else
+                g.setColour (Colour { 0xff'2a'2a'2a });
             g.fillRect (launchR);
-            g.setColour (sceneActive ? kPlayheadAccent
-                                     : Colour { 0xff'd0'd0'd0 });
+
+            if (sceneActive)
+                g.setColour (kPlayheadAccent);
+            else if (sceneQueued)
+                g.setColour (kPlayheadAccent.withAlpha (queuedAlpha));
+            else
+                g.setColour (Colour { 0xff'd0'd0'd0 });
             {
                 juce::Path p;
                 const float gx = (float) launchR.getX() + 6.0f;
@@ -1067,20 +1087,37 @@ void SessionView::paint (Graphics& g)
         }
     }
 
-    /* Active-scene row indicator -- translucent amber overlay across
-     * the entire row (scene label + clip cells + master cell) so the
-     * user can see the whole "current scene" in one visual sweep.
-     * Drawn AFTER all per-cell paint so it tints them uniformly.
-     * Top/bottom edges accented at higher alpha for definition. */
+    /* Master scene row indicator -- translucent amber overlay across
+     * the entire row (scene label + clip cells + master cell).  Bound
+     * to the master scene identity (currentSceneRow_, set on bang).
+     * Solid amber while the master scene has at least one Playing
+     * clip; pulsed amber while clips are still queued
+     * (WaitingToStart) so the bang has immediate visual feedback
+     * during the launch-quant gap.  No highlight on other scenes
+     * whose clips happen to be playing.  Drawn AFTER all per-cell
+     * paint so it tints them uniformly. */
     if (currentSceneRow_ >= 0 && currentSceneRow_ < scenes_.size())
     {
-        const auto sl = sceneLabelBounds (currentSceneRow_);
-        const Rectangle<int> rowR (0, sl.getY(), getWidth(), kRowH);
-        g.setColour (kPlayheadAccent.withAlpha (0.10f));
-        g.fillRect (rowR);
-        g.setColour (kPlayheadAccent.withAlpha (0.80f));
-        g.drawHorizontalLine (rowR.getY(),         0.0f, (float) getWidth());
-        g.drawHorizontalLine (rowR.getBottom() - 1, 0.0f, (float) getWidth());
+        const bool rowActive = sceneHasActiveClip (currentSceneRow_);
+        const bool rowQueued = (! rowActive)
+                             && sceneHasQueuedClip (currentSceneRow_);
+        if (rowActive || rowQueued)
+        {
+            float alpha = 1.0f;
+            if (rowQueued)
+            {
+                const float t = (float) (pulsePhase_ % 24) / 24.0f;
+                alpha = 0.50f + 0.45f
+                      * std::sin (t * juce::MathConstants<float>::twoPi);
+            }
+            const auto sl = sceneLabelBounds (currentSceneRow_);
+            const Rectangle<int> rowR (0, sl.getY(), getWidth(), kRowH);
+            g.setColour (kPlayheadAccent.withAlpha (0.10f * alpha));
+            g.fillRect (rowR);
+            g.setColour (kPlayheadAccent.withAlpha (0.80f * alpha));
+            g.drawHorizontalLine (rowR.getY(),         0.0f, (float) getWidth());
+            g.drawHorizontalLine (rowR.getBottom() - 1, 0.0f, (float) getWidth());
+        }
     }
 
     /* Close the scrollable-area clip region -- everything after this
@@ -1693,29 +1730,38 @@ void SessionView::bangScene (int sceneRow)
         ? computeTargetBeat (currentTransportBeat(), slowest)
         : -1.0;
 
-    /* Exclusive scene launch -- stop every clip that's currently
-     * active on a row OTHER than the one we're banging.  Without
-     * this, scene 2's clips keep playing when the user goes back
-     * to scene 1 (since same-column mutual exclusion only catches
-     * the clips that scene 1 ALSO has a slot for).  All stops use
-     * the same targetBeat so the switch is atomic in one audio
-     * block. */
-    for (auto* c : clips_)
+    /* Scene launch is column-wise.  For each column:
+     *   - new scene has a clip here -> launch it via transitionClip
+     *     (same-column mutual exclusion stops any prior clip on the
+     *     column);
+     *   - new scene has an EMPTY slot here -> stop whatever was
+     *     playing on this column.  Empty slots act as "stop the
+     *     track" in Ableton / Bitwig, so a row with sparse clips
+     *     still represents a coherent musical state.
+     * Columns the user hasn't authored a clip on are left alone. */
+    for (int col = 0; col < columns_.size(); ++col)
     {
-        if (c->sceneRow == sceneRow) continue;
-        const LiveState s = c->state.load (std::memory_order_relaxed);
-        if (s != LiveState::Playing && s != LiveState::WaitingToStart) continue;
-        if (auto* trk = lookupTracker (c->trackerNodeId))
-            trk->schedulePlaying (c->sequenceIdx, targetBeat, false);
-        c->state.store (targetBeat < 0.0 ? LiveState::Stopped
-                                         : LiveState::WaitingToStop,
-                        std::memory_order_relaxed);
-        repaint (cellBounds (c->sceneRow, c->columnIdx));
-    }
+        if (auto* newClip = findClip (sceneRow, col))
+        {
+            transitionClip (*newClip, targetBeat);
+            continue;
+        }
 
-    for (auto* c : clips_)
-        if (c->sceneRow == sceneRow)
-            transitionClip (*c, targetBeat);
+        /* Empty slot -- stop active clips on this column at the
+         * same targetBeat so the switch is atomic in one block. */
+        for (auto* c : clips_)
+        {
+            if (c->columnIdx != col) continue;
+            const LiveState s = c->state.load (std::memory_order_relaxed);
+            if (s != LiveState::Playing && s != LiveState::WaitingToStart) continue;
+            if (auto* trk = lookupTracker (c->trackerNodeId))
+                trk->schedulePlaying (c->sequenceIdx, targetBeat, false);
+            c->state.store (targetBeat < 0.0 ? LiveState::Stopped
+                                             : LiveState::WaitingToStop,
+                            std::memory_order_relaxed);
+            repaint (cellBounds (c->sceneRow, c->columnIdx));
+        }
+    }
 
     /* Track the most-recently launched scene so the entire row can
      * be drawn as the "current" scene (Ableton convention).  Repaint
@@ -1890,6 +1936,22 @@ bool SessionView::sceneHasActiveClip (int sceneRow) const noexcept
     {
         if (c->sceneRow != sceneRow) continue;
         if (c->state.load (std::memory_order_relaxed) == LiveState::Playing)
+            return true;
+    }
+    return false;
+}
+
+bool SessionView::sceneHasQueuedClip (int sceneRow) const noexcept
+{
+    /* "Queued" = WaitingToStart -- clicked, waiting for the launch
+     * quant boundary to fire.  Used to drive the pulsing visual on
+     * the master button + row band so the user gets immediate
+     * feedback on bang during the quant gap (Bar at 120 BPM 4/4 can
+     * be up to 2 s of wait). */
+    for (auto* c : clips_)
+    {
+        if (c->sceneRow != sceneRow) continue;
+        if (c->state.load (std::memory_order_relaxed) == LiveState::WaitingToStart)
             return true;
     }
     return false;
@@ -3228,23 +3290,38 @@ void SessionView::timerCallback()
         const bool enginePlaying = trk->isSequencePlaying (clip->sequenceIdx);
         const LiveState cur = clip->state.load (std::memory_order_relaxed);
 
-        /* State reconciliation: the audio thread flips seq->playing
-         * at the scheduled boundary; the UI tick observes the result
-         * and transitions WaitingTo* -> final state.  Crucially, we
-         * do NOT clobber WaitingTo* with an engine snapshot that
-         * disagrees -- those states represent "we're waiting for the
-         * boundary," which means engine has NOT changed yet. */
+        /* State reconciliation -- SessionClip.state is authoritative
+         * for "did the user launch this from session view".  We do NOT
+         * auto-flip Stopped -> Playing from engine state: vht keeps
+         * each tracker's curr_seq->playing = 1 by default so it can
+         * emit MIDI at all (installDefaultPattern / setState), and a
+         * naive engine-mirror would light up every first-clip as
+         * "active" on session open without any user input.
+         *
+         * Allowed transitions:
+         *   WaitingToStart -> Playing  when audio thread fires the launch
+         *   WaitingToStop  -> Stopped  when audio thread fires the stop
+         *   Playing        -> Stopped  ONLY after we have observed engine
+         *                              playing at least once for this
+         *                              clip (lastDrawnPlaying was true).
+         *                              This lets us catch engine-side
+         *                              kills (one-shot patterns, kill
+         *                              triggers) while protecting against
+         *                              the brief race where we set state
+         *                              to Playing immediately on bang
+         *                              but the audio thread hasn't fired
+         *                              yet (isSequencePlaying false). */
         LiveState next = cur;
         switch (cur)
         {
             case LiveState::Stopped:
-                if (enginePlaying) next = LiveState::Playing;
                 break;
             case LiveState::WaitingToStart:
                 if (enginePlaying) next = LiveState::Playing;
                 break;
             case LiveState::Playing:
-                if (! enginePlaying) next = LiveState::Stopped;
+                if (! enginePlaying && clip->lastDrawnPlaying)
+                    next = LiveState::Stopped;
                 break;
             case LiveState::WaitingToStop:
                 if (! enginePlaying) next = LiveState::Stopped;
@@ -3260,18 +3337,47 @@ void SessionView::timerCallback()
          * border animates each tick). */
         const bool isWaiting = (cur == LiveState::WaitingToStart
                              || cur == LiveState::WaitingToStop);
-        const bool needRepaint = (next != cur)
+        const bool stateChanged = (next != cur);
+        const bool needRepaint = stateChanged
                               || (posRow != clip->lastDrawnPosRow)
-                              || (enginePlaying != clip->lastDrawnPlaying)
                               || isWaiting;
 
-        if (next != cur)
+        if (stateChanged)
             clip->state.store (next, std::memory_order_relaxed);
         clip->lastDrawnPlaying = enginePlaying;
         clip->lastDrawnPosRow  = posRow;
 
         if (needRepaint)
             repaint (cellBounds (clip->sceneRow, clip->columnIdx));
+
+        /* Master launch button + scene row amber both derive from
+         * whether the scene has any Playing or WaitingToStart clip.
+         * Repaint conditions:
+         *   - clip transitioned into / out of Playing : reflect the
+         *     solid-amber boundary on the master cell + row band.
+         *   - clip transitioned into / out of WaitingToStart : same
+         *     reason, on the pulsed boundary.
+         *   - clip is currently WaitingToStart : drive the pulse
+         *     animation each tick. */
+        const bool wasWaitingStart  = (cur  == LiveState::WaitingToStart);
+        const bool willWaitingStart = (next == LiveState::WaitingToStart);
+        const bool needMasterPaint =
+            (stateChanged
+             && (cur  == LiveState::Playing
+              || next == LiveState::Playing
+              || wasWaitingStart
+              || willWaitingStart))
+            || wasWaitingStart;
+
+        if (needMasterPaint)
+        {
+            repaint (masterCellBounds (clip->sceneRow));
+            if (clip->sceneRow == currentSceneRow_)
+            {
+                const auto sl = sceneLabelBounds (clip->sceneRow);
+                repaint (Rectangle<int> (0, sl.getY(), getWidth(), kRowH));
+            }
+        }
 
         /* Follow-action edge: only check after state reconciliation
          * so a freshly-launched clip doesn't immediately fire its
