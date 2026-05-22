@@ -6,6 +6,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>      // ::access for native POSIX file-existence checks
 
 /* Vendored ft2-clone mixer (BSD-3-Clause). See src/engine/sampler/. */
 extern "C" {
@@ -142,6 +143,11 @@ SamplerInstrument::prepareSlot (const File& file, AudioFormatManager& fmt)
 
     auto s = std::make_unique<SamplerSampleSlot>();
     s->name             = file.getFileNameWithoutExtension();
+    /* Capture the absolute path as a native POSIX string for session
+     * persistence (see SamplerSampleSlot::sourceFile docs).  toRawUTF8
+     * + toStdString round-trips through juce::String without keeping
+     * a juce::File alive. */
+    s->sourceFile       = file.getFullPathName().toRawUTF8();
     s->numSamples       = n;
     s->sourceSampleRate = reader->sampleRate;
     s->rootNote         = 60;
@@ -4460,12 +4466,21 @@ public:
         addChildComponent (fxPage_);
         instCombo.onChange = [this] {
             const int sel = instCombo.getSelectedId() - 1;
-            if (sel >= 0 && sel < node.getNumInstruments())
+            if (sel < 0 || sel >= SamplerNode::kMaxInstruments) return;
+            /* Lazy-allocate any banks the user selects beyond the
+             * current count -- matches Disk Op's
+             * ensureInstrumentExists pattern.  Empty bank gets a
+             * default-constructed SamplerInstrument the user can
+             * load samples into. */
+            while (sel >= node.getNumInstruments())
             {
-                activeInstrument = sel;
-                rebuildEnvelopeViews();
-                refresh();
+                if (node.addInstrument() == nullptr) break;
             }
+            if (sel >= node.getNumInstruments()) return;
+            activeInstrument = sel;
+            rebuildInstCombo();
+            rebuildEnvelopeViews();
+            refresh();
         };
         addAndMakeVisible (instCombo);
 
@@ -4928,14 +4943,29 @@ private:
 
     void rebuildInstCombo()
     {
+        /* Always expose all 128 banks -- the same fixed grid Disk Op's
+         * Sample Bank pane shows -- so the user can switch to any
+         * bank from the sampler editor and see / load samples into
+         * it.  Empty banks lazily allocate on selection (see
+         * onChange handler).  Matches Disk Op's row count
+         * (SampleBankPane::kNumBanks = 128). */
         instCombo.clear (dontSendNotification);
-        const int n = juce::jmax (1, node.getNumInstruments());
-        for (int i = 0; i < n; ++i)
+        const int n = node.getNumInstruments();
+        for (int i = 0; i < SamplerNode::kMaxInstruments; ++i)
         {
-            auto inst = node.getInstrument (i);
-            String label = String::formatted ("%02d ", i + 1);
-            if (inst != nullptr && inst->name.isNotEmpty()) label += inst->name;
-            else                                            label += "(empty)";
+            String label = String::formatted ("%03d ", i + 1);
+            if (i < n)
+            {
+                auto inst = node.getInstrument (i);
+                if (inst != nullptr && inst->name.isNotEmpty())
+                    label += inst->name;
+                else
+                    label += "(empty)";
+            }
+            else
+            {
+                label += "(empty)";
+            }
             instCombo.addItem (label, i + 1);
         }
         instCombo.setSelectedId (activeInstrument + 1, dontSendNotification);
@@ -5566,6 +5596,7 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
             ValueTree slotTree ("slot");
             slotTree.setProperty ("idx",          i,                    nullptr);
             slotTree.setProperty ("name",         slot->name,           nullptr);
+            slotTree.setProperty ("sourceFile",   String (slot->sourceFile), nullptr);
             slotTree.setProperty ("rootNote",     slot->rootNote,       nullptr);
             slotTree.setProperty ("relativeNote", slot->relativeNote,   nullptr);
             slotTree.setProperty ("finetune",     slot->finetune,       nullptr);
@@ -5577,6 +5608,20 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
             slotTree.setProperty ("busIndex",     slot->busIndex,           nullptr);
             instTree.appendChild (slotTree, nullptr);
         }
+
+        /* Persist the 128-byte MIDI keymap as a CSV of slot indices.
+         * Older saves without this property fall back to autoSpread
+         * during reload. */
+        {
+            String km;
+            for (int n = 0; n < 128; ++n)
+            {
+                if (n > 0) km += ",";
+                km += String ((int) inst->slotForNote (n));
+            }
+            instTree.setProperty ("keymap", km, nullptr);
+        }
+
         tree.appendChild (instTree, nullptr);
     }
 
@@ -5676,46 +5721,114 @@ void SamplerNode::setStateInformation (const void* data, int size)
             const auto slotTree = instTree.getChild (c);
             if (slotTree.getType() != Identifier ("slot")) continue;
             const int idx = (int) slotTree.getProperty ("idx", 0);
-            if (auto* slot = inst->getSlot (idx))
-            {
-                slot->name         = slotTree.getProperty ("name", "").toString();
-                slot->rootNote     = (int) slotTree.getProperty ("rootNote", 60);
-                slot->relativeNote = (int) slotTree.getProperty ("relativeNote", 0);
-                slot->finetune     = (int) slotTree.getProperty ("finetune", 0);
-                slot->volume       = (float) (double) slotTree.getProperty ("volume", 1.0);
-                slot->panning      = (float) (double) slotTree.getProperty ("pan", 0.5);
-                slot->loopMode     = (SamplerLoopMode) (int) slotTree.getProperty ("loopMode", 0);
-                slot->loopStart    = (int) slotTree.getProperty ("loopStart",  0);
-                slot->loopLength   = (int) slotTree.getProperty ("loopLength", 0);
+            if (idx < 0 || idx >= SamplerInstrument::kNumSlots) continue;
 
-                /* Bus assignment.  Read busIndex if present; older
-                 * intermediate formats (busSend1..N from the multi-
-                 * send experiment / busAssign+busWet) get folded into
-                 * busIndex with a best-effort mapping.  Default if
-                 * none present: Bus 1 (from ctor). */
-                if (slotTree.hasProperty ("busIndex"))
+            /* ALWAYS allocate a slot for any persisted slot tree.
+             * Without this, the old codepath silently dropped saved
+             * slot metadata because SamplerInstrument's slots[] is
+             * default-null after construction, so getSlot(idx)
+             * returned nullptr and the metadata setters never ran.
+             * That's why sessions reloaded with empty banks. */
+            auto fresh = std::make_unique<SamplerSampleSlot>();
+
+            /* If a source path was saved (commits >= 309e5e24, now
+             * re-implemented), check existence with the native POSIX
+             * ::access syscall -- matches Disk Op's own native-path
+             * convention.  juce::File only enters the picture when
+             * we actually need to decode the audio (which goes
+             * through juce::AudioFormatManager either way). */
+            const std::string savedPath =
+                slotTree.getProperty ("sourceFile", "").toString().toRawUTF8();
+
+            if (! savedPath.empty()
+                && ::access (savedPath.c_str(), R_OK) == 0)
+            {
+                const File f { String (savedPath) };   // brace-init avoids most-vexing-parse
+                if (auto loaded = inst->prepareSlot (f, formatManager))
                 {
-                    slot->busIndex = juce::jlimit (0, SamplerNode::kNumBuses - 1,
-                                                   (int) slotTree.getProperty ("busIndex", 0));
+                    /* Move only the AUDIO buffers + decode-derived
+                     * metadata over to our slot; keep the persisted
+                     * tuning/loop/etc. for the metadata block below
+                     * to apply.  This way "saved volume / loop /
+                     * pan" wins over "fresh-decode defaults." */
+                    fresh->data16L          = std::move (loaded->data16L);
+                    fresh->data16R          = std::move (loaded->data16R);
+                    fresh->isStereo         = loaded->isStereo;
+                    fresh->numSamples       = loaded->numSamples;
+                    fresh->sourceSampleRate = loaded->sourceSampleRate;
+                    fresh->sourceFile       = loaded->sourceFile;
                 }
-                else if (slotTree.hasProperty ("busSend1"))
+                else
                 {
-                    float best = 0.0f; int bestIdx = 0;
-                    for (int b = 0; b < SamplerNode::kNumBuses; ++b)
-                    {
-                        const float s = (float) (double) slotTree.getProperty (
-                            Identifier ("busSend" + String (b + 1)), 0.0);
-                        if (s > best) { best = s; bestIdx = b; }
-                    }
-                    slot->busIndex = bestIdx;
-                }
-                else if (slotTree.hasProperty ("busAssign"))
-                {
-                    const int oldAssign = (int) slotTree.getProperty ("busAssign", 0);
-                    slot->busIndex = juce::jmax (0, oldAssign - 1);
+                    fresh->sourceFile = savedPath;
                 }
             }
+            else
+            {
+                fresh->sourceFile = savedPath;   // path tracked even if file missing
+            }
+
+            /* Apply the saved metadata on top of (possibly reloaded) audio. */
+            fresh->name         = slotTree.getProperty ("name", "").toString();
+            fresh->rootNote     = (int) slotTree.getProperty ("rootNote", 60);
+            fresh->relativeNote = (int) slotTree.getProperty ("relativeNote", 0);
+            fresh->finetune     = (int) slotTree.getProperty ("finetune", 0);
+            fresh->volume       = (float) (double) slotTree.getProperty ("volume", 1.0);
+            fresh->panning      = (float) (double) slotTree.getProperty ("pan", 0.5);
+            fresh->loopMode     = (SamplerLoopMode) (int) slotTree.getProperty ("loopMode", 0);
+            fresh->loopStart    = (int) slotTree.getProperty ("loopStart",  0);
+            fresh->loopLength   = (int) slotTree.getProperty ("loopLength", 0);
+
+            /* Bus assignment.  Read busIndex if present; older
+             * intermediate formats (busSend1..N from the multi-
+             * send experiment / busAssign+busWet) get folded into
+             * busIndex with a best-effort mapping.  Default if
+             * none present: Bus 1 (from ctor). */
+            if (slotTree.hasProperty ("busIndex"))
+            {
+                fresh->busIndex = juce::jlimit (0, SamplerNode::kNumBuses - 1,
+                                                (int) slotTree.getProperty ("busIndex", 0));
+            }
+            else if (slotTree.hasProperty ("busSend1"))
+            {
+                float best = 0.0f; int bestIdx = 0;
+                for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+                {
+                    const float s = (float) (double) slotTree.getProperty (
+                        Identifier ("busSend" + String (b + 1)), 0.0);
+                    if (s > best) { best = s; bestIdx = b; }
+                }
+                fresh->busIndex = bestIdx;
+            }
+            else if (slotTree.hasProperty ("busAssign"))
+            {
+                const int oldAssign = (int) slotTree.getProperty ("busAssign", 0);
+                fresh->busIndex = juce::jmax (0, oldAssign - 1);
+            }
+
+            /* commitSlot publishes the slot under the (already held)
+             * sampleLock.  inst is a fresh SamplerInstrument so this
+             * is the first commit -- no audio-thread contention. */
+            inst->commitSlot (idx, std::move (fresh));
         }
+
+        /* Restore the saved keymap if present, AFTER all slots are
+         * committed (commitSlot auto-spreads on first-load if
+         * !keymapUserModified, so this needs to fire last to override
+         * the auto-spread). */
+        const String savedKeymap = instTree.getProperty ("keymap", "").toString();
+        if (savedKeymap.isNotEmpty())
+        {
+            auto parts = StringArray::fromTokens (savedKeymap, ",", "");
+            const int n = juce::jmin (128, parts.size());
+            for (int k = 0; k < n; ++k)
+            {
+                const int s = juce::jlimit (0, SamplerInstrument::kNumSlots - 1,
+                                            parts[k].getIntValue());
+                inst->setSlotForNote (k, s);
+            }
+        }
+
         instruments.push_back (inst);
     }
 
