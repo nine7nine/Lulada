@@ -55,10 +55,12 @@ public:
     void mouseWheelMove (const juce::MouseEvent&,
                          const juce::MouseWheelDetails&) override;
 
-private:
+public:
     /* Per-clip launch state.  Driven by the message thread on bang(),
      * reconciled toward engine truth in the UI timer once the audio
-     * thread flips seq->playing at the scheduled boundary. */
+     * thread flips seq->playing at the scheduled boundary.  Public
+     * because the Clip View popup component (declared in
+     * sessionview.cpp at file scope) needs to name the type. */
     enum class LiveState : uint8_t { Stopped, WaitingToStart, Playing, WaitingToStop };
 
     /* Per-clip launch quantisation.  Off = immediate (next render
@@ -74,6 +76,8 @@ private:
      *    same column.  If none exists, falls back to Stop.
      *  - FirstClip: bang the lowest-sceneRow clip on the same column. */
     enum class FollowAction : uint8_t { None, Stop, RestartClip, NextClip, FirstClip };
+
+private:
 
     struct SessionClip {
         juce::Uuid     id;
@@ -125,7 +129,14 @@ private:
     void stopAllClips();
     void stopColumn (int columnIdx);   // per-column stop button
     void toggleColumnMute (int columnIdx);
-    bool isColumnMuted (int columnIdx) const noexcept;
+    void toggleColumnSolo (int columnIdx);
+    bool isColumnMuted (int columnIdx) const noexcept;   // user-asserted mute
+    bool isColumnSoloed (int columnIdx) const noexcept;
+    /* Reconcile engine-level mute on TrackerNodes from our
+     * columnUserMuted_ + columnSoloed_ vectors.  When any column is
+     * soloed, every non-soloed column is muted regardless of user
+     * intent; when no solo is active, mute follows user intent. */
+    void applyMuteAndSoloState();
     void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
     void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
@@ -178,14 +189,18 @@ private:
      * by paint() + mouseDown() for hit-testing. */
     juce::Rectangle<int> toolbarBounds() const noexcept;
     juce::Rectangle<int> footerBounds() const noexcept;
-    juce::Rectangle<int> columnStopRowBounds() const noexcept;
+    /* STOP + MUTE are embedded in each column's header, not a
+     * separate footer row.  Bounds are relative to columnHeaderBounds. */
+    juce::Rectangle<int> columnNameLabelBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> columnMuteButtonBounds (int columnIdx) const noexcept;
+    juce::Rectangle<int> columnSoloButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> masterColumnBounds() const noexcept;
     juce::Rectangle<int> masterCellBounds (int sceneRow) const noexcept;
     juce::Rectangle<int> masterLaunchButtonBounds (int sceneRow) const noexcept;
     juce::Rectangle<int> masterTempoFieldBounds  (int sceneRow) const noexcept;
     juce::Rectangle<int> masterSigFieldBounds    (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterEditButtonBounds  (int sceneRow) const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -200,20 +215,44 @@ private:
     bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestColumnStop (juce::Point<int> p, int& outCol) const noexcept;
     bool hitTestColumnMute (juce::Point<int> p, int& outCol) const noexcept;
+    bool hitTestColumnSolo (juce::Point<int> p, int& outCol) const noexcept;
     bool hitTestMasterCell (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterLaunch (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterTempo  (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterSig    (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterEdit   (juce::Point<int> p, int& outRow) const noexcept;
 
-    /* Scene property editors -- invoked from the master column's
-     * right-click menu and direct clicks.  Editors are inline
-     * (TextEditor positioned over the field, no modal AlertWindow)
-     * so they don't steal focus from the main app. */
-    void editSceneTempo    (int sceneRow);
-    void editSceneSignature (int sceneRow);
+    /* Scene property editors -- master cell tempo/sig clicks AND the
+     * scene-label "Properties..." menu both open the dedicated
+     * floating Scene View (juce::DocumentWindow, non-modal,
+     * self-deleting on close), matching the tracker pattern editor
+     * popup convention. */
+    void editSceneTempo    (int sceneRow);   // delegates to openSceneView
+    void editSceneSignature (int sceneRow);  // delegates to openSceneView
     void clearSceneTempo    (int sceneRow);
     void clearSceneSignature (int sceneRow);
+    void openSceneView      (int sceneRow);
     void applySceneOverridesToTransport (const SessionScene&);
+
+    /* Public helpers used by the SceneView popup -- it edits scene
+     * fields in our scenes_ array, then asks us to persist + repaint
+     * the master cell. */
+public:
+    void notifySceneEdited (int sceneRow);
+    SessionScene* sceneAt  (int sceneRow) noexcept;
+    /* Used by floating popup windows (tracker pattern editor, Clip
+     * View) so they can wire spacebar to the global transport. */
+    void transportTogglePlay() noexcept;
+    void bangClipByUuid (const juce::Uuid& clipId);
+
+    /* Clip View popup support -- mirrors Scene View.  Right-click /
+     * double-click on a clip routes here instead of the AlertWindow
+     * rename / cycle-colour / etc. menu items.  Structural ops
+     * (Add / Assign / Delete) stay on the right-click menu. */
+    void openClipView (SessionClip&);
+    void notifyClipEdited (SessionClip&);
+    SessionClip* clipByUuid (const juce::Uuid&) noexcept;
+private:
 
     /* Inline editor -- shared single TextEditor positioned over the
      * field being edited.  Replaces AlertWindow prompts so the user
@@ -283,6 +322,23 @@ private:
     /* Phase animation for WaitingTo* outline pulse (Phase 4 will exercise). */
     int   pulsePhase_ = 0;
 
+    /* Diff-gate for master column repaint when the session-wide
+     * tempo / time signature changes outside our view. */
+    double lastSessionTempo_ = -1.0;
+    int    lastSessionBpb_   = -1;
+    int    lastSessionBd_    = -1;
+
+    /* Mute / solo intent now lives on each TrackerNode itself
+     * (TrackerNode::getUserMuted / getSoloed) so the session view
+     * and the tracker editor popup see the same state.  SessionView
+     * reconciles effective Processor::setMuted from those flags on
+     * every UI tick via applyMuteAndSoloState. */
+
+    /* The most-recently-launched scene -- the "current" scene in
+     * Ableton parlance.  -1 means none banged this session.  Used
+     * by master-column paint to highlight the active scene row. */
+    int currentSceneRow_ = -1;
+
     /* Drag state for clip-move/copy.  dragSource_ is set on mouseDown
      * over a clip's body (not its play/edit zones); dragActive_ trips
      * once the cursor moves past the drag threshold.  dragHover{Row,Col}
@@ -317,12 +373,11 @@ private:
     /* Layout constants -- sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
     static constexpr int kToolbarH      = 36;
-    static constexpr int kHeaderH       = 28;
+    static constexpr int kHeaderH       = 44;   // taller -- holds track name + STOP + MUTE
     static constexpr int kSceneLabelW   = 84;
     static constexpr int kColW          = 132;
     static constexpr int kRowH          = 30;
     static constexpr int kMasterColW    = 220;   // Ableton-style scene master column
-    static constexpr int kColumnStopH   = 32;   // footer strip for STOP + MUTE
     static constexpr int kSceneFooterH  = 22;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)

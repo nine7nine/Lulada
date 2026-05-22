@@ -292,6 +292,12 @@ void TrackerNode::getState (juce::MemoryBlock& block)
         {
             tree.setProperty ("bpm", (double) mod_->bpm, nullptr);
 
+            /* Session-view user mute / solo intent.  Effective
+             * Processor::isMuted is reconciled by SessionView from
+             * these + every other tracker's solo state. */
+            tree.setProperty ("userMuted", userMuted_, nullptr);
+            tree.setProperty ("soloed",    soloed_,    nullptr);
+
             /* Current pattern index — used to restore the active
              * pattern on load. */
             int currIdx = 0;
@@ -691,6 +697,11 @@ void TrackerNode::setState (const void* data, int size)
 
     const float bpm = (float) (double) tree.getProperty ("bpm", 120.0);
     const int   currIdx = (int) tree.getProperty ("currentPattern", 0);
+
+    /* Restore user mute / solo intent.  Missing props default to
+     * false (older saves predate the field). */
+    userMuted_ = (bool) tree.getProperty ("userMuted", false);
+    soloed_    = (bool) tree.getProperty ("soloed",    false);
 
     /* Walk pattern children. Backwards-compat: if the tree has 'track'
      * children directly (old single-pattern format) fall through to a

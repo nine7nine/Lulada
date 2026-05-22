@@ -136,6 +136,17 @@ public:
      *  practice 64-slot FIFO at human click rate never fills. */
     void   schedulePlaying (int sequenceIdx, double beatTarget, bool wantPlaying) noexcept;
 
+    /** Session-view mute / solo state for this tracker.  Both flags
+     *  live on the node so the session view AND the tracker editor
+     *  popup can show one consistent state.  These are USER intent;
+     *  the effective engine mute (Processor::isMuted) is reconciled
+     *  by SessionView -- when any tracker is soloed, non-soloed
+     *  trackers get setMuted(true), otherwise setMuted(getUserMuted()). */
+    bool getUserMuted() const noexcept { return userMuted_; }
+    void setUserMuted (bool b) noexcept { userMuted_ = b; }
+    bool getSoloed() const noexcept { return soloed_; }
+    void setSoloed (bool b) noexcept { soloed_ = b; }
+
     /** Undo / redo.  Snapshots whole-module state into a memento stack.
      *  Editor calls pushUndo() before any mutation. */
     void pushUndo();
@@ -171,6 +182,11 @@ private:
     enum { kMaxUndo = 64 };
     juce::Array<juce::MemoryBlock> undoStack_;
     juce::Array<juce::MemoryBlock> redoStack_;
+
+    /* Session-view user mute + solo state.  Read + written by both
+     * SessionView and TrackerEditor; not used by render() directly. */
+    bool userMuted_ = false;
+    bool soloed_    = false;
 
     /* Per-sequence previous song_pos cache for wrap-edge detection
      * in sequenceWrappedSinceLastQuery().  Lazily grown to mod_->nseq;

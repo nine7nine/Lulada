@@ -43,9 +43,10 @@ const juce::Colour kRowDividerColour  { 0xff'22'22'22 };
 const juce::Colour kBeatHighlight     { 0xff'1f'1f'1f };
 const juce::Colour kPlayheadHighlight { 0x66'ff'a0'40 }; // amber, translucent
 const juce::Colour kCursorHighlight   { 0x88'40'a0'ff }; // cyan, translucent
-const juce::Colour kRowTextColour     { 0xff'6a'6a'6a };
-const juce::Colour kNoteTextColour    { 0xff'd4'd4'd4 };
-const juce::Colour kEmptyCellColour   { 0xff'3a'3a'3a };
+const juce::Colour kRowTextColour     { 0xff'a8'a8'a8 };   // bumped (was 0x6a6a6a)
+const juce::Colour kNoteTextColour    { 0xff'f0'f0'f0 };   // bumped (was 0xd4d4d4)
+const juce::Colour kEmptyCellColour   { 0xff'3a'3a'3a };   // fill colour
+const juce::Colour kEmptyTextColour   { 0xff'7a'7a'7a };   // "---" / "--" in empty cells -- distinct from cell fill so the text is readable
 const juce::Colour kVelTextColour     { 0xff'd0'80'40 };
 const juce::Colour kEditModeColour    { 0xff'e0'40'40 };
 
@@ -818,13 +819,13 @@ private:
             g.drawText ("OFF",
                         x + kNoteX, y, kNoteW, h,
                         juce::Justification::centredLeft);
-            g.setColour (kEmptyCellColour);
+            g.setColour (kEmptyTextColour);
             g.drawText ("--", x + kVelX, y, kVelW, h,
                         juce::Justification::centredLeft);
         }
         else
         {
-            g.setColour (kEmptyCellColour);
+            g.setColour (kEmptyTextColour);
             g.drawText ("---", x + kNoteX, y, kNoteW, h,
                         juce::Justification::centredLeft);
             g.drawText ("--", x + kVelX, y, kVelW, h,
@@ -860,7 +861,7 @@ private:
         }
         else
         {
-            g.setColour (kEmptyCellColour);
+            g.setColour (kEmptyTextColour);
             g.drawText (".", x, y, kFxCharW, h, juce::Justification::centred);
             g.drawText (".", x + kFxCharW, y, kFxCharW, h, juce::Justification::centred);
             g.drawText (".", x + 2 * kFxCharW, y, kFxCharW, h, juce::Justification::centred);
@@ -869,7 +870,7 @@ private:
 
     void drawEmptyCell (juce::Graphics& g, int x, int y, int h)
     {
-        g.setColour (kEmptyCellColour);
+        g.setColour (kEmptyTextColour);
         g.drawText ("---", x + kNoteX, y, kNoteW, h, juce::Justification::centredLeft);
         g.drawText ("--",  x + kVelX,  y, kVelW,  h, juce::Justification::centredLeft);
         drawFxCell (g, 0, 0, x + kFx1X, y, h);

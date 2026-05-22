@@ -14,6 +14,7 @@
 
 #include "nodes/tracker.hpp"
 #include "nodes/trackereditor.hpp"
+#include "tempo.hpp"   // BeatType::fromDivisor for scene sig overrides
 
 namespace element {
 
@@ -37,8 +38,8 @@ const Colour kGutterColour      { 0xff'14'14'14 };
 const Colour kHeaderBgColour    { 0xff'1a'1a'1a };
 const Colour kEmptyCellColour   { 0xff'24'24'24 };
 const Colour kCellOutlineColour { 0xff'33'33'33 };
-const Colour kRowTextColour     { 0xff'6a'6a'6a };
-const Colour kLabelTextColour   { 0xff'a0'a0'a0 };
+const Colour kRowTextColour     { 0xff'a8'a8'a8 };   // bumped (was 0x6a6a6a)
+const Colour kLabelTextColour   { 0xff'd8'd8'd8 };   // bumped (was 0xa0a0a0)
 const Colour kPlayheadAccent    { 0xff'ff'a0'40 };  // amber
 
 /* Column-tint palette, cycling -- same hues as trackereditor's track
@@ -147,15 +148,16 @@ SessionView::SessionView()
                              juce::Colour { 0xff'40'40'40 });
     inlineEditor_.setColour (juce::TextEditor::focusedOutlineColourId,
                              juce::Colour { 0xff'ff'a0'40 });
+    /* Return commits, Escape + focus-loss REVERT (per
+     * feedback_inline_edit_cancel_on_click_away memory note).
+     * Click-away on a value editor that the user is unsure about
+     * should leave the original value alone. */
     inlineEditor_.onReturnKey = [this] {
         if (inlineEditorCommit_) inlineEditorCommit_ (inlineEditor_.getText());
         hideInlineEditor();
     };
     inlineEditor_.onEscapeKey = [this] { hideInlineEditor(); };
-    inlineEditor_.onFocusLost = [this] {
-        if (inlineEditorCommit_) inlineEditorCommit_ (inlineEditor_.getText());
-        hideInlineEditor();
-    };
+    inlineEditor_.onFocusLost = [this] { hideInlineEditor(); };
     addChildComponent (inlineEditor_);
     scenesValueLabel_.onTextChange = [this] {
         const auto txt = scenesValueLabel_.getText()
@@ -353,35 +355,6 @@ Rectangle<int> SessionView::footerBounds() const noexcept
     return getLocalBounds().removeFromBottom (kSceneFooterH);
 }
 
-Rectangle<int> SessionView::columnStopRowBounds() const noexcept
-{
-    auto r = getLocalBounds();
-    r.removeFromBottom (kSceneFooterH);
-    return r.removeFromBottom (kColumnStopH);
-}
-
-Rectangle<int> SessionView::columnStopButtonBounds (int columnIdx) const noexcept
-{
-    /* Left half of the column footer cell -- STOP affordance. */
-    const auto row = columnStopRowBounds();
-    const int cellX = row.getX() + kSceneLabelW + columnIdx * kColW;
-    const int half  = (kColW - 12) / 2;
-    return Rectangle<int> (cellX + 6,
-                           row.getY() + 4,
-                           half - 2, row.getHeight() - 8);
-}
-
-Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcept
-{
-    /* Right half of the column footer cell -- MUTE toggle. */
-    const auto row = columnStopRowBounds();
-    const int cellX = row.getX() + kSceneLabelW + columnIdx * kColW;
-    const int half  = (kColW - 12) / 2;
-    return Rectangle<int> (cellX + 6 + half + 2,
-                           row.getY() + 4,
-                           half - 2, row.getHeight() - 8);
-}
-
 Rectangle<int> SessionView::headerRowBounds() const noexcept
 {
     auto r = getLocalBounds();
@@ -393,7 +366,7 @@ Rectangle<int> SessionView::sceneLabelStripBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH + kColumnStopH);
+    r.removeFromBottom (kSceneFooterH);
     return r.removeFromLeft (kSceneLabelW);
 }
 
@@ -401,7 +374,7 @@ Rectangle<int> SessionView::gridBodyBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH + kColumnStopH);
+    r.removeFromBottom (kSceneFooterH);
     r.removeFromLeft (kSceneLabelW);
     r.removeFromRight (kMasterColW);
     return r;
@@ -411,8 +384,54 @@ Rectangle<int> SessionView::masterColumnBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH + kColumnStopH);
+    r.removeFromBottom (kSceneFooterH);
     return r.removeFromRight (kMasterColW);
+}
+
+Rectangle<int> SessionView::columnNameLabelBounds (int columnIdx) const noexcept
+{
+    /* Top half of the column header -- track name + tint band. */
+    const auto h = columnHeaderBounds (columnIdx);
+    return Rectangle<int> (h.getX(), h.getY(), h.getWidth(),
+                           h.getHeight() / 2);
+}
+
+/* Column header bottom-half layout: two equal-width buttons with
+ * a 2 px gap.  MUTE | SOLO.  STOP was dropped (STOP ALL handles the
+ * global case; per-clip click handles individual stops; per-column
+ * STOP was the redundant affordance). */
+static int columnFooterButtonWidth (int innerW) noexcept
+{
+    return (innerW - 2) / 2;   // 1 gap of 2 px
+}
+
+Rectangle<int> SessionView::columnStopButtonBounds (int) const noexcept
+{
+    /* STOP no longer has a visible affordance in the column header.
+     * Returned rect is empty so hit-tests fail and paint is skipped. */
+    return {};
+}
+
+Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcept
+{
+    const auto h = columnHeaderBounds (columnIdx);
+    const int topH = h.getHeight() / 2;
+    const int btnAreaH = h.getHeight() - topH - 2;
+    const int btnAreaY = h.getY() + topH;
+    const int innerW = h.getWidth() - 4;
+    const int w = columnFooterButtonWidth (innerW);
+    return Rectangle<int> (h.getX() + 2, btnAreaY, w, btnAreaH);
+}
+
+Rectangle<int> SessionView::columnSoloButtonBounds (int columnIdx) const noexcept
+{
+    const auto h = columnHeaderBounds (columnIdx);
+    const int topH = h.getHeight() / 2;
+    const int btnAreaH = h.getHeight() - topH - 2;
+    const int btnAreaY = h.getY() + topH;
+    const int innerW = h.getWidth() - 4;
+    const int w = columnFooterButtonWidth (innerW);
+    return Rectangle<int> (h.getX() + 2 + w + 2, btnAreaY, w, btnAreaH);
 }
 
 Rectangle<int> SessionView::masterCellBounds (int sceneRow) const noexcept
@@ -431,19 +450,36 @@ Rectangle<int> SessionView::masterLaunchButtonBounds (int sceneRow) const noexce
 
 Rectangle<int> SessionView::masterTempoFieldBounds (int sceneRow) const noexcept
 {
-    /* Right ~80 px of the master cell holds tempo + sig side-by-side.
-     * Layout: [launch] [tempo  ][sig] */
+    /* Master cell layout: [launch] [tempo field] [sig field] [edit].
+     * Reserve 22 px each for launch (left) and edit (right) with
+     * 4 px gaps; tempo + sig split the rest 55/45 (BPM strings are
+     * typically wider). */
     auto inner = masterCellBounds (sceneRow).reduced (3, 3);
-    inner.removeFromLeft (22 + 4);            // launch button + spacing
-    return inner.removeFromLeft (juce::jmax (40, inner.getWidth() - 52));
+    inner.removeFromLeft  (22 + 4);
+    inner.removeFromRight (22 + 4);
+    const int remaining = inner.getWidth();
+    const int tempoW = (remaining - 4) * 11 / 20;
+    return inner.removeFromLeft (tempoW);
 }
 
 Rectangle<int> SessionView::masterSigFieldBounds (int sceneRow) const noexcept
 {
     auto inner = masterCellBounds (sceneRow).reduced (3, 3);
-    inner.removeFromLeft (22 + 4);
-    inner.removeFromLeft (juce::jmax (40, inner.getWidth() - 52));
+    inner.removeFromLeft  (22 + 4);
+    inner.removeFromRight (22 + 4);
+    const int remaining = inner.getWidth();
+    const int tempoW = (remaining - 4) * 11 / 20;
+    inner.removeFromLeft (tempoW + 4);
     return inner;
+}
+
+Rectangle<int> SessionView::masterEditButtonBounds (int sceneRow) const noexcept
+{
+    /* Rightmost 22 px of the master cell -- opens the Scene View
+     * popup, mirroring the clip cell's edit button which opens the
+     * tracker pattern editor. */
+    auto inner = masterCellBounds (sceneRow).reduced (3, 3);
+    return inner.removeFromRight (22);
 }
 
 Rectangle<int> SessionView::cellBounds (int sceneRow, int columnIdx) const noexcept
@@ -519,26 +555,35 @@ bool SessionView::hitTestEditButton (Point<int> p, int& outRow, int& outCol) con
 
 bool SessionView::hitTestColumnStop (Point<int> p, int& outCol) const noexcept
 {
-    const auto row = columnStopRowBounds();
-    if (! row.contains (p)) return false;
-    if (p.x < row.getX() + kSceneLabelW) return false;
-    const int gridWidth = row.getWidth() - kSceneLabelW - kMasterColW;
-    if (p.x >= row.getX() + kSceneLabelW + gridWidth) return false;
-    outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
+    /* STOP + MUTE now live in the column header, not a separate
+     * footer row.  Quickly scope down by checking the header strip
+     * before pixel-perfect bounds testing. */
+    const auto header = headerRowBounds();
+    if (! header.contains (p)) return false;
+    if (p.x < header.getX() + kSceneLabelW) return false;
+    outCol = (p.x - header.getX() - kSceneLabelW) / kColW;
     if (outCol < 0 || outCol >= columns_.size()) return false;
     return columnStopButtonBounds (outCol).contains (p);
 }
 
 bool SessionView::hitTestColumnMute (Point<int> p, int& outCol) const noexcept
 {
-    const auto row = columnStopRowBounds();
-    if (! row.contains (p)) return false;
-    if (p.x < row.getX() + kSceneLabelW) return false;
-    const int gridWidth = row.getWidth() - kSceneLabelW - kMasterColW;
-    if (p.x >= row.getX() + kSceneLabelW + gridWidth) return false;
-    outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
+    const auto header = headerRowBounds();
+    if (! header.contains (p)) return false;
+    if (p.x < header.getX() + kSceneLabelW) return false;
+    outCol = (p.x - header.getX() - kSceneLabelW) / kColW;
     if (outCol < 0 || outCol >= columns_.size()) return false;
     return columnMuteButtonBounds (outCol).contains (p);
+}
+
+bool SessionView::hitTestColumnSolo (Point<int> p, int& outCol) const noexcept
+{
+    const auto header = headerRowBounds();
+    if (! header.contains (p)) return false;
+    if (p.x < header.getX() + kSceneLabelW) return false;
+    outCol = (p.x - header.getX() - kSceneLabelW) / kColW;
+    if (outCol < 0 || outCol >= columns_.size()) return false;
+    return columnSoloButtonBounds (outCol).contains (p);
 }
 
 bool SessionView::hitTestMasterCell (Point<int> p, int& outRow) const noexcept
@@ -565,6 +610,12 @@ bool SessionView::hitTestMasterSig (Point<int> p, int& outRow) const noexcept
 {
     if (! hitTestMasterCell (p, outRow)) return false;
     return masterSigFieldBounds (outRow).contains (p);
+}
+
+bool SessionView::hitTestMasterEdit (Point<int> p, int& outRow) const noexcept
+{
+    if (! hitTestMasterCell (p, outRow)) return false;
+    return masterEditButtonBounds (outRow).contains (p);
 }
 
 int SessionView::maxGridScrollY() const noexcept
@@ -609,22 +660,56 @@ void SessionView::paint (Graphics& g)
 
     for (int c = 0; c < columns_.size(); ++c)
     {
-        const auto h    = columnHeaderBounds (c);
-        const auto tint = columnTint (c);
+        const auto h     = columnHeaderBounds (c);
+        const auto tint  = columnTint (c);
+        const auto nameR = columnNameLabelBounds (c);
+        const auto muteR = columnMuteButtonBounds (c);
+        const auto soloR = columnSoloButtonBounds (c);
 
         /* Top tint band, a la trackereditor track header. */
         g.setColour (tint);
         g.fillRect (h.getX(), h.getY(), h.getWidth() - 1, 4);
 
-        /* Body of header -- translucent tint over header bg. */
+        /* Top-half background -- translucent tint over header bg.
+         * Bottom-half (where the buttons live) stays plain so the
+         * button shapes read clearly. */
         g.setColour (tint.withAlpha (0.10f));
-        g.fillRect (h.getX(), h.getY() + 4, h.getWidth() - 1, h.getHeight() - 4);
+        g.fillRect (h.getX(), h.getY() + 4, h.getWidth() - 1, nameR.getHeight() - 4);
 
-        /* Column name. */
+        /* Column name -- top half of the header. */
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      kHeaderFontSize, juce::Font::bold));
         g.setColour (tint);
         g.drawText (columns_.getReference (c).name,
-                    h.reduced (8, 4),
+                    nameR.reduced (8, 0),
                     juce::Justification::centredLeft, true);
+
+        const bool muted  = isColumnMuted  (c);
+        const bool soloed = isColumnSoloed (c);
+        const Colour btnTint = tint.withMultipliedSaturation (0.6f)
+                                   .withMultipliedBrightness (0.55f);
+
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      9.0f, juce::Font::bold));
+
+        /* MUTE -- amber-red when user-muted (NOT when muted by
+         * solo elsewhere, since the visual should reflect intent). */
+        g.setColour (muted ? Colour { 0xff'c0'30'30 } : btnTint);
+        g.fillRect (muteR);
+        g.setColour (kCellOutlineColour);
+        g.drawRect (muteR, 1);
+        g.setColour (muted ? juce::Colours::white
+                           : juce::Colours::white.withAlpha (0.70f));
+        g.drawText ("MUTE", muteR, juce::Justification::centred);
+
+        /* SOLO -- yellow when active; matches mixing-desk convention. */
+        g.setColour (soloed ? Colour { 0xff'd5'b0'30 } : btnTint);
+        g.fillRect (soloR);
+        g.setColour (kCellOutlineColour);
+        g.drawRect (soloR, 1);
+        g.setColour (soloed ? juce::Colours::black
+                            : juce::Colours::white.withAlpha (0.70f));
+        g.drawText ("SOLO", soloR, juce::Justification::centred);
     }
 
     /* Everything from here through the cell loop draws inside the
@@ -870,6 +955,23 @@ void SessionView::paint (Graphics& g)
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       kCellFontSize, juce::Font::plain));
 
+        /* Current session-wide tempo + signature -- shown dimmed in
+         * scenes that don't carry an override so the user can see
+         * what the scene would inherit on launch.  Matches Ableton's
+         * Master column convention. */
+        double curTempo = 120.0;
+        int    curBpb   = 4;
+        int    curBd    = 4;
+        if (services_ != nullptr)
+        {
+            if (auto sess = services_->context().session())
+            {
+                curTempo = (double) sess->getProperty (tags::tempo,       120.0);
+                curBpb   = (int)    sess->getProperty (tags::beatsPerBar, 4);
+                curBd    = (int)    sess->getProperty (tags::beatDivisor, 4);
+            }
+        }
+
         for (int r = 0; r < scenes_.size(); ++r)
         {
             const auto cell    = masterCellBounds (r);
@@ -886,13 +988,14 @@ void SessionView::paint (Graphics& g)
                 g.fillRect (cell);
             }
 
-            /* Launch button -- styled to match clip play buttons so
-             * the user reads it as the same gesture.  Lights up
-             * amber when any clip in the scene is currently active. */
+            /* Launch button -- gray background by default, amber
+             * when ONE clip in the scene is currently playing.
+             * Waiting-state clips don't light it up so a scene on
+             * its way out doesn't look "active" anymore. */
             const bool sceneActive = sceneHasActiveClip (r);
             g.setColour (sceneActive
-                            ? kPlayheadAccent.withAlpha (0.30f)
-                            : juce::Colours::black.withAlpha (0.20f));
+                            ? kPlayheadAccent.withAlpha (0.35f)
+                            : Colour { 0xff'2a'2a'2a });
             g.fillRect (launchR);
             g.setColour (sceneActive ? kPlayheadAccent
                                      : Colour { 0xff'd0'd0'd0 });
@@ -919,24 +1022,42 @@ void SessionView::paint (Graphics& g)
                 g.fillRect (rr);
                 g.setColour (kCellOutlineColour);
                 g.drawRect (rr, 1);
-                g.setColour (overrideSet ? Colour { 0xff'd4'd4'd4 }
+                g.setColour (overrideSet ? Colour { 0xff'ff'ff'ff }
                                          : kRowTextColour);
                 g.drawText (text, rr.reduced (4, 0),
                             juce::Justification::centred, true);
             };
 
-            /* Placeholder text is the FIELD NAME itself ("TEMPO" /
-             * "SIG") so an empty cell explains what it's for
-             * without needing a separate column header label. */
+            /* Show the OVERRIDE value bright when set; otherwise
+             * the current session value dimmed (inherit-on-launch).
+             * Ableton convention -- the user can see what the scene
+             * would do without having to click in. */
             drawField (tempoR,
-                       sc.tempoOverride > 0.0 ? String (sc.tempoOverride, 1)
-                                              : String ("TEMPO"),
+                       sc.tempoOverride > 0.0 ? String (sc.tempoOverride, 2)
+                                              : String (curTempo, 2),
                        sc.tempoOverride > 0.0);
             drawField (sigR,
                        (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
                             ? String (sc.beatsPerBar) + "/" + String (sc.beatDivisor)
-                            : String ("SIG"),
+                            : String (curBpb) + "/" + String (curBd),
                        sc.beatsPerBar > 0 && sc.beatDivisor > 0);
+
+            /* Edit button -- three horizontal lines glyph (same as
+             * clip cell edit button) opens the Scene View popup. */
+            const auto editR = masterEditButtonBounds (r);
+            g.setColour (juce::Colours::black.withAlpha (0.20f));
+            g.fillRect (editR);
+            g.setColour (juce::Colour { 0xff'd0'd0'd0 });
+            {
+                const int cx = editR.getCentreX();
+                const int cy = editR.getCentreY();
+                const int lineW = 9;
+                const int xL = cx - lineW / 2;
+                const int xR = cx + lineW / 2;
+                g.drawHorizontalLine (cy - 4, (float) xL, (float) xR);
+                g.drawHorizontalLine (cy,     (float) xL, (float) xR);
+                g.drawHorizontalLine (cy + 4, (float) xL, (float) xR);
+            }
 
             /* Row divider. */
             g.setColour (kCellOutlineColour);
@@ -946,69 +1067,25 @@ void SessionView::paint (Graphics& g)
         }
     }
 
+    /* Active-scene row indicator -- translucent amber overlay across
+     * the entire row (scene label + clip cells + master cell) so the
+     * user can see the whole "current scene" in one visual sweep.
+     * Drawn AFTER all per-cell paint so it tints them uniformly.
+     * Top/bottom edges accented at higher alpha for definition. */
+    if (currentSceneRow_ >= 0 && currentSceneRow_ < scenes_.size())
+    {
+        const auto sl = sceneLabelBounds (currentSceneRow_);
+        const Rectangle<int> rowR (0, sl.getY(), getWidth(), kRowH);
+        g.setColour (kPlayheadAccent.withAlpha (0.10f));
+        g.fillRect (rowR);
+        g.setColour (kPlayheadAccent.withAlpha (0.80f));
+        g.drawHorizontalLine (rowR.getY(),         0.0f, (float) getWidth());
+        g.drawHorizontalLine (rowR.getBottom() - 1, 0.0f, (float) getWidth());
+    }
+
     /* Close the scrollable-area clip region -- everything after this
      * draws into the fixed (non-scrolling) chrome strips. */
     g.restoreState();
-
-    /* --- Per-column track-control footer row (STOP + MUTE) --- */
-    const auto stopRow = columnStopRowBounds();
-    g.setColour (kBgColour);    // match session-view bg (was kHeaderBgColour)
-    g.fillRect (stopRow);
-    g.setColour (kCellOutlineColour);
-    g.drawHorizontalLine (stopRow.getY(), 0.0f, (float) getWidth());
-
-    /* Left "TRACK" label at the scene-labels x-range so the user can
-     * read what the row controls without guessing. */
-    {
-        const Rectangle<int> labelR (stopRow.getX(), stopRow.getY(),
-                                     kSceneLabelW, stopRow.getHeight());
-        g.setColour (kRowTextColour);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                      kLabelFontSize, juce::Font::plain));
-        g.drawText ("TRACK", labelR.reduced (8, 0),
-                    juce::Justification::centredLeft, true);
-    }
-
-    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                  10.0f, juce::Font::bold));
-
-    for (int c = 0; c < columns_.size(); ++c)
-    {
-        const auto stopR = columnStopButtonBounds (c);
-        const auto muteR = columnMuteButtonBounds (c);
-
-        bool active = false;
-        for (auto* clip : clips_)
-            if (clip->columnIdx == c)
-            {
-                const LiveState s = clip->state.load (std::memory_order_relaxed);
-                if (s != LiveState::Stopped) { active = true; break; }
-            }
-        const bool muted = isColumnMuted (c);
-        const Colour tint = columnTint (c).withMultipliedSaturation (0.6f)
-                                          .withMultipliedBrightness (0.55f);
-
-        /* STOP -- column-tinted background, white "STOP" text;
-         * brighter (full saturation) when the column has at least
-         * one active clip. */
-        g.setColour (active ? tint.withMultipliedBrightness (1.6f) : tint);
-        g.fillRect (stopR);
-        g.setColour (kCellOutlineColour);
-        g.drawRect (stopR, 1);
-        g.setColour (active ? juce::Colours::white
-                            : juce::Colours::white.withAlpha (0.65f));
-        g.drawText ("STOP", stopR, juce::Justification::centred);
-
-        /* MUTE toggle -- amber-red when muted, otherwise the same
-         * tinted background as STOP. */
-        g.setColour (muted ? Colour { 0xff'c0'30'30 } : tint);
-        g.fillRect (muteR);
-        g.setColour (kCellOutlineColour);
-        g.drawRect (muteR, 1);
-        g.setColour (muted ? juce::Colours::white
-                           : juce::Colours::white.withAlpha (0.65f));
-        g.drawText (muted ? "MUTED" : "MUTE", muteR, juce::Justification::centred);
-    }
 
     /* Footer hint strip. */
     const auto footer = footerBounds();
@@ -1070,49 +1147,21 @@ void SessionView::mouseDown (const MouseEvent& e)
         {
             if (auto* clip = findClip (row, col))
             {
-                juce::PopupMenu quant;
-                const auto cq = clip->launchQuant;
-                quant.addItem (10, "Off",     true, cq == LaunchQuant::Off);
-                quant.addItem (11, "1 Beat",  true, cq == LaunchQuant::Beat);
-                quant.addItem (12, "1 Bar",   true, cq == LaunchQuant::Bar);
-                quant.addItem (13, "2 Bars",  true, cq == LaunchQuant::TwoBars);
-                quant.addItem (14, "4 Bars",  true, cq == LaunchQuant::FourBars);
-
-                juce::PopupMenu follow;
-                const auto cf = clip->followAction;
-                follow.addItem (20, "None (loop)",      true, cf == FollowAction::None);
-                follow.addItem (21, "Stop",             true, cf == FollowAction::Stop);
-                follow.addItem (22, "Restart",          true, cf == FollowAction::RestartClip);
-                follow.addItem (23, "Next clip",        true, cf == FollowAction::NextClip);
-                follow.addItem (24, "First clip",       true, cf == FollowAction::FirstClip);
-
+                /* Right-click clip menu is now STRUCTURAL only:
+                 *   - Clip properties... (opens Clip View popup with
+                 *     Name + Colour + Launch quant + Follow action)
+                 *   - Delete clip
+                 * Per-property edits live inside the Clip View popup. */
                 juce::PopupMenu m;
-                m.addItem (2, "Rename...");
-                m.addItem (3, "Cycle colour");
-                m.addItem (4, "Colour...");
-                m.addSeparator();
-                m.addSubMenu ("Launch quantisation", quant);
-                m.addSubMenu ("Follow action",       follow);
+                m.addItem (5, "Clip properties...");
                 m.addSeparator();
                 m.addItem (1, "Delete clip");
 
                 const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
                 switch (r)
                 {
-                    case 1: deleteClip (*clip); break;
-                    case 2: renameClip (*clip); break;
-                    case 3: cycleClipColor (*clip); break;
-                    case 4: pickClipColour (*clip); break;
-                    case 10: clip->launchQuant = LaunchQuant::Off;       writeToSession(); break;
-                    case 11: clip->launchQuant = LaunchQuant::Beat;      writeToSession(); break;
-                    case 12: clip->launchQuant = LaunchQuant::Bar;       writeToSession(); break;
-                    case 13: clip->launchQuant = LaunchQuant::TwoBars;   writeToSession(); break;
-                    case 14: clip->launchQuant = LaunchQuant::FourBars;  writeToSession(); break;
-                    case 20: clip->followAction = FollowAction::None;        writeToSession(); break;
-                    case 21: clip->followAction = FollowAction::Stop;        writeToSession(); break;
-                    case 22: clip->followAction = FollowAction::RestartClip; writeToSession(); break;
-                    case 23: clip->followAction = FollowAction::NextClip;    writeToSession(); break;
-                    case 24: clip->followAction = FollowAction::FirstClip;   writeToSession(); break;
+                    case 1: deleteClip   (*clip); break;
+                    case 5: openClipView (*clip); break;
                     default: break;
                 }
             }
@@ -1148,7 +1197,7 @@ void SessionView::mouseDown (const MouseEvent& e)
             juce::PopupMenu m;
             m.addItem (1, "Launch scene");
             m.addSeparator();
-            m.addItem (5, "Rename...");
+            m.addItem (5, "Scene properties...");
             m.addSeparator();
             m.addItem (2, "Insert scene above");
             m.addItem (3, "Insert scene below");
@@ -1158,27 +1207,29 @@ void SessionView::mouseDown (const MouseEvent& e)
             const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
             switch (r)
             {
-                case 1: bangScene   (row);     break;
-                case 2: insertScene (row);     break;
-                case 3: insertScene (row + 1); break;
-                case 4: deleteScene (row);     break;
-                case 5: renameScene (row);     break;
+                case 1: bangScene     (row);     break;
+                case 2: insertScene   (row);     break;
+                case 3: insertScene   (row + 1); break;
+                case 4: deleteScene   (row);     break;
+                case 5: openSceneView (row);     break;
                 default: break;
             }
         }
         return;
     }
 
-    /* Per-column footer -- STOP / MUTE.  Tested before cell hits
-     * so a click here never stages a drag. */
-    if (hitTestColumnStop (e.getPosition(), col))
-    {
-        stopColumn (col);
-        return;
-    }
+    /* Column-header MUTE / SOLO.  Tested before cell hits so a click
+     * here never stages a clip drag.  STOP is no longer surfaced --
+     * STOP ALL covers the global, per-clip click stops individual
+     * clips, and MUTE silences the column without stopping clips. */
     if (hitTestColumnMute (e.getPosition(), col))
     {
         toggleColumnMute (col);
+        return;
+    }
+    if (hitTestColumnSolo (e.getPosition(), col))
+    {
+        toggleColumnSolo (col);
         return;
     }
 
@@ -1187,6 +1238,11 @@ void SessionView::mouseDown (const MouseEvent& e)
     if (hitTestMasterLaunch (e.getPosition(), row))
     {
         bangScene (row);
+        return;
+    }
+    if (hitTestMasterEdit (e.getPosition(), row))
+    {
+        openSceneView (row);
         return;
     }
     if (hitTestMasterTempo (e.getPosition(), row))
@@ -1377,9 +1433,9 @@ void SessionView::mouseDoubleClick (const MouseEvent& e)
 {
     int row = -1, col = -1;
 
-    /* Double-click on the middle of a clip cell renames it.  The play
-     * and edit buttons swallow their own clicks via mouseDown, so the
-     * double event only reaches the cell body. */
+    /* Double-click on the middle of a clip cell opens the Clip View
+     * popup.  The play + edit buttons swallow their own clicks via
+     * mouseDown, so the double event only reaches the cell body. */
     if (hitTestCell (e.getPosition(), row, col))
     {
         if (auto* clip = findClip (row, col))
@@ -1387,7 +1443,7 @@ void SessionView::mouseDoubleClick (const MouseEvent& e)
             if (! playButtonBounds (row, col).contains (e.getPosition())
              && ! editButtonBounds (row, col).contains (e.getPosition()))
             {
-                renameClip (*clip);
+                openClipView (*clip);
                 return;
             }
         }
@@ -1602,11 +1658,25 @@ void SessionView::bangScene (int sceneRow)
      * tempo immediately when their beat-target is computed. */
     applySceneOverridesToTransport (scenes_.getReference (sceneRow));
 
+    /* "Sketch Mode" -- if the transport is stopped, launching a
+     * scene also starts the transport so the clips actually fire.
+     * Without this, schedulePlaying queues entries that never get
+     * drained (engine doesn't advance with the transport stopped).
+     * Matches Ableton's behaviour where clicking a scene launch
+     * triangle plays even if the global transport isn't already
+     * running. */
+    if (monitor_ != nullptr && ! monitor_->playing.get())
+    {
+        if (services_ != nullptr)
+            if (auto* eng = services_->context().audio().get())
+                eng->setPlaying (true);
+    }
+
     /* Pick the slowest quant among this scene's clips so they all
-     * snap to the same target beat -- Bitwig convention.  If clips
-     * use heterogeneous quants the per-clip values are ignored for
-     * the duration of this bang; subsequent solo bangs use the
-     * clip's own quant again. */
+     * snap to the same target beat -- Bitwig convention.  Empty
+     * scenes fall back to the toolbar's default quant: launching
+     * an empty scene is the user's way of saying "stop everything
+     * else at this boundary," and we still want the boundary. */
     LaunchQuant slowest = LaunchQuant::Off;
     bool any = false;
     for (auto* c : clips_)
@@ -1616,16 +1686,53 @@ void SessionView::bangScene (int sceneRow)
         if ((int) c->launchQuant > (int) slowest)
             slowest = c->launchQuant;
     }
-    if (! any) return;
+    if (! any) slowest = defaultLaunchQuant_;
 
     const bool transportPlaying = (monitor_ != nullptr && monitor_->playing.get());
     const double targetBeat = transportPlaying
         ? computeTargetBeat (currentTransportBeat(), slowest)
         : -1.0;
 
+    /* Exclusive scene launch -- stop every clip that's currently
+     * active on a row OTHER than the one we're banging.  Without
+     * this, scene 2's clips keep playing when the user goes back
+     * to scene 1 (since same-column mutual exclusion only catches
+     * the clips that scene 1 ALSO has a slot for).  All stops use
+     * the same targetBeat so the switch is atomic in one audio
+     * block. */
+    for (auto* c : clips_)
+    {
+        if (c->sceneRow == sceneRow) continue;
+        const LiveState s = c->state.load (std::memory_order_relaxed);
+        if (s != LiveState::Playing && s != LiveState::WaitingToStart) continue;
+        if (auto* trk = lookupTracker (c->trackerNodeId))
+            trk->schedulePlaying (c->sequenceIdx, targetBeat, false);
+        c->state.store (targetBeat < 0.0 ? LiveState::Stopped
+                                         : LiveState::WaitingToStop,
+                        std::memory_order_relaxed);
+        repaint (cellBounds (c->sceneRow, c->columnIdx));
+    }
+
     for (auto* c : clips_)
         if (c->sceneRow == sceneRow)
             transitionClip (*c, targetBeat);
+
+    /* Track the most-recently launched scene so the entire row can
+     * be drawn as the "current" scene (Ableton convention).  Repaint
+     * the old + new row strips across the full width. */
+    if (currentSceneRow_ != sceneRow)
+    {
+        const int prev = currentSceneRow_;
+        currentSceneRow_ = sceneRow;
+        auto repaintRow = [this] (int row)
+        {
+            if (row < 0 || row >= scenes_.size()) return;
+            const auto sl = sceneLabelBounds (row);
+            repaint (Rectangle<int> (0, sl.getY(), getWidth(), kRowH));
+        };
+        repaintRow (prev);
+        repaintRow (sceneRow);
+    }
 }
 
 void SessionView::applySceneOverridesToTransport (const SessionScene& s)
@@ -1640,27 +1747,44 @@ void SessionView::applySceneOverridesToTransport (const SessionScene& s)
      * Transport monitor. */
     auto tree = sess->data();
     if (! tree.isValid()) return;
-    /* ValueTree property writes broadcast through the session's
-     * ObjectModel listener chain -- same path the Session Settings
-     * panel uses to nudge BPM at runtime.  No notifyChanged() poke
-     * needed (it's private and the listener path runs anyway). */
+    auto* eng = services_->context().audio().get();
+
+    /* Tempo: writing tags::tempo on the session ValueTree DOES
+     * propagate to the audio engine -- AudioEngine has a
+     * juce::Value listener bound to that property (see
+     * audioengine.cpp connectSessionValues + valueChanged). */
     if (s.tempoOverride > 0.0)
         tree.setProperty (tags::tempo, s.tempoOverride, nullptr);
-    if (s.beatsPerBar > 0)
+
+    /* Time signature: NO Value listener on tags::beatsPerBar or
+     * tags::beatDivisor -- AudioEngine reads them ONCE in
+     * connectSessionValues and never re-syncs.  So we have to call
+     * AudioEngine::setMeter directly to actually move the transport.
+     *
+     * Also: the session XML uses BeatType encoding for beatDivisor
+     * (0=whole, 2=quarter, 4=sixteenth) while our SessionScene
+     * stores the user-meaningful denominator (4 = quarter, 8 =
+     * eighth).  Convert via BeatType::fromDivisor. */
+    if (s.beatsPerBar > 0 && s.beatDivisor > 0)
+    {
+        const int bd = BeatType::fromDivisor (s.beatDivisor);
         tree.setProperty (tags::beatsPerBar, s.beatsPerBar, nullptr);
-    if (s.beatDivisor > 0)
-        tree.setProperty (tags::beatDivisor, s.beatDivisor, nullptr);
+        tree.setProperty (tags::beatDivisor, bd,            nullptr);
+        if (eng != nullptr)
+            eng->setMeter (s.beatsPerBar, bd);
+    }
 }
 
 void SessionView::editSceneTempo (int sceneRow)
 {
+    /* Inline editor for fast in-place edits.  Scene View popup
+     * (opened via the master cell edit button) is the full editor
+     * for name + tempo + sig together. */
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
     const auto& sc = scenes_.getReference (sceneRow);
-
     const auto initial = sc.tempoOverride > 0.0
                             ? juce::String (sc.tempoOverride, 2)
                             : juce::String();
-
     showInlineEditor (
         masterTempoFieldBounds (sceneRow),
         initial,
@@ -1669,16 +1793,13 @@ void SessionView::editSceneTempo (int sceneRow)
             if (sceneRow >= scenes_.size()) return;
             auto& s = scenes_.getReference (sceneRow);
             const auto trimmed = txt.trim();
-            if (trimmed.isEmpty()) { s.tempoOverride = -1.0; }
+            if (trimmed.isEmpty()) s.tempoOverride = -1.0;
             else
             {
                 const double v = trimmed.getDoubleValue();
-                s.tempoOverride = (v > 0.0)
-                    ? juce::jlimit (20.0, 999.0, v)
-                    : -1.0;
+                s.tempoOverride = (v > 0.0) ? juce::jlimit (20.0, 999.0, v) : -1.0;
             }
-            writeToSession();
-            repaint (masterCellBounds (sceneRow));
+            notifySceneEdited (sceneRow);
         });
 }
 
@@ -1686,13 +1807,9 @@ void SessionView::editSceneSignature (int sceneRow)
 {
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
     const auto& sc = scenes_.getReference (sceneRow);
-
-    /* Single field, "num/den" format -- much faster than two
-     * AlertWindow inputs.  Empty input clears the override. */
     const auto initial = (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
                             ? juce::String (sc.beatsPerBar) + "/" + juce::String (sc.beatDivisor)
                             : juce::String();
-
     showInlineEditor (
         masterSigFieldBounds (sceneRow),
         initial,
@@ -1723,18 +1840,56 @@ void SessionView::editSceneSignature (int sceneRow)
                 s.beatsPerBar = juce::jlimit (0, 32, num);
                 s.beatDivisor = juce::jlimit (0, 32, den);
             }
-            writeToSession();
-            repaint (masterCellBounds (sceneRow));
+            notifySceneEdited (sceneRow);
         });
+}
+
+void SessionView::notifySceneEdited (int sceneRow)
+{
+    /* Persist the mutation + repaint the visual surfaces that mirror
+     * scene data (left scene label + master cell). */
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    writeToSession();
+    refreshToolbarLabels();
+    repaint (sceneLabelBounds  (sceneRow));
+    repaint (masterCellBounds  (sceneRow));
+}
+
+SessionView::SessionScene* SessionView::sceneAt (int sceneRow) noexcept
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return nullptr;
+    return &scenes_.getReference (sceneRow);
+}
+
+void SessionView::transportTogglePlay() noexcept
+{
+    if (services_ == nullptr) return;
+    if (auto* eng = services_->context().audio().get())
+        eng->togglePlayPause();
+}
+
+void SessionView::bangClipByUuid (const juce::Uuid& clipId)
+{
+    for (auto* c : clips_)
+    {
+        if (c->id == clipId)
+        {
+            bangClip (*c);
+            return;
+        }
+    }
 }
 
 bool SessionView::sceneHasActiveClip (int sceneRow) const noexcept
 {
+    /* "Active" here means CURRENTLY emitting -- only the Playing
+     * state, not WaitingToStart or WaitingToStop.  Scenes whose
+     * clips are queued to stop on the next bar shouldn't read as
+     * "active" -- they're on their way out. */
     for (auto* c : clips_)
     {
         if (c->sceneRow != sceneRow) continue;
-        const auto s = c->state.load (std::memory_order_relaxed);
-        if (s != LiveState::Stopped)
+        if (c->state.load (std::memory_order_relaxed) == LiveState::Playing)
             return true;
     }
     return false;
@@ -1811,18 +1966,64 @@ void SessionView::stopColumn (int columnIdx)
 
 bool SessionView::isColumnMuted (int columnIdx) const noexcept
 {
+    /* Returns USER-asserted mute (the explicit press), not the
+     * effective engine state.  Lives on the TrackerNode so the
+     * tracker editor popup queries the same state. */
     if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
     if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        return trk->isMuted();
+        return trk->getUserMuted();
     return false;
+}
+
+bool SessionView::isColumnSoloed (int columnIdx) const noexcept
+{
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        return trk->getSoloed();
+    return false;
+}
+
+void SessionView::applyMuteAndSoloState()
+{
+    /* Scan TrackerNodes via the columns array, decide if any are
+     * soloed, then reconcile each tracker's Processor::isMuted from
+     * (any-solo ? !this-soloed : userMuted).  Engine mute is the
+     * EFFECTIVE state; user-intent flags live on the node. */
+    bool anySolo = false;
+    for (int i = 0; i < columns_.size(); ++i)
+    {
+        if (auto* trk = lookupTracker (columns_.getReference (i).trackerNodeId))
+            if (trk->getSoloed()) { anySolo = true; break; }
+    }
+
+    for (int c = 0; c < columns_.size(); ++c)
+    {
+        if (auto* trk = lookupTracker (columns_.getReference (c).trackerNodeId))
+        {
+            const bool effectiveMute = anySolo ? ! trk->getSoloed()
+                                               : trk->getUserMuted();
+            if (trk->isMuted() != effectiveMute)
+                trk->setMuted (effectiveMute);
+        }
+    }
 }
 
 void SessionView::toggleColumnMute (int columnIdx)
 {
     if (columnIdx < 0 || columnIdx >= columns_.size()) return;
     if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        trk->setMuted (! trk->isMuted());
-    repaint (columnStopRowBounds());
+        trk->setUserMuted (! trk->getUserMuted());
+    applyMuteAndSoloState();
+    repaint (headerRowBounds());
+}
+
+void SessionView::toggleColumnSolo (int columnIdx)
+{
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return;
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        trk->setSoloed (! trk->getSoloed());
+    applyMuteAndSoloState();
+    repaint (headerRowBounds());
 }
 
 void SessionView::addScene()
@@ -1856,31 +2057,10 @@ void SessionView::insertScene (int beforeRow)
 
 void SessionView::renameScene (int row)
 {
-    if (row < 0 || row >= scenes_.size()) return;
-
-    auto* aw = new juce::AlertWindow ("Rename scene",
-                                      "New name for "
-                                      + scenes_.getReference (row).name + ":",
-                                      juce::AlertWindow::NoIcon);
-    aw->addTextEditor ("name", scenes_.getReference (row).name);
-    aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
-    aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-
-    aw->enterModalState (true,
-        juce::ModalCallbackFunction::create (
-            [this, row, aw] (int result) {
-                if (result == 1 && row < scenes_.size())
-                {
-                    const auto newName = aw->getTextEditorContents ("name").trim();
-                    if (newName.isNotEmpty())
-                    {
-                        scenes_.getReference (row).name = newName;
-                        writeToSession();
-                        repaint (sceneLabelBounds (row));
-                    }
-                }
-            }),
-        true /* delete when dismissed */);
+    /* Rename routes through the Scene View popup, per user request:
+     * one window for all scene properties instead of three separate
+     * AlertWindow / inline-editor flows. */
+    openSceneView (row);
 }
 
 void SessionView::renameClip (SessionClip& clip)
@@ -2160,19 +2340,569 @@ void SessionView::addClipAt (int sceneRow, int columnIdx)
 class TrackerPatternWindow : public juce::DocumentWindow
 {
 public:
-    TrackerPatternWindow (juce::Component* content, const juce::String& title)
+    TrackerPatternWindow (juce::Component::SafePointer<SessionView> view,
+                          const juce::Uuid& clipId,
+                          juce::Component* content,
+                          const juce::String& title)
         : juce::DocumentWindow (title,
                                 juce::Colour { 0xff'18'18'18 },
-                                juce::DocumentWindow::allButtons)
+                                juce::DocumentWindow::allButtons),
+          owner_  (view),
+          clipId_ (clipId)
     {
         setUsingNativeTitleBar (true);
         setContentOwned (content, true);
         setResizable (true, false);
         centreWithSize (820, 540);
+        setWantsKeyboardFocus (true);
+        setVisible (true);
+    }
+    void closeButtonPressed() override { delete this; }
+
+    /* Transport keyboard hooks while the tracker popup is focused:
+     *   Space       -> global transport play / pause toggle
+     *   Ctrl+Space  -> Sketch-Mode launch of THIS clip (bangClip starts
+     *                  the transport if stopped, fires the clip
+     *                  through the audio FIFO).  Both are no-ops if
+     *                  the underlying SessionView has been torn down. */
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (auto* v = owner_.getComponent())
+        {
+            if (key == juce::KeyPress::spaceKey
+                && key.getModifiers().isCtrlDown())
+            {
+                v->bangClipByUuid (clipId_);
+                return true;
+            }
+            if (key == juce::KeyPress::spaceKey)
+            {
+                v->transportTogglePlay();
+                return true;
+            }
+        }
+        return juce::DocumentWindow::keyPressed (key);
+    }
+
+private:
+    juce::Component::SafePointer<SessionView> owner_;
+    juce::Uuid clipId_;
+};
+
+/* === SceneView popup ===================================================
+ * Dedicated floating window for editing scene properties (name, tempo
+ * override, time-signature override).  Replaces the inline tempo/sig
+ * editors AND the rename AlertWindow with a single non-modal surface
+ * the user opens once and edits in.
+ *
+ * Per feedback_inline_edit_cancel_on_click_away: Return commits a
+ * field, Escape + focus-loss revert.  Per the dedicated-window pattern
+ * the popup is non-modal so the user can interact with the main app
+ * (transport, other scenes) while it's open.  Window is self-deleting
+ * via the close button.  SafePointer<SessionView> guards against the
+ * view being torn down while the window is open. */
+class SceneViewContent : public juce::Component,
+                         private juce::TextEditor::Listener
+{
+public:
+    SceneViewContent (juce::Component::SafePointer<SessionView> view, int sceneRow)
+        : view_ (view), sceneRow_ (sceneRow)
+    {
+        setSize (320, 200);
+
+        configureLabel (titleLabel_,  "Scene " + juce::String (sceneRow + 1),
+                        14.0f, juce::Font::bold);
+        configureLabel (nameLabel_,   "Name",      11.0f, juce::Font::plain);
+        configureLabel (tempoLabel_,  "Tempo",     11.0f, juce::Font::plain);
+        configureLabel (sigLabel_,    "Signature", 11.0f, juce::Font::plain);
+        configureLabel (sigSlashLbl_, "/",         12.0f, juce::Font::bold);
+        configureLabel (hintLabel_,
+            "Tempo / sig left blank = inherit session value.",
+            10.0f, juce::Font::plain);
+        hintLabel_.setColour (juce::Label::textColourId, juce::Colour { 0xff'70'70'70 });
+
+        configureEditor (nameEditor_);
+        configureEditor (tempoEditor_);
+        configureEditor (sigNumEditor_);
+        configureEditor (sigDenEditor_);
+
+        nameEditor_  .setInputRestrictions (0);
+        tempoEditor_ .setInputRestrictions (8,   "0123456789.");
+        sigNumEditor_.setInputRestrictions (2,   "0123456789");
+        sigDenEditor_.setInputRestrictions (2,   "0123456789");
+
+        refreshFromScene();
+    }
+
+    void resized() override
+    {
+        const int margin = 12;
+        const int rowH   = 24;
+        const int labelW = 78;
+        const int colGap = 8;
+
+        auto r = getLocalBounds().reduced (margin);
+        titleLabel_.setBounds (r.removeFromTop (rowH));
+        r.removeFromTop (6);
+
+        auto layoutRow = [&] (juce::Label& lab, juce::Component& field) {
+            auto row = r.removeFromTop (rowH);
+            lab.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            field.setBounds (row);
+            r.removeFromTop (4);
+        };
+
+        layoutRow (nameLabel_,  nameEditor_);
+        layoutRow (tempoLabel_, tempoEditor_);
+
+        /* Signature row -- two narrow fields with a / between. */
+        {
+            auto row = r.removeFromTop (rowH);
+            sigLabel_.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            const int fieldW = 46;
+            sigNumEditor_.setBounds (row.removeFromLeft (fieldW));
+            row.removeFromLeft (6);
+            sigSlashLbl_.setBounds (row.removeFromLeft (10));
+            row.removeFromLeft (6);
+            sigDenEditor_.setBounds (row.removeFromLeft (fieldW));
+            r.removeFromTop (4);
+        }
+
+        r.removeFromTop (6);
+        hintLabel_.setBounds (r.removeFromTop (rowH));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour { 0xff'18'18'18 });
+    }
+
+private:
+    void configureLabel (juce::Label& l, const juce::String& text,
+                         float pt, int style)
+    {
+        l.setText (text, juce::dontSendNotification);
+        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      pt, style));
+        l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
+        addAndMakeVisible (l);
+    }
+
+    void configureEditor (juce::TextEditor& e)
+    {
+        e.setMultiLine (false);
+        e.setReturnKeyStartsNewLine (false);
+        e.setSelectAllWhenFocused (true);
+        e.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      12.0f, juce::Font::plain));
+        e.setColour (juce::TextEditor::backgroundColourId, juce::Colour { 0xff'20'20'20 });
+        e.setColour (juce::TextEditor::textColourId,       juce::Colour { 0xff'ff'ff'ff });
+        e.setColour (juce::TextEditor::outlineColourId,    juce::Colour { 0xff'3a'3a'3a });
+        e.setColour (juce::TextEditor::focusedOutlineColourId,
+                                                            juce::Colour { 0xff'ff'a0'40 });
+        e.addListener (this);
+        addAndMakeVisible (e);
+    }
+
+    void refreshFromScene()
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* sc = v->sceneAt (sceneRow_);
+        if (sc == nullptr) return;
+
+        nameEditor_.setText (sc->name, juce::dontSendNotification);
+        tempoEditor_.setText (sc->tempoOverride > 0.0
+                                  ? juce::String (sc->tempoOverride, 2)
+                                  : juce::String(),
+                              juce::dontSendNotification);
+        sigNumEditor_.setText (sc->beatsPerBar > 0
+                                   ? juce::String (sc->beatsPerBar)
+                                   : juce::String(),
+                               juce::dontSendNotification);
+        sigDenEditor_.setText (sc->beatDivisor > 0
+                                   ? juce::String (sc->beatDivisor)
+                                   : juce::String(),
+                               juce::dontSendNotification);
+
+    }
+
+    void textEditorReturnKeyPressed (juce::TextEditor& e) override
+    {
+        commit (e);
+    }
+
+    void textEditorEscapeKeyPressed (juce::TextEditor& e) override
+    {
+        juce::ignoreUnused (e);
+        refreshFromScene();   // revert
+    }
+
+    void textEditorFocusLost (juce::TextEditor& e) override
+    {
+        /* Per feedback_inline_edit_cancel_on_click_away: focus loss
+         * REVERTS, doesn't commit.  User has to press Return to lock
+         * the value in. */
+        juce::ignoreUnused (e);
+        refreshFromScene();
+    }
+
+    void commit (juce::TextEditor& e)
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* sc = v->sceneAt (sceneRow_);
+        if (sc == nullptr) return;
+
+        if (&e == &nameEditor_)
+        {
+            const auto n = e.getText().trim();
+            if (n.isNotEmpty()) sc->name = n;
+        }
+        else if (&e == &tempoEditor_)
+        {
+            const auto t = e.getText().trim();
+            if (t.isEmpty()) { sc->tempoOverride = -1.0; }
+            else
+            {
+                const double bpm = t.getDoubleValue();
+                sc->tempoOverride = (bpm > 0.0)
+                    ? juce::jlimit (20.0, 999.0, bpm)
+                    : -1.0;
+            }
+        }
+        else if (&e == &sigNumEditor_)
+        {
+            const auto n = e.getText().trim();
+            sc->beatsPerBar = n.isEmpty() ? 0
+                                          : juce::jlimit (0, 32, n.getIntValue());
+        }
+        else if (&e == &sigDenEditor_)
+        {
+            const auto d = e.getText().trim();
+            sc->beatDivisor = d.isEmpty() ? 0
+                                          : juce::jlimit (0, 32, d.getIntValue());
+        }
+
+        v->notifySceneEdited (sceneRow_);
+        refreshFromScene();
+    }
+
+    juce::Component::SafePointer<SessionView> view_;
+    int sceneRow_;
+
+    juce::Label titleLabel_, nameLabel_, tempoLabel_, sigLabel_, sigSlashLbl_, hintLabel_;
+    juce::TextEditor nameEditor_, tempoEditor_, sigNumEditor_, sigDenEditor_;
+};
+
+class SceneViewWindow : public juce::DocumentWindow
+{
+public:
+    SceneViewWindow (juce::Component* content, const juce::String& title)
+        : juce::DocumentWindow (title,
+                                juce::Colour { 0xff'18'18'18 },
+                                juce::DocumentWindow::closeButton)
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (content, true);
+        setResizable (false, false);
+        centreWithSize (340, 220);
         setVisible (true);
     }
     void closeButtonPressed() override { delete this; }
 };
+
+/* === ClipView popup ====================================================
+ * Mirror of SceneView for clips.  Replaces the right-click Rename /
+ * Cycle colour / Colour... / Launch quantisation submenu / Follow
+ * action submenu items with a single dedicated window.  Right-click
+ * still carries the STRUCTURAL ops (Add new / Assign existing /
+ * Delete clip).
+ *
+ * SafePointer<SessionView> + clip Uuid for lifetime safety; per
+ * feedback_inline_edit_cancel_on_click_away the name TextEditor
+ * commits on Return, reverts on Escape + focus loss. */
+class ClipViewContent : public juce::Component,
+                        private juce::TextEditor::Listener,
+                        private juce::ChangeListener
+{
+public:
+    ClipViewContent (juce::Component::SafePointer<SessionView> view,
+                     const juce::Uuid& clipId)
+        : view_ (view), clipId_ (clipId)
+    {
+        setSize (340, 240);
+
+        configureLabel (titleLabel_, "Clip", 14.0f, juce::Font::bold);
+        configureLabel (nameLabel_,   "Name",       11.0f, juce::Font::plain);
+        configureLabel (colourLabel_, "Colour",     11.0f, juce::Font::plain);
+        configureLabel (quantLabel_,  "Quant",      11.0f, juce::Font::plain);
+        configureLabel (followLabel_, "Follow",     11.0f, juce::Font::plain);
+        configureLabel (hintLabel_,
+            "Click the colour swatch to pick a new colour.",
+            10.0f, juce::Font::plain);
+        hintLabel_.setColour (juce::Label::textColourId, juce::Colour { 0xff'70'70'70 });
+
+        configureEditor (nameEditor_);
+        nameEditor_.setInputRestrictions (0);
+
+        configureCombo (quantCombo_,  { "Off", "1 Beat", "1 Bar", "2 Bars", "4 Bars" });
+        configureCombo (followCombo_, { "None (loop)", "Stop", "Restart", "Next clip", "First clip" });
+
+        addAndMakeVisible (swatch_);
+        swatch_.onClick = [this] { openColourPicker(); };
+
+        refreshFromClip();
+    }
+
+    ~ClipViewContent() override { detachColourPicker(); }
+
+    void resized() override
+    {
+        const int margin = 12;
+        const int rowH   = 24;
+        const int labelW = 78;
+        const int colGap = 8;
+
+        auto r = getLocalBounds().reduced (margin);
+        titleLabel_.setBounds (r.removeFromTop (rowH));
+        r.removeFromTop (6);
+
+        auto layoutRow = [&] (juce::Label& lab, juce::Component& field) {
+            auto row = r.removeFromTop (rowH);
+            lab.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            field.setBounds (row);
+            r.removeFromTop (4);
+        };
+
+        layoutRow (nameLabel_,   nameEditor_);
+
+        /* Colour row: label + swatch (24x16) + room. */
+        {
+            auto row = r.removeFromTop (rowH);
+            colourLabel_.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            swatch_.setBounds (row.removeFromLeft (60).withSizeKeepingCentre (60, 18));
+            r.removeFromTop (4);
+        }
+
+        layoutRow (quantLabel_,  quantCombo_);
+        layoutRow (followLabel_, followCombo_);
+
+        r.removeFromTop (6);
+        hintLabel_.setBounds (r.removeFromTop (rowH));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour { 0xff'18'18'18 });
+    }
+
+private:
+    void configureLabel (juce::Label& l, const juce::String& text,
+                         float pt, int style)
+    {
+        l.setText (text, juce::dontSendNotification);
+        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      pt, style));
+        l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
+        addAndMakeVisible (l);
+    }
+
+    void configureEditor (juce::TextEditor& e)
+    {
+        e.setMultiLine (false);
+        e.setReturnKeyStartsNewLine (false);
+        e.setSelectAllWhenFocused (true);
+        e.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      12.0f, juce::Font::plain));
+        e.setColour (juce::TextEditor::backgroundColourId, juce::Colour { 0xff'20'20'20 });
+        e.setColour (juce::TextEditor::textColourId,       juce::Colour { 0xff'ff'ff'ff });
+        e.setColour (juce::TextEditor::outlineColourId,    juce::Colour { 0xff'3a'3a'3a });
+        e.setColour (juce::TextEditor::focusedOutlineColourId,
+                                                            juce::Colour { 0xff'ff'a0'40 });
+        e.addListener (this);
+        addAndMakeVisible (e);
+    }
+
+    void configureCombo (juce::ComboBox& cb, const juce::StringArray& items)
+    {
+        for (int i = 0; i < items.size(); ++i)
+            cb.addItem (items[i], i + 1);     // 1-based
+        cb.setColour (juce::ComboBox::backgroundColourId, juce::Colour { 0xff'20'20'20 });
+        cb.setColour (juce::ComboBox::textColourId,       juce::Colour { 0xff'ff'ff'ff });
+        cb.setColour (juce::ComboBox::outlineColourId,    juce::Colour { 0xff'3a'3a'3a });
+        cb.onChange = [this, &cb] { commitCombo (cb); };
+        addAndMakeVisible (cb);
+    }
+
+    void refreshFromClip()
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* clip = v->clipByUuid (clipId_);
+        if (clip == nullptr) return;
+
+        titleLabel_.setText ("Clip - " + clip->name, juce::dontSendNotification);
+        nameEditor_.setText (clip->name, juce::dontSendNotification);
+        swatch_.setSwatchColour (clip->color);
+        quantCombo_ .setSelectedId ((int) clip->launchQuant  + 1, juce::dontSendNotification);
+        followCombo_.setSelectedId ((int) clip->followAction + 1, juce::dontSendNotification);
+    }
+
+    /* TextEditor::Listener */
+    void textEditorReturnKeyPressed (juce::TextEditor& e) override
+    {
+        if (&e != &nameEditor_) return;
+        if (auto* v = view_.getComponent())
+            if (auto* clip = v->clipByUuid (clipId_))
+            {
+                const auto n = e.getText().trim();
+                if (n.isNotEmpty()) clip->name = n;
+                v->notifyClipEdited (*clip);
+            }
+        refreshFromClip();
+    }
+    void textEditorEscapeKeyPressed (juce::TextEditor&) override { refreshFromClip(); }
+    void textEditorFocusLost (juce::TextEditor&) override         { refreshFromClip(); }
+
+    /* ComboBox commit */
+    void commitCombo (juce::ComboBox& cb)
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* clip = v->clipByUuid (clipId_);
+        if (clip == nullptr) return;
+        const int idx = cb.getSelectedId() - 1;
+        if (idx < 0) return;
+        if (&cb == &quantCombo_)
+            clip->launchQuant = static_cast<SessionView::LaunchQuant> (juce::jlimit (0, 4, idx));
+        else if (&cb == &followCombo_)
+            clip->followAction = static_cast<SessionView::FollowAction> (juce::jlimit (0, 4, idx));
+        v->notifyClipEdited (*clip);
+    }
+
+    /* --- Colour picker ----------------------------------------------- */
+
+    class Swatch : public juce::Component
+    {
+    public:
+        std::function<void()> onClick;
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (juce::Colour { 0xff'10'10'10 });
+            g.setColour (current_);
+            g.fillRect (getLocalBounds().reduced (2));
+            g.setColour (juce::Colour { 0xff'3a'3a'3a });
+            g.drawRect (getLocalBounds().reduced (2), 1);
+        }
+        void mouseDown (const juce::MouseEvent&) override { if (onClick) onClick(); }
+        void setSwatchColour (juce::Colour c) { current_ = c; repaint(); }
+    private:
+        juce::Colour current_ { 0xff'4a'7a'b5 };
+    };
+
+    void openColourPicker()
+    {
+        detachColourPicker();
+        auto* cs = new juce::ColourSelector (juce::ColourSelector::showColourspace
+                                             | juce::ColourSelector::showSliders
+                                             | juce::ColourSelector::showAlphaChannel);
+        cs->setSize (300, 360);
+        if (auto* v = view_.getComponent())
+            if (auto* clip = v->clipByUuid (clipId_))
+                cs->setCurrentColour (clip->color);
+        cs->addChangeListener (this);
+        activeColourSel_ = cs;
+        juce::CallOutBox::launchAsynchronously (
+            std::unique_ptr<juce::Component> (cs),
+            swatch_.getScreenBounds(),
+            nullptr);
+    }
+
+    void detachColourPicker()
+    {
+        if (activeColourSel_ != nullptr)
+            activeColourSel_->removeChangeListener (this);
+        activeColourSel_ = nullptr;
+    }
+
+    void changeListenerCallback (juce::ChangeBroadcaster* src) override
+    {
+        auto* cs = dynamic_cast<juce::ColourSelector*> (src);
+        if (cs == nullptr) return;
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* clip = v->clipByUuid (clipId_);
+        if (clip == nullptr) return;
+        clip->color = cs->getCurrentColour();
+        swatch_.setSwatchColour (clip->color);
+        v->notifyClipEdited (*clip);
+    }
+
+    juce::Component::SafePointer<SessionView> view_;
+    juce::Uuid clipId_;
+
+    juce::Label titleLabel_, nameLabel_, colourLabel_, quantLabel_, followLabel_, hintLabel_;
+    juce::TextEditor nameEditor_;
+    juce::ComboBox quantCombo_, followCombo_;
+    Swatch swatch_;
+    juce::ColourSelector* activeColourSel_ = nullptr;
+};
+
+class ClipViewWindow : public juce::DocumentWindow
+{
+public:
+    ClipViewWindow (juce::Component* content, const juce::String& title)
+        : juce::DocumentWindow (title,
+                                juce::Colour { 0xff'18'18'18 },
+                                juce::DocumentWindow::closeButton)
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (content, true);
+        setResizable (false, false);
+        centreWithSize (360, 270);
+        setVisible (true);
+    }
+    void closeButtonPressed() override { delete this; }
+};
+
+/* openSceneView + openClipView are defined here so their content +
+ * window classes are complete types at the point of `new`.  All
+ * other SessionView method definitions live above. */
+
+void SessionView::openClipView (SessionClip& clip)
+{
+    auto* content = new ClipViewContent (this, clip.id);
+    auto* win = new ClipViewWindow (content, "Clip - " + clip.name);
+    juce::ignoreUnused (win);
+}
+
+void SessionView::notifyClipEdited (SessionClip& clip)
+{
+    writeToSession();
+    repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+}
+
+SessionView::SessionClip* SessionView::clipByUuid (const juce::Uuid& clipId) noexcept
+{
+    for (auto* c : clips_)
+        if (c->id == clipId)
+            return c;
+    return nullptr;
+}
+
+void SessionView::openSceneView (int sceneRow)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    auto* content = new SceneViewContent (this, sceneRow);
+    auto* win = new SceneViewWindow (content,
+                                     "Scene " + juce::String (sceneRow + 1));
+    juce::ignoreUnused (win);   // self-deletes on close
+}
 
 void SessionView::openPatternEditor (SessionClip& clip)
 {
@@ -2206,7 +2936,8 @@ void SessionView::openPatternEditor (SessionClip& clip)
      * (Wine here, plus a few Linux WMs) garble multi-byte UTF-8 chars
      * when the title is set as a system call.  The em-dash showed up
      * as "a" in testing. */
-    auto* win = new TrackerPatternWindow (editor, "Tracker - " + clip.name);
+    auto* win = new TrackerPatternWindow (this, clip.id, editor,
+                                          "Tracker - " + clip.name);
     juce::ignoreUnused (win);   // self-deletes on close
 }
 
@@ -2456,6 +3187,37 @@ void SessionView::timerCallback()
     if (! isShowing()) return;   // gated per feedback_gui_must_stay_fast
 
     ++pulsePhase_;
+
+    /* Reconcile effective Processor::setMuted from each tracker's
+     * user-mute + solo flags.  Cheap (O(columns) bool comparisons +
+     * a setMuted call only when the effective state changed).  Runs
+     * every tick so changes from the tracker editor popup (separate
+     * window) propagate back into the session view. */
+    applyMuteAndSoloState();
+
+    /* Diff-gated repaint of the master column when the session
+     * tempo / signature changes outside this view (e.g. user
+     * tweaks the main toolbar BPM).  Scenes without explicit
+     * overrides display the current value dimmed, so they need
+     * to refresh on transport changes. */
+    if (services_ != nullptr)
+    {
+        if (auto sess = services_->context().session())
+        {
+            const double t   = (double) sess->getProperty (tags::tempo,       120.0);
+            const int    bpb = (int)    sess->getProperty (tags::beatsPerBar, 4);
+            const int    bd  = (int)    sess->getProperty (tags::beatDivisor, 4);
+            if (std::abs (t - lastSessionTempo_) > 0.01
+                || bpb != lastSessionBpb_
+                || bd  != lastSessionBd_)
+            {
+                lastSessionTempo_ = t;
+                lastSessionBpb_   = bpb;
+                lastSessionBd_    = bd;
+                repaint (masterColumnBounds());
+            }
+        }
+    }
 
     for (auto* clip : clips_)
     {
