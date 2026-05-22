@@ -988,10 +988,12 @@ void SessionView::paint (Graphics& g)
                 g.fillRect (cell);
             }
 
-            /* Launch button -- gray background by default, amber
-             * when ONE clip in the scene is currently playing.
-             * Waiting-state clips don't light it up so a scene on
-             * its way out doesn't look "active" anymore. */
+            /* Launch button amber ONLY when a clip in this scene is
+             * actually playing.  Per user direction 2026-05-22:
+             * the play button should reflect real audible state,
+             * not "I clicked this" intent.  Per-clip pulse
+             * indicates queued/waiting; the master button is
+             * binary "scene is sounding" / "scene is silent." */
             const bool sceneActive = sceneHasActiveClip (r);
             g.setColour (sceneActive
                             ? kPlayheadAccent.withAlpha (0.35f)
@@ -1067,14 +1069,15 @@ void SessionView::paint (Graphics& g)
         }
     }
 
-    /* Active-scene row indicator -- translucent amber overlay across
-     * the entire row (scene label + clip cells + master cell) so the
-     * user can see the whole "current scene" in one visual sweep.
-     * Drawn AFTER all per-cell paint so it tints them uniformly.
-     * Top/bottom edges accented at higher alpha for definition. */
-    if (currentSceneRow_ >= 0 && currentSceneRow_ < scenes_.size())
+    /* Row highlight tracks ACTUAL playing state, not "last banged",
+     * per user 2026-05-22.  Any row with at least one playing clip
+     * gets the amber overlay.  Multiple rows can light at once
+     * because there's no cross-row mutual exclusion (only same-
+     * column).  Drawn AFTER per-cell paint so the tint sits on top. */
+    for (int rr = 0; rr < scenes_.size(); ++rr)
     {
-        const auto sl = sceneLabelBounds (currentSceneRow_);
+        if (! sceneHasActiveClip (rr)) continue;
+        const auto sl = sceneLabelBounds (rr);
         const Rectangle<int> rowR (0, sl.getY(), getWidth(), kRowH);
         g.setColour (kPlayheadAccent.withAlpha (0.10f));
         g.fillRect (rowR);
@@ -1693,46 +1696,17 @@ void SessionView::bangScene (int sceneRow)
         ? computeTargetBeat (currentTransportBeat(), slowest)
         : -1.0;
 
-    /* Exclusive scene launch -- stop every clip that's currently
-     * active on a row OTHER than the one we're banging.  Without
-     * this, scene 2's clips keep playing when the user goes back
-     * to scene 1 (since same-column mutual exclusion only catches
-     * the clips that scene 1 ALSO has a slot for).  All stops use
-     * the same targetBeat so the switch is atomic in one audio
-     * block. */
-    for (auto* c : clips_)
-    {
-        if (c->sceneRow == sceneRow) continue;
-        const LiveState s = c->state.load (std::memory_order_relaxed);
-        if (s != LiveState::Playing && s != LiveState::WaitingToStart) continue;
-        if (auto* trk = lookupTracker (c->trackerNodeId))
-            trk->schedulePlaying (c->sequenceIdx, targetBeat, false);
-        c->state.store (targetBeat < 0.0 ? LiveState::Stopped
-                                         : LiveState::WaitingToStop,
-                        std::memory_order_relaxed);
-        repaint (cellBounds (c->sceneRow, c->columnIdx));
-    }
-
+    /* User direction 2026-05-22: NO cross-tracker mutual exclusion.
+     * Only vertical (same-column) exclusion -- per-column you can
+     * play one clip at a time; across columns, scenes are
+     * independent.  Scene-bang = bang each of this scene's clips
+     * individually; each call to transitionClip handles same-column
+     * mutual exclusion against any other scene's clip on that
+     * column.  Clips on columns this scene doesn't touch keep
+     * playing untouched. */
     for (auto* c : clips_)
         if (c->sceneRow == sceneRow)
             transitionClip (*c, targetBeat);
-
-    /* Track the most-recently launched scene so the entire row can
-     * be drawn as the "current" scene (Ableton convention).  Repaint
-     * the old + new row strips across the full width. */
-    if (currentSceneRow_ != sceneRow)
-    {
-        const int prev = currentSceneRow_;
-        currentSceneRow_ = sceneRow;
-        auto repaintRow = [this] (int row)
-        {
-            if (row < 0 || row >= scenes_.size()) return;
-            const auto sl = sceneLabelBounds (row);
-            repaint (Rectangle<int> (0, sl.getY(), getWidth(), kRowH));
-        };
-        repaintRow (prev);
-        repaintRow (sceneRow);
-    }
 }
 
 void SessionView::applySceneOverridesToTransport (const SessionScene& s)
@@ -3051,6 +3025,14 @@ void SessionView::readFromSession()
 {
     const auto tree = getOrCreateSessionViewTree();
     if (! tree.isValid()) return;
+
+    /* No scene is current at session-open time -- the row indicator
+     * should reflect "no scene has been launched yet" until the user
+     * actually bangs one.  Without this reset, a previous session's
+     * currentSceneRow_ carries over (SessionView is reused across
+     * session loads inside the same Element process) and the user
+     * sees a phantom amber row on a freshly-opened session. */
+    currentSceneRow_ = -1;
 
     /* Toolbar prefs at the sessionView root. */
     defaultLaunchQuant_ = static_cast<LaunchQuant> (
