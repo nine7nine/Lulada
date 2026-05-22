@@ -38,8 +38,8 @@ const Colour kGutterColour      { 0xff'14'14'14 };
 const Colour kHeaderBgColour    { 0xff'1a'1a'1a };
 const Colour kEmptyCellColour   { 0xff'24'24'24 };
 const Colour kCellOutlineColour { 0xff'33'33'33 };
-const Colour kRowTextColour     { 0xff'6a'6a'6a };
-const Colour kLabelTextColour   { 0xff'a0'a0'a0 };
+const Colour kRowTextColour     { 0xff'a8'a8'a8 };   // bumped (was 0x6a6a6a)
+const Colour kLabelTextColour   { 0xff'd8'd8'd8 };   // bumped (was 0xa0a0a0)
 const Colour kPlayheadAccent    { 0xff'ff'a0'40 };  // amber
 
 /* Column-tint palette, cycling -- same hues as trackereditor's track
@@ -1004,7 +1004,7 @@ void SessionView::paint (Graphics& g)
                 g.fillRect (rr);
                 g.setColour (kCellOutlineColour);
                 g.drawRect (rr, 1);
-                g.setColour (overrideSet ? Colour { 0xff'd4'd4'd4 }
+                g.setColour (overrideSet ? Colour { 0xff'ff'ff'ff }
                                          : kRowTextColour);
                 g.drawText (text, rr.reduced (4, 0),
                             juce::Justification::centred, true);
