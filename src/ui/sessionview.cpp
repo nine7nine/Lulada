@@ -443,11 +443,20 @@ void SessionView::paint (Graphics& g)
                     const double pos  = trk->getSequencePositionRows (clip->sequenceIdx);
                     const float frac  = (float) juce::jlimit (0.0, 1.0, pos / (double) total);
                     const int barW    = juce::jmax (1, (int) (frac * cb.getWidth()));
-                    g.setColour (kPlayheadAccent.withAlpha (0.85f));
+                    /* Translucent track underneath so the playhead reads
+                     * as a moving fill on a dim runway — easier to spot
+                     * at a glance than a bare 3 px line over the cell
+                     * colour. */
+                    g.setColour (juce::Colours::black.withAlpha (0.30f));
                     g.fillRect (cb.getX() + 2,
-                                cb.getBottom() - 4,
+                                cb.getBottom() - 5,
+                                cb.getWidth() - 4,
+                                3);
+                    g.setColour (kPlayheadAccent.withAlpha (0.95f));
+                    g.fillRect (cb.getX() + 2,
+                                cb.getBottom() - 5,
                                 barW - 4,
-                                2);
+                                3);
                 }
             }
 
@@ -472,6 +481,48 @@ void SessionView::paint (Graphics& g)
                 g.drawRect (inner, 1);
             }
         }
+    }
+
+    /* Clip-drag drop-target highlight — drawn over an empty cell that
+     * the cursor is hovering during an active drag.  Same-column
+     * drops are accepted; cross-column ones are silently rejected
+     * by moveClip, but the highlight still appears so the user gets
+     * feedback on where their cursor is.  Source cell dims so the
+     * "lift" is visible. */
+    if (dragActive_ && dragSource_ != nullptr)
+    {
+        const auto srcRect = cellBounds (dragSource_->sceneRow, dragSource_->columnIdx);
+        g.setColour (juce::Colours::black.withAlpha (0.35f));
+        g.fillRect (srcRect.reduced (2, 2));
+
+        if (dragHoverRow_ >= 0 && dragHoverCol_ >= 0
+            && (dragHoverRow_ != dragSource_->sceneRow
+             || dragHoverCol_ != dragSource_->columnIdx))
+        {
+            const auto target = cellBounds (dragHoverRow_, dragHoverCol_);
+            const bool empty  = (findClip (dragHoverRow_, dragHoverCol_) == nullptr);
+            const bool sameTracker = (dragHoverCol_ < columns_.size()
+                && columns_.getReference (dragHoverCol_).trackerNodeId
+                   == dragSource_->trackerNodeId);
+            const Colour outline = (empty && sameTracker)
+                ? kPlayheadAccent.withAlpha (0.95f)
+                : Colour { 0xff'e0'40'40 }.withAlpha (0.85f);
+            g.setColour (outline);
+            g.drawRect (target.reduced (2, 2), 2);
+        }
+    }
+
+    /* Scene-reorder insertion indicator — thin amber line at the row
+     * boundary the source scene will land on. */
+    if (sceneDragActive_ && sceneDragSource_ >= 0 && sceneDragHoverRow_ >= 0
+        && sceneDragHoverRow_ != sceneDragSource_)
+    {
+        const auto target = sceneLabelBounds (sceneDragHoverRow_);
+        const int y = (sceneDragHoverRow_ > sceneDragSource_)
+                          ? target.getBottom()
+                          : target.getY();
+        g.setColour (kPlayheadAccent);
+        g.fillRect (target.getX() + 4, y - 1, target.getWidth() - 8, 3);
     }
 
     /* Footer hint strip — right of the "+ Scene" button area. */
@@ -527,6 +578,7 @@ void SessionView::mouseDown (const MouseEvent& e)
                 juce::PopupMenu m;
                 m.addItem (2, "Rename...");
                 m.addItem (3, "Cycle colour");
+                m.addItem (4, "Colour...");
                 m.addSeparator();
                 m.addSubMenu ("Launch quantisation", quant);
                 m.addSubMenu ("Follow action",       follow);
@@ -539,6 +591,7 @@ void SessionView::mouseDown (const MouseEvent& e)
                     case 1: deleteClip (*clip); break;
                     case 2: renameClip (*clip); break;
                     case 3: cycleClipColor (*clip); break;
+                    case 4: pickClipColour (*clip); break;
                     case 10: clip->launchQuant = LaunchQuant::Off;       writeToSession(); break;
                     case 11: clip->launchQuant = LaunchQuant::Beat;      writeToSession(); break;
                     case 12: clip->launchQuant = LaunchQuant::Bar;       writeToSession(); break;
@@ -552,12 +605,29 @@ void SessionView::mouseDown (const MouseEvent& e)
                     default: break;
                 }
             }
-            else if (col < columns_.size() && lookupTracker (columns_.getReference (col).trackerNodeId) != nullptr)
+            else if (col < columns_.size())
             {
+                auto* trk = lookupTracker (columns_.getReference (col).trackerNodeId);
+                if (trk == nullptr) return;
+
+                juce::PopupMenu assign;
+                const int patternCount = trk->numPatterns();
+                for (int i = 0; i < patternCount; ++i)
+                {
+                    /* Item id 100+i so it never collides with the
+                     * fixed top-level items below. */
+                    assign.addItem (100 + i, "Pattern " + String (i + 1));
+                }
+
                 juce::PopupMenu m;
-                m.addItem (1, "Add Tracker pattern");
+                m.addItem (1, "Add new pattern");
+                if (patternCount > 0)
+                    m.addSubMenu ("Assign existing pattern", assign);
+
                 const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
                 if (r == 1) addClipAt (row, col);
+                else if (r >= 100 && r < 100 + patternCount)
+                    assignExistingPattern (row, col, r - 100);
             }
             return;
         }
@@ -610,69 +680,142 @@ void SessionView::mouseDown (const MouseEvent& e)
         }
     }
 
-    /* Middle of a filled cell — stage a potential drag.  mouseDrag
-     * upgrades to an active drag once the cursor moves past a
-     * threshold; mouseUp performs the move/copy or, if drag never
-     * activated, treats the click as a no-op. */
+    /* Middle of a filled cell — stage a potential clip drag. */
     if (hitTestCell (e.getPosition(), row, col))
     {
         if (auto* clip = findClip (row, col))
         {
-            dragSource_ = clip;
-            dragStart_  = e.getPosition();
-            dragActive_ = false;
+            dragSource_   = clip;
+            dragStart_    = e.getPosition();
+            dragActive_   = false;
+            dragHoverRow_ = -1;
+            dragHoverCol_ = -1;
             return;
         }
     }
 
+    /* Scene label click — stage a potential reorder.  mouseUp fires
+     * bangScene if the click never moved past the drag threshold;
+     * otherwise it performs the reorder. */
     if (hitTestSceneLabel (e.getPosition(), row))
     {
-        bangScene (row);
+        sceneDragSource_   = row;
+        dragStart_         = e.getPosition();
+        sceneDragActive_   = false;
+        sceneDragHoverRow_ = row;
     }
 }
 
 void SessionView::mouseDrag (const MouseEvent& e)
 {
-    if (dragSource_ == nullptr) return;
-    if (! dragActive_)
+    /* --- Clip drag --- */
+    if (dragSource_ != nullptr)
     {
-        if (e.getPosition().getDistanceFrom (dragStart_) < 6) return;
-        dragActive_ = true;
-        setMouseCursor (e.mods.isShiftDown() ? juce::MouseCursor::CopyingCursor
-                                             : juce::MouseCursor::DraggingHandCursor);
+        if (! dragActive_)
+        {
+            if (e.getPosition().getDistanceFrom (dragStart_) < 6) return;
+            dragActive_ = true;
+            setMouseCursor (e.mods.isShiftDown() ? juce::MouseCursor::CopyingCursor
+                                                 : juce::MouseCursor::DraggingHandCursor);
+        }
+
+        int row = -1, col = -1;
+        const bool overCell = hitTestCell (e.getPosition(), row, col);
+        if (! overCell) { row = -1; col = -1; }
+        if (row != dragHoverRow_ || col != dragHoverCol_)
+        {
+            /* Diff-gated repaint: only redraw the old + new target
+             * cells so we don't burn paint cycles on every drag pixel. */
+            if (dragHoverRow_ >= 0 && dragHoverCol_ >= 0)
+                repaint (cellBounds (dragHoverRow_, dragHoverCol_));
+            dragHoverRow_ = row;
+            dragHoverCol_ = col;
+            if (row >= 0 && col >= 0)
+                repaint (cellBounds (row, col));
+        }
+        return;
+    }
+
+    /* --- Scene drag --- */
+    if (sceneDragSource_ >= 0)
+    {
+        if (! sceneDragActive_)
+        {
+            if (e.getPosition().getDistanceFrom (dragStart_) < 6) return;
+            sceneDragActive_ = true;
+            setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+        }
+
+        int row = -1;
+        if (! hitTestSceneLabel (e.getPosition(), row)) row = -1;
+        if (row != sceneDragHoverRow_)
+        {
+            sceneDragHoverRow_ = row;
+            repaint (sceneLabelStripBounds());
+        }
     }
 }
 
 void SessionView::mouseUp (const MouseEvent& e)
 {
-    if (dragSource_ == nullptr) return;
-
-    if (dragActive_)
+    /* --- Clip drag drop --- */
+    if (dragSource_ != nullptr)
     {
-        setMouseCursor (juce::MouseCursor::NormalCursor);
-
-        int row = -1, col = -1;
-        if (hitTestCell (e.getPosition(), row, col))
+        if (dragActive_)
         {
-            const bool sameSpot = (row == dragSource_->sceneRow
-                                && col == dragSource_->columnIdx);
-            const bool sameColumn = (col >= 0 && col < columns_.size()
-                                  && columns_.getReference (col).trackerNodeId
-                                     == dragSource_->trackerNodeId);
-            const bool targetEmpty = (findClip (row, col) == nullptr);
+            setMouseCursor (juce::MouseCursor::NormalCursor);
 
-            if (! sameSpot && sameColumn && targetEmpty)
+            int row = -1, col = -1;
+            if (hitTestCell (e.getPosition(), row, col))
             {
-                if (e.mods.isShiftDown())
-                    copyClip (*dragSource_, row, col);
-                else
-                    moveClip (*dragSource_, row, col);
+                const bool sameSpot = (row == dragSource_->sceneRow
+                                    && col == dragSource_->columnIdx);
+                const bool targetEmpty = (findClip (row, col) == nullptr);
+
+                if (! sameSpot && targetEmpty
+                    && col >= 0 && col < columns_.size())
+                {
+                    if (e.mods.isShiftDown())
+                        copyClip (*dragSource_, row, col);
+                    else
+                        moveClip (*dragSource_, row, col);
+                }
             }
         }
+
+        dragSource_   = nullptr;
+        dragActive_   = false;
+        dragHoverRow_ = -1;
+        dragHoverCol_ = -1;
+        repaint();
+        return;
     }
 
-    dragSource_ = nullptr;
-    dragActive_ = false;
+    /* --- Scene drag drop OR scene-label click --- */
+    if (sceneDragSource_ >= 0)
+    {
+        if (sceneDragActive_)
+        {
+            setMouseCursor (juce::MouseCursor::NormalCursor);
+
+            int row = -1;
+            if (hitTestSceneLabel (e.getPosition(), row)
+                && row != sceneDragSource_)
+            {
+                reorderScene (sceneDragSource_, row);
+            }
+        }
+        else
+        {
+            /* Static click — bang the scene. */
+            bangScene (sceneDragSource_);
+        }
+
+        sceneDragSource_   = -1;
+        sceneDragActive_   = false;
+        sceneDragHoverRow_ = -1;
+        repaint();
+    }
 }
 
 void SessionView::mouseDoubleClick (const MouseEvent& e)
@@ -784,7 +927,11 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
 
     /* Same-column mutual exclusion at the shared targetBeat — A→stop
      * and B→start hit the audio thread in the same render block, so
-     * the flip is atomic.  Skip self. */
+     * the flip is atomic.  Skip self.  Also skip clips that point at
+     * the SAME underlying sequence as us: two clips sharing a
+     * sequence are functionally one engine-level voice, so banging
+     * one should not stop the other (would cause "stuck WaitingTo*"
+     * states from contradictory FIFO requests). */
     if (wantPlaying)
     {
         for (auto* other : clips_)
@@ -792,6 +939,7 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
             if (other == &clip) continue;
             if (other->columnIdx     != clip.columnIdx)     continue;
             if (other->trackerNodeId != clip.trackerNodeId) continue;
+            if (other->sequenceIdx   == clip.sequenceIdx)   continue;
             const LiveState os = other->state.load (std::memory_order_relaxed);
             if (os != LiveState::Playing && os != LiveState::WaitingToStart) continue;
 
@@ -1049,17 +1197,22 @@ void SessionView::moveClip (SessionClip& clip, int newSceneRow, int newColumnIdx
     if (newColumnIdx < 0 || newColumnIdx >= columns_.size()) return;
     if (findClip (newSceneRow, newColumnIdx) != nullptr) return;  // target busy
 
-    /* Same-tracker move only.  sequenceIdx stays bound to the same
-     * vht sequence; columnIdx changes only if columns_.size() >= 2
-     * and both columns share the same trackerNodeId — currently we
-     * rejected cross-column drops in mouseUp, so this is sanity. */
-    if (columns_.getReference (newColumnIdx).trackerNodeId != clip.trackerNodeId)
-        return;
+    const auto targetTrackerId = columns_.getReference (newColumnIdx).trackerNodeId;
+
+    /* Cross-tracker migration would require re-parenting a vht
+     * `sequence` (changing its `clt` + back-pointer to a different
+     * `module`); deferred until a dedicated adoptSequence API lands.
+     * v1: silently reject cross-tracker drops.  In practice columns
+     * are 1:1 with TrackerNodes today, so cross-column ⇒ cross-
+     * tracker; same-column drag inside a single column is the only
+     * case that actually fires. */
+    if (targetTrackerId != clip.trackerNodeId) return;
 
     const int oldRow = clip.sceneRow;
     const int oldCol = clip.columnIdx;
     clip.sceneRow  = newSceneRow;
     clip.columnIdx = newColumnIdx;
+
     writeToSession();
     repaint (cellBounds (oldRow,        oldCol));
     repaint (cellBounds (newSceneRow,   newColumnIdx));
@@ -1070,7 +1223,8 @@ void SessionView::copyClip (SessionClip& src, int newSceneRow, int newColumnIdx)
     if (newSceneRow < 0 || newSceneRow >= scenes_.size()) return;
     if (newColumnIdx < 0 || newColumnIdx >= columns_.size()) return;
     if (findClip (newSceneRow, newColumnIdx) != nullptr) return;
-    if (columns_.getReference (newColumnIdx).trackerNodeId != src.trackerNodeId) return;
+    if (columns_.getReference (newColumnIdx).trackerNodeId != src.trackerNodeId)
+        return;   // cross-tracker copy needs deferred adoptSequence API
 
     auto* trk = lookupTracker (src.trackerNodeId);
     if (trk == nullptr) return;
@@ -1092,6 +1246,108 @@ void SessionView::copyClip (SessionClip& src, int newSceneRow, int newColumnIdx)
 
     writeToSession();
     repaint (cellBounds (newSceneRow, newColumnIdx));
+}
+
+void SessionView::reorderScene (int fromRow, int toRow)
+{
+    if (fromRow < 0 || fromRow >= scenes_.size()) return;
+    if (toRow   < 0 || toRow   >= scenes_.size()) return;
+    if (fromRow == toRow) return;
+
+    /* Move the scene struct; remap every clip's sceneRow so they
+     * stay attached to their visual row. */
+    auto moved = scenes_.removeAndReturn (fromRow);
+    scenes_.insert (toRow, moved);
+
+    /* Remap clip sceneRows.  Whatever was at fromRow now lives at
+     * toRow; rows between shift.  Easier to just rebuild each
+     * clip's sceneRow by remapping using the old → new permutation. */
+    if (fromRow < toRow)
+    {
+        for (auto* c : clips_)
+        {
+            if (c->sceneRow == fromRow) c->sceneRow = toRow;
+            else if (c->sceneRow > fromRow && c->sceneRow <= toRow) --c->sceneRow;
+        }
+    }
+    else
+    {
+        for (auto* c : clips_)
+        {
+            if (c->sceneRow == fromRow) c->sceneRow = toRow;
+            else if (c->sceneRow >= toRow && c->sceneRow < fromRow) ++c->sceneRow;
+        }
+    }
+
+    writeToSession();
+    repaint();
+}
+
+void SessionView::assignExistingPattern (int sceneRow, int columnIdx, int sequenceIdx)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return;
+    if (findClip (sceneRow, columnIdx) != nullptr) return;
+    auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId);
+    if (trk == nullptr) return;
+    if (sequenceIdx < 0 || sequenceIdx >= trk->numPatterns()) return;
+
+    auto* clip = new SessionClip();
+    clip->id            = juce::Uuid();
+    clip->name          = "Clip " + String (clips_.size() + 1);
+    clip->color         = columnTint (columnIdx).withMultipliedSaturation (0.6f)
+                                                .withMultipliedBrightness (0.85f);
+    clip->trackerNodeId = columns_.getReference (columnIdx).trackerNodeId;
+    clip->sequenceIdx   = sequenceIdx;
+    clip->sceneRow      = sceneRow;
+    clip->columnIdx     = columnIdx;
+    clips_.add (clip);
+
+    writeToSession();
+    repaint (cellBounds (sceneRow, columnIdx));
+}
+
+void SessionView::pickClipColour (SessionClip& clip)
+{
+    /* Bind this clip to the picker for the duration of the modal.
+     * ColourSelector broadcasts changes via ChangeBroadcaster; our
+     * changeListenerCallback applies them live. */
+    colourPickerClip_ = &clip;
+
+    auto* cs = new juce::ColourSelector (juce::ColourSelector::showColourspace
+                                         | juce::ColourSelector::showSliders
+                                         | juce::ColourSelector::showAlphaChannel);
+    cs->setSize (320, 360);
+    cs->setCurrentColour (clip.color);
+    cs->addChangeListener (this);
+
+    /* Show in a CallOutBox anchored on the clip cell, in screen
+     * coords.  CallOutBox takes ownership of the selector and is
+     * self-deleting on dismiss. */
+    const auto screenAnchor = localAreaToGlobal (cellBounds (clip.sceneRow, clip.columnIdx));
+    juce::CallOutBox::launchAsynchronously (
+        std::unique_ptr<juce::Component> (cs),
+        screenAnchor,
+        nullptr);
+}
+
+void SessionView::changeListenerCallback (juce::ChangeBroadcaster* src)
+{
+    if (colourPickerClip_ == nullptr) return;
+    auto* cs = dynamic_cast<juce::ColourSelector*> (src);
+    if (cs == nullptr) return;
+
+    /* Confirm the clip is still alive — user may have deleted it
+     * while the picker was open. */
+    bool stillValid = false;
+    for (auto* c : clips_)
+        if (c == colourPickerClip_) { stillValid = true; break; }
+    if (! stillValid) { colourPickerClip_ = nullptr; return; }
+
+    colourPickerClip_->color = cs->getCurrentColour();
+    writeToSession();
+    repaint (cellBounds (colourPickerClip_->sceneRow,
+                         colourPickerClip_->columnIdx));
 }
 
 void SessionView::deleteScene (int row)

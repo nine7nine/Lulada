@@ -35,7 +35,8 @@ class TrackerNode;
  *  Design + cookbook: ~/wine-nspa-notes/session-view-design.md
  */
 class SessionView : public ContentView,
-                    private juce::Timer
+                    private juce::Timer,
+                    private juce::ChangeListener
 {
 public:
     SessionView();
@@ -125,9 +126,17 @@ private:
     void insertScene (int beforeRow);
     void deleteScene (int row);
     void renameScene (int row);
+    void reorderScene (int fromRow, int toRow);  // drag-drop reorder
 
     void renameClip      (SessionClip&);
     void cycleClipColor  (SessionClip&);
+    void pickClipColour  (SessionClip&);   // full ColourSelector popup
+    void assignExistingPattern (int sceneRow, int columnIdx, int sequenceIdx);
+
+    /* juce::ChangeListener — receives ColourSelector edits from the
+     * popup picker.  colourPickerClip_ tracks which clip the picker
+     * is bound to so we can apply on each broadcast. */
+    void changeListenerCallback (juce::ChangeBroadcaster*) override;
 
     /* Drag-and-drop within the grid.  Move = drop on another cell on
      * the SAME column (sequenceIdx remains valid).  Copy (Shift+drag) =
@@ -191,11 +200,28 @@ private:
 
     /* Drag state for clip-move/copy.  dragSource_ is set on mouseDown
      * over a clip's body (not its play/edit zones); dragActive_ trips
-     * once the cursor moves past the drag threshold.  mouseUp clears
-     * both. */
+     * once the cursor moves past the drag threshold.  dragHover{Row,Col}
+     * are the current target cell under the cursor, used to highlight
+     * the drop target in paint().  mouseUp clears everything. */
     SessionClip*       dragSource_ = nullptr;
     juce::Point<int>   dragStart_  {};
     bool               dragActive_ = false;
+    int                dragHoverRow_ = -1;
+    int                dragHoverCol_ = -1;
+
+    /* Scene-label drag state — distinct from clip drag.  Mouse-down on
+     * a scene label stages a potential reorder; promoted to active
+     * past the drag threshold; release drops the scene at the target
+     * row index. */
+    int    sceneDragSource_ = -1;
+    bool   sceneDragActive_ = false;
+    int    sceneDragHoverRow_ = -1;
+
+    /* ColourSelector popup state — when a picker is open against a
+     * clip, change broadcasts route through changeListenerCallback
+     * to mutate clip.color.  Cleared when the picker closes (its
+     * ChangeBroadcaster is destroyed, broadcasts stop arriving). */
+    SessionClip* colourPickerClip_ = nullptr;
 
     /* Layout constants — sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
