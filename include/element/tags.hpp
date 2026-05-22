@@ -135,6 +135,7 @@ static const juce::Identifier object = "object";
 static const juce::Identifier output = "output";
 
 static const juce::Identifier session = "session";
+static const juce::Identifier sessionView = "sessionView";
 static const juce::Identifier state = "state";
 static const juce::Identifier programState = "programState";
 static const juce::Identifier beatsPerBar = "beatsPerBar";

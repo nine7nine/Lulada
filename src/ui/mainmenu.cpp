@@ -370,7 +370,9 @@ void MainMenu::buildViewMenu (Commands& cmd, PopupMenu& menu)
     menu.addCommandItem (&cmd, Commands::showGraphEditor, "Graph Editor");
     menu.addCommandItem (&cmd, Commands::showArrangement, "Arrangement");
     menu.addCommandItem (&cmd, Commands::showTrackerHost, "Trackers");
+    menu.addCommandItem (&cmd, Commands::showSessionView, "Session");
     menu.addCommandItem (&cmd, Commands::showDiskOp, "Disk Op");
+    menu.addCommandItem (&cmd, Commands::showPluginManager, "Plugin Manager");
     menu.addSeparator();
     menu.addCommandItem (&cmd, Commands::showGraphMixer, "Graph Mixer");
     menu.addCommandItem (&cmd, Commands::showConsole, "Console");
@@ -383,7 +385,6 @@ void MainMenu::buildViewMenu (Commands& cmd, PopupMenu& menu)
     menu.addSeparator();
     menu.addCommandItem (&cmd, Commands::showSessionConfig, "Session Properties");
     menu.addSeparator();
-    menu.addCommandItem (&cmd, Commands::showPluginManager, "Plugin Manager");
     menu.addCommandItem (&cmd, Commands::showKeymapEditor, "Key Mappings");
 }
 

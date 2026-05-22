@@ -135,6 +135,7 @@ void Session::setMissingProperties (bool resetExisting)
     objectData.getOrCreateChildWithName (tags::graphs, nullptr);
     objectData.getOrCreateChildWithName (tags::controllers, nullptr);
     objectData.getOrCreateChildWithName (tags::maps, nullptr);
+    objectData.getOrCreateChildWithName (tags::sessionView, nullptr);
 }
 
 Node Session::findNodeById (const Uuid& uuid)

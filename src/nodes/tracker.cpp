@@ -84,6 +84,41 @@ void TrackerNode::render (RenderContext& rc)
     }
     mod_->recording = wantRecording ? 1 : 0;
 
+    /* ---- Phase-4 launch scheduler: drain message-thread requests
+     * and flip per-sequence playing flags BEFORE module_advance, so
+     * sequences launched on this block's quant boundary start
+     * emitting immediately rather than the block after. */
+    double blockStartBeat = -1.0, blockEndBeat = -1.0;
+    if (mod_->bpm > 0.0f)
+    {
+        if (auto* const ph = getPlayHead())
+        {
+            if (auto pos = ph->getPosition())
+            {
+                if (auto inSamples = pos->getTimeInSamples())
+                {
+                    const double samplesPerBeat = currentSampleRate_ * 60.0 / (double) mod_->bpm;
+                    if (samplesPerBeat > 0.0)
+                    {
+                        blockStartBeat = (double) *inSamples / samplesPerBeat;
+                        blockEndBeat   = blockStartBeat + (double) nsamples / samplesPerBeat;
+                    }
+                }
+                else if (auto ppq = pos->getPpqPosition())
+                {
+                    const double samplesPerBeat = currentSampleRate_ * 60.0 / (double) mod_->bpm;
+                    if (samplesPerBeat > 0.0)
+                    {
+                        blockStartBeat = *ppq;
+                        blockEndBeat   = blockStartBeat + (double) nsamples / samplesPerBeat;
+                    }
+                }
+            }
+        }
+    }
+    drainLaunchFifo();
+    applyPendingForBlock (blockStartBeat, blockEndBeat);
+
     /* Drain incoming MIDI from upstream (port 0 is our MIDI input).
      * Push events into clt->midi_in_buffer for the engine to consume in
      * module_advance — record / trigger / indicator paths run from
@@ -396,6 +431,219 @@ int TrackerNode::numPatterns() const noexcept
 {
     juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
     return mod_ != nullptr ? mod_->nseq : 0;
+}
+
+/* === Session-view API ================================================== */
+
+int TrackerNode::createSequence (int rowsLength)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr) return -1;
+
+    const int len = juce::jlimit (1, SEQUENCE_MAX_LENGTH, rowsLength);
+    sequence* seq = sequence_new (len);
+    if (seq == nullptr) return -1;
+
+    /* One track per sequence — matches the "one clip = one track"
+     * mapping the session-view design rests on (see §2.2 of
+     * ~/wine-nspa-notes/session-view-design.md).  Multi-track clip
+     * groups can be a later feature. */
+    track* trk = track_new (0, 0, len, len, TRACK_DEF_CTRLPR);
+    sequence_add_track (seq, trk);
+    module_add_sequence (mod_, seq);
+
+    /* sequence_new defaults playing=0; the clip launcher flips it
+     * when the clip is banged.  Leave it untouched here. */
+    return mod_->nseq - 1;
+}
+
+void TrackerNode::removeSequence (int sequenceIdx)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr || mod_->nseq <= 1) return;
+    if (sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return;
+
+    sequence* doomed = mod_->seq[sequenceIdx];
+    const bool removingCurr = (mod_->curr_seq == doomed);
+
+    /* Capture the replacement curr_seq pointer BEFORE module_del_sequence
+     * runs — afterwards the splice has shifted everything and seq[1]
+     * doesn't exist if we removed index 0.  After deletion, what was
+     * seq[1] occupies seq[0]; the pointer we stored still resolves. */
+    sequence* nextCurr = removingCurr
+        ? mod_->seq[sequenceIdx == 0 ? 1 : 0]
+        : nullptr;
+
+    module_del_sequence (mod_, sequenceIdx);
+
+    if (removingCurr)
+        mod_->curr_seq = nextCurr;
+
+    /* Keep wrap-detection cache aligned with vht's seq[] indexing. */
+    if (sequenceIdx < lastSeqPos_.size())
+        lastSeqPos_.remove (sequenceIdx);
+}
+
+void TrackerNode::setSequencePlaying (int sequenceIdx, bool on)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr) return;
+    if (sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return;
+
+    sequence* seq = mod_->seq[sequenceIdx];
+    if (seq == nullptr) return;
+
+    sequence_set_playing (seq, on ? 1 : 0);
+
+    if (on)
+    {
+        /* Launch = rewind to row 0 (Ableton/Bitwig convention).  Reset
+         * sequence pos + every track's pos so track_advance starts at
+         * the top on the next module_advance pass. */
+        seq->pos = 0.0;
+        for (int t = 0; t < seq->ntrk; ++t)
+            if (seq->trk[t] != nullptr)
+                seq->trk[t]->pos = 0.0;
+    }
+
+    /* Reset wrap-cache for this index so the next wrap query sees the
+     * fresh pos rather than reporting a phantom wrap from the previous
+     * playthrough. */
+    if (sequenceIdx < lastSeqPos_.size())
+        lastSeqPos_.set (sequenceIdx, 0.0);
+}
+
+bool TrackerNode::isSequencePlaying (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return false;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    return seq != nullptr && seq->playing != 0;
+}
+
+double TrackerNode::getSequencePositionRows (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return 0.0;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    return seq != nullptr ? seq->pos : 0.0;
+}
+
+int TrackerNode::getSequenceLengthRows (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return 0;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    return seq != nullptr ? seq->length : 0;
+}
+
+/* === Audio-thread launch scheduler ===================================== */
+
+void TrackerNode::schedulePlaying (int sequenceIdx, double beatTarget, bool wantPlaying) noexcept
+{
+    /* Single-writer (message thread) — no lock needed.  juce::AbstractFifo
+     * gives us SPSC counters; we own the backing storage. */
+    int start1, size1, start2, size2;
+    launchFifo_.prepareToWrite (1, start1, size1, start2, size2);
+    if (size1 + size2 < 1) return;   // FIFO full — drop silently
+
+    const LaunchReq r { sequenceIdx, beatTarget, wantPlaying ? 1 : 0 };
+    if (size1 > 0)
+        launchFifoStorage_[(size_t) start1] = r;
+    else
+        launchFifoStorage_[(size_t) start2] = r;
+    launchFifo_.finishedWrite (1);
+}
+
+void TrackerNode::drainLaunchFifo() noexcept
+{
+    const int ready = launchFifo_.getNumReady();
+    if (ready == 0) return;
+
+    int start1, size1, start2, size2;
+    launchFifo_.prepareToRead (ready, start1, size1, start2, size2);
+
+    auto apply = [this] (const LaunchReq& r) noexcept
+    {
+        if (r.sequenceIdx < 0) return;
+        /* Grow pending array to cover this seqIdx.  Cheap; only on
+         * first request after a new sequence is created. */
+        while (pendingActions_.size() <= r.sequenceIdx)
+            pendingActions_.add ({});
+        auto& slot = pendingActions_.getReference (r.sequenceIdx);
+        slot.beatTarget  = r.beatTarget;
+        slot.wantPlaying = (r.wantPlaying != 0);
+        slot.valid       = true;
+    };
+
+    for (int i = 0; i < size1; ++i)
+        apply (launchFifoStorage_[(size_t) (start1 + i)]);
+    for (int i = 0; i < size2; ++i)
+        apply (launchFifoStorage_[(size_t) (start2 + i)]);
+
+    launchFifo_.finishedRead (ready);
+}
+
+void TrackerNode::applyPendingForBlock (double blockStartBeat, double blockEndBeat) noexcept
+{
+    if (mod_ == nullptr) return;
+
+    const int n = juce::jmin (pendingActions_.size(), mod_->nseq);
+    for (int i = 0; i < n; ++i)
+    {
+        auto& p = pendingActions_.getReference (i);
+        if (! p.valid) continue;
+
+        /* Immediate (-ve target) fires now; quantised targets fire
+         * inside the block that contains them.  If transport info
+         * is unavailable (blockStartBeat<0) only immediate fires. */
+        const bool inBlock = (p.beatTarget < 0.0)
+                          || (blockStartBeat >= 0.0
+                              && p.beatTarget >= blockStartBeat
+                              && p.beatTarget <  blockEndBeat);
+        if (! inBlock) continue;
+
+        sequence* seq = mod_->seq[i];
+        if (seq != nullptr)
+        {
+            sequence_set_playing (seq, p.wantPlaying ? 1 : 0);
+            if (p.wantPlaying)
+            {
+                /* Rewind to row 0 on launch (Ableton/Bitwig convention). */
+                seq->pos = 0.0;
+                for (int t = 0; t < seq->ntrk; ++t)
+                    if (seq->trk[t] != nullptr)
+                        seq->trk[t]->pos = 0.0;
+            }
+        }
+
+        if (i < lastSeqPos_.size())
+            lastSeqPos_.set (i, 0.0);
+        p.valid = false;
+    }
+}
+
+bool TrackerNode::sequenceWrappedSinceLastQuery (int sequenceIdx) noexcept
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return false;
+
+    /* Lazy grow the per-sequence cache to current nseq.  Shrinks
+     * happen in removeSequence; this only ever appends zeros. */
+    while (lastSeqPos_.size() < mod_->nseq)
+        lastSeqPos_.add (0.0);
+
+    const sequence* seq = mod_->seq[sequenceIdx];
+    if (seq == nullptr) return false;
+
+    const double cur  = seq->pos;
+    const double prev = lastSeqPos_.getUnchecked (sequenceIdx);
+    lastSeqPos_.set (sequenceIdx, cur);
+
+    /* sequence_advance resets pos to 0 at the end of a sequence (or
+     * loop point).  Wrap = current pos strictly less than the prior
+     * pos.  False on fresh launches where prev was reset to 0. */
+    return cur < prev;
 }
 
 /* ===================================================================== */

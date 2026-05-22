@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <element/midipipe.hpp>
 #include "nodes/midifilter.hpp"
 #include "nodes/baseprocessor.hpp"
@@ -69,6 +71,65 @@ public:
     int currentPatternIndex() const noexcept;
     int numPatterns() const noexcept;
 
+    /* ---------------------------------------------------------------
+     * Session-view API — operates on vht's per-sequence `playing` flag
+     * directly, distinct from `advanceToPattern` which uses the
+     * pattern-switch (single-playhead) model.  Multiple sequences in
+     * the same module can have playing=1 concurrently; module_advance
+     * iterates all of them and each one's emitted events land in the
+     * shared per-port MIDI buffer, time-sorted in drainEngineToMidi.
+     *
+     * All methods acquire engineLock_.  Safe to call from the message
+     * thread; calls are infrequent (UI click rate / 30 Hz poll). */
+
+    /** Append a new empty sequence (one track, default channel/port)
+     *  with `rowsLength` rows.  Returns the new sequence's index, or
+     *  -1 if the engine isn't initialised.  The new sequence starts
+     *  with playing=0 — clip launcher arms it explicitly. */
+    int  createSequence (int rowsLength = 16);
+
+    /** Remove a sequence by index.  No-op when nseq <= 1 (vht needs
+     *  at least one sequence) or when the index is out of range.  If
+     *  the removed sequence was `curr_seq`, the module's `curr_seq`
+     *  rolls over to a sibling so vht's internal state stays valid. */
+    void removeSequence (int sequenceIdx);
+
+    /** Flip a single sequence's playing flag without touching
+     *  `curr_seq`.  This is the session-view launch primitive.  When
+     *  turning a clip on, the sequence + all its tracks rewind to
+     *  position 0 — Bitwig/Ableton "launch restarts from start". */
+    void setSequencePlaying (int sequenceIdx, bool on);
+
+    bool   isSequencePlaying       (int sequenceIdx) const noexcept;
+    double getSequencePositionRows (int sequenceIdx) const noexcept;
+    int    getSequenceLengthRows   (int sequenceIdx) const noexcept;
+
+    /** Edge-trigger: returns true once per wrap of the sequence's
+     *  playhead (used for followAction at clip end).  Consumes the
+     *  wrap on read — repeated calls in the same wrap window return
+     *  false until the next wrap.  Internally tracks the previous
+     *  song-relative row position per sequence. */
+    bool   sequenceWrappedSinceLastQuery (int sequenceIdx) noexcept;
+
+    /** Schedule a future flip of a sequence's playing flag.
+     *
+     *  beatTarget < 0 means "immediate" (fires at the start of the
+     *  next render block).  beatTarget >= 0 is a transport-beat
+     *  position; the flip fires inside the render block whose beat
+     *  range contains it — sample-accurate to ±1 audio block, with
+     *  zero inter-clip skew for clips targeting the same beat.
+     *
+     *  Lock-free SPSC: safe to call from the message thread without
+     *  touching engineLock_.  Latest request per sequenceIdx wins —
+     *  the audio thread keeps only the most recent pending action
+     *  per sequence, so re-banging a queued clip cancels the prior
+     *  request.
+     *
+     *  Backpressure: if the internal FIFO fills (way over expected
+     *  click rate), the new request is dropped silently.  In
+     *  practice 64-slot FIFO at human click rate never fills. */
+    void   schedulePlaying (int sequenceIdx, double beatTarget, bool wantPlaying) noexcept;
+
     /** Undo / redo.  Snapshots whole-module state into a memento stack.
      *  Editor calls pushUndo() before any mutation. */
     void pushUndo();
@@ -104,6 +165,40 @@ private:
     enum { kMaxUndo = 64 };
     juce::Array<juce::MemoryBlock> undoStack_;
     juce::Array<juce::MemoryBlock> redoStack_;
+
+    /* Per-sequence previous song_pos cache for wrap-edge detection
+     * in sequenceWrappedSinceLastQuery().  Lazily grown to mod_->nseq;
+     * indices follow vht's seq[] array.  Updated only when the
+     * session-view scheduler polls; not touched by render(). */
+    juce::Array<double> lastSeqPos_;
+
+    /* ---------- Phase-4 sample-accurate launch scheduler ---------- */
+
+    /** One request in the message-thread → audio-thread FIFO. */
+    struct LaunchReq {
+        int    sequenceIdx;
+        double beatTarget;    // <0 = immediate
+        int    wantPlaying;   // 0 or 1
+    };
+
+    /** Per-sequence pending flip, owned by the audio thread.  Latest
+     *  FIFO request for a given sequenceIdx overwrites the slot,
+     *  giving us implicit cancellation. */
+    struct PendingAction {
+        double beatTarget   = 0.0;
+        bool   wantPlaying  = false;
+        bool   valid        = false;
+    };
+
+    static constexpr int kLaunchFifoSize = 64;
+    std::array<LaunchReq, (size_t) kLaunchFifoSize> launchFifoStorage_ {};
+    juce::AbstractFifo launchFifo_ { kLaunchFifoSize };
+    juce::Array<PendingAction> pendingActions_;   // indexed by sequenceIdx
+
+    /** Audio-thread helpers — called from inside render() under
+     *  engineLock_, before module_advance. */
+    void drainLaunchFifo() noexcept;
+    void applyPendingForBlock (double blockStartBeat, double blockEndBeat) noexcept;
 };
 
 } // namespace element
