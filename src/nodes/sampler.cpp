@@ -4515,31 +4515,45 @@ public:
             return node.collectPlayheadsForSlot (slot);
         });
         addChildComponent (fxPage_);
-        instCombo.onChange = [this] {
-            const int sel = instCombo.getSelectedId() - 1;
-            if (sel < 0 || sel >= SamplerNode::kMaxInstruments) return;
-            /* Lazy-allocate any banks the user selects beyond the
-             * current count -- matches Disk Op's
-             * ensureInstrumentExists pattern.  Empty bank gets a
-             * default-constructed SamplerInstrument the user can
-             * load samples into. */
-            while (sel >= node.getNumInstruments())
-            {
+        /* Bank label -- read-only display of "NNN <name>".  Updated
+         * by refreshInstLabel() on every refresh() tick + on nav
+         * presses.  Matches the tracker editor's bank-display pattern. */
+        instLabel.setJustificationType (Justification::centredLeft);
+        instLabel.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                                        13.0f, Font::plain));
+        instLabel.setColour (Label::backgroundColourId, Colour { 0xff'24'24'24 });
+        instLabel.setColour (Label::textColourId,       Colour { 0xff'd0'd0'd0 });
+        instLabel.setColour (Label::outlineColourId,    Colour { 0xff'3a'3a'3a });
+        instLabel.setBorderSize ({ 0, 6, 0, 6 });
+        addAndMakeVisible (instLabel);
+
+        /* Prev / next nav -- step through the 128-bank grid the same
+         * way Disk Op's instrument list does.  Lazy-allocate when
+         * advancing past the current count so the user can populate
+         * any of the 128 banks. */
+        auto navigate = [this] (int delta) {
+            const int target = juce::jlimit (0, SamplerNode::kMaxInstruments - 1,
+                                             activeInstrument + delta);
+            if (target == activeInstrument) return;
+            while (target >= node.getNumInstruments())
                 if (node.addInstrument() == nullptr) break;
-            }
-            if (sel >= node.getNumInstruments()) return;
-            activeInstrument = sel;
-            rebuildInstCombo();
+            if (target >= node.getNumInstruments()) return;
+            activeInstrument = target;
             rebuildEnvelopeViews();
             refresh();
         };
-        addAndMakeVisible (instCombo);
+        instPrevBtn.setButtonText ("<");
+        instPrevBtn.onClick = [navigate] { navigate (-1); };
+        addAndMakeVisible (instPrevBtn);
+
+        instNextBtn.setButtonText (">");
+        instNextBtn.onClick = [navigate] { navigate (+1); };
+        addAndMakeVisible (instNextBtn);
 
         instAddBtn.setButtonText ("+");
         instAddBtn.onClick = [this] {
             node.addInstrument();
             activeInstrument = node.getNumInstruments() - 1;
-            rebuildInstCombo();
             rebuildEnvelopeViews();
             refresh();
         };
@@ -4551,7 +4565,6 @@ public:
             node.removeInstrument (activeInstrument);
             if (activeInstrument >= node.getNumInstruments())
                 activeInstrument = node.getNumInstruments() - 1;
-            rebuildInstCombo();
             rebuildEnvelopeViews();
             refresh();
         };
@@ -4564,9 +4577,10 @@ public:
         slotList.setOutlineThickness (1);
         addAndMakeVisible (slotList);
 
-        loadBtn.setButtonText ("Load from Disk Op");
-        loadBtn.onClick = [this] { onLoad(); };
-        addAndMakeVisible (loadBtn);
+        /* "Load from Disk Op" removed -- it was a one-shot single-
+         * sample loader that didn't surface which file was about to
+         * land, and is redundant with the Disk Op panel's own
+         * load-into-active-slot affordance. */
 
         clearBtn.setButtonText ("Clear");
         clearBtn.onClick = [this] {
@@ -4702,7 +4716,7 @@ public:
 
         setOpaque (true);
         setSize (1040, 600);
-        rebuildInstCombo();
+        refreshInstLabel();
         rebuildEnvelopeViews();
         switchPage (Page::kBank);
         refresh();
@@ -4727,11 +4741,15 @@ public:
         instNavBtn  .setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (2);
         sampleNavBtn.setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (2);
         fxNavBtn    .setBounds (navRow.removeFromLeft (navBtnW)); navRow.removeFromLeft (12);
-        instAddBtn.setBounds (navRow.removeFromRight (24));
+        instAddBtn .setBounds (navRow.removeFromRight (24));
         navRow.removeFromRight (2);
-        instDelBtn.setBounds (navRow.removeFromRight (24));
+        instDelBtn .setBounds (navRow.removeFromRight (24));
+        navRow.removeFromRight (8);
+        instNextBtn.setBounds (navRow.removeFromRight (24));
+        navRow.removeFromRight (2);
+        instPrevBtn.setBounds (navRow.removeFromRight (24));
         navRow.removeFromRight (4);
-        instCombo .setBounds (navRow);
+        instLabel  .setBounds (navRow);
         r.removeFromTop (6);
 
         /* === Body area for the active page. === */
@@ -4755,8 +4773,7 @@ public:
          * (right edge) in addition to slot number + key range + name. */
         auto leftCol = bankR.removeFromLeft (380);
         auto leftFooter = leftCol.removeFromBottom (24);
-        clearBtn.setBounds (leftFooter.removeFromRight (50)); leftFooter.removeFromRight (4);
-        loadBtn .setBounds (leftFooter);
+        clearBtn.setBounds (leftFooter.removeFromRight (50));
         leftCol.removeFromBottom (6);
         slotList.setBounds (leftCol);
 
@@ -4810,7 +4827,6 @@ public:
         fxNavBtn    .setToggleState (fx,     dontSendNotification);
 
         slotList     .setVisible (bank);
-        loadBtn      .setVisible (bank);
         clearBtn     .setVisible (bank);
         rootSlider   .setVisible (bank);
         relSlider    .setVisible (bank);
@@ -4992,34 +5008,49 @@ private:
         return nullptr;
     }
 
-    void rebuildInstCombo()
+    /** Compose the label shown for `instrumentIndex`.  Reads from the
+     *  live SamplerNode (no caching) so any Disk Op mutation -- a
+     *  bank rename or a slot load -- is reflected the moment this
+     *  is called (see refresh()'s diff-gated dispatch).
+     *
+     *  Display rules:
+     *    - Bank has a user-set name      -> "NNN <bank-name>"
+     *    - Bank has samples but no name  -> "NNN <first-loaded-slot-name>"
+     *    - Bank empty                    -> "NNN (empty)"
+     */
+    String composeInstLabel (int instrumentIndex) const
     {
-        /* Always expose all 128 banks -- the same fixed grid Disk Op's
-         * Sample Bank pane shows -- so the user can switch to any
-         * bank from the sampler editor and see / load samples into
-         * it.  Empty banks lazily allocate on selection (see
-         * onChange handler).  Matches Disk Op's row count
-         * (SampleBankPane::kNumBanks = 128). */
-        instCombo.clear (dontSendNotification);
-        const int n = node.getNumInstruments();
-        for (int i = 0; i < SamplerNode::kMaxInstruments; ++i)
+        String label = String::formatted ("%03d  ", instrumentIndex + 1);
+        if (instrumentIndex < 0 || instrumentIndex >= node.getNumInstruments())
+            return label + "(empty)";
+
+        auto inst = node.getInstrument (instrumentIndex);
+        if (inst == nullptr) return label + "(empty)";
+
+        if (inst->name.isNotEmpty())
+            return label + inst->name;
+
+        /* No bank name set but the user may have loaded samples
+         * directly.  Surface the first loaded slot's name so the
+         * dropdown / nav label isn't misleading. */
+        for (int i = 0; i < SamplerInstrument::kNumSlots; ++i)
         {
-            String label = String::formatted ("%03d ", i + 1);
-            if (i < n)
-            {
-                auto inst = node.getInstrument (i);
-                if (inst != nullptr && inst->name.isNotEmpty())
-                    label += inst->name;
-                else
-                    label += "(empty)";
-            }
-            else
-            {
-                label += "(empty)";
-            }
-            instCombo.addItem (label, i + 1);
+            if (auto* s = inst->getSlot (i))
+                if (s->name.isNotEmpty() || s->isLoaded())
+                    return label + s->name;
         }
-        instCombo.setSelectedId (activeInstrument + 1, dontSendNotification);
+        return label + "(empty)";
+    }
+
+    /** Push the current bank label into the toolbar Label component.
+     *  Cheap; called on every refresh tick after the diff-gate
+     *  decides something changed (count, names, or slot mutations). */
+    void refreshInstLabel()
+    {
+        instLabel.setText (composeInstLabel (activeInstrument),
+                           dontSendNotification);
+        instPrevBtn.setEnabled (activeInstrument > 0);
+        instNextBtn.setEnabled (activeInstrument < SamplerNode::kMaxInstruments - 1);
     }
 
     void rebuildEnvelopeViews()
@@ -5168,37 +5199,19 @@ private:
         if (slotPtr != lastSlotPtr_)
             waveformView.repaint();
 
-        /* Detect external bank changes -- count OR per-row name.
-         * The right-side Sample Bank panel (DiskOpView) can both add
-         * banks (numInst delta) and rename existing banks in place
-         * (no count delta).  Without a name watch, an in-place
-         * rename leaves this editor's combo showing the OLD label
-         * until the editor is closed and reopened.  User-reported
-         * 2026-05-22. */
-        bool comboDirty = (numInst != lastNumInstruments_);
-        if (! comboDirty)
-        {
-            for (int i = 0; i < numInst; ++i)
-            {
-                auto inst = node.getInstrument (i);
-                const String n = (inst != nullptr) ? inst->name : String();
-                if (i >= lastInstNames_.size() || lastInstNames_[i] != n)
-                {
-                    comboDirty = true;
-                    break;
-                }
-            }
-        }
-        if (comboDirty)
-        {
-            rebuildInstCombo();
-            lastInstNames_.clearQuick();
-            for (int i = 0; i < numInst; ++i)
-            {
-                auto inst = node.getInstrument (i);
-                lastInstNames_.add ((inst != nullptr) ? inst->name : String());
-            }
-        }
+        /* Bank label refreshes unconditionally each tick (cheap: one
+         * setText with dontSendNotification on equal text is a no-op
+         * inside juce::Label).  This covers all the live-sync cases
+         * the user listed:
+         *   - Disk Op rename bank -> instLabel picks up new name
+         *   - Disk Op load sample -> first-slot-name surfaces
+         *   - addInstrument / removeInstrument -> activeInstrument
+         *     stays valid + label reflects current bank
+         * The lastInstNames_ array is no longer needed for combo
+         * rebuild gating, but is kept here for the moment in case a
+         * follow-up commit needs it (TODO remove after verification). */
+        juce::ignoreUnused (lastInstNames_, lastNumInstruments_);
+        refreshInstLabel();
 
         const int voices = node.getNumVoices();
         const String slotName = (slot != nullptr) ? slot->name : String ("(empty)");
@@ -5236,11 +5249,18 @@ private:
 
     SamplerNode& node;
 
-    ComboBox     instCombo;
-    TextButton   instAddBtn, instDelBtn;
+    /* Bank navigation -- replaces a ComboBox with a fixed label +
+     * prev/next nudge buttons, matching the tracker editor's OCT /
+     * STEP / TRK / PAT toolbar pattern.  The label shows
+     *   "NNN BankName"  (bank has a user-set name)
+     *   "NNN <first-slot-name>"  (samples loaded but bank not named)
+     *   "NNN (empty)"   (no samples, no name) */
+    Label        instLabel;
+    TextButton   instPrevBtn, instNextBtn;
+    TextButton   instAddBtn,  instDelBtn;
 
     ListBox      slotList;
-    TextButton   loadBtn, clearBtn;
+    TextButton   clearBtn;
 
     Slider       rootSlider, relSlider, fineSlider, volSlider, panSlider;
     ComboBox     loopCombo;
