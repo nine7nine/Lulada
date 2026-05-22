@@ -18,6 +18,12 @@ enum class SamplerLoopMode { kNone = 0, kForward = 1, kPingpong = 2 };
 struct SamplerSampleSlot
 {
     String  name;
+    /** Source file path -- captured at load time so the session can
+     *  reload the audio data from disk on restart.  Empty for slots
+     *  created from non-file sources (clipboard paste, future
+     *  synth-bake, etc).  data16L/data16R + numSamples are NOT
+     *  persisted in the session XML; only this path is. */
+    String  sourceFile;
     std::unique_ptr<int16_t[]> data16L;
     std::unique_ptr<int16_t[]> data16R;
     bool    isStereo = false;
