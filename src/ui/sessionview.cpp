@@ -98,6 +98,17 @@ SessionView::SessionView()
     setOpaque (true);
     setWantsKeyboardFocus (false);
 
+    /* Top toolbar — global actions the user reaches for often. */
+    addAndMakeVisible (stopAllBtn_);
+    addAndMakeVisible (rescanBtn_);
+    stopAllBtn_.onClick = [this]() { stopAllClips(); };
+    rescanBtn_ .onClick = [this]() { rescanColumns(); };
+
+    /* Footer "+" — append a scene.  Bottom-left under the scene
+     * label column matches Bitwig's affordance. */
+    addAndMakeVisible (addSceneBtn_);
+    addSceneBtn_.onClick = [this]() { addScene(); };
+
     /* Seed with 8 empty scenes so the user always has a target grid
      * to click into; persistence may overwrite this. */
     for (int i = 0; i < 8; ++i)
@@ -140,21 +151,44 @@ void SessionView::stabilizeContent()
 
 void SessionView::resized()
 {
-    /* Geometry is computed on demand from getLocalBounds() in each
-     * *Bounds() helper — no per-child layout to push. */
+    /* Toolbar layout — two buttons left-aligned, compact spacing.
+     * Geometry helpers compute the rest from getLocalBounds() on
+     * demand so we don't have to push it here. */
+    auto tb = toolbarBounds().reduced (4, 4);
+    stopAllBtn_.setBounds (tb.removeFromLeft (80)); tb.removeFromLeft (4);
+    rescanBtn_ .setBounds (tb.removeFromLeft (72));
+
+    addSceneBtn_.setBounds (addSceneButtonBounds().reduced (4, 4));
 }
 
 /* === Geometry ========================================================== */
 
+Rectangle<int> SessionView::toolbarBounds() const noexcept
+{
+    return getLocalBounds().removeFromTop (kToolbarH);
+}
+
+Rectangle<int> SessionView::footerBounds() const noexcept
+{
+    return getLocalBounds().removeFromBottom (kSceneFooterH);
+}
+
+Rectangle<int> SessionView::addSceneButtonBounds() const noexcept
+{
+    return footerBounds().removeFromLeft (kSceneLabelW);
+}
+
 Rectangle<int> SessionView::headerRowBounds() const noexcept
 {
-    return getLocalBounds().removeFromTop (kHeaderH);
+    auto r = getLocalBounds();
+    r.removeFromTop (kToolbarH);
+    return r.removeFromTop (kHeaderH);
 }
 
 Rectangle<int> SessionView::sceneLabelStripBounds() const noexcept
 {
     auto r = getLocalBounds();
-    r.removeFromTop (kHeaderH);
+    r.removeFromTop (kToolbarH + kHeaderH);
     r.removeFromBottom (kSceneFooterH);
     return r.removeFromLeft (kSceneLabelW);
 }
@@ -162,7 +196,7 @@ Rectangle<int> SessionView::sceneLabelStripBounds() const noexcept
 Rectangle<int> SessionView::gridBodyBounds() const noexcept
 {
     auto r = getLocalBounds();
-    r.removeFromTop (kHeaderH);
+    r.removeFromTop (kToolbarH + kHeaderH);
     r.removeFromBottom (kSceneFooterH);
     r.removeFromLeft (kSceneLabelW);
     return r;
@@ -241,6 +275,13 @@ bool SessionView::hitTestEditButton (Point<int> p, int& outRow, int& outCol) con
 void SessionView::paint (Graphics& g)
 {
     g.fillAll (kBgColour);
+
+    /* Toolbar background — sits above the column-header row. */
+    g.setColour (kHeaderBgColour);
+    g.fillRect (toolbarBounds());
+    g.setColour (kCellOutlineColour);
+    g.drawHorizontalLine (toolbarBounds().getBottom() - 1,
+                          0.0f, (float) getWidth());
 
     const auto header = headerRowBounds();
     const auto labels = sceneLabelStripBounds();
@@ -412,10 +453,13 @@ void SessionView::paint (Graphics& g)
         }
     }
 
-    /* Footer hint strip. */
+    /* Footer hint strip — right of the "+ Scene" button area. */
+    const auto footer = footerBounds();
     g.setColour (kHeaderBgColour);
-    g.fillRect (Rectangle<int> (0, getHeight() - kSceneFooterH,
-                                getWidth(), kSceneFooterH));
+    g.fillRect (footer);
+    g.setColour (kCellOutlineColour);
+    g.drawHorizontalLine (footer.getY(), 0.0f, (float) getWidth());
+
     g.setColour (kRowTextColour);
     g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                   kLabelFontSize, juce::Font::plain));
@@ -426,11 +470,9 @@ void SessionView::paint (Graphics& g)
         hint = String (columns_.size()) + " column"  + (columns_.size() == 1 ? "" : "s")
              + " · "
              + String (scenes_.size())  + " scene"  + (scenes_.size()  == 1 ? "" : "s")
-             + " · right-click a cell to add a clip";
-    g.drawText (hint,
-                Rectangle<int> (8, getHeight() - kSceneFooterH,
-                                getWidth() - 16, kSceneFooterH),
-                juce::Justification::centredLeft, true);
+             + " · right-click a cell or scene label for more";
+    const auto hintR = footer.withTrimmedLeft (kSceneLabelW + 8);
+    g.drawText (hint, hintR, juce::Justification::centredLeft, true);
 }
 
 /* === Mouse ============================================================= */
@@ -456,6 +498,28 @@ void SessionView::mouseDown (const MouseEvent& e)
                 m.addItem (1, "Add Tracker pattern");
                 const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
                 if (r == 1) addClipAt (row, col);
+            }
+            return;
+        }
+
+        if (hitTestSceneLabel (e.getPosition(), row))
+        {
+            juce::PopupMenu m;
+            m.addItem (1, "Launch scene");
+            m.addSeparator();
+            m.addItem (2, "Insert scene above");
+            m.addItem (3, "Insert scene below");
+            m.addSeparator();
+            const bool canDelete = scenes_.size() > 1;
+            m.addItem (4, "Delete scene", canDelete);
+            const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
+            switch (r)
+            {
+                case 1: bangScene   (row);     break;
+                case 2: insertScene (row);     break;
+                case 3: insertScene (row + 1); break;
+                case 4: deleteScene (row);     break;
+                default: break;
             }
         }
         return;
@@ -529,6 +593,70 @@ void SessionView::bangScene (int sceneRow)
     for (auto* c : clips_)
         if (c->sceneRow == sceneRow)
             bangClip (*c);
+}
+
+void SessionView::stopAllClips()
+{
+    for (auto* c : clips_)
+    {
+        if (auto* trk = lookupTracker (c->trackerNodeId))
+            trk->setSequencePlaying (c->sequenceIdx, false);
+        c->state.store (LiveState::Stopped, std::memory_order_relaxed);
+    }
+    repaint();
+}
+
+void SessionView::addScene()
+{
+    SessionScene s;
+    s.id   = Uuid();
+    s.name = "Scene " + String (scenes_.size() + 1);
+    scenes_.add (s);
+    writeToSession();
+    repaint();
+}
+
+void SessionView::insertScene (int beforeRow)
+{
+    const int idx = juce::jlimit (0, scenes_.size(), beforeRow);
+    SessionScene s;
+    s.id   = Uuid();
+    s.name = "Scene " + String (scenes_.size() + 1);  // numeric name from total
+    scenes_.insert (idx, s);
+
+    /* Shift every clip on row >= idx down by 1. */
+    for (auto* c : clips_)
+        if (c->sceneRow >= idx)
+            ++c->sceneRow;
+
+    writeToSession();
+    repaint();
+}
+
+void SessionView::deleteScene (int row)
+{
+    if (row < 0 || row >= scenes_.size()) return;
+    if (scenes_.size() <= 1) return;  // always keep one scene
+
+    /* Stop + delete every clip on this row. */
+    for (int i = clips_.size(); --i >= 0;)
+    {
+        if (clips_[i]->sceneRow == row)
+        {
+            if (auto* trk = lookupTracker (clips_[i]->trackerNodeId))
+                trk->setSequencePlaying (clips_[i]->sequenceIdx, false);
+            clips_.remove (i);
+        }
+    }
+
+    /* Shift remaining clips above the deleted row up by 1. */
+    for (auto* c : clips_)
+        if (c->sceneRow > row)
+            --c->sceneRow;
+
+    scenes_.remove (row);
+    writeToSession();
+    repaint();
 }
 
 void SessionView::addClipAt (int sceneRow, int columnIdx)

@@ -11,6 +11,8 @@
 #include <element/transport.hpp>
 #include <element/ui/content.hpp>
 
+#include "ui/blocktoolbutton.hpp"
+
 #define EL_VIEW_SESSION_VIEW "SessionView"
 
 namespace element {
@@ -92,9 +94,14 @@ private:
 
     void bangClip   (SessionClip&);
     void bangScene  (int sceneRow);
+    void stopAllClips();
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
     void deleteClip (SessionClip&);
     void openPatternEditor (SessionClip&);  // popup tracker editor at clip's seqIdx
+
+    void addScene();                  // append at end
+    void insertScene (int beforeRow);
+    void deleteScene (int row);
 
     TrackerNode* lookupTracker (juce::uint32 nodeId) const;
     SessionClip* findClip (int sceneRow, int columnIdx) const;
@@ -108,6 +115,9 @@ private:
 
     /* Grid geometry.  Returned by laying out in resized(); also queried
      * by paint() + mouseDown() for hit-testing. */
+    juce::Rectangle<int> toolbarBounds() const noexcept;
+    juce::Rectangle<int> footerBounds() const noexcept;
+    juce::Rectangle<int> addSceneButtonBounds() const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -124,6 +134,12 @@ private:
     Services* services_ = nullptr;
     Transport::MonitorPtr monitor_;
 
+    /* Top toolbar buttons + footer "+ Scene".  BlockToolButton matches
+     * the tracker editor's toolbar density. */
+    BlockToolButton stopAllBtn_   { "Stop All" };
+    BlockToolButton rescanBtn_    { "Rescan"   };
+    BlockToolButton addSceneBtn_  { "+ Scene"  };
+
     juce::Array<SessionColumn>      columns_;
     juce::OwnedArray<SessionClip>   clips_;
     juce::Array<SessionScene>       scenes_;
@@ -133,11 +149,12 @@ private:
 
     /* Layout constants — sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
+    static constexpr int kToolbarH     = 28;
     static constexpr int kHeaderH      = 28;
     static constexpr int kSceneLabelW  = 84;
     static constexpr int kColW         = 132;
     static constexpr int kRowH         = 30;
-    static constexpr int kSceneFooterH = 24;   // "+" add-scene strip
+    static constexpr int kSceneFooterH = 26;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)
 };
