@@ -91,6 +91,10 @@ static const juce::Identifier bounds = "bounds";
 static const juce::Identifier barSize = "barSize";
 static const juce::Identifier sizes = "sizes";
 static const juce::Identifier active = "active";
+/** Property on a Session ValueTree: base64-encoded MemoryBlock holding
+ *  SampleBankPool::getStateInformation output.  See
+ *  project_sample_bank_pool_architecture memory note. */
+static const juce::Identifier sampleBankPool = "sampleBankPool";
 static const juce::Identifier arc = "arc";
 static const juce::Identifier arcs = "arcs";
 static const juce::Identifier bypass = "bypass";

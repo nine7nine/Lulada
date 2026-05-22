@@ -7,6 +7,7 @@
 #include <element/session.hpp>
 
 #include <element/context.hpp>
+#include "services/samplebankpool.hpp"
 #include "tempo.hpp"
 
 using namespace juce;
@@ -236,6 +237,11 @@ void Session::saveGraphState()
 
 void Session::restoreGraphState()
 {
+    /* Pool first -- SamplerNode setStateInformation references banks
+     * by index, so the pool must already hold them when each node's
+     * state is applied. */
+    restoreSampleBankPool();
+
     for (int i = 0; i < getNumGraphs(); ++i)
         getGraph (i).restorePluginState();
 }
@@ -289,6 +295,20 @@ void Session::setActiveGraph (int index)
 bool Session::writeToFile (const File& file) const
 {
     ValueTree saveData = objectData.createCopy();
+
+    /* Serialise the session-global SampleBankPool into the session
+     * ValueTree so all banks + slots round-trip with the session
+     * file.  The pool replaces per-SamplerNode instruments[] -- see
+     * project_sample_bank_pool_architecture memory note. */
+    {
+        juce::MemoryBlock poolBlock;
+        SampleBankPool::get().getStateInformation (poolBlock);
+        if (poolBlock.getSize() > 0)
+            saveData.setProperty (tags::sampleBankPool,
+                                  poolBlock.toBase64Encoding(),
+                                  nullptr);
+    }
+
     Node::sanitizeProperties (saveData, true);
     TemporaryFile tempFile (file);
 
@@ -303,6 +323,25 @@ bool Session::writeToFile (const File& file) const
     }
 
     return false;
+}
+
+void Session::restoreSampleBankPool() const
+{
+    /* Inverse of the write above: pull the base64-encoded pool blob
+     * off the session ValueTree and push it into the singleton.
+     * Called after readFromFile / migrate; before restoreGraphState
+     * so SamplerNodes' setStateInformation runs against a pool that
+     * already has the right banks. */
+    SampleBankPool::get().clearAll();
+
+    const auto encoded = objectData.getProperty (tags::sampleBankPool, "").toString();
+    if (encoded.isEmpty()) return;
+
+    juce::MemoryBlock block;
+    if (! block.fromBase64Encoding (encoded)) return;
+    if (block.getSize() == 0) return;
+
+    SampleBankPool::get().setStateInformation (block.getData(), (int) block.getSize());
 }
 
 ValueTree Session::readFromFile (const File& file)
