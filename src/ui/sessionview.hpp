@@ -21,7 +21,7 @@ class TrackerNode;
 /** Bitwig/Ableton-style clip-grid launcher view.
  *
  *  Each column maps 1:1 to a TrackerNode in the active graph.  Each
- *  scene (row) holds a sparse set of clips — one per column at most.
+ *  scene (row) holds a sparse set of clips -- one per column at most.
  *  Clicking a clip flips its underlying vht sequence's `playing` flag
  *  via TrackerNode::setSequencePlaying.  No quantisation in Phase 3;
  *  launch is "fire on next render".
@@ -99,6 +99,12 @@ private:
         juce::Uuid     id;
         juce::String   name;
         juce::Colour   color { 0xff'30'30'30 };
+        /* Ableton-style per-scene overrides -- applied to the session
+         * transport when the scene is launched.  Sentinel values
+         * mean "no override; inherit current". */
+        double         tempoOverride { -1.0 };   // bpm; -1 = no override
+        int            beatsPerBar   { 0 };      // 0 = no override
+        int            beatDivisor   { 0 };      // 0 = no override
     };
 
     struct SessionColumn {
@@ -118,6 +124,8 @@ private:
     void bangScene  (int sceneRow);
     void stopAllClips();
     void stopColumn (int columnIdx);   // per-column stop button
+    void toggleColumnMute (int columnIdx);
+    bool isColumnMuted (int columnIdx) const noexcept;
     void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
     void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
@@ -135,7 +143,7 @@ private:
     void pickClipColour  (SessionClip&);   // full ColourSelector popup
     void assignExistingPattern (int sceneRow, int columnIdx, int sequenceIdx);
 
-    /* juce::ChangeListener — receives ColourSelector edits from the
+    /* juce::ChangeListener -- receives ColourSelector edits from the
      * popup picker.  colourPickerClip_ tracks which clip the picker
      * is bound to so we can apply on each broadcast. */
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
@@ -144,7 +152,7 @@ private:
      * the SAME column (sequenceIdx remains valid).  Copy (Shift+drag) =
      * clone the underlying vht sequence via TrackerNode::cloneSequence
      * and place a new clip at the target.  Cross-column drags are no-ops
-     * for v1 — sequenceIdx is tracker-scoped, so the migration story is
+     * for v1 -- sequenceIdx is tracker-scoped, so the migration story is
      * still TBD. */
     void moveClip (SessionClip&, int newSceneRow, int newColumnIdx);
     void copyClip (SessionClip&, int newSceneRow, int newColumnIdx);
@@ -154,7 +162,7 @@ private:
 
     /* Quantisation maths.  beatsPerBar() reads tags::beatsPerBar from
      * the session (default 4).  computeTargetBeat returns -1.0 for
-     * Off quant or for a stopped transport — both fire immediately. */
+     * Off quant or for a stopped transport -- both fire immediately. */
     int    beatsPerBar() const;
     double currentTransportBeat() const;
     double computeTargetBeat (double curBeat, LaunchQuant q) const;
@@ -172,6 +180,12 @@ private:
     juce::Rectangle<int> footerBounds() const noexcept;
     juce::Rectangle<int> columnStopRowBounds() const noexcept;
     juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
+    juce::Rectangle<int> columnMuteButtonBounds (int columnIdx) const noexcept;
+    juce::Rectangle<int> masterColumnBounds() const noexcept;
+    juce::Rectangle<int> masterCellBounds (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterLaunchButtonBounds (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterTempoFieldBounds  (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterSigFieldBounds    (int sceneRow) const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -185,8 +199,36 @@ private:
     bool hitTestPlayButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestColumnStop (juce::Point<int> p, int& outCol) const noexcept;
+    bool hitTestColumnMute (juce::Point<int> p, int& outCol) const noexcept;
+    bool hitTestMasterCell (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterLaunch (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterTempo  (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterSig    (juce::Point<int> p, int& outRow) const noexcept;
 
-    /* Scroll offset for the grid body — applied to scene-label and
+    /* Scene property editors -- invoked from the master column's
+     * right-click menu and direct clicks.  Editors are inline
+     * (TextEditor positioned over the field, no modal AlertWindow)
+     * so they don't steal focus from the main app. */
+    void editSceneTempo    (int sceneRow);
+    void editSceneSignature (int sceneRow);
+    void clearSceneTempo    (int sceneRow);
+    void clearSceneSignature (int sceneRow);
+    void applySceneOverridesToTransport (const SessionScene&);
+
+    /* Inline editor -- shared single TextEditor positioned over the
+     * field being edited.  Replaces AlertWindow prompts so the user
+     * doesn't get a modal popup stealing focus from the main app. */
+    void showInlineEditor (juce::Rectangle<int> bounds,
+                           const juce::String& initial,
+                           std::function<void (const juce::String&)> commit);
+    void hideInlineEditor();
+
+    /* Returns true if any clip in the given scene is currently
+     * Playing or queued (WaitingToStart) -- drives the master
+     * launch button's "scene active" visual state. */
+    bool sceneHasActiveClip (int sceneRow) const noexcept;
+
+    /* Scroll offset for the grid body -- applied to scene-label and
      * cell y positions in their *Bounds() helpers so paint + hit
      * test both reflect the scroll state automatically. */
     int gridScrollY_ = 0;
@@ -196,7 +238,21 @@ private:
     Services* services_ = nullptr;
     Transport::MonitorPtr monitor_;
 
-    /* Top toolbar — tracker-editor-styled (juce::TextButton with the
+    /* Label subclass that fires a callback on click.  Used for the
+     * QUANT value display -- clicking pops a menu of enum options
+     * rather than dropping into a text editor (typing "2 Bars" exact
+     * is awkward; menu is one click). */
+    class ClickableLabel : public juce::Label
+    {
+    public:
+        std::function<void()> onClick;
+        void mouseDown (const juce::MouseEvent&) override
+        {
+            if (onClick) onClick();
+        }
+    };
+
+    /* Top toolbar -- tracker-editor-styled (juce::TextButton with the
      * same palette + juce::Label for static name / editable value
      * pairs).  Mirrors `TrackerEditor::Toolbar` so the two views
      * share a visual vocabulary. */
@@ -204,7 +260,8 @@ private:
     juce::TextButton sceneMinusBtn_, scenePlusBtn_;
     juce::TextButton quantPrevBtn_,  quantNextBtn_;
     juce::Label scenesNameLabel_, scenesValueLabel_;
-    juce::Label quantNameLabel_,  quantValueLabel_;
+    juce::Label quantNameLabel_;
+    ClickableLabel quantValueLabel_;
 
     /* Default launch quant applied to NEW clips when they're added
      * (right-click "Add new pattern" / "Assign existing pattern" or
@@ -215,6 +272,8 @@ private:
     void configureToolbarLabel  (juce::Label&, const juce::String& text, bool editable);
     void refreshToolbarLabels();
     void cycleDefaultQuant (int delta);   // +1 next / -1 prev
+    void showQuantMenu();                 // popup picker for default quant
+    void commitScenesCount (int target);  // grow / shrink to match
     juce::String formatLaunchQuant (LaunchQuant) const noexcept;
 
     juce::Array<SessionColumn>      columns_;
@@ -235,7 +294,7 @@ private:
     int                dragHoverRow_ = -1;
     int                dragHoverCol_ = -1;
 
-    /* Scene-label drag state — distinct from clip drag.  Mouse-down on
+    /* Scene-label drag state -- distinct from clip drag.  Mouse-down on
      * a scene label stages a potential reorder; promoted to active
      * past the drag threshold; release drops the scene at the target
      * row index. */
@@ -243,20 +302,27 @@ private:
     bool   sceneDragActive_ = false;
     int    sceneDragHoverRow_ = -1;
 
-    /* ColourSelector popup state — when a picker is open against a
+    /* ColourSelector popup state -- when a picker is open against a
      * clip, change broadcasts route through changeListenerCallback
      * to mutate clip.color.  Cleared when the picker closes (its
      * ChangeBroadcaster is destroyed, broadcasts stop arriving). */
     SessionClip* colourPickerClip_ = nullptr;
 
-    /* Layout constants — sized to match the tracker editor's visual
+    /* Inline text editor.  Single shared child component reused
+     * across every editable field (scene tempo, scene sig, future
+     * clip name inspector, etc.). */
+    juce::TextEditor inlineEditor_;
+    std::function<void (const juce::String&)> inlineEditorCommit_;
+
+    /* Layout constants -- sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
     static constexpr int kToolbarH      = 36;
     static constexpr int kHeaderH       = 28;
     static constexpr int kSceneLabelW   = 84;
     static constexpr int kColW          = 132;
     static constexpr int kRowH          = 30;
-    static constexpr int kColumnStopH   = 24;
+    static constexpr int kMasterColW    = 220;   // Ableton-style scene master column
+    static constexpr int kColumnStopH   = 32;   // footer strip for STOP + MUTE
     static constexpr int kSceneFooterH  = 22;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)
