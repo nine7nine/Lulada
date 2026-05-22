@@ -353,35 +353,6 @@ Rectangle<int> SessionView::footerBounds() const noexcept
     return getLocalBounds().removeFromBottom (kSceneFooterH);
 }
 
-Rectangle<int> SessionView::columnStopRowBounds() const noexcept
-{
-    auto r = getLocalBounds();
-    r.removeFromBottom (kSceneFooterH);
-    return r.removeFromBottom (kColumnStopH);
-}
-
-Rectangle<int> SessionView::columnStopButtonBounds (int columnIdx) const noexcept
-{
-    /* Left half of the column footer cell -- STOP affordance. */
-    const auto row = columnStopRowBounds();
-    const int cellX = row.getX() + kSceneLabelW + columnIdx * kColW;
-    const int half  = (kColW - 12) / 2;
-    return Rectangle<int> (cellX + 6,
-                           row.getY() + 4,
-                           half - 2, row.getHeight() - 8);
-}
-
-Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcept
-{
-    /* Right half of the column footer cell -- MUTE toggle. */
-    const auto row = columnStopRowBounds();
-    const int cellX = row.getX() + kSceneLabelW + columnIdx * kColW;
-    const int half  = (kColW - 12) / 2;
-    return Rectangle<int> (cellX + 6 + half + 2,
-                           row.getY() + 4,
-                           half - 2, row.getHeight() - 8);
-}
-
 Rectangle<int> SessionView::headerRowBounds() const noexcept
 {
     auto r = getLocalBounds();
@@ -393,7 +364,7 @@ Rectangle<int> SessionView::sceneLabelStripBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH + kColumnStopH);
+    r.removeFromBottom (kSceneFooterH);
     return r.removeFromLeft (kSceneLabelW);
 }
 
@@ -401,7 +372,7 @@ Rectangle<int> SessionView::gridBodyBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH + kColumnStopH);
+    r.removeFromBottom (kSceneFooterH);
     r.removeFromLeft (kSceneLabelW);
     r.removeFromRight (kMasterColW);
     return r;
@@ -411,8 +382,41 @@ Rectangle<int> SessionView::masterColumnBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH + kColumnStopH);
+    r.removeFromBottom (kSceneFooterH);
     return r.removeFromRight (kMasterColW);
+}
+
+Rectangle<int> SessionView::columnNameLabelBounds (int columnIdx) const noexcept
+{
+    /* Top half of the column header -- track name + tint band. */
+    const auto h = columnHeaderBounds (columnIdx);
+    return Rectangle<int> (h.getX(), h.getY(), h.getWidth(),
+                           h.getHeight() / 2);
+}
+
+Rectangle<int> SessionView::columnStopButtonBounds (int columnIdx) const noexcept
+{
+    /* Bottom-left of column header: STOP button.  Layout:
+     *   row 0 (top half)    name + tint band
+     *   row 1 (bottom half) [STOP] [MUTE] */
+    const auto h = columnHeaderBounds (columnIdx);
+    const int topH = h.getHeight() / 2;
+    const int btnAreaH = h.getHeight() - topH - 2;
+    const int btnAreaY = h.getY() + topH;
+    const int innerW = h.getWidth() - 4;  // 2 px margins
+    const int half = (innerW - 2) / 2;
+    return Rectangle<int> (h.getX() + 2, btnAreaY, half, btnAreaH);
+}
+
+Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcept
+{
+    const auto h = columnHeaderBounds (columnIdx);
+    const int topH = h.getHeight() / 2;
+    const int btnAreaH = h.getHeight() - topH - 2;
+    const int btnAreaY = h.getY() + topH;
+    const int innerW = h.getWidth() - 4;
+    const int half = (innerW - 2) / 2;
+    return Rectangle<int> (h.getX() + 2 + half + 2, btnAreaY, half, btnAreaH);
 }
 
 Rectangle<int> SessionView::masterCellBounds (int sceneRow) const noexcept
@@ -431,18 +435,24 @@ Rectangle<int> SessionView::masterLaunchButtonBounds (int sceneRow) const noexce
 
 Rectangle<int> SessionView::masterTempoFieldBounds (int sceneRow) const noexcept
 {
-    /* Right ~80 px of the master cell holds tempo + sig side-by-side.
-     * Layout: [launch] [tempo  ][sig] */
+    /* Master cell layout: [launch button] [tempo field] [sig field]
+     * Tempo + sig get a balanced split of the remaining width with a
+     * 4 px gap; tempo gets slightly more because BPM strings ("120.00")
+     * are typically wider than sig strings ("4/4"). */
     auto inner = masterCellBounds (sceneRow).reduced (3, 3);
     inner.removeFromLeft (22 + 4);            // launch button + spacing
-    return inner.removeFromLeft (juce::jmax (40, inner.getWidth() - 52));
+    const int remaining = inner.getWidth();
+    const int tempoW = (remaining - 4) * 11 / 20;  // ~55%
+    return inner.removeFromLeft (tempoW);
 }
 
 Rectangle<int> SessionView::masterSigFieldBounds (int sceneRow) const noexcept
 {
     auto inner = masterCellBounds (sceneRow).reduced (3, 3);
     inner.removeFromLeft (22 + 4);
-    inner.removeFromLeft (juce::jmax (40, inner.getWidth() - 52));
+    const int remaining = inner.getWidth();
+    const int tempoW = (remaining - 4) * 11 / 20;
+    inner.removeFromLeft (tempoW + 4);        // skip tempo + gap
     return inner;
 }
 
@@ -519,24 +529,23 @@ bool SessionView::hitTestEditButton (Point<int> p, int& outRow, int& outCol) con
 
 bool SessionView::hitTestColumnStop (Point<int> p, int& outCol) const noexcept
 {
-    const auto row = columnStopRowBounds();
-    if (! row.contains (p)) return false;
-    if (p.x < row.getX() + kSceneLabelW) return false;
-    const int gridWidth = row.getWidth() - kSceneLabelW - kMasterColW;
-    if (p.x >= row.getX() + kSceneLabelW + gridWidth) return false;
-    outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
+    /* STOP + MUTE now live in the column header, not a separate
+     * footer row.  Quickly scope down by checking the header strip
+     * before pixel-perfect bounds testing. */
+    const auto header = headerRowBounds();
+    if (! header.contains (p)) return false;
+    if (p.x < header.getX() + kSceneLabelW) return false;
+    outCol = (p.x - header.getX() - kSceneLabelW) / kColW;
     if (outCol < 0 || outCol >= columns_.size()) return false;
     return columnStopButtonBounds (outCol).contains (p);
 }
 
 bool SessionView::hitTestColumnMute (Point<int> p, int& outCol) const noexcept
 {
-    const auto row = columnStopRowBounds();
-    if (! row.contains (p)) return false;
-    if (p.x < row.getX() + kSceneLabelW) return false;
-    const int gridWidth = row.getWidth() - kSceneLabelW - kMasterColW;
-    if (p.x >= row.getX() + kSceneLabelW + gridWidth) return false;
-    outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
+    const auto header = headerRowBounds();
+    if (! header.contains (p)) return false;
+    if (p.x < header.getX() + kSceneLabelW) return false;
+    outCol = (p.x - header.getX() - kSceneLabelW) / kColW;
     if (outCol < 0 || outCol >= columns_.size()) return false;
     return columnMuteButtonBounds (outCol).contains (p);
 }
@@ -609,22 +618,62 @@ void SessionView::paint (Graphics& g)
 
     for (int c = 0; c < columns_.size(); ++c)
     {
-        const auto h    = columnHeaderBounds (c);
-        const auto tint = columnTint (c);
+        const auto h     = columnHeaderBounds (c);
+        const auto tint  = columnTint (c);
+        const auto nameR = columnNameLabelBounds (c);
+        const auto stopR = columnStopButtonBounds (c);
+        const auto muteR = columnMuteButtonBounds (c);
 
         /* Top tint band, a la trackereditor track header. */
         g.setColour (tint);
         g.fillRect (h.getX(), h.getY(), h.getWidth() - 1, 4);
 
-        /* Body of header -- translucent tint over header bg. */
+        /* Top-half background -- translucent tint over header bg.
+         * Bottom-half (where the buttons live) stays plain so the
+         * STOP / MUTE button shapes read clearly. */
         g.setColour (tint.withAlpha (0.10f));
-        g.fillRect (h.getX(), h.getY() + 4, h.getWidth() - 1, h.getHeight() - 4);
+        g.fillRect (h.getX(), h.getY() + 4, h.getWidth() - 1, nameR.getHeight() - 4);
 
-        /* Column name. */
+        /* Column name -- top half of the header. */
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      kHeaderFontSize, juce::Font::bold));
         g.setColour (tint);
         g.drawText (columns_.getReference (c).name,
-                    h.reduced (8, 4),
+                    nameR.reduced (8, 0),
                     juce::Justification::centredLeft, true);
+
+        /* STOP + MUTE buttons in the bottom half.  STOP lightens
+         * when the column has an active clip; MUTE turns red when
+         * the TrackerNode is muted. */
+        bool active = false;
+        for (auto* clip : clips_)
+            if (clip->columnIdx == c)
+            {
+                const LiveState s = clip->state.load (std::memory_order_relaxed);
+                if (s != LiveState::Stopped) { active = true; break; }
+            }
+        const bool muted = isColumnMuted (c);
+        const Colour btnTint = tint.withMultipliedSaturation (0.6f)
+                                   .withMultipliedBrightness (0.55f);
+
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      9.0f, juce::Font::bold));
+
+        g.setColour (active ? btnTint.withMultipliedBrightness (1.6f) : btnTint);
+        g.fillRect (stopR);
+        g.setColour (kCellOutlineColour);
+        g.drawRect (stopR, 1);
+        g.setColour (active ? juce::Colours::white
+                            : juce::Colours::white.withAlpha (0.70f));
+        g.drawText ("STOP", stopR, juce::Justification::centred);
+
+        g.setColour (muted ? Colour { 0xff'c0'30'30 } : btnTint);
+        g.fillRect (muteR);
+        g.setColour (kCellOutlineColour);
+        g.drawRect (muteR, 1);
+        g.setColour (muted ? juce::Colours::white
+                           : juce::Colours::white.withAlpha (0.70f));
+        g.drawText (muted ? "MUTED" : "MUTE", muteR, juce::Justification::centred);
     }
 
     /* Everything from here through the cell loop draws inside the
@@ -870,6 +919,23 @@ void SessionView::paint (Graphics& g)
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       kCellFontSize, juce::Font::plain));
 
+        /* Current session-wide tempo + signature -- shown dimmed in
+         * scenes that don't carry an override so the user can see
+         * what the scene would inherit on launch.  Matches Ableton's
+         * Master column convention. */
+        double curTempo = 120.0;
+        int    curBpb   = 4;
+        int    curBd    = 4;
+        if (services_ != nullptr)
+        {
+            if (auto sess = services_->context().session())
+            {
+                curTempo = (double) sess->getProperty (tags::tempo,       120.0);
+                curBpb   = (int)    sess->getProperty (tags::beatsPerBar, 4);
+                curBd    = (int)    sess->getProperty (tags::beatDivisor, 4);
+            }
+        }
+
         for (int r = 0; r < scenes_.size(); ++r)
         {
             const auto cell    = masterCellBounds (r);
@@ -925,17 +991,18 @@ void SessionView::paint (Graphics& g)
                             juce::Justification::centred, true);
             };
 
-            /* Placeholder text is the FIELD NAME itself ("TEMPO" /
-             * "SIG") so an empty cell explains what it's for
-             * without needing a separate column header label. */
+            /* Show the OVERRIDE value bright when set; otherwise
+             * the current session value dimmed (inherit-on-launch).
+             * Ableton convention -- the user can see what the scene
+             * would do without having to click in. */
             drawField (tempoR,
-                       sc.tempoOverride > 0.0 ? String (sc.tempoOverride, 1)
-                                              : String ("TEMPO"),
+                       sc.tempoOverride > 0.0 ? String (sc.tempoOverride, 2)
+                                              : String (curTempo, 2),
                        sc.tempoOverride > 0.0);
             drawField (sigR,
                        (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
                             ? String (sc.beatsPerBar) + "/" + String (sc.beatDivisor)
-                            : String ("SIG"),
+                            : String (curBpb) + "/" + String (curBd),
                        sc.beatsPerBar > 0 && sc.beatDivisor > 0);
 
             /* Row divider. */
@@ -949,66 +1016,6 @@ void SessionView::paint (Graphics& g)
     /* Close the scrollable-area clip region -- everything after this
      * draws into the fixed (non-scrolling) chrome strips. */
     g.restoreState();
-
-    /* --- Per-column track-control footer row (STOP + MUTE) --- */
-    const auto stopRow = columnStopRowBounds();
-    g.setColour (kBgColour);    // match session-view bg (was kHeaderBgColour)
-    g.fillRect (stopRow);
-    g.setColour (kCellOutlineColour);
-    g.drawHorizontalLine (stopRow.getY(), 0.0f, (float) getWidth());
-
-    /* Left "TRACK" label at the scene-labels x-range so the user can
-     * read what the row controls without guessing. */
-    {
-        const Rectangle<int> labelR (stopRow.getX(), stopRow.getY(),
-                                     kSceneLabelW, stopRow.getHeight());
-        g.setColour (kRowTextColour);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                      kLabelFontSize, juce::Font::plain));
-        g.drawText ("TRACK", labelR.reduced (8, 0),
-                    juce::Justification::centredLeft, true);
-    }
-
-    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                  10.0f, juce::Font::bold));
-
-    for (int c = 0; c < columns_.size(); ++c)
-    {
-        const auto stopR = columnStopButtonBounds (c);
-        const auto muteR = columnMuteButtonBounds (c);
-
-        bool active = false;
-        for (auto* clip : clips_)
-            if (clip->columnIdx == c)
-            {
-                const LiveState s = clip->state.load (std::memory_order_relaxed);
-                if (s != LiveState::Stopped) { active = true; break; }
-            }
-        const bool muted = isColumnMuted (c);
-        const Colour tint = columnTint (c).withMultipliedSaturation (0.6f)
-                                          .withMultipliedBrightness (0.55f);
-
-        /* STOP -- column-tinted background, white "STOP" text;
-         * brighter (full saturation) when the column has at least
-         * one active clip. */
-        g.setColour (active ? tint.withMultipliedBrightness (1.6f) : tint);
-        g.fillRect (stopR);
-        g.setColour (kCellOutlineColour);
-        g.drawRect (stopR, 1);
-        g.setColour (active ? juce::Colours::white
-                            : juce::Colours::white.withAlpha (0.65f));
-        g.drawText ("STOP", stopR, juce::Justification::centred);
-
-        /* MUTE toggle -- amber-red when muted, otherwise the same
-         * tinted background as STOP. */
-        g.setColour (muted ? Colour { 0xff'c0'30'30 } : tint);
-        g.fillRect (muteR);
-        g.setColour (kCellOutlineColour);
-        g.drawRect (muteR, 1);
-        g.setColour (muted ? juce::Colours::white
-                           : juce::Colours::white.withAlpha (0.65f));
-        g.drawText (muted ? "MUTED" : "MUTE", muteR, juce::Justification::centred);
-    }
 
     /* Footer hint strip. */
     const auto footer = footerBounds();
@@ -1602,6 +1609,20 @@ void SessionView::bangScene (int sceneRow)
      * tempo immediately when their beat-target is computed. */
     applySceneOverridesToTransport (scenes_.getReference (sceneRow));
 
+    /* "Sketch Mode" -- if the transport is stopped, launching a
+     * scene also starts the transport so the clips actually fire.
+     * Without this, schedulePlaying queues entries that never get
+     * drained (engine doesn't advance with the transport stopped).
+     * Matches Ableton's behaviour where clicking a scene launch
+     * triangle plays even if the global transport isn't already
+     * running. */
+    if (monitor_ != nullptr && ! monitor_->playing.get())
+    {
+        if (services_ != nullptr)
+            if (auto* eng = services_->context().audio().get())
+                eng->setPlaying (true);
+    }
+
     /* Pick the slowest quant among this scene's clips so they all
      * snap to the same target beat -- Bitwig convention.  If clips
      * use heterogeneous quants the per-clip values are ignored for
@@ -1822,7 +1843,7 @@ void SessionView::toggleColumnMute (int columnIdx)
     if (columnIdx < 0 || columnIdx >= columns_.size()) return;
     if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
         trk->setMuted (! trk->isMuted());
-    repaint (columnStopRowBounds());
+    repaint (headerRowBounds());
 }
 
 void SessionView::addScene()
@@ -2456,6 +2477,30 @@ void SessionView::timerCallback()
     if (! isShowing()) return;   // gated per feedback_gui_must_stay_fast
 
     ++pulsePhase_;
+
+    /* Diff-gated repaint of the master column when the session
+     * tempo / signature changes outside this view (e.g. user
+     * tweaks the main toolbar BPM).  Scenes without explicit
+     * overrides display the current value dimmed, so they need
+     * to refresh on transport changes. */
+    if (services_ != nullptr)
+    {
+        if (auto sess = services_->context().session())
+        {
+            const double t   = (double) sess->getProperty (tags::tempo,       120.0);
+            const int    bpb = (int)    sess->getProperty (tags::beatsPerBar, 4);
+            const int    bd  = (int)    sess->getProperty (tags::beatDivisor, 4);
+            if (std::abs (t - lastSessionTempo_) > 0.01
+                || bpb != lastSessionBpb_
+                || bd  != lastSessionBd_)
+            {
+                lastSessionTempo_ = t;
+                lastSessionBpb_   = bpb;
+                lastSessionBd_    = bd;
+                repaint (masterColumnBounds());
+            }
+        }
+    }
 
     for (auto* clip : clips_)
     {

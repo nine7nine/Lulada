@@ -178,7 +178,9 @@ private:
      * by paint() + mouseDown() for hit-testing. */
     juce::Rectangle<int> toolbarBounds() const noexcept;
     juce::Rectangle<int> footerBounds() const noexcept;
-    juce::Rectangle<int> columnStopRowBounds() const noexcept;
+    /* STOP + MUTE are embedded in each column's header, not a
+     * separate footer row.  Bounds are relative to columnHeaderBounds. */
+    juce::Rectangle<int> columnNameLabelBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> columnMuteButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> masterColumnBounds() const noexcept;
@@ -283,6 +285,12 @@ private:
     /* Phase animation for WaitingTo* outline pulse (Phase 4 will exercise). */
     int   pulsePhase_ = 0;
 
+    /* Diff-gate for master column repaint when the session-wide
+     * tempo / time signature changes outside our view. */
+    double lastSessionTempo_ = -1.0;
+    int    lastSessionBpb_   = -1;
+    int    lastSessionBd_    = -1;
+
     /* Drag state for clip-move/copy.  dragSource_ is set on mouseDown
      * over a clip's body (not its play/edit zones); dragActive_ trips
      * once the cursor moves past the drag threshold.  dragHover{Row,Col}
@@ -317,12 +325,11 @@ private:
     /* Layout constants -- sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
     static constexpr int kToolbarH      = 36;
-    static constexpr int kHeaderH       = 28;
+    static constexpr int kHeaderH       = 44;   // taller -- holds track name + STOP + MUTE
     static constexpr int kSceneLabelW   = 84;
     static constexpr int kColW          = 132;
     static constexpr int kRowH          = 30;
     static constexpr int kMasterColW    = 220;   // Ableton-style scene master column
-    static constexpr int kColumnStopH   = 32;   // footer strip for STOP + MUTE
     static constexpr int kSceneFooterH  = 22;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)
