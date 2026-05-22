@@ -142,7 +142,6 @@ SamplerInstrument::prepareSlot (const File& file, AudioFormatManager& fmt)
 
     auto s = std::make_unique<SamplerSampleSlot>();
     s->name             = file.getFileNameWithoutExtension();
-    s->sourceFile       = file.getFullPathName();   // for session persistence
     s->numSamples       = n;
     s->sourceSampleRate = reader->sampleRate;
     s->rootNote         = 60;
@@ -5567,7 +5566,6 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
             ValueTree slotTree ("slot");
             slotTree.setProperty ("idx",          i,                    nullptr);
             slotTree.setProperty ("name",         slot->name,           nullptr);
-            slotTree.setProperty ("sourceFile",   slot->sourceFile,     nullptr);
             slotTree.setProperty ("rootNote",     slot->rootNote,       nullptr);
             slotTree.setProperty ("relativeNote", slot->relativeNote,   nullptr);
             slotTree.setProperty ("finetune",     slot->finetune,       nullptr);
@@ -5579,22 +5577,6 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
             slotTree.setProperty ("busIndex",     slot->busIndex,           nullptr);
             instTree.appendChild (slotTree, nullptr);
         }
-
-        /* Persist the 128-byte MIDI keymap so user note-to-slot
-         * assignments survive a reload.  Encoded as a comma-separated
-         * list of slot indices (one per MIDI note).  Default keymap
-         * (auto-spread) is reapplied on load if the property is
-         * missing in older saves. */
-        {
-            String km;
-            for (int n = 0; n < 128; ++n)
-            {
-                if (n > 0) km += ",";
-                km += String ((int) inst->slotForNote (n));
-            }
-            instTree.setProperty ("keymap", km, nullptr);
-        }
-
         tree.appendChild (instTree, nullptr);
     }
 
@@ -5694,29 +5676,9 @@ void SamplerNode::setStateInformation (const void* data, int size)
             const auto slotTree = instTree.getChild (c);
             if (slotTree.getType() != Identifier ("slot")) continue;
             const int idx = (int) slotTree.getProperty ("idx", 0);
-
-            /* If the saved slot has a sourceFile path, reload the
-             * audio from disk first (prepareSlot decodes + allocates
-             * data16L/data16R + sets numSamples).  The user's saved
-             * metadata is then overlaid on top so volume / pan /
-             * loop / etc. survive intact.  Missing-file = silent
-             * skip; the metadata still loads but the slot is
-             * empty (the same end state old saves had). */
-            const String savedPath = slotTree.getProperty ("sourceFile", "").toString();
-            if (savedPath.isNotEmpty() && idx >= 0 && idx < SamplerInstrument::kNumSlots)
-            {
-                File f (savedPath);
-                if (f.existsAsFile())
-                {
-                    auto loaded = inst->prepareSlot (f, formatManager);
-                    if (loaded != nullptr) inst->commitSlot (idx, std::move (loaded));
-                }
-            }
-
             if (auto* slot = inst->getSlot (idx))
             {
                 slot->name         = slotTree.getProperty ("name", "").toString();
-                slot->sourceFile   = savedPath;
                 slot->rootNote     = (int) slotTree.getProperty ("rootNote", 60);
                 slot->relativeNote = (int) slotTree.getProperty ("relativeNote", 0);
                 slot->finetune     = (int) slotTree.getProperty ("finetune", 0);
@@ -5754,23 +5716,6 @@ void SamplerNode::setStateInformation (const void* data, int size)
                 }
             }
         }
-
-        /* Restore saved MIDI keymap if present.  Older saves
-         * (predating this field) get the auto-spread default that
-         * commitSlot/autoSpreadKeymap applied while reloading. */
-        const String savedKeymap = instTree.getProperty ("keymap", "").toString();
-        if (savedKeymap.isNotEmpty())
-        {
-            auto parts = StringArray::fromTokens (savedKeymap, ",", "");
-            const int n = juce::jmin (128, parts.size());
-            for (int k = 0; k < n; ++k)
-            {
-                const int s = juce::jlimit (0, SamplerInstrument::kNumSlots - 1,
-                                            parts[k].getIntValue());
-                inst->setSlotForNote (k, s);
-            }
-        }
-
         instruments.push_back (inst);
     }
 
