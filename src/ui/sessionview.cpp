@@ -688,8 +688,12 @@ void SessionView::paint (Graphics& g)
             g.setColour (juce::Colours::black.withAlpha (0.85f));
             if (playing)
             {
-                /* Square stop glyph. */
-                g.fillRect (playR.reduced (5, 7));
+                /* Proper centred square stop glyph -- the prior
+                 * reduced(5,7) made it a narrow rectangle because
+                 * playR's width and height differ.  Use a fixed
+                 * 8x8 centred square so it visually matches the
+                 * equilateral play triangle. */
+                g.fillRect (playR.withSizeKeepingCentre (8, 8));
             }
             else
             {
@@ -895,14 +899,17 @@ void SessionView::paint (Graphics& g)
                             juce::Justification::centred, true);
             };
 
+            /* Placeholder text is the FIELD NAME itself ("TEMPO" /
+             * "SIG") so an empty cell explains what it's for
+             * without needing a separate column header label. */
             drawField (tempoR,
                        sc.tempoOverride > 0.0 ? String (sc.tempoOverride, 1)
-                                              : String ("--"),
+                                              : String ("TEMPO"),
                        sc.tempoOverride > 0.0);
             drawField (sigR,
                        (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
                             ? String (sc.beatsPerBar) + "/" + String (sc.beatDivisor)
-                            : String ("--"),
+                            : String ("SIG"),
                        sc.beatsPerBar > 0 && sc.beatDivisor > 0);
 
             /* Row divider. */

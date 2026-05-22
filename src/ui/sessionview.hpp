@@ -317,7 +317,7 @@ private:
     static constexpr int kSceneLabelW   = 84;
     static constexpr int kColW          = 132;
     static constexpr int kRowH          = 30;
-    static constexpr int kMasterColW    = 152;   // Ableton-style scene master column
+    static constexpr int kMasterColW    = 220;   // Ableton-style scene master column
     static constexpr int kColumnStopH   = 24;
     static constexpr int kSceneFooterH  = 22;
 
