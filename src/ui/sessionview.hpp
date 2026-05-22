@@ -237,6 +237,7 @@ public:
     /* Used by floating popup windows (tracker pattern editor, future
      * Clip View) so they can wire spacebar to the global transport. */
     void transportTogglePlay() noexcept;
+    void bangClipByUuid (const juce::Uuid& clipId);
 private:
 
     /* Inline editor -- shared single TextEditor positioned over the
