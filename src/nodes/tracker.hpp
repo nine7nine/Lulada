@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <element/midipipe.hpp>
 #include "nodes/midifilter.hpp"
 #include "nodes/baseprocessor.hpp"
@@ -109,6 +111,25 @@ public:
      *  song-relative row position per sequence. */
     bool   sequenceWrappedSinceLastQuery (int sequenceIdx) noexcept;
 
+    /** Schedule a future flip of a sequence's playing flag.
+     *
+     *  beatTarget < 0 means "immediate" (fires at the start of the
+     *  next render block).  beatTarget >= 0 is a transport-beat
+     *  position; the flip fires inside the render block whose beat
+     *  range contains it — sample-accurate to ±1 audio block, with
+     *  zero inter-clip skew for clips targeting the same beat.
+     *
+     *  Lock-free SPSC: safe to call from the message thread without
+     *  touching engineLock_.  Latest request per sequenceIdx wins —
+     *  the audio thread keeps only the most recent pending action
+     *  per sequence, so re-banging a queued clip cancels the prior
+     *  request.
+     *
+     *  Backpressure: if the internal FIFO fills (way over expected
+     *  click rate), the new request is dropped silently.  In
+     *  practice 64-slot FIFO at human click rate never fills. */
+    void   schedulePlaying (int sequenceIdx, double beatTarget, bool wantPlaying) noexcept;
+
     /** Undo / redo.  Snapshots whole-module state into a memento stack.
      *  Editor calls pushUndo() before any mutation. */
     void pushUndo();
@@ -150,6 +171,34 @@ private:
      * indices follow vht's seq[] array.  Updated only when the
      * session-view scheduler polls; not touched by render(). */
     juce::Array<double> lastSeqPos_;
+
+    /* ---------- Phase-4 sample-accurate launch scheduler ---------- */
+
+    /** One request in the message-thread → audio-thread FIFO. */
+    struct LaunchReq {
+        int    sequenceIdx;
+        double beatTarget;    // <0 = immediate
+        int    wantPlaying;   // 0 or 1
+    };
+
+    /** Per-sequence pending flip, owned by the audio thread.  Latest
+     *  FIFO request for a given sequenceIdx overwrites the slot,
+     *  giving us implicit cancellation. */
+    struct PendingAction {
+        double beatTarget   = 0.0;
+        bool   wantPlaying  = false;
+        bool   valid        = false;
+    };
+
+    static constexpr int kLaunchFifoSize = 64;
+    std::array<LaunchReq, (size_t) kLaunchFifoSize> launchFifoStorage_ {};
+    juce::AbstractFifo launchFifo_ { kLaunchFifoSize };
+    juce::Array<PendingAction> pendingActions_;   // indexed by sequenceIdx
+
+    /** Audio-thread helpers — called from inside render() under
+     *  engineLock_, before module_advance. */
+    void drainLaunchFifo() noexcept;
+    void applyPendingForBlock (double blockStartBeat, double blockEndBeat) noexcept;
 };
 
 } // namespace element

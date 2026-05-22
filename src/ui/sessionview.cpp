@@ -371,8 +371,10 @@ void SessionView::paint (Graphics& g)
                 continue;
             }
 
-            const bool playing = clip->state.load (std::memory_order_relaxed)
-                                 == LiveState::Playing;
+            const LiveState clipState = clip->state.load (std::memory_order_relaxed);
+            const bool playing    = (clipState == LiveState::Playing);
+            const bool waitStart  = (clipState == LiveState::WaitingToStart);
+            const bool waitStop   = (clipState == LiveState::WaitingToStop);
 
             /* Fill body with the clip's colour, brightened when playing. */
             const Colour fill = playing ? clip->color.brighter (0.25f)
@@ -447,9 +449,26 @@ void SessionView::paint (Graphics& g)
                 }
             }
 
-            /* Outline. */
-            g.setColour (kCellOutlineColour);
-            g.drawRect (inner, 1);
+            /* Outline.  WaitingTo* states pulse the border so the user
+             * can see the clip is queued.  Pulse alpha runs sin-wave
+             * off pulsePhase_, repainted each timer tick (gated in
+             * timerCallback). */
+            if (waitStart || waitStop)
+            {
+                /* 30 Hz timer; one full pulse cycle every ~0.7 s. */
+                const float t = (float) (pulsePhase_ % 24) / 24.0f;
+                const float a = 0.50f + 0.45f * std::sin (t * juce::MathConstants<float>::twoPi);
+                const Colour pulseCol = waitStart
+                    ? kPlayheadAccent          // amber for "waiting to start"
+                    : Colour { 0xff'e0'40'40 }; // red for "waiting to stop"
+                g.setColour (pulseCol.withAlpha (a));
+                g.drawRect (inner, 2);
+            }
+            else
+            {
+                g.setColour (kCellOutlineColour);
+                g.drawRect (inner, 1);
+            }
         }
     }
 
@@ -487,10 +506,30 @@ void SessionView::mouseDown (const MouseEvent& e)
         {
             if (auto* clip = findClip (row, col))
             {
+                juce::PopupMenu quant;
+                const auto cq = clip->launchQuant;
+                quant.addItem (10, "Off",     true, cq == LaunchQuant::Off);
+                quant.addItem (11, "1 Beat",  true, cq == LaunchQuant::Beat);
+                quant.addItem (12, "1 Bar",   true, cq == LaunchQuant::Bar);
+                quant.addItem (13, "2 Bars",  true, cq == LaunchQuant::TwoBars);
+                quant.addItem (14, "4 Bars",  true, cq == LaunchQuant::FourBars);
+
                 juce::PopupMenu m;
+                m.addSubMenu ("Launch quantisation", quant);
+                m.addSeparator();
                 m.addItem (1, "Delete clip");
+
                 const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
-                if (r == 1) deleteClip (*clip);
+                switch (r)
+                {
+                    case 1: deleteClip (*clip); break;
+                    case 10: clip->launchQuant = LaunchQuant::Off;      writeToSession(); break;
+                    case 11: clip->launchQuant = LaunchQuant::Beat;     writeToSession(); break;
+                    case 12: clip->launchQuant = LaunchQuant::Bar;      writeToSession(); break;
+                    case 13: clip->launchQuant = LaunchQuant::TwoBars;  writeToSession(); break;
+                    case 14: clip->launchQuant = LaunchQuant::FourBars; writeToSession(); break;
+                    default: break;
+                }
             }
             else if (col < columns_.size() && lookupTracker (columns_.getReference (col).trackerNodeId) != nullptr)
             {
@@ -575,15 +614,116 @@ TrackerNode* SessionView::lookupTracker (juce::uint32 nodeId) const
     return dynamic_cast<TrackerNode*> (n.getObject());
 }
 
+int SessionView::beatsPerBar() const
+{
+    if (services_ == nullptr) return 4;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return 4;
+    return juce::jmax (1, (int) sess->getProperty (tags::beatsPerBar, 4));
+}
+
+double SessionView::currentTransportBeat() const
+{
+    if (monitor_ == nullptr) return 0.0;
+    return (double) monitor_->getPositionBeats();
+}
+
+double SessionView::computeTargetBeat (double curBeat, LaunchQuant q) const
+{
+    double qb = 0.0;
+    switch (q)
+    {
+        case LaunchQuant::Off:      return -1.0;
+        case LaunchQuant::Beat:     qb = 1.0;                          break;
+        case LaunchQuant::Bar:      qb = (double) beatsPerBar();       break;
+        case LaunchQuant::TwoBars:  qb = 2.0 * (double) beatsPerBar(); break;
+        case LaunchQuant::FourBars: qb = 4.0 * (double) beatsPerBar(); break;
+    }
+    if (qb <= 0.0) return -1.0;
+
+    /* Strictly future boundary.  If curBeat sits exactly on the
+     * boundary, jump to the NEXT one — pressing bang on the bar
+     * line should land on the next bar, not "right now" with
+     * zero waiting time (UX gives the user a moment of feedback). */
+    constexpr double kEps = 1e-6;
+    return std::ceil ((curBeat + kEps) / qb) * qb;
+}
+
 void SessionView::bangClip (SessionClip& clip)
 {
     auto* trk = lookupTracker (clip.trackerNodeId);
     if (trk == nullptr || clip.sequenceIdx < 0) return;
 
-    const bool wasPlaying = trk->isSequencePlaying (clip.sequenceIdx);
-    trk->setSequencePlaying (clip.sequenceIdx, ! wasPlaying);
-    clip.state.store (wasPlaying ? LiveState::Stopped : LiveState::Playing,
-                      std::memory_order_relaxed);
+    const LiveState cur = clip.state.load (std::memory_order_relaxed);
+
+    /* === Cancel rules: re-banging a queued clip un-queues it.
+     * Re-banging a WaitingToStart cancels the start → stays Stopped.
+     * Re-banging a WaitingToStop cancels the stop → stays Playing.
+     * Both cancel paths fire an immediate schedule that overwrites
+     * the pending action in the audio thread. */
+    if (cur == LiveState::WaitingToStart)
+    {
+        trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
+        clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
+        repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+        return;
+    }
+    if (cur == LiveState::WaitingToStop)
+    {
+        trk->schedulePlaying (clip.sequenceIdx, -1.0, true);
+        clip.state.store (LiveState::Playing, std::memory_order_relaxed);
+        repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+        return;
+    }
+
+    const bool wantPlaying = (cur != LiveState::Playing);
+
+    /* Determine target beat.  Transport-stopped path forces immediate
+     * launch — quant boundaries make no sense without a moving
+     * playhead.  Off-quant always immediate. */
+    const bool transportPlaying = (monitor_ != nullptr && monitor_->playing.get());
+    const double targetBeat = (transportPlaying)
+        ? computeTargetBeat (currentTransportBeat(), clip.launchQuant)
+        : -1.0;
+
+    /* === Same-column mutual exclusion ===
+     * If we're STARTING this clip and another clip on the same column
+     * is currently Playing or queued to start, push a STOP request
+     * for it at the SAME target beat.  The audio thread applies both
+     * pendings in the same render block → atomic switch with zero
+     * inter-clip skew. */
+    if (wantPlaying)
+    {
+        for (auto* other : clips_)
+        {
+            if (other == &clip) continue;
+            if (other->columnIdx     != clip.columnIdx)     continue;
+            if (other->trackerNodeId != clip.trackerNodeId) continue;
+            const LiveState os = other->state.load (std::memory_order_relaxed);
+            if (os != LiveState::Playing && os != LiveState::WaitingToStart) continue;
+
+            if (auto* otrk = lookupTracker (other->trackerNodeId))
+                otrk->schedulePlaying (other->sequenceIdx, targetBeat, false);
+
+            other->state.store (targetBeat < 0.0 ? LiveState::Stopped
+                                                 : LiveState::WaitingToStop,
+                                std::memory_order_relaxed);
+            repaint (cellBounds (other->sceneRow, other->columnIdx));
+        }
+    }
+
+    /* Schedule this clip's transition. */
+    trk->schedulePlaying (clip.sequenceIdx, targetBeat, wantPlaying);
+
+    /* Update message-thread state.  Immediate launches go straight to
+     * Playing/Stopped (the UI tick will reconcile once engine confirms);
+     * quantised launches go through WaitingTo* until the boundary fires. */
+    LiveState next;
+    if (targetBeat < 0.0)
+        next = wantPlaying ? LiveState::Playing : LiveState::Stopped;
+    else
+        next = wantPlaying ? LiveState::WaitingToStart : LiveState::WaitingToStop;
+    clip.state.store (next, std::memory_order_relaxed);
     repaint (cellBounds (clip.sceneRow, clip.columnIdx));
 }
 
@@ -597,10 +737,14 @@ void SessionView::bangScene (int sceneRow)
 
 void SessionView::stopAllClips()
 {
+    /* Immediate stop — bypass quantisation.  Schedules through the
+     * audio-thread FIFO with beatTarget=-1 so every clip stops on
+     * the next render block.  Resets message-thread state to Stopped
+     * straight away; UI tick will confirm. */
     for (auto* c : clips_)
     {
         if (auto* trk = lookupTracker (c->trackerNodeId))
-            trk->setSequencePlaying (c->sequenceIdx, false);
+            trk->schedulePlaying (c->sequenceIdx, -1.0, false);
         c->state.store (LiveState::Stopped, std::memory_order_relaxed);
     }
     repaint();
@@ -644,7 +788,7 @@ void SessionView::deleteScene (int row)
         if (clips_[i]->sceneRow == row)
         {
             if (auto* trk = lookupTracker (clips_[i]->trackerNodeId))
-                trk->setSequencePlaying (clips_[i]->sequenceIdx, false);
+                trk->schedulePlaying (clips_[i]->sequenceIdx, -1.0, false);
             clips_.remove (i);
         }
     }
@@ -728,7 +872,7 @@ void SessionView::openPatternEditor (SessionClip& clip)
 void SessionView::deleteClip (SessionClip& clip)
 {
     if (auto* trk = lookupTracker (clip.trackerNodeId))
-        trk->setSequencePlaying (clip.sequenceIdx, false);
+        trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
 
     /* Note: we do NOT call trk->removeSequence() — the underlying vht
      * sequence may be referenced by other clips or by the arrangement
@@ -888,6 +1032,9 @@ void SessionView::readFromSession()
             clip->sequenceIdx   = (int) cn.getProperty ("sequenceIdx", -1);
             clip->sceneRow      = (int) cn.getProperty ("sceneRow", 0);
             clip->columnIdx     = (int) cn.getProperty ("columnIdx", 0);
+            clip->launchQuant   = static_cast<LaunchQuant> (
+                juce::jlimit (0, 4, (int) cn.getProperty ("launchQuant",
+                                                          (int) LaunchQuant::Bar)));
             clips_.add (clip);
         }
     }
@@ -936,6 +1083,7 @@ void SessionView::writeToSession()
         cn.setProperty ("sequenceIdx",   clip->sequenceIdx,                nullptr);
         cn.setProperty ("sceneRow",      clip->sceneRow,                   nullptr);
         cn.setProperty ("columnIdx",     clip->columnIdx,                  nullptr);
+        cn.setProperty ("launchQuant",   (int) clip->launchQuant,          nullptr);
         clipsTree.appendChild (cn, nullptr);
     }
     tree.appendChild (clipsTree, nullptr);
@@ -955,20 +1103,53 @@ void SessionView::timerCallback()
         auto* trk = lookupTracker (clip->trackerNodeId);
         if (trk == nullptr) continue;
 
-        const bool playing = trk->isSequencePlaying (clip->sequenceIdx);
-        const LiveState observed = playing ? LiveState::Playing : LiveState::Stopped;
-        const LiveState prev = clip->state.exchange (observed, std::memory_order_relaxed);
+        const bool enginePlaying = trk->isSequencePlaying (clip->sequenceIdx);
+        const LiveState cur = clip->state.load (std::memory_order_relaxed);
 
-        const int posRow = playing
+        /* State reconciliation: the audio thread flips seq->playing
+         * at the scheduled boundary; the UI tick observes the result
+         * and transitions WaitingTo* → final state.  Crucially, we
+         * do NOT clobber WaitingTo* with an engine snapshot that
+         * disagrees — those states represent "we're waiting for the
+         * boundary," which means engine has NOT changed yet. */
+        LiveState next = cur;
+        switch (cur)
+        {
+            case LiveState::Stopped:
+                if (enginePlaying) next = LiveState::Playing;
+                break;
+            case LiveState::WaitingToStart:
+                if (enginePlaying) next = LiveState::Playing;
+                break;
+            case LiveState::Playing:
+                if (! enginePlaying) next = LiveState::Stopped;
+                break;
+            case LiveState::WaitingToStop:
+                if (! enginePlaying) next = LiveState::Stopped;
+                break;
+        }
+
+        const int posRow = enginePlaying
             ? (int) trk->getSequencePositionRows (clip->sequenceIdx)
             : -1;
 
-        if (prev != observed || posRow != clip->lastDrawnPosRow)
-        {
-            clip->lastDrawnPlaying = playing;
-            clip->lastDrawnPosRow  = posRow;
+        /* Repaint conditions: state change, position bar moved while
+         * playing, OR clip is in a WaitingTo* state (so the pulsing
+         * border animates each tick). */
+        const bool isWaiting = (cur == LiveState::WaitingToStart
+                             || cur == LiveState::WaitingToStop);
+        const bool needRepaint = (next != cur)
+                              || (posRow != clip->lastDrawnPosRow)
+                              || (enginePlaying != clip->lastDrawnPlaying)
+                              || isWaiting;
+
+        if (next != cur)
+            clip->state.store (next, std::memory_order_relaxed);
+        clip->lastDrawnPlaying = enginePlaying;
+        clip->lastDrawnPosRow  = posRow;
+
+        if (needRepaint)
             repaint (cellBounds (clip->sceneRow, clip->columnIdx));
-        }
     }
 }
 

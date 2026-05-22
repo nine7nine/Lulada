@@ -84,6 +84,41 @@ void TrackerNode::render (RenderContext& rc)
     }
     mod_->recording = wantRecording ? 1 : 0;
 
+    /* ---- Phase-4 launch scheduler: drain message-thread requests
+     * and flip per-sequence playing flags BEFORE module_advance, so
+     * sequences launched on this block's quant boundary start
+     * emitting immediately rather than the block after. */
+    double blockStartBeat = -1.0, blockEndBeat = -1.0;
+    if (mod_->bpm > 0.0f)
+    {
+        if (auto* const ph = getPlayHead())
+        {
+            if (auto pos = ph->getPosition())
+            {
+                if (auto inSamples = pos->getTimeInSamples())
+                {
+                    const double samplesPerBeat = currentSampleRate_ * 60.0 / (double) mod_->bpm;
+                    if (samplesPerBeat > 0.0)
+                    {
+                        blockStartBeat = (double) *inSamples / samplesPerBeat;
+                        blockEndBeat   = blockStartBeat + (double) nsamples / samplesPerBeat;
+                    }
+                }
+                else if (auto ppq = pos->getPpqPosition())
+                {
+                    const double samplesPerBeat = currentSampleRate_ * 60.0 / (double) mod_->bpm;
+                    if (samplesPerBeat > 0.0)
+                    {
+                        blockStartBeat = *ppq;
+                        blockEndBeat   = blockStartBeat + (double) nsamples / samplesPerBeat;
+                    }
+                }
+            }
+        }
+    }
+    drainLaunchFifo();
+    applyPendingForBlock (blockStartBeat, blockEndBeat);
+
     /* Drain incoming MIDI from upstream (port 0 is our MIDI input).
      * Push events into clt->midi_in_buffer for the engine to consume in
      * module_advance — record / trigger / indicator paths run from
@@ -500,6 +535,92 @@ int TrackerNode::getSequenceLengthRows (int sequenceIdx) const noexcept
     if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return 0;
     const sequence* seq = mod_->seq[sequenceIdx];
     return seq != nullptr ? seq->length : 0;
+}
+
+/* === Audio-thread launch scheduler ===================================== */
+
+void TrackerNode::schedulePlaying (int sequenceIdx, double beatTarget, bool wantPlaying) noexcept
+{
+    /* Single-writer (message thread) — no lock needed.  juce::AbstractFifo
+     * gives us SPSC counters; we own the backing storage. */
+    int start1, size1, start2, size2;
+    launchFifo_.prepareToWrite (1, start1, size1, start2, size2);
+    if (size1 + size2 < 1) return;   // FIFO full — drop silently
+
+    const LaunchReq r { sequenceIdx, beatTarget, wantPlaying ? 1 : 0 };
+    if (size1 > 0)
+        launchFifoStorage_[(size_t) start1] = r;
+    else
+        launchFifoStorage_[(size_t) start2] = r;
+    launchFifo_.finishedWrite (1);
+}
+
+void TrackerNode::drainLaunchFifo() noexcept
+{
+    const int ready = launchFifo_.getNumReady();
+    if (ready == 0) return;
+
+    int start1, size1, start2, size2;
+    launchFifo_.prepareToRead (ready, start1, size1, start2, size2);
+
+    auto apply = [this] (const LaunchReq& r) noexcept
+    {
+        if (r.sequenceIdx < 0) return;
+        /* Grow pending array to cover this seqIdx.  Cheap; only on
+         * first request after a new sequence is created. */
+        while (pendingActions_.size() <= r.sequenceIdx)
+            pendingActions_.add ({});
+        auto& slot = pendingActions_.getReference (r.sequenceIdx);
+        slot.beatTarget  = r.beatTarget;
+        slot.wantPlaying = (r.wantPlaying != 0);
+        slot.valid       = true;
+    };
+
+    for (int i = 0; i < size1; ++i)
+        apply (launchFifoStorage_[(size_t) (start1 + i)]);
+    for (int i = 0; i < size2; ++i)
+        apply (launchFifoStorage_[(size_t) (start2 + i)]);
+
+    launchFifo_.finishedRead (ready);
+}
+
+void TrackerNode::applyPendingForBlock (double blockStartBeat, double blockEndBeat) noexcept
+{
+    if (mod_ == nullptr) return;
+
+    const int n = juce::jmin (pendingActions_.size(), mod_->nseq);
+    for (int i = 0; i < n; ++i)
+    {
+        auto& p = pendingActions_.getReference (i);
+        if (! p.valid) continue;
+
+        /* Immediate (-ve target) fires now; quantised targets fire
+         * inside the block that contains them.  If transport info
+         * is unavailable (blockStartBeat<0) only immediate fires. */
+        const bool inBlock = (p.beatTarget < 0.0)
+                          || (blockStartBeat >= 0.0
+                              && p.beatTarget >= blockStartBeat
+                              && p.beatTarget <  blockEndBeat);
+        if (! inBlock) continue;
+
+        sequence* seq = mod_->seq[i];
+        if (seq != nullptr)
+        {
+            sequence_set_playing (seq, p.wantPlaying ? 1 : 0);
+            if (p.wantPlaying)
+            {
+                /* Rewind to row 0 on launch (Ableton/Bitwig convention). */
+                seq->pos = 0.0;
+                for (int t = 0; t < seq->ntrk; ++t)
+                    if (seq->trk[t] != nullptr)
+                        seq->trk[t]->pos = 0.0;
+            }
+        }
+
+        if (i < lastSeqPos_.size())
+            lastSeqPos_.set (i, 0.0);
+        p.valid = false;
+    }
 }
 
 bool TrackerNode::sequenceWrappedSinceLastQuery (int sequenceIdx) noexcept

@@ -51,9 +51,15 @@ public:
     void mouseDown (const juce::MouseEvent&) override;
 
 private:
-    /* Per-clip launch state.  Phase 3 only uses Stopped/Playing; the
-     * WaitingTo* states are placeholders for Phase 4's quantisation. */
+    /* Per-clip launch state.  Driven by the message thread on bang(),
+     * reconciled toward engine truth in the UI timer once the audio
+     * thread flips seq->playing at the scheduled boundary. */
     enum class LiveState : uint8_t { Stopped, WaitingToStart, Playing, WaitingToStop };
+
+    /* Per-clip launch quantisation.  Off = immediate (next render
+     * block).  All other values snap to transport beats: Beat=1,
+     * Bar=beatsPerBar, TwoBars=2*bpb, FourBars=4*bpb. */
+    enum class LaunchQuant : uint8_t { Off, Beat, Bar, TwoBars, FourBars };
 
     struct SessionClip {
         juce::Uuid     id;
@@ -63,6 +69,7 @@ private:
         int            sequenceIdx   { -1 }; // -1 = unbound
         int            sceneRow      { 0 };
         int            columnIdx     { 0 };
+        LaunchQuant    launchQuant   { LaunchQuant::Bar };
         std::atomic<LiveState> state { LiveState::Stopped };
         /* UI-side cached engine state for diff-gated repaint. */
         bool           lastDrawnPlaying { false };
@@ -105,6 +112,13 @@ private:
 
     TrackerNode* lookupTracker (juce::uint32 nodeId) const;
     SessionClip* findClip (int sceneRow, int columnIdx) const;
+
+    /* Quantisation maths.  beatsPerBar() reads tags::beatsPerBar from
+     * the session (default 4).  computeTargetBeat returns -1.0 for
+     * Off quant or for a stopped transport — both fire immediately. */
+    int    beatsPerBar() const;
+    double currentTransportBeat() const;
+    double computeTargetBeat (double curBeat, LaunchQuant q) const;
 
     /* Persistence.  ValueTree is a child of the session's `objectData`
      * created by Session::setMissingProperties (`tags::sessionView`).
