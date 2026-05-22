@@ -691,8 +691,29 @@ public:
         }
     }
 
-    void pitchWheelMoved (int)            override {}
-    void controllerMoved (int, int)       override {}
+    /** MIDI pitch wheel.  JUCE passes the raw 14-bit value (0..16383,
+     *  centre 8192).  Convert to a fractional-semitone pitch ratio
+     *  (±kPitchBendSemis full range — hardcoded to 2 for now) and
+     *  fold it into the per-voice pitchBendMul; applyEnvelopeToVoice
+     *  multiplies it into voice.delta every envelope tick. */
+    void pitchWheelMoved (int value) override
+    {
+        constexpr double kPitchBendSemis = 2.0;     /* ± range */
+        const double norm  = (value - 8192) / 8192.0;       /* -1..+1 */
+        const double semis = norm * kPitchBendSemis;
+        pitchBendMul = std::pow (2.0, semis / 12.0);
+    }
+
+    /** MIDI CC.  We implement CC1 (mod wheel) → vibrato amount.  If
+     *  the instrument has autoVib configured, mod wheel scales /
+     *  augments its amplitude; if not, mod wheel synthesises a default
+     *  sine vibrato at rate=8 so "wiggle the wheel, hear vibrato"
+     *  works out of the box.  All other CCs are ignored for now. */
+    void controllerMoved (int controllerNumber, int newValue) override
+    {
+        if (controllerNumber == 1)
+            modWheelAmount = juce::jlimit (0.0f, 1.0f, newValue / 127.0f);
+    }
 
     void renderNextBlock (AudioBuffer<float>& out,
                           int startSample, int numSamples) override
@@ -902,7 +923,14 @@ private:
             if (amp >= cap) { autoVibAmp = (uint16_t) cap; autoVibSweepCounter = 0; }
             else            { autoVibAmp = (uint16_t) amp; }
         }
-        autoVibPos = (uint8_t) (autoVibPos + instrument->autoVib.rate);
+        /* Mod wheel synthesises a default-rate vibrato when the
+         * instrument has no autoVib rate configured — so wiggling the
+         * wheel produces audible motion out of the box.  Otherwise
+         * autoVib.rate drives the phase as before. */
+        const uint8_t rate = (instrument->autoVib.rate > 0)
+                              ? instrument->autoVib.rate
+                              : (modWheelAmount > 0.001f ? (uint8_t) 8 : (uint8_t) 0);
+        autoVibPos = (uint8_t) (autoVibPos + rate);
     }
 
     /* Advance an envelope state by one FT2 tick.  Mirrors the per-tick
@@ -1028,13 +1056,16 @@ private:
          * setVoiceGain doc above. */
         setVoiceGain (gain, pan, /*useRamp=*/true);
 
-        /* autoVib pitch modulation.  Always call setVoiceDelta so glide
-         * updates to basePitchMul (mono+portamento) actually reach the
-         * mixer even when autoVib is off — previously the no-autoVib
-         * path left voice.delta stuck at the value last set by
-         * startNote, freezing the pitch mid-glide. */
+        /* autoVib pitch modulation + mod-wheel synthesised vibrato.
+         * Always call setVoiceDelta so basePitchMul / pitchBendMul
+         * changes (glide, MIDI pitch wheel) reach the mixer even when
+         * vibrato is off — previously the no-autoVib path left
+         * voice.delta stuck at startNote's value. */
         double mult = 1.0;
-        if (instrument->autoVib.depth > 0)
+        const bool useAutoVib = instrument->autoVib.depth > 0;
+        const bool useModVib  = modWheelAmount > 0.001f;
+
+        if (useAutoVib || useModVib)
         {
             int16_t vibVal;
             switch (instrument->autoVib.type)
@@ -1044,7 +1075,14 @@ private:
                 case 3: vibVal = (int16_t) (((-(autoVibPos >> 1) + 64) & 127) - 64); break;
                 default: vibVal = kAutoVibSineTab[autoVibPos];
             }
-            const int32_t scaled = (vibVal * (int16_t) autoVibAmp) >> (6 + 8);
+            /* Effective amp combines the swept autoVibAmp with a
+             * mod-wheel contribution scaled to be musically usable at
+             * full deflection (~50% of max autoVib range = ~50 cents
+             * peak at the sine peak). */
+            const uint32_t modAmp     = (uint32_t) (modWheelAmount * 8192.0f);
+            const uint32_t effAmp     = juce::jmin (65535u,
+                                                    (uint32_t) autoVibAmp + modAmp);
+            const int32_t scaled = (vibVal * (int16_t) effAmp) >> (6 + 8);
             /* scaled is in "period" units; for our delta-driven voice
              * apply as a fractional semitone perturbation.  64 ~= ±1 semi
              * at full depth at the sine peak; scale to cents:
@@ -1052,7 +1090,7 @@ private:
             const double cents = scaled * (100.0 / 64.0);
             mult = std::pow (2.0, cents / 1200.0);
         }
-        setVoiceDelta (basePitchMul * mult);
+        setVoiceDelta (basePitchMul * mult * pitchBendMul);
     }
 
     /* ChannelTrackingSynth.noteOn / .noteOff call the glide helpers + the
@@ -1208,6 +1246,15 @@ private:
     double targetSemis  = 0.0;
     double glideStepSemisPerTick = 0.0;
     int    glideTicksRemaining   = 0;
+
+    /** MIDI controller state — JUCE calls pitchWheelMoved /
+     *  controllerMoved per voice when the host dispatches channel
+     *  events through Synthesiser.  Carried across notes so a long-
+     *  held bend or sustained mod-wheel position persists between
+     *  legato notes (we DON'T reset in startNote — channel-wide CCs
+     *  should outlive individual notes). */
+    double pitchBendMul   = 1.0;      /* multiplied into voice.delta */
+    float  modWheelAmount = 0.0f;     /* 0..1 — drives extra vibrato */
 
     /* Stereo render-gain cache. */
     float gLL = 1.0f, gLR = 0.0f, gRL = 0.0f, gRR = 1.0f;
