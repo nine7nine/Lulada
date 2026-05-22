@@ -100,16 +100,28 @@ SessionView::SessionView()
     setOpaque (true);
     setWantsKeyboardFocus (false);
 
-    /* Top toolbar — global actions the user reaches for often. */
-    addAndMakeVisible (stopAllBtn_);
-    addAndMakeVisible (rescanBtn_);
-    stopAllBtn_.onClick = [this]() { stopAllClips(); };
-    rescanBtn_ .onClick = [this]() { rescanColumns(); };
+    /* Tracker-editor-styled toolbar.  All actions delegate to
+     * SessionView methods; the value labels (scenes count, default
+     * quant) refresh via refreshToolbarLabels(), called from the
+     * 30 Hz tick on any structural change. */
+    configureToolbarButton (stopAllBtn_,     "STOP ALL",
+                            [this] { stopAllClips(); });
+    configureToolbarButton (sceneMinusBtn_,  "-",
+                            [this] { if (scenes_.size() > 1)
+                                         deleteScene (scenes_.size() - 1); });
+    configureToolbarButton (scenePlusBtn_,   "+",
+                            [this] { addScene(); });
+    configureToolbarButton (quantPrevBtn_,   "<",
+                            [this] { cycleDefaultQuant (-1); });
+    configureToolbarButton (quantNextBtn_,   ">",
+                            [this] { cycleDefaultQuant ( 1); });
+    configureToolbarButton (rescanBtn_,      "RESCAN",
+                            [this] { rescanColumns(); });
 
-    /* Footer "+" — append a scene.  Bottom-left under the scene
-     * label column matches Bitwig's affordance. */
-    addAndMakeVisible (addSceneBtn_);
-    addSceneBtn_.onClick = [this]() { addScene(); };
+    configureToolbarLabel  (scenesNameLabel_,  "SCENES", false);
+    configureToolbarLabel  (scenesValueLabel_, "8",      false);
+    configureToolbarLabel  (quantNameLabel_,   "QUANT",  false);
+    configureToolbarLabel  (quantValueLabel_,  "Bar",    false);
 
     /* Seed with 8 empty scenes so the user always has a target grid
      * to click into; persistence may overwrite this. */
@@ -120,6 +132,73 @@ SessionView::SessionView()
         s.name = "Scene " + String (i + 1);
         scenes_.add (s);
     }
+
+    refreshToolbarLabels();
+}
+
+void SessionView::configureToolbarButton (juce::TextButton& b,
+                                          const juce::String& text,
+                                          std::function<void()> onClick)
+{
+    b.setButtonText (text);
+    b.onClick = std::move (onClick);
+    /* Same palette as TrackerEditor::Toolbar — keeps the two views
+     * visually adjacent. */
+    b.setColour (juce::TextButton::buttonColourId,  juce::Colour { 0xff'2c'2c'2c });
+    b.setColour (juce::TextButton::textColourOffId, juce::Colour { 0xff'd0'd0'd0 });
+    b.setColour (juce::TextButton::textColourOnId,  juce::Colours::white);
+    addAndMakeVisible (b);
+}
+
+void SessionView::configureToolbarLabel (juce::Label& l,
+                                         const juce::String& text,
+                                         bool editable)
+{
+    l.setText (text, juce::dontSendNotification);
+    l.setJustificationType (juce::Justification::centred);
+    l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                  12.0f, editable ? juce::Font::bold : juce::Font::plain));
+    l.setColour (juce::Label::textColourId,
+                 editable ? juce::Colour { 0xff'ff'ff'ff }
+                          : juce::Colour { 0xff'c0'c0'c0 });
+    if (editable)
+    {
+        l.setColour (juce::Label::backgroundColourId,           juce::Colour { 0xff'18'18'18 });
+        l.setColour (juce::Label::backgroundWhenEditingColourId,juce::Colour { 0xff'30'30'30 });
+        l.setColour (juce::Label::outlineColourId,              juce::Colour { 0xff'40'40'40 });
+    }
+    addAndMakeVisible (l);
+}
+
+void SessionView::refreshToolbarLabels()
+{
+    scenesValueLabel_.setText (String (scenes_.size()), juce::dontSendNotification);
+    quantValueLabel_ .setText (formatLaunchQuant (defaultLaunchQuant_),
+                               juce::dontSendNotification);
+    sceneMinusBtn_.setEnabled (scenes_.size() > 1);
+}
+
+juce::String SessionView::formatLaunchQuant (LaunchQuant q) const noexcept
+{
+    switch (q)
+    {
+        case LaunchQuant::Off:      return "Off";
+        case LaunchQuant::Beat:     return "Beat";
+        case LaunchQuant::Bar:      return "Bar";
+        case LaunchQuant::TwoBars:  return "2 Bars";
+        case LaunchQuant::FourBars: return "4 Bars";
+    }
+    return {};
+}
+
+void SessionView::cycleDefaultQuant (int delta)
+{
+    const int n = 5;
+    int idx = (int) defaultLaunchQuant_;
+    idx = ((idx + delta) % n + n) % n;
+    defaultLaunchQuant_ = static_cast<LaunchQuant> (idx);
+    refreshToolbarLabels();
+    writeToSession();
 }
 
 SessionView::~SessionView() = default;
@@ -153,14 +232,42 @@ void SessionView::stabilizeContent()
 
 void SessionView::resized()
 {
-    /* Toolbar layout — two buttons left-aligned, compact spacing.
-     * Geometry helpers compute the rest from getLocalBounds() on
-     * demand so we don't have to push it here. */
-    auto tb = toolbarBounds().reduced (4, 4);
-    stopAllBtn_.setBounds (tb.removeFromLeft (80)); tb.removeFromLeft (4);
-    rescanBtn_ .setBounds (tb.removeFromLeft (72));
+    /* Toolbar layout — tracker-editor-styled groups, left-aligned.
+     * Each group: [name label] [value label] [- btn] [+ btn].  6 px
+     * gutters at the toolbar edges, 8 px gap between groups, 2 px
+     * gap within a group. */
+    auto tb = toolbarBounds();
+    int x  = tb.getX() + 6;
+    const int y  = tb.getY() + 4;
+    const int h  = tb.getHeight() - 8;
+    const int btnW   = 22;
+    const int nameW  = 56;
+    const int valueW = 64;
+    const int gap    = 2;
+    const int sep    = 10;
 
-    addSceneBtn_.setBounds (addSceneButtonBounds().reduced (4, 4));
+    auto place = [&] (juce::Component& c, int w)
+    {
+        c.setBounds (x, y, w, h);
+        x += w + gap;
+    };
+
+    place (stopAllBtn_, 80);
+    x += sep;
+
+    place (scenesNameLabel_,  nameW);
+    place (scenesValueLabel_, 32);
+    place (sceneMinusBtn_,    btnW);
+    place (scenePlusBtn_,     btnW);
+    x += sep;
+
+    place (quantNameLabel_,   nameW);
+    place (quantValueLabel_,  valueW);
+    place (quantPrevBtn_,     btnW);
+    place (quantNextBtn_,     btnW);
+    x += sep;
+
+    place (rescanBtn_, 64);
 }
 
 /* === Geometry ========================================================== */
@@ -173,11 +280,6 @@ Rectangle<int> SessionView::toolbarBounds() const noexcept
 Rectangle<int> SessionView::footerBounds() const noexcept
 {
     return getLocalBounds().removeFromBottom (kSceneFooterH);
-}
-
-Rectangle<int> SessionView::addSceneButtonBounds() const noexcept
-{
-    return footerBounds().removeFromLeft (kSceneLabelW);
 }
 
 Rectangle<int> SessionView::headerRowBounds() const noexcept
@@ -1090,6 +1192,7 @@ void SessionView::addScene()
     s.name = "Scene " + String (scenes_.size() + 1);
     scenes_.add (s);
     writeToSession();
+    refreshToolbarLabels();
     repaint();
 }
 
@@ -1107,6 +1210,7 @@ void SessionView::insertScene (int beforeRow)
             ++c->sceneRow;
 
     writeToSession();
+    refreshToolbarLabels();
     repaint();
 }
 
@@ -1301,6 +1405,7 @@ void SessionView::assignExistingPattern (int sceneRow, int columnIdx, int sequen
     clip->sequenceIdx   = sequenceIdx;
     clip->sceneRow      = sceneRow;
     clip->columnIdx     = columnIdx;
+    clip->launchQuant   = defaultLaunchQuant_;
     clips_.add (clip);
 
     writeToSession();
@@ -1373,6 +1478,7 @@ void SessionView::deleteScene (int row)
 
     scenes_.remove (row);
     writeToSession();
+    refreshToolbarLabels();
     repaint();
 }
 
@@ -1398,6 +1504,7 @@ void SessionView::addClipAt (int sceneRow, int columnIdx)
     clip->sequenceIdx   = seqIdx;
     clip->sceneRow      = sceneRow;
     clip->columnIdx     = columnIdx;
+    clip->launchQuant   = defaultLaunchQuant_;
     clips_.add (clip);
 
     writeToSession();
@@ -1553,6 +1660,12 @@ void SessionView::readFromSession()
     const auto tree = getOrCreateSessionViewTree();
     if (! tree.isValid()) return;
 
+    /* Toolbar prefs at the sessionView root. */
+    defaultLaunchQuant_ = static_cast<LaunchQuant> (
+        juce::jlimit (0, 4, (int) tree.getProperty ("defaultLaunchQuant",
+                                                    (int) LaunchQuant::Bar)));
+    refreshToolbarLabels();
+
     /* Columns. */
     columns_.clearQuick();
     const auto colsTree = tree.getChildWithName ("columns");
@@ -1620,6 +1733,9 @@ void SessionView::writeToSession()
 {
     auto tree = getOrCreateSessionViewTree();
     if (! tree.isValid()) return;
+
+    /* Toolbar prefs at the sessionView root. */
+    tree.setProperty ("defaultLaunchQuant", (int) defaultLaunchQuant_, nullptr);
 
     tree.removeAllChildren (nullptr);
 

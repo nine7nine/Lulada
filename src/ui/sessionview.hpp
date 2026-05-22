@@ -11,7 +11,6 @@
 #include <element/transport.hpp>
 #include <element/ui/content.hpp>
 
-#include "ui/blocktoolbutton.hpp"
 
 #define EL_VIEW_SESSION_VIEW "SessionView"
 
@@ -168,7 +167,6 @@ private:
      * by paint() + mouseDown() for hit-testing. */
     juce::Rectangle<int> toolbarBounds() const noexcept;
     juce::Rectangle<int> footerBounds() const noexcept;
-    juce::Rectangle<int> addSceneButtonBounds() const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -185,11 +183,26 @@ private:
     Services* services_ = nullptr;
     Transport::MonitorPtr monitor_;
 
-    /* Top toolbar buttons + footer "+ Scene".  BlockToolButton matches
-     * the tracker editor's toolbar density. */
-    BlockToolButton stopAllBtn_   { "Stop All" };
-    BlockToolButton rescanBtn_    { "Rescan"   };
-    BlockToolButton addSceneBtn_  { "+ Scene"  };
+    /* Top toolbar — tracker-editor-styled (juce::TextButton with the
+     * same palette + juce::Label for static name / editable value
+     * pairs).  Mirrors `TrackerEditor::Toolbar` so the two views
+     * share a visual vocabulary. */
+    juce::TextButton stopAllBtn_, rescanBtn_;
+    juce::TextButton sceneMinusBtn_, scenePlusBtn_;
+    juce::TextButton quantPrevBtn_,  quantNextBtn_;
+    juce::Label scenesNameLabel_, scenesValueLabel_;
+    juce::Label quantNameLabel_,  quantValueLabel_;
+
+    /* Default launch quant applied to NEW clips when they're added
+     * (right-click "Add new pattern" / "Assign existing pattern" or
+     * drag-clone).  Persisted to the session XML at sessionView root. */
+    LaunchQuant defaultLaunchQuant_ { LaunchQuant::Bar };
+
+    void configureToolbarButton (juce::TextButton&, const juce::String&, std::function<void()>);
+    void configureToolbarLabel  (juce::Label&, const juce::String& text, bool editable);
+    void refreshToolbarLabels();
+    void cycleDefaultQuant (int delta);   // +1 next / -1 prev
+    juce::String formatLaunchQuant (LaunchQuant) const noexcept;
 
     juce::Array<SessionColumn>      columns_;
     juce::OwnedArray<SessionClip>   clips_;
@@ -225,12 +238,12 @@ private:
 
     /* Layout constants — sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
-    static constexpr int kToolbarH     = 28;
+    static constexpr int kToolbarH     = 36;
     static constexpr int kHeaderH      = 28;
     static constexpr int kSceneLabelW  = 84;
     static constexpr int kColW         = 132;
     static constexpr int kRowH         = 30;
-    static constexpr int kSceneFooterH = 26;
+    static constexpr int kSceneFooterH = 22;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)
 };
