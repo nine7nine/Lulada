@@ -988,13 +988,14 @@ void SessionView::paint (Graphics& g)
                 g.fillRect (cell);
             }
 
-            /* Launch button -- styled to match clip play buttons so
-             * the user reads it as the same gesture.  Lights up
-             * amber when any clip in the scene is currently active. */
+            /* Launch button -- gray background by default, amber
+             * when ONE clip in the scene is currently playing.
+             * Waiting-state clips don't light it up so a scene on
+             * its way out doesn't look "active" anymore. */
             const bool sceneActive = sceneHasActiveClip (r);
             g.setColour (sceneActive
-                            ? kPlayheadAccent.withAlpha (0.30f)
-                            : juce::Colours::black.withAlpha (0.20f));
+                            ? kPlayheadAccent.withAlpha (0.35f)
+                            : Colour { 0xff'2a'2a'2a });
             g.fillRect (launchR);
             g.setColour (sceneActive ? kPlayheadAccent
                                      : Colour { 0xff'd0'd0'd0 });
@@ -1672,10 +1673,10 @@ void SessionView::bangScene (int sceneRow)
     }
 
     /* Pick the slowest quant among this scene's clips so they all
-     * snap to the same target beat -- Bitwig convention.  If clips
-     * use heterogeneous quants the per-clip values are ignored for
-     * the duration of this bang; subsequent solo bangs use the
-     * clip's own quant again. */
+     * snap to the same target beat -- Bitwig convention.  Empty
+     * scenes fall back to the toolbar's default quant: launching
+     * an empty scene is the user's way of saying "stop everything
+     * else at this boundary," and we still want the boundary. */
     LaunchQuant slowest = LaunchQuant::Off;
     bool any = false;
     for (auto* c : clips_)
@@ -1685,7 +1686,7 @@ void SessionView::bangScene (int sceneRow)
         if ((int) c->launchQuant > (int) slowest)
             slowest = c->launchQuant;
     }
-    if (! any) return;
+    if (! any) slowest = defaultLaunchQuant_;
 
     const bool transportPlaying = (monitor_ != nullptr && monitor_->playing.get());
     const double targetBeat = transportPlaying
@@ -1881,11 +1882,14 @@ void SessionView::bangClipByUuid (const juce::Uuid& clipId)
 
 bool SessionView::sceneHasActiveClip (int sceneRow) const noexcept
 {
+    /* "Active" here means CURRENTLY emitting -- only the Playing
+     * state, not WaitingToStart or WaitingToStop.  Scenes whose
+     * clips are queued to stop on the next bar shouldn't read as
+     * "active" -- they're on their way out. */
     for (auto* c : clips_)
     {
         if (c->sceneRow != sceneRow) continue;
-        const auto s = c->state.load (std::memory_order_relaxed);
-        if (s != LiveState::Stopped)
+        if (c->state.load (std::memory_order_relaxed) == LiveState::Playing)
             return true;
     }
     return false;
