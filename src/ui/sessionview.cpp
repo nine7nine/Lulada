@@ -3,6 +3,8 @@
 
 #include "ui/sessionview.hpp"
 
+#include <limits>
+
 #include <element/audioengine.hpp>
 #include <element/context.hpp>
 #include <element/node.hpp>
@@ -514,8 +516,17 @@ void SessionView::mouseDown (const MouseEvent& e)
                 quant.addItem (13, "2 Bars",  true, cq == LaunchQuant::TwoBars);
                 quant.addItem (14, "4 Bars",  true, cq == LaunchQuant::FourBars);
 
+                juce::PopupMenu follow;
+                const auto cf = clip->followAction;
+                follow.addItem (20, "None (loop)",      true, cf == FollowAction::None);
+                follow.addItem (21, "Stop",             true, cf == FollowAction::Stop);
+                follow.addItem (22, "Restart",          true, cf == FollowAction::RestartClip);
+                follow.addItem (23, "Next clip",        true, cf == FollowAction::NextClip);
+                follow.addItem (24, "First clip",       true, cf == FollowAction::FirstClip);
+
                 juce::PopupMenu m;
                 m.addSubMenu ("Launch quantisation", quant);
+                m.addSubMenu ("Follow action",       follow);
                 m.addSeparator();
                 m.addItem (1, "Delete clip");
 
@@ -523,11 +534,16 @@ void SessionView::mouseDown (const MouseEvent& e)
                 switch (r)
                 {
                     case 1: deleteClip (*clip); break;
-                    case 10: clip->launchQuant = LaunchQuant::Off;      writeToSession(); break;
-                    case 11: clip->launchQuant = LaunchQuant::Beat;     writeToSession(); break;
-                    case 12: clip->launchQuant = LaunchQuant::Bar;      writeToSession(); break;
-                    case 13: clip->launchQuant = LaunchQuant::TwoBars;  writeToSession(); break;
-                    case 14: clip->launchQuant = LaunchQuant::FourBars; writeToSession(); break;
+                    case 10: clip->launchQuant = LaunchQuant::Off;       writeToSession(); break;
+                    case 11: clip->launchQuant = LaunchQuant::Beat;      writeToSession(); break;
+                    case 12: clip->launchQuant = LaunchQuant::Bar;       writeToSession(); break;
+                    case 13: clip->launchQuant = LaunchQuant::TwoBars;   writeToSession(); break;
+                    case 14: clip->launchQuant = LaunchQuant::FourBars;  writeToSession(); break;
+                    case 20: clip->followAction = FollowAction::None;        writeToSession(); break;
+                    case 21: clip->followAction = FollowAction::Stop;        writeToSession(); break;
+                    case 22: clip->followAction = FollowAction::RestartClip; writeToSession(); break;
+                    case 23: clip->followAction = FollowAction::NextClip;    writeToSession(); break;
+                    case 24: clip->followAction = FollowAction::FirstClip;   writeToSession(); break;
                     default: break;
                 }
             }
@@ -649,18 +665,14 @@ double SessionView::computeTargetBeat (double curBeat, LaunchQuant q) const
     return std::ceil ((curBeat + kEps) / qb) * qb;
 }
 
-void SessionView::bangClip (SessionClip& clip)
+void SessionView::transitionClip (SessionClip& clip, double targetBeat)
 {
     auto* trk = lookupTracker (clip.trackerNodeId);
     if (trk == nullptr || clip.sequenceIdx < 0) return;
 
     const LiveState cur = clip.state.load (std::memory_order_relaxed);
 
-    /* === Cancel rules: re-banging a queued clip un-queues it.
-     * Re-banging a WaitingToStart cancels the start → stays Stopped.
-     * Re-banging a WaitingToStop cancels the stop → stays Playing.
-     * Both cancel paths fire an immediate schedule that overwrites
-     * the pending action in the audio thread. */
+    /* === Cancel rules: re-banging a queued clip un-queues it. */
     if (cur == LiveState::WaitingToStart)
     {
         trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
@@ -678,20 +690,9 @@ void SessionView::bangClip (SessionClip& clip)
 
     const bool wantPlaying = (cur != LiveState::Playing);
 
-    /* Determine target beat.  Transport-stopped path forces immediate
-     * launch — quant boundaries make no sense without a moving
-     * playhead.  Off-quant always immediate. */
-    const bool transportPlaying = (monitor_ != nullptr && monitor_->playing.get());
-    const double targetBeat = (transportPlaying)
-        ? computeTargetBeat (currentTransportBeat(), clip.launchQuant)
-        : -1.0;
-
-    /* === Same-column mutual exclusion ===
-     * If we're STARTING this clip and another clip on the same column
-     * is currently Playing or queued to start, push a STOP request
-     * for it at the SAME target beat.  The audio thread applies both
-     * pendings in the same render block → atomic switch with zero
-     * inter-clip skew. */
+    /* Same-column mutual exclusion at the shared targetBeat — A→stop
+     * and B→start hit the audio thread in the same render block, so
+     * the flip is atomic.  Skip self. */
     if (wantPlaying)
     {
         for (auto* other : clips_)
@@ -712,27 +713,119 @@ void SessionView::bangClip (SessionClip& clip)
         }
     }
 
-    /* Schedule this clip's transition. */
     trk->schedulePlaying (clip.sequenceIdx, targetBeat, wantPlaying);
 
-    /* Update message-thread state.  Immediate launches go straight to
-     * Playing/Stopped (the UI tick will reconcile once engine confirms);
-     * quantised launches go through WaitingTo* until the boundary fires. */
-    LiveState next;
-    if (targetBeat < 0.0)
-        next = wantPlaying ? LiveState::Playing : LiveState::Stopped;
-    else
-        next = wantPlaying ? LiveState::WaitingToStart : LiveState::WaitingToStop;
+    const LiveState next = (targetBeat < 0.0)
+        ? (wantPlaying ? LiveState::Playing       : LiveState::Stopped)
+        : (wantPlaying ? LiveState::WaitingToStart : LiveState::WaitingToStop);
     clip.state.store (next, std::memory_order_relaxed);
     repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+}
+
+void SessionView::bangClip (SessionClip& clip)
+{
+    const bool transportPlaying = (monitor_ != nullptr && monitor_->playing.get());
+    const double targetBeat = transportPlaying
+        ? computeTargetBeat (currentTransportBeat(), clip.launchQuant)
+        : -1.0;
+    transitionClip (clip, targetBeat);
+}
+
+void SessionView::applyFollowAction (SessionClip& clip)
+{
+    /* Called from the UI timer when a playing clip wraps past its
+     * end.  The actions schedule through the audio-thread FIFO; no
+     * direct engine mutation here. */
+    auto* trk = lookupTracker (clip.trackerNodeId);
+    if (trk == nullptr) return;
+
+    switch (clip.followAction)
+    {
+        case FollowAction::None:
+            break;
+
+        case FollowAction::Stop:
+            trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
+            clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
+            repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+            break;
+
+        case FollowAction::RestartClip:
+            /* schedulePlaying(_, true) rewinds pos to 0 even when the
+             * sequence is already playing — see applyPendingForBlock
+             * in tracker.cpp.  Effectively a re-trigger on wrap. */
+            trk->schedulePlaying (clip.sequenceIdx, -1.0, true);
+            break;
+
+        case FollowAction::NextClip:
+        {
+            SessionClip* nextClip = nullptr;
+            int bestRow = std::numeric_limits<int>::max();
+            for (auto* c : clips_)
+            {
+                if (c == &clip) continue;
+                if (c->columnIdx != clip.columnIdx) continue;
+                if (c->sceneRow > clip.sceneRow && c->sceneRow < bestRow)
+                    { bestRow = c->sceneRow; nextClip = c; }
+            }
+            if (nextClip != nullptr)
+                bangClip (*nextClip);   // mutual-exclusion stops this one
+            else
+            {
+                /* No further clip — fall through to Stop. */
+                trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
+                clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
+                repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+            }
+            break;
+        }
+
+        case FollowAction::FirstClip:
+        {
+            SessionClip* firstClip = nullptr;
+            int bestRow = std::numeric_limits<int>::max();
+            for (auto* c : clips_)
+            {
+                if (c == &clip) continue;
+                if (c->columnIdx != clip.columnIdx) continue;
+                if (c->sceneRow < bestRow)
+                    { bestRow = c->sceneRow; firstClip = c; }
+            }
+            if (firstClip != nullptr)
+                bangClip (*firstClip);
+            break;
+        }
+    }
 }
 
 void SessionView::bangScene (int sceneRow)
 {
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+
+    /* Pick the slowest quant among this scene's clips so they all
+     * snap to the same target beat — Bitwig convention.  If clips
+     * use heterogeneous quants the per-clip values are ignored for
+     * the duration of this bang; subsequent solo bangs use the
+     * clip's own quant again. */
+    LaunchQuant slowest = LaunchQuant::Off;
+    bool any = false;
+    for (auto* c : clips_)
+    {
+        if (c->sceneRow != sceneRow) continue;
+        any = true;
+        if ((int) c->launchQuant > (int) slowest)
+            slowest = c->launchQuant;
+    }
+    if (! any) return;
+
+    const bool transportPlaying = (monitor_ != nullptr && monitor_->playing.get());
+    const double targetBeat = transportPlaying
+        ? computeTargetBeat (currentTransportBeat(), slowest)
+        : -1.0;
+
     for (auto* c : clips_)
         if (c->sceneRow == sceneRow)
-            bangClip (*c);
+            transitionClip (*c, targetBeat);
 }
 
 void SessionView::stopAllClips()
@@ -1035,6 +1128,9 @@ void SessionView::readFromSession()
             clip->launchQuant   = static_cast<LaunchQuant> (
                 juce::jlimit (0, 4, (int) cn.getProperty ("launchQuant",
                                                           (int) LaunchQuant::Bar)));
+            clip->followAction  = static_cast<FollowAction> (
+                juce::jlimit (0, 4, (int) cn.getProperty ("followAction",
+                                                          (int) FollowAction::None)));
             clips_.add (clip);
         }
     }
@@ -1084,6 +1180,7 @@ void SessionView::writeToSession()
         cn.setProperty ("sceneRow",      clip->sceneRow,                   nullptr);
         cn.setProperty ("columnIdx",     clip->columnIdx,                  nullptr);
         cn.setProperty ("launchQuant",   (int) clip->launchQuant,          nullptr);
+        cn.setProperty ("followAction",  (int) clip->followAction,         nullptr);
         clipsTree.appendChild (cn, nullptr);
     }
     tree.appendChild (clipsTree, nullptr);
@@ -1150,6 +1247,18 @@ void SessionView::timerCallback()
 
         if (needRepaint)
             repaint (cellBounds (clip->sceneRow, clip->columnIdx));
+
+        /* Follow-action edge: only check after state reconciliation
+         * so a freshly-launched clip doesn't immediately fire its
+         * follow action on the first poll.  sequenceWrappedSinceLastQuery
+         * consumes the wrap edge — repeated calls in the same wrap
+         * window return false. */
+        if (next == LiveState::Playing
+            && clip->followAction != FollowAction::None
+            && trk->sequenceWrappedSinceLastQuery (clip->sequenceIdx))
+        {
+            applyFollowAction (*clip);
+        }
     }
 }
 

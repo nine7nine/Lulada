@@ -61,6 +61,15 @@ private:
      * Bar=beatsPerBar, TwoBars=2*bpb, FourBars=4*bpb. */
     enum class LaunchQuant : uint8_t { Off, Beat, Bar, TwoBars, FourBars };
 
+    /* Action applied when a playing clip's sequence wraps past its end.
+     *  - None: keep looping (default; vht naturally loops).
+     *  - Stop: schedule immediate stop on wrap.
+     *  - RestartClip: re-launch from row 0 (same clip).
+     *  - NextClip: bang the clip on the next-greater sceneRow in the
+     *    same column.  If none exists, falls back to Stop.
+     *  - FirstClip: bang the lowest-sceneRow clip on the same column. */
+    enum class FollowAction : uint8_t { None, Stop, RestartClip, NextClip, FirstClip };
+
     struct SessionClip {
         juce::Uuid     id;
         juce::String   name;
@@ -70,6 +79,7 @@ private:
         int            sceneRow      { 0 };
         int            columnIdx     { 0 };
         LaunchQuant    launchQuant   { LaunchQuant::Bar };
+        FollowAction   followAction  { FollowAction::None };
         std::atomic<LiveState> state { LiveState::Stopped };
         /* UI-side cached engine state for diff-gated repaint. */
         bool           lastDrawnPlaying { false };
@@ -102,6 +112,8 @@ private:
     void bangClip   (SessionClip&);
     void bangScene  (int sceneRow);
     void stopAllClips();
+    void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
+    void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
     void deleteClip (SessionClip&);
     void openPatternEditor (SessionClip&);  // popup tracker editor at clip's seqIdx
