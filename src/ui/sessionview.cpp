@@ -361,7 +361,47 @@ Rectangle<int> SessionView::gridBodyBounds() const noexcept
     r.removeFromTop (kToolbarH + kHeaderH);
     r.removeFromBottom (kSceneFooterH + kColumnStopH);
     r.removeFromLeft (kSceneLabelW);
+    r.removeFromRight (kMasterColW);
     return r;
+}
+
+Rectangle<int> SessionView::masterColumnBounds() const noexcept
+{
+    auto r = getLocalBounds();
+    r.removeFromTop (kToolbarH + kHeaderH);
+    r.removeFromBottom (kSceneFooterH + kColumnStopH);
+    return r.removeFromRight (kMasterColW);
+}
+
+Rectangle<int> SessionView::masterCellBounds (int sceneRow) const noexcept
+{
+    const auto col = masterColumnBounds();
+    return Rectangle<int> (col.getX(),
+                           col.getY() + sceneRow * kRowH - gridScrollY_,
+                           col.getWidth(), kRowH);
+}
+
+Rectangle<int> SessionView::masterLaunchButtonBounds (int sceneRow) const noexcept
+{
+    auto inner = masterCellBounds (sceneRow).reduced (3, 3);
+    return inner.removeFromLeft (22);
+}
+
+Rectangle<int> SessionView::masterTempoFieldBounds (int sceneRow) const noexcept
+{
+    /* Right ~80 px of the master cell holds tempo + sig side-by-side.
+     * Layout: [launch] [tempo  ][sig] */
+    auto inner = masterCellBounds (sceneRow).reduced (3, 3);
+    inner.removeFromLeft (22 + 4);            // launch button + spacing
+    return inner.removeFromLeft (juce::jmax (40, inner.getWidth() - 52));
+}
+
+Rectangle<int> SessionView::masterSigFieldBounds (int sceneRow) const noexcept
+{
+    auto inner = masterCellBounds (sceneRow).reduced (3, 3);
+    inner.removeFromLeft (22 + 4);
+    inner.removeFromLeft (juce::jmax (40, inner.getWidth() - 52));
+    return inner;
 }
 
 Rectangle<int> SessionView::cellBounds (int sceneRow, int columnIdx) const noexcept
@@ -440,8 +480,37 @@ bool SessionView::hitTestColumnStop (Point<int> p, int& outCol) const noexcept
     const auto row = columnStopRowBounds();
     if (! row.contains (p)) return false;
     if (p.x < row.getX() + kSceneLabelW) return false;
+    /* Stop row stops before the master column. */
+    const int gridWidth = row.getWidth() - kSceneLabelW - kMasterColW;
+    if (p.x >= row.getX() + kSceneLabelW + gridWidth) return false;
     outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
     return outCol >= 0 && outCol < columns_.size();
+}
+
+bool SessionView::hitTestMasterCell (Point<int> p, int& outRow) const noexcept
+{
+    const auto col = masterColumnBounds();
+    if (! col.contains (p)) return false;
+    outRow = (p.y - col.getY() + gridScrollY_) / kRowH;
+    return outRow >= 0 && outRow < scenes_.size();
+}
+
+bool SessionView::hitTestMasterLaunch (Point<int> p, int& outRow) const noexcept
+{
+    if (! hitTestMasterCell (p, outRow)) return false;
+    return masterLaunchButtonBounds (outRow).contains (p);
+}
+
+bool SessionView::hitTestMasterTempo (Point<int> p, int& outRow) const noexcept
+{
+    if (! hitTestMasterCell (p, outRow)) return false;
+    return masterTempoFieldBounds (outRow).contains (p);
+}
+
+bool SessionView::hitTestMasterSig (Point<int> p, int& outRow) const noexcept
+{
+    if (! hitTestMasterCell (p, outRow)) return false;
+    return masterSigFieldBounds (outRow).contains (p);
 }
 
 int SessionView::maxGridScrollY() const noexcept
@@ -718,6 +787,92 @@ void SessionView::paint (Graphics& g)
         g.fillRect (target.getX() + 4, y - 1, target.getWidth() - 8, 3);
     }
 
+    /* --- Master column (rightmost, scrolls with grid) ------------
+     * Ableton-style "scene master" — each row shows a launch button
+     * + tempo + signature.  Drawn inside the scrollable clip region
+     * so it scrolls in lock-step with grid rows.  See
+     * project_session_view_ableton_scene_master_column memory. */
+    {
+        const auto masterCol = masterColumnBounds();
+        /* Strip background — slightly darker than the gutter so it
+         * reads as a chrome column rather than a content cell. */
+        g.setColour (Colour { 0xff'10'10'10 });
+        g.fillRect (masterCol);
+        g.setColour (kCellOutlineColour);
+        g.drawVerticalLine (masterCol.getX(),
+                            (float) masterCol.getY(),
+                            (float) masterCol.getBottom());
+
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      kCellFontSize, juce::Font::plain));
+
+        for (int r = 0; r < scenes_.size(); ++r)
+        {
+            const auto cell    = masterCellBounds (r);
+            const auto launchR = masterLaunchButtonBounds (r);
+            const auto tempoR  = masterTempoFieldBounds (r);
+            const auto sigR    = masterSigFieldBounds (r);
+            const auto& sc     = scenes_.getReference (r);
+
+            /* Row alternation hint mirrors the scene-label strip. */
+            if ((r & 3) == 0)
+            {
+                g.setColour (Colour { 0xff'14'14'14 });
+                g.fillRect (cell);
+            }
+
+            /* Launch button — small bordered play triangle.  Mirrors
+             * the per-clip play button visually so the affordance
+             * reads as the same gesture. */
+            g.setColour (Colour { 0xff'2c'2c'2c });
+            g.fillRect (launchR);
+            g.setColour (Colours::white.withAlpha (0.80f));
+            {
+                juce::Path p;
+                const float gx = (float) launchR.getX() + 6.0f;
+                const float gy = (float) launchR.getY() + 6.0f;
+                const float gh = (float) launchR.getHeight() - 12.0f;
+                const float gw = gh * 0.866f;
+                p.addTriangle (gx,      gy,
+                               gx,      gy + gh,
+                               gx + gw, gy + gh * 0.5f);
+                g.fillPath (p);
+            }
+
+            /* Tempo + sig fields — show value or "—" when no override
+             * is set.  Editable via click (handled in mouseDown via
+             * AlertWindow prompts); editable affordance is the dark
+             * inset background + bright text. */
+            auto drawField = [&] (const Rectangle<int>& rr, const String& text,
+                                  bool overrideSet)
+            {
+                g.setColour (overrideSet ? Colour { 0xff'18'18'18 }
+                                         : Colour { 0xff'13'13'13 });
+                g.fillRect (rr);
+                g.setColour (overrideSet ? Colour { 0xff'ff'ff'ff }
+                                         : Colour { 0xff'70'70'70 });
+                g.drawText (text, rr.reduced (4, 0),
+                            juce::Justification::centred, true);
+            };
+
+            drawField (tempoR,
+                       sc.tempoOverride > 0.0 ? String (sc.tempoOverride, 1)
+                                              : String ("—"),
+                       sc.tempoOverride > 0.0);
+            drawField (sigR,
+                       (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
+                            ? String (sc.beatsPerBar) + "/" + String (sc.beatDivisor)
+                            : String ("—"),
+                       sc.beatsPerBar > 0 && sc.beatDivisor > 0);
+
+            /* Row divider. */
+            g.setColour (kCellOutlineColour);
+            g.drawHorizontalLine (cell.getBottom() - 1,
+                                  (float) cell.getX(),
+                                  (float) cell.getRight());
+        }
+    }
+
     /* Close the scrollable-area clip region — everything after this
      * draws into the fixed (non-scrolling) chrome strips. */
     g.restoreState();
@@ -785,6 +940,32 @@ void SessionView::mouseDown (const MouseEvent& e)
 
     if (e.mods.isPopupMenu())
     {
+        /* Master column right-click — scene transport overrides. */
+        if (hitTestMasterCell (e.getPosition(), row))
+        {
+            const auto& sc = scenes_.getReference (row);
+            juce::PopupMenu m;
+            m.addItem (1, "Launch scene");
+            m.addSeparator();
+            m.addItem (10, "Set tempo...");
+            m.addItem (11, "Clear tempo override", sc.tempoOverride > 0.0);
+            m.addSeparator();
+            m.addItem (12, "Set signature...");
+            m.addItem (13, "Clear signature override",
+                       sc.beatsPerBar > 0 && sc.beatDivisor > 0);
+            const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
+            switch (r)
+            {
+                case 1:  bangScene           (row); break;
+                case 10: editSceneTempo      (row); break;
+                case 11: clearSceneTempo     (row); break;
+                case 12: editSceneSignature  (row); break;
+                case 13: clearSceneSignature (row); break;
+                default: break;
+            }
+            return;
+        }
+
         if (hitTestCell (e.getPosition(), row, col))
         {
             if (auto* clip = findClip (row, col))
@@ -894,6 +1075,24 @@ void SessionView::mouseDown (const MouseEvent& e)
     if (hitTestColumnStop (e.getPosition(), col))
     {
         stopColumn (col);
+        return;
+    }
+
+    /* Master column launch button → bang scene.
+     * Master column tempo/sig fields → click-to-edit prompts. */
+    if (hitTestMasterLaunch (e.getPosition(), row))
+    {
+        bangScene (row);
+        return;
+    }
+    if (hitTestMasterTempo (e.getPosition(), row))
+    {
+        editSceneTempo (row);
+        return;
+    }
+    if (hitTestMasterSig (e.getPosition(), row))
+    {
+        editSceneSignature (row);
         return;
     }
 
@@ -1294,6 +1493,11 @@ void SessionView::bangScene (int sceneRow)
 {
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
 
+    /* Apply Ableton-style scene-level transport overrides (tempo +
+     * time signature) BEFORE launching clips so they latch the new
+     * tempo immediately when their beat-target is computed. */
+    applySceneOverridesToTransport (scenes_.getReference (sceneRow));
+
     /* Pick the slowest quant among this scene's clips so they all
      * snap to the same target beat — Bitwig convention.  If clips
      * use heterogeneous quants the per-clip values are ignored for
@@ -1318,6 +1522,112 @@ void SessionView::bangScene (int sceneRow)
     for (auto* c : clips_)
         if (c->sceneRow == sceneRow)
             transitionClip (*c, targetBeat);
+}
+
+void SessionView::applySceneOverridesToTransport (const SessionScene& s)
+{
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+
+    /* Session::setProperty is protected — go through the public
+     * data() ValueTree directly.  Same effect: the audio engine's
+     * ValueTree::Listener picks up the change and routes it to the
+     * Transport monitor. */
+    auto tree = sess->data();
+    if (! tree.isValid()) return;
+    /* ValueTree property writes broadcast through the session's
+     * ObjectModel listener chain — same path the Session Settings
+     * panel uses to nudge BPM at runtime.  No notifyChanged() poke
+     * needed (it's private and the listener path runs anyway). */
+    if (s.tempoOverride > 0.0)
+        tree.setProperty (tags::tempo, s.tempoOverride, nullptr);
+    if (s.beatsPerBar > 0)
+        tree.setProperty (tags::beatsPerBar, s.beatsPerBar, nullptr);
+    if (s.beatDivisor > 0)
+        tree.setProperty (tags::beatDivisor, s.beatDivisor, nullptr);
+}
+
+void SessionView::editSceneTempo (int sceneRow)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    auto& sc = scenes_.getReference (sceneRow);
+
+    auto* aw = new juce::AlertWindow ("Scene tempo",
+                                      "Enter tempo in BPM (blank or 0 = no override):",
+                                      juce::AlertWindow::NoIcon);
+    aw->addTextEditor ("tempo", sc.tempoOverride > 0.0
+                                    ? juce::String (sc.tempoOverride, 2)
+                                    : juce::String());
+    aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    aw->enterModalState (true,
+        juce::ModalCallbackFunction::create (
+            [this, sceneRow, aw] (int result) {
+                if (result != 1 || sceneRow >= scenes_.size()) return;
+                const auto txt = aw->getTextEditorContents ("tempo").trim();
+                auto& s = scenes_.getReference (sceneRow);
+                if (txt.isEmpty()) { s.tempoOverride = -1.0; }
+                else
+                {
+                    const double v = txt.getDoubleValue();
+                    s.tempoOverride = (v > 0.0)
+                        ? juce::jlimit (20.0, 999.0, v)
+                        : -1.0;
+                }
+                writeToSession();
+                repaint (masterCellBounds (sceneRow));
+            }),
+        true);
+}
+
+void SessionView::editSceneSignature (int sceneRow)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    auto& sc = scenes_.getReference (sceneRow);
+
+    auto* aw = new juce::AlertWindow ("Scene time signature",
+                                      "Numerator / denominator (blank = no override):",
+                                      juce::AlertWindow::NoIcon);
+    aw->addTextEditor ("num", sc.beatsPerBar > 0 ? juce::String (sc.beatsPerBar)
+                                                 : juce::String());
+    aw->addTextEditor ("den", sc.beatDivisor > 0 ? juce::String (sc.beatDivisor)
+                                                 : juce::String());
+    aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    aw->enterModalState (true,
+        juce::ModalCallbackFunction::create (
+            [this, sceneRow, aw] (int result) {
+                if (result != 1 || sceneRow >= scenes_.size()) return;
+                auto& s = scenes_.getReference (sceneRow);
+                const int num = aw->getTextEditorContents ("num").trim().getIntValue();
+                const int den = aw->getTextEditorContents ("den").trim().getIntValue();
+                s.beatsPerBar = juce::jlimit (0, 32, num);
+                s.beatDivisor = juce::jlimit (0, 32, den);
+                writeToSession();
+                repaint (masterCellBounds (sceneRow));
+            }),
+        true);
+}
+
+void SessionView::clearSceneTempo (int sceneRow)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    scenes_.getReference (sceneRow).tempoOverride = -1.0;
+    writeToSession();
+    repaint (masterCellBounds (sceneRow));
+}
+
+void SessionView::clearSceneSignature (int sceneRow)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    auto& s = scenes_.getReference (sceneRow);
+    s.beatsPerBar = 0;
+    s.beatDivisor = 0;
+    writeToSession();
+    repaint (masterCellBounds (sceneRow));
 }
 
 void SessionView::stopAllClips()
@@ -1858,9 +2168,12 @@ void SessionView::readFromSession()
         {
             const auto sn = scenesTree.getChild (i);
             SessionScene sc;
-            sc.id    = Uuid (sn.getProperty ("id").toString());
-            sc.name  = sn.getProperty ("name", "Scene " + String (i + 1));
-            sc.color = Colour::fromString (sn.getProperty ("color", "ff303030").toString());
+            sc.id            = Uuid (sn.getProperty ("id").toString());
+            sc.name          = sn.getProperty ("name", "Scene " + String (i + 1));
+            sc.color         = Colour::fromString (sn.getProperty ("color", "ff303030").toString());
+            sc.tempoOverride = (double) sn.getProperty ("tempoOverride", -1.0);
+            sc.beatsPerBar   = (int)    sn.getProperty ("beatsPerBar", 0);
+            sc.beatDivisor   = (int)    sn.getProperty ("beatDivisor", 0);
             scenes_.add (sc);
         }
     }
@@ -1923,9 +2236,12 @@ void SessionView::writeToSession()
     for (const auto& s : scenes_)
     {
         juce::ValueTree sn ("scene");
-        sn.setProperty ("id",    s.id.toString(),         nullptr);
-        sn.setProperty ("name",  s.name,                  nullptr);
-        sn.setProperty ("color", s.color.toString(),      nullptr);
+        sn.setProperty ("id",            s.id.toString(),    nullptr);
+        sn.setProperty ("name",          s.name,             nullptr);
+        sn.setProperty ("color",         s.color.toString(), nullptr);
+        sn.setProperty ("tempoOverride", s.tempoOverride,    nullptr);
+        sn.setProperty ("beatsPerBar",   s.beatsPerBar,      nullptr);
+        sn.setProperty ("beatDivisor",   s.beatDivisor,      nullptr);
         scenesTree.appendChild (sn, nullptr);
     }
     tree.appendChild (scenesTree, nullptr);

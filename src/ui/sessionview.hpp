@@ -99,6 +99,12 @@ private:
         juce::Uuid     id;
         juce::String   name;
         juce::Colour   color { 0xff'30'30'30 };
+        /* Ableton-style per-scene overrides — applied to the session
+         * transport when the scene is launched.  Sentinel values
+         * mean "no override; inherit current". */
+        double         tempoOverride { -1.0 };   // bpm; -1 = no override
+        int            beatsPerBar   { 0 };      // 0 = no override
+        int            beatDivisor   { 0 };      // 0 = no override
     };
 
     struct SessionColumn {
@@ -172,6 +178,11 @@ private:
     juce::Rectangle<int> footerBounds() const noexcept;
     juce::Rectangle<int> columnStopRowBounds() const noexcept;
     juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
+    juce::Rectangle<int> masterColumnBounds() const noexcept;
+    juce::Rectangle<int> masterCellBounds (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterLaunchButtonBounds (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterTempoFieldBounds  (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterSigFieldBounds    (int sceneRow) const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -185,6 +196,18 @@ private:
     bool hitTestPlayButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestColumnStop (juce::Point<int> p, int& outCol) const noexcept;
+    bool hitTestMasterCell (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterLaunch (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterTempo  (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterSig    (juce::Point<int> p, int& outRow) const noexcept;
+
+    /* Scene property editors — invoked from the master column's
+     * right-click menu and direct clicks. */
+    void editSceneTempo    (int sceneRow);
+    void editSceneSignature (int sceneRow);
+    void clearSceneTempo    (int sceneRow);
+    void clearSceneSignature (int sceneRow);
+    void applySceneOverridesToTransport (const SessionScene&);
 
     /* Scroll offset for the grid body — applied to scene-label and
      * cell y positions in their *Bounds() helpers so paint + hit
@@ -273,6 +296,7 @@ private:
     static constexpr int kSceneLabelW   = 84;
     static constexpr int kColW          = 132;
     static constexpr int kRowH          = 30;
+    static constexpr int kMasterColW    = 152;   // Ableton-style scene master column
     static constexpr int kColumnStopH   = 24;
     static constexpr int kSceneFooterH  = 22;
 
