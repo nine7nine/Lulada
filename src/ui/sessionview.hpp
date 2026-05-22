@@ -52,6 +52,8 @@ public:
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp   (const juce::MouseEvent&) override;
     void mouseDoubleClick (const juce::MouseEvent&) override;
+    void mouseWheelMove (const juce::MouseEvent&,
+                         const juce::MouseWheelDetails&) override;
 
 private:
     /* Per-clip launch state.  Driven by the message thread on bang(),
@@ -115,6 +117,7 @@ private:
     void bangClip   (SessionClip&);
     void bangScene  (int sceneRow);
     void stopAllClips();
+    void stopColumn (int columnIdx);   // per-column stop button
     void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
     void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
@@ -167,6 +170,8 @@ private:
      * by paint() + mouseDown() for hit-testing. */
     juce::Rectangle<int> toolbarBounds() const noexcept;
     juce::Rectangle<int> footerBounds() const noexcept;
+    juce::Rectangle<int> columnStopRowBounds() const noexcept;
+    juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -179,6 +184,14 @@ private:
     bool hitTestSceneLabel (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestPlayButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
+    bool hitTestColumnStop (juce::Point<int> p, int& outCol) const noexcept;
+
+    /* Scroll offset for the grid body — applied to scene-label and
+     * cell y positions in their *Bounds() helpers so paint + hit
+     * test both reflect the scroll state automatically. */
+    int gridScrollY_ = 0;
+    int maxGridScrollY() const noexcept;
+    void clampScrollOffset();
 
     Services* services_ = nullptr;
     Transport::MonitorPtr monitor_;
@@ -238,12 +251,13 @@ private:
 
     /* Layout constants — sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
-    static constexpr int kToolbarH     = 36;
-    static constexpr int kHeaderH      = 28;
-    static constexpr int kSceneLabelW  = 84;
-    static constexpr int kColW         = 132;
-    static constexpr int kRowH         = 30;
-    static constexpr int kSceneFooterH = 22;
+    static constexpr int kToolbarH      = 36;
+    static constexpr int kHeaderH       = 28;
+    static constexpr int kSceneLabelW   = 84;
+    static constexpr int kColW          = 132;
+    static constexpr int kRowH          = 30;
+    static constexpr int kColumnStopH   = 24;
+    static constexpr int kSceneFooterH  = 22;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)
 };

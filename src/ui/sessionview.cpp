@@ -282,6 +282,21 @@ Rectangle<int> SessionView::footerBounds() const noexcept
     return getLocalBounds().removeFromBottom (kSceneFooterH);
 }
 
+Rectangle<int> SessionView::columnStopRowBounds() const noexcept
+{
+    auto r = getLocalBounds();
+    r.removeFromBottom (kSceneFooterH);
+    return r.removeFromBottom (kColumnStopH);
+}
+
+Rectangle<int> SessionView::columnStopButtonBounds (int columnIdx) const noexcept
+{
+    const auto row = columnStopRowBounds();
+    return Rectangle<int> (row.getX() + kSceneLabelW + columnIdx * kColW + 6,
+                           row.getY() + 4,
+                           kColW - 12, row.getHeight() - 8);
+}
+
 Rectangle<int> SessionView::headerRowBounds() const noexcept
 {
     auto r = getLocalBounds();
@@ -293,7 +308,7 @@ Rectangle<int> SessionView::sceneLabelStripBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH);
+    r.removeFromBottom (kSceneFooterH + kColumnStopH);
     return r.removeFromLeft (kSceneLabelW);
 }
 
@@ -301,16 +316,19 @@ Rectangle<int> SessionView::gridBodyBounds() const noexcept
 {
     auto r = getLocalBounds();
     r.removeFromTop (kToolbarH + kHeaderH);
-    r.removeFromBottom (kSceneFooterH);
+    r.removeFromBottom (kSceneFooterH + kColumnStopH);
     r.removeFromLeft (kSceneLabelW);
     return r;
 }
 
 Rectangle<int> SessionView::cellBounds (int sceneRow, int columnIdx) const noexcept
 {
+    /* gridScrollY_ shifts all rows up; off-screen cells get a y
+     * outside gridBodyBounds and naturally fail hit-tests / clip
+     * out of the paint region. */
     const auto body = gridBodyBounds();
     return Rectangle<int> (body.getX() + columnIdx * kColW,
-                           body.getY() + sceneRow  * kRowH,
+                           body.getY() + sceneRow  * kRowH - gridScrollY_,
                            kColW, kRowH);
 }
 
@@ -318,7 +336,7 @@ Rectangle<int> SessionView::sceneLabelBounds (int sceneRow) const noexcept
 {
     const auto strip = sceneLabelStripBounds();
     return Rectangle<int> (strip.getX(),
-                           strip.getY() + sceneRow * kRowH,
+                           strip.getY() + sceneRow * kRowH - gridScrollY_,
                            strip.getWidth(), kRowH);
 }
 
@@ -348,7 +366,7 @@ bool SessionView::hitTestCell (Point<int> p, int& outRow, int& outCol) const noe
 {
     const auto body = gridBodyBounds();
     if (! body.contains (p)) return false;
-    outRow = (p.y - body.getY()) / kRowH;
+    outRow = (p.y - body.getY() + gridScrollY_) / kRowH;
     outCol = (p.x - body.getX()) / kColW;
     return outRow >= 0 && outRow < scenes_.size()
         && outCol >= 0 && outCol < columns_.size();
@@ -358,7 +376,7 @@ bool SessionView::hitTestSceneLabel (Point<int> p, int& outRow) const noexcept
 {
     const auto strip = sceneLabelStripBounds();
     if (! strip.contains (p)) return false;
-    outRow = (p.y - strip.getY()) / kRowH;
+    outRow = (p.y - strip.getY() + gridScrollY_) / kRowH;
     return outRow >= 0 && outRow < scenes_.size();
 }
 
@@ -372,6 +390,27 @@ bool SessionView::hitTestEditButton (Point<int> p, int& outRow, int& outCol) con
 {
     if (! hitTestCell (p, outRow, outCol)) return false;
     return editButtonBounds (outRow, outCol).contains (p);
+}
+
+bool SessionView::hitTestColumnStop (Point<int> p, int& outCol) const noexcept
+{
+    const auto row = columnStopRowBounds();
+    if (! row.contains (p)) return false;
+    if (p.x < row.getX() + kSceneLabelW) return false;
+    outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
+    return outCol >= 0 && outCol < columns_.size();
+}
+
+int SessionView::maxGridScrollY() const noexcept
+{
+    const int totalH = scenes_.size() * kRowH;
+    const int viewH  = gridBodyBounds().getHeight();
+    return juce::jmax (0, totalH - viewH);
+}
+
+void SessionView::clampScrollOffset()
+{
+    gridScrollY_ = juce::jlimit (0, maxGridScrollY(), gridScrollY_);
 }
 
 /* === Paint ============================================================= */
@@ -421,6 +460,15 @@ void SessionView::paint (Graphics& g)
                     h.reduced (8, 4),
                     juce::Justification::centredLeft, true);
     }
+
+    /* Everything from here through the cell loop draws inside the
+     * scrollable strip (scene labels + grid body).  Clip to that
+     * union so scroll-shifted rows can't bleed into the column
+     * header or column-stop area.  Explicit save/restore so we can
+     * close the clip region at a known point further down. */
+    const auto scrollableArea = labels.getUnion (body);
+    g.saveState();
+    g.reduceClipRegion (scrollableArea);
 
     /* --- Scene label strip (left column) --- */
     g.setColour (kGutterColour);
@@ -627,7 +675,44 @@ void SessionView::paint (Graphics& g)
         g.fillRect (target.getX() + 4, y - 1, target.getWidth() - 8, 3);
     }
 
-    /* Footer hint strip — right of the "+ Scene" button area. */
+    /* Close the scrollable-area clip region — everything after this
+     * draws into the fixed (non-scrolling) chrome strips. */
+    g.restoreState();
+
+    /* --- Per-column stop button row --- */
+    const auto stopRow = columnStopRowBounds();
+    g.setColour (kHeaderBgColour);
+    g.fillRect (stopRow);
+    g.setColour (kCellOutlineColour);
+    g.drawHorizontalLine (stopRow.getY(), 0.0f, (float) getWidth());
+
+    for (int c = 0; c < columns_.size(); ++c)
+    {
+        const auto btnR = columnStopButtonBounds (c);
+        /* Tint button background by column hue so the user can tell
+         * which column they're hitting at a glance. */
+        const Colour tint = columnTint (c).withMultipliedSaturation (0.6f)
+                                          .withMultipliedBrightness (0.55f);
+        g.setColour (tint);
+        g.fillRect (btnR);
+
+        /* Centred stop square — only filled when the column has at
+         * least one active clip; otherwise just an outline so the
+         * button still reads as a button. */
+        bool active = false;
+        for (auto* clip : clips_)
+            if (clip->columnIdx == c)
+            {
+                const LiveState s = clip->state.load (std::memory_order_relaxed);
+                if (s != LiveState::Stopped) { active = true; break; }
+            }
+        const auto sq = btnR.withSizeKeepingCentre (8, 8);
+        g.setColour (active ? juce::Colours::white
+                            : juce::Colours::white.withAlpha (0.35f));
+        g.fillRect (sq);
+    }
+
+    /* Footer hint strip. */
     const auto footer = footerBounds();
     g.setColour (kHeaderBgColour);
     g.fillRect (footer);
@@ -757,6 +842,15 @@ void SessionView::mouseDown (const MouseEvent& e)
                 default: break;
             }
         }
+        return;
+    }
+
+    /* Column stop button row — kills the column's active clip(s).
+     * Tested before cell hits so a click on the stop row never
+     * stages a drag. */
+    if (hitTestColumnStop (e.getPosition(), col))
+    {
+        stopColumn (col);
         return;
     }
 
@@ -918,6 +1012,19 @@ void SessionView::mouseUp (const MouseEvent& e)
         sceneDragHoverRow_ = -1;
         repaint();
     }
+}
+
+void SessionView::mouseWheelMove (const MouseEvent& e, const juce::MouseWheelDetails& wheel)
+{
+    juce::ignoreUnused (e);
+    if (maxGridScrollY() <= 0) return;
+    /* Convert wheel delta to pixels.  3 rows per "tick" feels natural
+     * — matches the usual JUCE default for list scrolling. */
+    const int delta = (int) std::round (-wheel.deltaY * kRowH * 3.0f);
+    const int prev  = gridScrollY_;
+    gridScrollY_ = juce::jlimit (0, maxGridScrollY(), gridScrollY_ + delta);
+    if (gridScrollY_ != prev)
+        repaint();
 }
 
 void SessionView::mouseDoubleClick (const MouseEvent& e)
@@ -1178,6 +1285,23 @@ void SessionView::stopAllClips()
      * straight away; UI tick will confirm. */
     for (auto* c : clips_)
     {
+        if (auto* trk = lookupTracker (c->trackerNodeId))
+            trk->schedulePlaying (c->sequenceIdx, -1.0, false);
+        c->state.store (LiveState::Stopped, std::memory_order_relaxed);
+    }
+    repaint();
+}
+
+void SessionView::stopColumn (int columnIdx)
+{
+    /* Immediate stop for every active clip on a single column.
+     * Same audio-thread path as stopAllClips, scoped to a column. */
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return;
+    for (auto* c : clips_)
+    {
+        if (c->columnIdx != columnIdx) continue;
+        const LiveState s = c->state.load (std::memory_order_relaxed);
+        if (s == LiveState::Stopped) continue;
         if (auto* trk = lookupTracker (c->trackerNodeId))
             trk->schedulePlaying (c->sequenceIdx, -1.0, false);
         c->state.store (LiveState::Stopped, std::memory_order_relaxed);
