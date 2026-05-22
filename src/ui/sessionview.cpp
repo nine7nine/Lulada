@@ -1806,6 +1806,13 @@ SessionView::SessionScene* SessionView::sceneAt (int sceneRow) noexcept
     return &scenes_.getReference (sceneRow);
 }
 
+void SessionView::transportTogglePlay() noexcept
+{
+    if (services_ == nullptr) return;
+    if (auto* eng = services_->context().audio().get())
+        eng->togglePlayPause();
+}
+
 bool SessionView::sceneHasActiveClip (int sceneRow) const noexcept
 {
     for (auto* c : clips_)
@@ -2258,18 +2265,41 @@ void SessionView::addClipAt (int sceneRow, int columnIdx)
 class TrackerPatternWindow : public juce::DocumentWindow
 {
 public:
-    TrackerPatternWindow (juce::Component* content, const juce::String& title)
+    TrackerPatternWindow (juce::Component::SafePointer<SessionView> view,
+                          juce::Component* content,
+                          const juce::String& title)
         : juce::DocumentWindow (title,
                                 juce::Colour { 0xff'18'18'18 },
-                                juce::DocumentWindow::allButtons)
+                                juce::DocumentWindow::allButtons),
+          owner_ (view)
     {
         setUsingNativeTitleBar (true);
         setContentOwned (content, true);
         setResizable (true, false);
         centreWithSize (820, 540);
+        setWantsKeyboardFocus (true);
         setVisible (true);
     }
     void closeButtonPressed() override { delete this; }
+
+    /* Spacebar in the tracker popup must toggle the global transport
+     * play/pause, same as Element's main spacebar binding -- otherwise
+     * the user has to dismiss the popup before starting playback. */
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key == juce::KeyPress::spaceKey)
+        {
+            if (auto* v = owner_.getComponent())
+            {
+                v->transportTogglePlay();
+                return true;
+            }
+        }
+        return juce::DocumentWindow::keyPressed (key);
+    }
+
+private:
+    juce::Component::SafePointer<SessionView> owner_;
 };
 
 /* === SceneView popup ===================================================
@@ -2540,7 +2570,7 @@ void SessionView::openPatternEditor (SessionClip& clip)
      * (Wine here, plus a few Linux WMs) garble multi-byte UTF-8 chars
      * when the title is set as a system call.  The em-dash showed up
      * as "a" in testing. */
-    auto* win = new TrackerPatternWindow (editor, "Tracker - " + clip.name);
+    auto* win = new TrackerPatternWindow (this, editor, "Tracker - " + clip.name);
     juce::ignoreUnused (win);   // self-deletes on close
 }
 
