@@ -457,6 +457,26 @@ int TrackerNode::createSequence (int rowsLength)
     return mod_->nseq - 1;
 }
 
+int TrackerNode::cloneSequence (int sourceIdx)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr) return -1;
+    if (sourceIdx < 0 || sourceIdx >= mod_->nseq) return -1;
+
+    sequence* src = mod_->seq[sourceIdx];
+    if (src == nullptr) return -1;
+
+    sequence* clone = sequence_clone (src);
+    if (clone == nullptr) return -1;
+
+    /* Force playing=0 on the clone regardless of source state — the
+     * clip launcher decides when it should fire, not the cloner. */
+    sequence_set_playing (clone, 0);
+
+    module_add_sequence (mod_, clone);
+    return mod_->nseq - 1;
+}
+
 void TrackerNode::removeSequence (int sequenceIdx)
 {
     juce::ScopedLock sl (engineLock_);

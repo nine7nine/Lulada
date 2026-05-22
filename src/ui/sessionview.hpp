@@ -11,7 +11,6 @@
 #include <element/transport.hpp>
 #include <element/ui/content.hpp>
 
-#include "ui/blocktoolbutton.hpp"
 
 #define EL_VIEW_SESSION_VIEW "SessionView"
 
@@ -35,7 +34,8 @@ class TrackerNode;
  *  Design + cookbook: ~/wine-nspa-notes/session-view-design.md
  */
 class SessionView : public ContentView,
-                    private juce::Timer
+                    private juce::Timer,
+                    private juce::ChangeListener
 {
 public:
     SessionView();
@@ -49,6 +49,11 @@ public:
     void resized() override;
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp   (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+    void mouseWheelMove (const juce::MouseEvent&,
+                         const juce::MouseWheelDetails&) override;
 
 private:
     /* Per-clip launch state.  Driven by the message thread on bang(),
@@ -61,6 +66,15 @@ private:
      * Bar=beatsPerBar, TwoBars=2*bpb, FourBars=4*bpb. */
     enum class LaunchQuant : uint8_t { Off, Beat, Bar, TwoBars, FourBars };
 
+    /* Action applied when a playing clip's sequence wraps past its end.
+     *  - None: keep looping (default; vht naturally loops).
+     *  - Stop: schedule immediate stop on wrap.
+     *  - RestartClip: re-launch from row 0 (same clip).
+     *  - NextClip: bang the clip on the next-greater sceneRow in the
+     *    same column.  If none exists, falls back to Stop.
+     *  - FirstClip: bang the lowest-sceneRow clip on the same column. */
+    enum class FollowAction : uint8_t { None, Stop, RestartClip, NextClip, FirstClip };
+
     struct SessionClip {
         juce::Uuid     id;
         juce::String   name;
@@ -70,6 +84,7 @@ private:
         int            sceneRow      { 0 };
         int            columnIdx     { 0 };
         LaunchQuant    launchQuant   { LaunchQuant::Bar };
+        FollowAction   followAction  { FollowAction::None };
         std::atomic<LiveState> state { LiveState::Stopped };
         /* UI-side cached engine state for diff-gated repaint. */
         bool           lastDrawnPlaying { false };
@@ -102,6 +117,9 @@ private:
     void bangClip   (SessionClip&);
     void bangScene  (int sceneRow);
     void stopAllClips();
+    void stopColumn (int columnIdx);   // per-column stop button
+    void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
+    void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
     void deleteClip (SessionClip&);
     void openPatternEditor (SessionClip&);  // popup tracker editor at clip's seqIdx
@@ -109,6 +127,27 @@ private:
     void addScene();                  // append at end
     void insertScene (int beforeRow);
     void deleteScene (int row);
+    void renameScene (int row);
+    void reorderScene (int fromRow, int toRow);  // drag-drop reorder
+
+    void renameClip      (SessionClip&);
+    void cycleClipColor  (SessionClip&);
+    void pickClipColour  (SessionClip&);   // full ColourSelector popup
+    void assignExistingPattern (int sceneRow, int columnIdx, int sequenceIdx);
+
+    /* juce::ChangeListener — receives ColourSelector edits from the
+     * popup picker.  colourPickerClip_ tracks which clip the picker
+     * is bound to so we can apply on each broadcast. */
+    void changeListenerCallback (juce::ChangeBroadcaster*) override;
+
+    /* Drag-and-drop within the grid.  Move = drop on another cell on
+     * the SAME column (sequenceIdx remains valid).  Copy (Shift+drag) =
+     * clone the underlying vht sequence via TrackerNode::cloneSequence
+     * and place a new clip at the target.  Cross-column drags are no-ops
+     * for v1 — sequenceIdx is tracker-scoped, so the migration story is
+     * still TBD. */
+    void moveClip (SessionClip&, int newSceneRow, int newColumnIdx);
+    void copyClip (SessionClip&, int newSceneRow, int newColumnIdx);
 
     TrackerNode* lookupTracker (juce::uint32 nodeId) const;
     SessionClip* findClip (int sceneRow, int columnIdx) const;
@@ -131,7 +170,8 @@ private:
      * by paint() + mouseDown() for hit-testing. */
     juce::Rectangle<int> toolbarBounds() const noexcept;
     juce::Rectangle<int> footerBounds() const noexcept;
-    juce::Rectangle<int> addSceneButtonBounds() const noexcept;
+    juce::Rectangle<int> columnStopRowBounds() const noexcept;
+    juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -144,15 +184,38 @@ private:
     bool hitTestSceneLabel (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestPlayButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
+    bool hitTestColumnStop (juce::Point<int> p, int& outCol) const noexcept;
+
+    /* Scroll offset for the grid body — applied to scene-label and
+     * cell y positions in their *Bounds() helpers so paint + hit
+     * test both reflect the scroll state automatically. */
+    int gridScrollY_ = 0;
+    int maxGridScrollY() const noexcept;
+    void clampScrollOffset();
 
     Services* services_ = nullptr;
     Transport::MonitorPtr monitor_;
 
-    /* Top toolbar buttons + footer "+ Scene".  BlockToolButton matches
-     * the tracker editor's toolbar density. */
-    BlockToolButton stopAllBtn_   { "Stop All" };
-    BlockToolButton rescanBtn_    { "Rescan"   };
-    BlockToolButton addSceneBtn_  { "+ Scene"  };
+    /* Top toolbar — tracker-editor-styled (juce::TextButton with the
+     * same palette + juce::Label for static name / editable value
+     * pairs).  Mirrors `TrackerEditor::Toolbar` so the two views
+     * share a visual vocabulary. */
+    juce::TextButton stopAllBtn_, rescanBtn_;
+    juce::TextButton sceneMinusBtn_, scenePlusBtn_;
+    juce::TextButton quantPrevBtn_,  quantNextBtn_;
+    juce::Label scenesNameLabel_, scenesValueLabel_;
+    juce::Label quantNameLabel_,  quantValueLabel_;
+
+    /* Default launch quant applied to NEW clips when they're added
+     * (right-click "Add new pattern" / "Assign existing pattern" or
+     * drag-clone).  Persisted to the session XML at sessionView root. */
+    LaunchQuant defaultLaunchQuant_ { LaunchQuant::Bar };
+
+    void configureToolbarButton (juce::TextButton&, const juce::String&, std::function<void()>);
+    void configureToolbarLabel  (juce::Label&, const juce::String& text, bool editable);
+    void refreshToolbarLabels();
+    void cycleDefaultQuant (int delta);   // +1 next / -1 prev
+    juce::String formatLaunchQuant (LaunchQuant) const noexcept;
 
     juce::Array<SessionColumn>      columns_;
     juce::OwnedArray<SessionClip>   clips_;
@@ -161,14 +224,40 @@ private:
     /* Phase animation for WaitingTo* outline pulse (Phase 4 will exercise). */
     int   pulsePhase_ = 0;
 
+    /* Drag state for clip-move/copy.  dragSource_ is set on mouseDown
+     * over a clip's body (not its play/edit zones); dragActive_ trips
+     * once the cursor moves past the drag threshold.  dragHover{Row,Col}
+     * are the current target cell under the cursor, used to highlight
+     * the drop target in paint().  mouseUp clears everything. */
+    SessionClip*       dragSource_ = nullptr;
+    juce::Point<int>   dragStart_  {};
+    bool               dragActive_ = false;
+    int                dragHoverRow_ = -1;
+    int                dragHoverCol_ = -1;
+
+    /* Scene-label drag state — distinct from clip drag.  Mouse-down on
+     * a scene label stages a potential reorder; promoted to active
+     * past the drag threshold; release drops the scene at the target
+     * row index. */
+    int    sceneDragSource_ = -1;
+    bool   sceneDragActive_ = false;
+    int    sceneDragHoverRow_ = -1;
+
+    /* ColourSelector popup state — when a picker is open against a
+     * clip, change broadcasts route through changeListenerCallback
+     * to mutate clip.color.  Cleared when the picker closes (its
+     * ChangeBroadcaster is destroyed, broadcasts stop arriving). */
+    SessionClip* colourPickerClip_ = nullptr;
+
     /* Layout constants — sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */
-    static constexpr int kToolbarH     = 28;
-    static constexpr int kHeaderH      = 28;
-    static constexpr int kSceneLabelW  = 84;
-    static constexpr int kColW         = 132;
-    static constexpr int kRowH         = 30;
-    static constexpr int kSceneFooterH = 26;
+    static constexpr int kToolbarH      = 36;
+    static constexpr int kHeaderH       = 28;
+    static constexpr int kSceneLabelW   = 84;
+    static constexpr int kColW          = 132;
+    static constexpr int kRowH          = 30;
+    static constexpr int kColumnStopH   = 24;
+    static constexpr int kSceneFooterH  = 22;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)
 };
