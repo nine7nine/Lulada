@@ -18,6 +18,17 @@ enum class SamplerLoopMode { kNone = 0, kForward = 1, kPingpong = 2 };
 struct SamplerSampleSlot
 {
     String  name;
+
+    /** Absolute POSIX path of the originally-loaded sample file.
+     *  Stored as std::string (not juce::File or juce::String) so the
+     *  persistence layer matches the native-path convention Disk Op
+     *  uses (::opendir / ::readdir / ::access).  Empty for slots
+     *  created from non-file sources (paste, future synth bake).
+     *  Used to reload audio across session save/restart -- the
+     *  decoded int16 buffers below are NEVER embedded in the
+     *  session XML, only this path is. */
+    std::string sourceFile;
+
     std::unique_ptr<int16_t[]> data16L;
     std::unique_ptr<int16_t[]> data16R;
     bool    isStereo = false;
