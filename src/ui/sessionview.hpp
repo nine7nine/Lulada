@@ -125,7 +125,14 @@ private:
     void stopAllClips();
     void stopColumn (int columnIdx);   // per-column stop button
     void toggleColumnMute (int columnIdx);
-    bool isColumnMuted (int columnIdx) const noexcept;
+    void toggleColumnSolo (int columnIdx);
+    bool isColumnMuted (int columnIdx) const noexcept;   // user-asserted mute
+    bool isColumnSoloed (int columnIdx) const noexcept;
+    /* Reconcile engine-level mute on TrackerNodes from our
+     * columnUserMuted_ + columnSoloed_ vectors.  When any column is
+     * soloed, every non-soloed column is muted regardless of user
+     * intent; when no solo is active, mute follows user intent. */
+    void applyMuteAndSoloState();
     void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
     void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
@@ -183,6 +190,7 @@ private:
     juce::Rectangle<int> columnNameLabelBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> columnMuteButtonBounds (int columnIdx) const noexcept;
+    juce::Rectangle<int> columnSoloButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> masterColumnBounds() const noexcept;
     juce::Rectangle<int> masterCellBounds (int sceneRow) const noexcept;
     juce::Rectangle<int> masterLaunchButtonBounds (int sceneRow) const noexcept;
@@ -202,6 +210,7 @@ private:
     bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestColumnStop (juce::Point<int> p, int& outCol) const noexcept;
     bool hitTestColumnMute (juce::Point<int> p, int& outCol) const noexcept;
+    bool hitTestColumnSolo (juce::Point<int> p, int& outCol) const noexcept;
     bool hitTestMasterCell (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterLaunch (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterTempo  (juce::Point<int> p, int& outRow) const noexcept;
@@ -290,6 +299,20 @@ private:
     double lastSessionTempo_ = -1.0;
     int    lastSessionBpb_   = -1;
     int    lastSessionBd_    = -1;
+
+    /* Per-column user-asserted mute + solo state.  Parallel to
+     * columns_; lazily grown by toggleColumnMute / toggleColumnSolo
+     * + applyMuteAndSoloState.  Engine mute is the EFFECTIVE state
+     * (mute || soloed-elsewhere); the visual buttons reflect user
+     * intent (columnUserMuted_ / columnSoloed_) so toggling stays
+     * predictable. */
+    juce::Array<bool> columnUserMuted_;
+    juce::Array<bool> columnSoloed_;
+
+    /* The most-recently-launched scene -- the "current" scene in
+     * Ableton parlance.  -1 means none banged this session.  Used
+     * by master-column paint to highlight the active scene row. */
+    int currentSceneRow_ = -1;
 
     /* Drag state for clip-move/copy.  dragSource_ is set on mouseDown
      * over a clip's body (not its play/edit zones); dragActive_ trips

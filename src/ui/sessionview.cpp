@@ -14,6 +14,7 @@
 
 #include "nodes/tracker.hpp"
 #include "nodes/trackereditor.hpp"
+#include "tempo.hpp"   // BeatType::fromDivisor for scene sig overrides
 
 namespace element {
 
@@ -394,18 +395,22 @@ Rectangle<int> SessionView::columnNameLabelBounds (int columnIdx) const noexcept
                            h.getHeight() / 2);
 }
 
+/* Column header bottom-half layout: three equal-width buttons with
+ * 2 px gaps.  STOP | MUTE | SOLO. */
+static int columnFooterButtonWidth (int innerW) noexcept
+{
+    return (innerW - 4) / 3;   // 2 gaps of 2 px each
+}
+
 Rectangle<int> SessionView::columnStopButtonBounds (int columnIdx) const noexcept
 {
-    /* Bottom-left of column header: STOP button.  Layout:
-     *   row 0 (top half)    name + tint band
-     *   row 1 (bottom half) [STOP] [MUTE] */
     const auto h = columnHeaderBounds (columnIdx);
     const int topH = h.getHeight() / 2;
     const int btnAreaH = h.getHeight() - topH - 2;
     const int btnAreaY = h.getY() + topH;
-    const int innerW = h.getWidth() - 4;  // 2 px margins
-    const int half = (innerW - 2) / 2;
-    return Rectangle<int> (h.getX() + 2, btnAreaY, half, btnAreaH);
+    const int innerW = h.getWidth() - 4;
+    const int w = columnFooterButtonWidth (innerW);
+    return Rectangle<int> (h.getX() + 2, btnAreaY, w, btnAreaH);
 }
 
 Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcept
@@ -415,8 +420,19 @@ Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcep
     const int btnAreaH = h.getHeight() - topH - 2;
     const int btnAreaY = h.getY() + topH;
     const int innerW = h.getWidth() - 4;
-    const int half = (innerW - 2) / 2;
-    return Rectangle<int> (h.getX() + 2 + half + 2, btnAreaY, half, btnAreaH);
+    const int w = columnFooterButtonWidth (innerW);
+    return Rectangle<int> (h.getX() + 2 + w + 2, btnAreaY, w, btnAreaH);
+}
+
+Rectangle<int> SessionView::columnSoloButtonBounds (int columnIdx) const noexcept
+{
+    const auto h = columnHeaderBounds (columnIdx);
+    const int topH = h.getHeight() / 2;
+    const int btnAreaH = h.getHeight() - topH - 2;
+    const int btnAreaY = h.getY() + topH;
+    const int innerW = h.getWidth() - 4;
+    const int w = columnFooterButtonWidth (innerW);
+    return Rectangle<int> (h.getX() + 2 + (w + 2) * 2, btnAreaY, w, btnAreaH);
 }
 
 Rectangle<int> SessionView::masterCellBounds (int sceneRow) const noexcept
@@ -550,6 +566,16 @@ bool SessionView::hitTestColumnMute (Point<int> p, int& outCol) const noexcept
     return columnMuteButtonBounds (outCol).contains (p);
 }
 
+bool SessionView::hitTestColumnSolo (Point<int> p, int& outCol) const noexcept
+{
+    const auto header = headerRowBounds();
+    if (! header.contains (p)) return false;
+    if (p.x < header.getX() + kSceneLabelW) return false;
+    outCol = (p.x - header.getX() - kSceneLabelW) / kColW;
+    if (outCol < 0 || outCol >= columns_.size()) return false;
+    return columnSoloButtonBounds (outCol).contains (p);
+}
+
 bool SessionView::hitTestMasterCell (Point<int> p, int& outRow) const noexcept
 {
     const auto col = masterColumnBounds();
@@ -623,6 +649,7 @@ void SessionView::paint (Graphics& g)
         const auto nameR = columnNameLabelBounds (c);
         const auto stopR = columnStopButtonBounds (c);
         const auto muteR = columnMuteButtonBounds (c);
+        const auto soloR = columnSoloButtonBounds (c);
 
         /* Top tint band, a la trackereditor track header. */
         g.setColour (tint);
@@ -630,7 +657,7 @@ void SessionView::paint (Graphics& g)
 
         /* Top-half background -- translucent tint over header bg.
          * Bottom-half (where the buttons live) stays plain so the
-         * STOP / MUTE button shapes read clearly. */
+         * button shapes read clearly. */
         g.setColour (tint.withAlpha (0.10f));
         g.fillRect (h.getX(), h.getY() + 4, h.getWidth() - 1, nameR.getHeight() - 4);
 
@@ -642,9 +669,6 @@ void SessionView::paint (Graphics& g)
                     nameR.reduced (8, 0),
                     juce::Justification::centredLeft, true);
 
-        /* STOP + MUTE buttons in the bottom half.  STOP lightens
-         * when the column has an active clip; MUTE turns red when
-         * the TrackerNode is muted. */
         bool active = false;
         for (auto* clip : clips_)
             if (clip->columnIdx == c)
@@ -652,13 +676,16 @@ void SessionView::paint (Graphics& g)
                 const LiveState s = clip->state.load (std::memory_order_relaxed);
                 if (s != LiveState::Stopped) { active = true; break; }
             }
-        const bool muted = isColumnMuted (c);
+        const bool muted  = isColumnMuted  (c);
+        const bool soloed = isColumnSoloed (c);
         const Colour btnTint = tint.withMultipliedSaturation (0.6f)
                                    .withMultipliedBrightness (0.55f);
 
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       9.0f, juce::Font::bold));
 
+        /* STOP -- lights up brighter when the column has an active
+         * clip; the click stops every active clip on this column. */
         g.setColour (active ? btnTint.withMultipliedBrightness (1.6f) : btnTint);
         g.fillRect (stopR);
         g.setColour (kCellOutlineColour);
@@ -667,13 +694,24 @@ void SessionView::paint (Graphics& g)
                             : juce::Colours::white.withAlpha (0.70f));
         g.drawText ("STOP", stopR, juce::Justification::centred);
 
+        /* MUTE -- amber-red when user-muted (NOT when muted by
+         * solo elsewhere, since the visual should reflect intent). */
         g.setColour (muted ? Colour { 0xff'c0'30'30 } : btnTint);
         g.fillRect (muteR);
         g.setColour (kCellOutlineColour);
         g.drawRect (muteR, 1);
         g.setColour (muted ? juce::Colours::white
                            : juce::Colours::white.withAlpha (0.70f));
-        g.drawText (muted ? "MUTED" : "MUTE", muteR, juce::Justification::centred);
+        g.drawText ("MUTE", muteR, juce::Justification::centred);
+
+        /* SOLO -- yellow when active; matches mixing-desk convention. */
+        g.setColour (soloed ? Colour { 0xff'd5'b0'30 } : btnTint);
+        g.fillRect (soloR);
+        g.setColour (kCellOutlineColour);
+        g.drawRect (soloR, 1);
+        g.setColour (soloed ? juce::Colours::black
+                            : juce::Colours::white.withAlpha (0.70f));
+        g.drawText ("SOLO", soloR, juce::Justification::centred);
     }
 
     /* Everything from here through the cell loop draws inside the
@@ -1010,6 +1048,15 @@ void SessionView::paint (Graphics& g)
             g.drawHorizontalLine (cell.getBottom() - 1,
                                   (float) cell.getX(),
                                   (float) cell.getRight());
+
+            /* Highlight border on the most-recently launched scene
+             * so the user can see which scene is "current" (Ableton
+             * convention).  Drawn LAST so it sits over everything. */
+            if (r == currentSceneRow_)
+            {
+                g.setColour (kPlayheadAccent);
+                g.drawRect (cell.reduced (1, 1), 2);
+            }
         }
     }
 
@@ -1186,6 +1233,11 @@ void SessionView::mouseDown (const MouseEvent& e)
     if (hitTestColumnMute (e.getPosition(), col))
     {
         toggleColumnMute (col);
+        return;
+    }
+    if (hitTestColumnSolo (e.getPosition(), col))
+    {
+        toggleColumnSolo (col);
         return;
     }
 
@@ -1647,6 +1699,17 @@ void SessionView::bangScene (int sceneRow)
     for (auto* c : clips_)
         if (c->sceneRow == sceneRow)
             transitionClip (*c, targetBeat);
+
+    /* Track the most-recently launched scene so the master column
+     * can highlight it.  Repaint old + new cells. */
+    if (currentSceneRow_ != sceneRow)
+    {
+        const int prev = currentSceneRow_;
+        currentSceneRow_ = sceneRow;
+        if (prev >= 0 && prev < scenes_.size())
+            repaint (masterCellBounds (prev));
+        repaint (masterCellBounds (sceneRow));
+    }
 }
 
 void SessionView::applySceneOverridesToTransport (const SessionScene& s)
@@ -1661,16 +1724,32 @@ void SessionView::applySceneOverridesToTransport (const SessionScene& s)
      * Transport monitor. */
     auto tree = sess->data();
     if (! tree.isValid()) return;
-    /* ValueTree property writes broadcast through the session's
-     * ObjectModel listener chain -- same path the Session Settings
-     * panel uses to nudge BPM at runtime.  No notifyChanged() poke
-     * needed (it's private and the listener path runs anyway). */
+    auto* eng = services_->context().audio().get();
+
+    /* Tempo: writing tags::tempo on the session ValueTree DOES
+     * propagate to the audio engine -- AudioEngine has a
+     * juce::Value listener bound to that property (see
+     * audioengine.cpp connectSessionValues + valueChanged). */
     if (s.tempoOverride > 0.0)
         tree.setProperty (tags::tempo, s.tempoOverride, nullptr);
-    if (s.beatsPerBar > 0)
+
+    /* Time signature: NO Value listener on tags::beatsPerBar or
+     * tags::beatDivisor -- AudioEngine reads them ONCE in
+     * connectSessionValues and never re-syncs.  So we have to call
+     * AudioEngine::setMeter directly to actually move the transport.
+     *
+     * Also: the session XML uses BeatType encoding for beatDivisor
+     * (0=whole, 2=quarter, 4=sixteenth) while our SessionScene
+     * stores the user-meaningful denominator (4 = quarter, 8 =
+     * eighth).  Convert via BeatType::fromDivisor. */
+    if (s.beatsPerBar > 0 && s.beatDivisor > 0)
+    {
+        const int bd = BeatType::fromDivisor (s.beatDivisor);
         tree.setProperty (tags::beatsPerBar, s.beatsPerBar, nullptr);
-    if (s.beatDivisor > 0)
-        tree.setProperty (tags::beatDivisor, s.beatDivisor, nullptr);
+        tree.setProperty (tags::beatDivisor, bd,            nullptr);
+        if (eng != nullptr)
+            eng->setMeter (s.beatsPerBar, bd);
+    }
 }
 
 void SessionView::editSceneTempo (int sceneRow)
@@ -1832,17 +1911,58 @@ void SessionView::stopColumn (int columnIdx)
 
 bool SessionView::isColumnMuted (int columnIdx) const noexcept
 {
-    if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
-    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        return trk->isMuted();
-    return false;
+    /* Returns the USER-asserted mute (the explicit press), not the
+     * effective engine state.  Visual buttons should reflect user
+     * intent so toggling is predictable. */
+    if (columnIdx < 0 || columnIdx >= columnUserMuted_.size()) return false;
+    return columnUserMuted_.getUnchecked (columnIdx);
+}
+
+bool SessionView::isColumnSoloed (int columnIdx) const noexcept
+{
+    if (columnIdx < 0 || columnIdx >= columnSoloed_.size()) return false;
+    return columnSoloed_.getUnchecked (columnIdx);
+}
+
+void SessionView::applyMuteAndSoloState()
+{
+    /* Lazy-grow the parallel state vectors to match columns_ size. */
+    while (columnUserMuted_.size() < columns_.size()) columnUserMuted_.add (false);
+    while (columnSoloed_.size()    < columns_.size()) columnSoloed_   .add (false);
+
+    bool anySolo = false;
+    for (int i = 0; i < columns_.size(); ++i)
+        if (columnSoloed_[i]) { anySolo = true; break; }
+
+    for (int c = 0; c < columns_.size(); ++c)
+    {
+        if (auto* trk = lookupTracker (columns_.getReference (c).trackerNodeId))
+        {
+            /* When any solo is active, non-soloed columns are
+             * effectively muted regardless of user intent. */
+            const bool effectiveMute = anySolo ? ! columnSoloed_[c]
+                                               : columnUserMuted_[c];
+            if (trk->isMuted() != effectiveMute)
+                trk->setMuted (effectiveMute);
+        }
+    }
 }
 
 void SessionView::toggleColumnMute (int columnIdx)
 {
     if (columnIdx < 0 || columnIdx >= columns_.size()) return;
-    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        trk->setMuted (! trk->isMuted());
+    while (columnUserMuted_.size() <= columnIdx) columnUserMuted_.add (false);
+    columnUserMuted_.set (columnIdx, ! columnUserMuted_[columnIdx]);
+    applyMuteAndSoloState();
+    repaint (headerRowBounds());
+}
+
+void SessionView::toggleColumnSolo (int columnIdx)
+{
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return;
+    while (columnSoloed_.size() <= columnIdx) columnSoloed_.add (false);
+    columnSoloed_.set (columnIdx, ! columnSoloed_[columnIdx]);
+    applyMuteAndSoloState();
     repaint (headerRowBounds());
 }
 
