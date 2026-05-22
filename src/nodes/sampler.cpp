@@ -2761,11 +2761,13 @@ private:
  * [viewStart_..viewEnd_).  Renders only the visible window.
  * ========================================================================*/
 class SampleEditCanvas : public Component,
-                         private juce::ScrollBar::Listener
+                         private juce::ScrollBar::Listener,
+                         private juce::Timer
 {
 public:
     using GetSlot = std::function<SamplerSampleSlot*()>;
     using RangeChangedCb = std::function<void()>;
+    using PlayheadQuery  = std::function<std::vector<int>(const SamplerSampleSlot*)>;
 
     explicit SampleEditCanvas (GetSlot gs, RangeChangedCb cb = {})
         : getSlot (std::move (gs)), onRangeChanged (std::move (cb)),
@@ -2775,7 +2777,18 @@ public:
         hScroll_.setAutoHide (false);
         addAndMakeVisible (hScroll_);
     }
-    ~SampleEditCanvas() override { hScroll_.removeListener (this); }
+    ~SampleEditCanvas() override { stopTimer(); hScroll_.removeListener (this); }
+
+    /** Provide a callback returning the current per-voice playhead
+     *  sample positions for this slot.  When set, the canvas polls at
+     *  30 Hz and repaints when positions change — same model as
+     *  SampleWaveformView's live indicator on the Bank page. */
+    void setPlayheadQuery (PlayheadQuery q)
+    {
+        playheadsFor_ = std::move (q);
+        if (playheadsFor_) startTimerHz (30);
+        else               stopTimer();
+    }
 
     void resized() override
     {
@@ -2933,7 +2946,9 @@ public:
             g.fillRect (bounds.getX() + sx1 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
         }
 
-        /* Loop region markers. */
+        /* Loop region markers + draggable handle dots — matches the
+         * Bank-page SampleWaveformView so the visual affordance is
+         * consistent across the two surfaces. */
         if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
         {
             const float lx0 = sampleToPixel (slot->loopStart, w);
@@ -2941,6 +2956,22 @@ public:
             g.setColour (Colour { 0xff'ff'a0'40 });
             g.fillRect (bounds.getX() + lx0 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
             g.fillRect (bounds.getX() + lx1 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+            g.fillEllipse (bounds.getX() + lx0 - 4.0f, bounds.getY(),                 8.0f, 8.0f);
+            g.fillEllipse (bounds.getX() + lx1 - 4.0f, bounds.getBottom() - 8.0f,     8.0f, 8.0f);
+        }
+
+        /* Live playheads (per-voice sample positions) — green vertical
+         * tick lines, clipped to the current viewport. */
+        if (playheadsFor_)
+        {
+            const auto positions = playheadsFor_ (slot);
+            g.setColour (Colour { 0xff'40'ff'80 });
+            for (int pos : positions)
+            {
+                if (pos < viewStart_ || pos >= viewEnd_) continue;
+                const float x = bounds.getX() + sampleToPixel (pos, w);
+                g.fillRect (x - 0.5f, bounds.getY(), 1.5f, bounds.getHeight());
+            }
         }
     }
 
@@ -2948,6 +2979,31 @@ public:
     {
         auto* slot = getSlot ? getSlot() : nullptr;
         if (slot == nullptr || ! slot->isLoaded()) return;
+
+        /* If a loop is configured, check for hit on either of its
+         * handles BEFORE falling through to selection drag.  Hit zone
+         * is the half-width of the handle dot plus a bit of slop.
+         * Either handle can be grabbed independently of the
+         * selection — selection-based loop set (the toolbar's
+         * "Loop=Sel" button) still works as the convenience path. */
+        if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
+        {
+            const auto bounds = getLocalBounds().reduced (2);
+            bounds.toFloat();
+            const int w     = bounds.getWidth();
+            const int xL    = bounds.getX() + (int) sampleToPixel (slot->loopStart, w);
+            const int xR    = bounds.getX() + (int) sampleToPixel (slot->loopStart + slot->loopLength, w);
+            const int dxL   = std::abs (e.x - xL);
+            const int dxR   = std::abs (e.x - xR);
+            constexpr int kLoopHitTolPx = 8;
+
+            if (dxL <= kLoopHitTolPx || dxR <= kLoopHitTolPx)
+            {
+                draggingLoopMarker_ = (dxL <= dxR) ? 0 : 1;
+                return;
+            }
+        }
+
         const int s = pixelToSample (e.x);
         if (e.mods.isShiftDown() && hasSelection())
             setSelection (selStart_, s);
@@ -2958,10 +3014,35 @@ public:
     {
         auto* slot = getSlot ? getSlot() : nullptr;
         if (slot == nullptr || ! slot->isLoaded()) return;
+
+        if (draggingLoopMarker_ >= 0)
+        {
+            const int newPos = pixelToSample (e.x);
+            if (draggingLoopMarker_ == 0)
+            {
+                const int oldEnd  = slot->loopStart + slot->loopLength;
+                slot->loopStart   = juce::jlimit (0, oldEnd - 1, newPos);
+                slot->loopLength  = oldEnd - slot->loopStart;
+            }
+            else
+            {
+                slot->loopLength  = juce::jlimit (1,
+                                                  slot->numSamples - slot->loopStart,
+                                                  newPos - slot->loopStart);
+            }
+            if (onRangeChanged) onRangeChanged();
+            repaint();
+            return;
+        }
+
         if (dragAnchor_ < 0) return;
         setSelection (dragAnchor_, pixelToSample (e.x));
     }
-    void mouseUp (const MouseEvent&) override { dragAnchor_ = -1; }
+    void mouseUp (const MouseEvent&) override
+    {
+        draggingLoopMarker_ = -1;
+        dragAnchor_         = -1;
+    }
     void mouseDoubleClick (const MouseEvent&) override
     {
         auto* slot = getSlot ? getSlot() : nullptr;
@@ -3057,11 +3138,26 @@ private:
         repaint();
     }
 
+    void timerCallback() override
+    {
+        if (! isShowing()) return;        /* free CPU when off-screen */
+        if (! playheadsFor_) return;
+        auto* slot = getSlot ? getSlot() : nullptr;
+        std::vector<int> cur = slot != nullptr ? playheadsFor_ (slot)
+                                                : std::vector<int>();
+        if (cur == lastPlayheads_) return;
+        lastPlayheads_ = std::move (cur);
+        repaint();
+    }
+
     GetSlot getSlot;
     RangeChangedCb onRangeChanged;
+    PlayheadQuery  playheadsFor_;
+    std::vector<int> lastPlayheads_;
     int viewStart_ = 0, viewEnd_ = 0;
     int selStart_  = -1, selEnd_  = -1;
-    int dragAnchor_ = -1;
+    int dragAnchor_         = -1;
+    int draggingLoopMarker_ = -1;  /* -1 none, 0 = loopStart, 1 = loopEnd */
 };
 
 
@@ -3079,6 +3175,11 @@ class SamplerSamplePage : public Component
 public:
     using GetSlot = std::function<SamplerSampleSlot*()>;
     using OnChange = std::function<void()>;
+    using PlayheadQuery = SampleEditCanvas::PlayheadQuery;
+
+    /** Pass-through to the underlying SampleEditCanvas — see its
+     *  setPlayheadQuery for behaviour. */
+    void setPlayheadQuery (PlayheadQuery q) { canvas.setPlayheadQuery (std::move (q)); }
 
     SamplerSamplePage (GetSlot gs, OnChange cb)
         : getSlot (std::move (gs)),
@@ -4248,6 +4349,9 @@ public:
 
         addChildComponent (instPage_);
         addChildComponent (samplePage_);
+        samplePage_.setPlayheadQuery ([this] (const SamplerSampleSlot* slot) {
+            return node.collectPlayheadsForSlot (slot);
+        });
         addChildComponent (fxPage_);
         instCombo.onChange = [this] {
             const int sel = instCombo.getSelectedId() - 1;
