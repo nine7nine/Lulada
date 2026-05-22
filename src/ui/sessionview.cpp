@@ -1885,37 +1885,42 @@ void SessionView::stopColumn (int columnIdx)
 
 bool SessionView::isColumnMuted (int columnIdx) const noexcept
 {
-    /* Returns the USER-asserted mute (the explicit press), not the
-     * effective engine state.  Visual buttons should reflect user
-     * intent so toggling is predictable. */
-    if (columnIdx < 0 || columnIdx >= columnUserMuted_.size()) return false;
-    return columnUserMuted_.getUnchecked (columnIdx);
+    /* Returns USER-asserted mute (the explicit press), not the
+     * effective engine state.  Lives on the TrackerNode so the
+     * tracker editor popup queries the same state. */
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        return trk->getUserMuted();
+    return false;
 }
 
 bool SessionView::isColumnSoloed (int columnIdx) const noexcept
 {
-    if (columnIdx < 0 || columnIdx >= columnSoloed_.size()) return false;
-    return columnSoloed_.getUnchecked (columnIdx);
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        return trk->getSoloed();
+    return false;
 }
 
 void SessionView::applyMuteAndSoloState()
 {
-    /* Lazy-grow the parallel state vectors to match columns_ size. */
-    while (columnUserMuted_.size() < columns_.size()) columnUserMuted_.add (false);
-    while (columnSoloed_.size()    < columns_.size()) columnSoloed_   .add (false);
-
+    /* Scan TrackerNodes via the columns array, decide if any are
+     * soloed, then reconcile each tracker's Processor::isMuted from
+     * (any-solo ? !this-soloed : userMuted).  Engine mute is the
+     * EFFECTIVE state; user-intent flags live on the node. */
     bool anySolo = false;
     for (int i = 0; i < columns_.size(); ++i)
-        if (columnSoloed_[i]) { anySolo = true; break; }
+    {
+        if (auto* trk = lookupTracker (columns_.getReference (i).trackerNodeId))
+            if (trk->getSoloed()) { anySolo = true; break; }
+    }
 
     for (int c = 0; c < columns_.size(); ++c)
     {
         if (auto* trk = lookupTracker (columns_.getReference (c).trackerNodeId))
         {
-            /* When any solo is active, non-soloed columns are
-             * effectively muted regardless of user intent. */
-            const bool effectiveMute = anySolo ? ! columnSoloed_[c]
-                                               : columnUserMuted_[c];
+            const bool effectiveMute = anySolo ? ! trk->getSoloed()
+                                               : trk->getUserMuted();
             if (trk->isMuted() != effectiveMute)
                 trk->setMuted (effectiveMute);
         }
@@ -1925,8 +1930,8 @@ void SessionView::applyMuteAndSoloState()
 void SessionView::toggleColumnMute (int columnIdx)
 {
     if (columnIdx < 0 || columnIdx >= columns_.size()) return;
-    while (columnUserMuted_.size() <= columnIdx) columnUserMuted_.add (false);
-    columnUserMuted_.set (columnIdx, ! columnUserMuted_[columnIdx]);
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        trk->setUserMuted (! trk->getUserMuted());
     applyMuteAndSoloState();
     repaint (headerRowBounds());
 }
@@ -1934,8 +1939,8 @@ void SessionView::toggleColumnMute (int columnIdx)
 void SessionView::toggleColumnSolo (int columnIdx)
 {
     if (columnIdx < 0 || columnIdx >= columns_.size()) return;
-    while (columnSoloed_.size() <= columnIdx) columnSoloed_.add (false);
-    columnSoloed_.set (columnIdx, ! columnSoloed_[columnIdx]);
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        trk->setSoloed (! trk->getSoloed());
     applyMuteAndSoloState();
     repaint (headerRowBounds());
 }
@@ -2822,6 +2827,13 @@ void SessionView::timerCallback()
     if (! isShowing()) return;   // gated per feedback_gui_must_stay_fast
 
     ++pulsePhase_;
+
+    /* Reconcile effective Processor::setMuted from each tracker's
+     * user-mute + solo flags.  Cheap (O(columns) bool comparisons +
+     * a setMuted call only when the effective state changed).  Runs
+     * every tick so changes from the tracker editor popup (separate
+     * window) propagate back into the session view. */
+    applyMuteAndSoloState();
 
     /* Diff-gated repaint of the master column when the session
      * tempo / signature changes outside this view (e.g. user

@@ -314,14 +314,11 @@ private:
     int    lastSessionBpb_   = -1;
     int    lastSessionBd_    = -1;
 
-    /* Per-column user-asserted mute + solo state.  Parallel to
-     * columns_; lazily grown by toggleColumnMute / toggleColumnSolo
-     * + applyMuteAndSoloState.  Engine mute is the EFFECTIVE state
-     * (mute || soloed-elsewhere); the visual buttons reflect user
-     * intent (columnUserMuted_ / columnSoloed_) so toggling stays
-     * predictable. */
-    juce::Array<bool> columnUserMuted_;
-    juce::Array<bool> columnSoloed_;
+    /* Mute / solo intent now lives on each TrackerNode itself
+     * (TrackerNode::getUserMuted / getSoloed) so the session view
+     * and the tracker editor popup see the same state.  SessionView
+     * reconciles effective Processor::setMuted from those flags on
+     * every UI tick via applyMuteAndSoloState. */
 
     /* The most-recently-launched scene -- the "current" scene in
      * Ableton parlance.  -1 means none banged this session.  Used
