@@ -263,9 +263,15 @@ private:
     void hideInlineEditor();
 
     /* Returns true if any clip in the given scene is currently
-     * Playing or queued (WaitingToStart) -- drives the master
-     * launch button's "scene active" visual state. */
+     * Playing -- drives the master launch button's solid amber
+     * state + the master scene row band. */
     bool sceneHasActiveClip (int sceneRow) const noexcept;
+
+    /* Returns true if any clip in the given scene is currently
+     * WaitingToStart -- drives the pulsing amber visual on the
+     * master button + row band while clips wait for the launch
+     * quant boundary to fire. */
+    bool sceneHasQueuedClip (int sceneRow) const noexcept;
 
     /* Scroll offset for the grid body -- applied to scene-label and
      * cell y positions in their *Bounds() helpers so paint + hit

@@ -988,17 +988,37 @@ void SessionView::paint (Graphics& g)
                 g.fillRect (cell);
             }
 
-            /* Launch button -- gray background by default, amber
-             * when ONE clip in the scene is currently playing.
-             * Waiting-state clips don't light it up so a scene on
-             * its way out doesn't look "active" anymore. */
+            /* Launch button.  Three states:
+             *   - Playing : solid amber bg + amber glyph.
+             *   - WaitingToStart only (no Playing yet) : amber bg +
+             *     glyph pulsed on pulsePhase_ so the user gets
+             *     immediate feedback during the quant gap.
+             *   - else : gray bg + neutral glyph. */
             const bool sceneActive = sceneHasActiveClip (r);
-            g.setColour (sceneActive
-                            ? kPlayheadAccent.withAlpha (0.35f)
-                            : Colour { 0xff'2a'2a'2a });
+            const bool sceneQueued = (! sceneActive) && sceneHasQueuedClip (r);
+
+            float queuedAlpha = 1.0f;
+            if (sceneQueued)
+            {
+                const float t = (float) (pulsePhase_ % 24) / 24.0f;
+                queuedAlpha = 0.50f + 0.45f
+                            * std::sin (t * juce::MathConstants<float>::twoPi);
+            }
+
+            if (sceneActive)
+                g.setColour (kPlayheadAccent.withAlpha (0.35f));
+            else if (sceneQueued)
+                g.setColour (kPlayheadAccent.withAlpha (0.35f * queuedAlpha));
+            else
+                g.setColour (Colour { 0xff'2a'2a'2a });
             g.fillRect (launchR);
-            g.setColour (sceneActive ? kPlayheadAccent
-                                     : Colour { 0xff'd0'd0'd0 });
+
+            if (sceneActive)
+                g.setColour (kPlayheadAccent);
+            else if (sceneQueued)
+                g.setColour (kPlayheadAccent.withAlpha (queuedAlpha));
+            else
+                g.setColour (Colour { 0xff'd0'd0'd0 });
             {
                 juce::Path p;
                 const float gx = (float) launchR.getX() + 6.0f;
@@ -1069,23 +1089,35 @@ void SessionView::paint (Graphics& g)
 
     /* Master scene row indicator -- translucent amber overlay across
      * the entire row (scene label + clip cells + master cell).  Bound
-     * to the master scene identity (currentSceneRow_, set on bang)
-     * AND to actual play state -- the band only renders while the
-     * master scene has at least one clip currently Playing.  No
-     * "intent" preview during WaitingToStart; no highlight on other
-     * scenes whose clips happen to be playing.  Drawn AFTER all
-     * per-cell paint so it tints them uniformly. */
-    if (currentSceneRow_ >= 0
-        && currentSceneRow_ < scenes_.size()
-        && sceneHasActiveClip (currentSceneRow_))
+     * to the master scene identity (currentSceneRow_, set on bang).
+     * Solid amber while the master scene has at least one Playing
+     * clip; pulsed amber while clips are still queued
+     * (WaitingToStart) so the bang has immediate visual feedback
+     * during the launch-quant gap.  No highlight on other scenes
+     * whose clips happen to be playing.  Drawn AFTER all per-cell
+     * paint so it tints them uniformly. */
+    if (currentSceneRow_ >= 0 && currentSceneRow_ < scenes_.size())
     {
-        const auto sl = sceneLabelBounds (currentSceneRow_);
-        const Rectangle<int> rowR (0, sl.getY(), getWidth(), kRowH);
-        g.setColour (kPlayheadAccent.withAlpha (0.10f));
-        g.fillRect (rowR);
-        g.setColour (kPlayheadAccent.withAlpha (0.80f));
-        g.drawHorizontalLine (rowR.getY(),         0.0f, (float) getWidth());
-        g.drawHorizontalLine (rowR.getBottom() - 1, 0.0f, (float) getWidth());
+        const bool rowActive = sceneHasActiveClip (currentSceneRow_);
+        const bool rowQueued = (! rowActive)
+                             && sceneHasQueuedClip (currentSceneRow_);
+        if (rowActive || rowQueued)
+        {
+            float alpha = 1.0f;
+            if (rowQueued)
+            {
+                const float t = (float) (pulsePhase_ % 24) / 24.0f;
+                alpha = 0.50f + 0.45f
+                      * std::sin (t * juce::MathConstants<float>::twoPi);
+            }
+            const auto sl = sceneLabelBounds (currentSceneRow_);
+            const Rectangle<int> rowR (0, sl.getY(), getWidth(), kRowH);
+            g.setColour (kPlayheadAccent.withAlpha (0.10f * alpha));
+            g.fillRect (rowR);
+            g.setColour (kPlayheadAccent.withAlpha (0.80f * alpha));
+            g.drawHorizontalLine (rowR.getY(),         0.0f, (float) getWidth());
+            g.drawHorizontalLine (rowR.getBottom() - 1, 0.0f, (float) getWidth());
+        }
     }
 
     /* Close the scrollable-area clip region -- everything after this
@@ -1904,6 +1936,22 @@ bool SessionView::sceneHasActiveClip (int sceneRow) const noexcept
     {
         if (c->sceneRow != sceneRow) continue;
         if (c->state.load (std::memory_order_relaxed) == LiveState::Playing)
+            return true;
+    }
+    return false;
+}
+
+bool SessionView::sceneHasQueuedClip (int sceneRow) const noexcept
+{
+    /* "Queued" = WaitingToStart -- clicked, waiting for the launch
+     * quant boundary to fire.  Used to drive the pulsing visual on
+     * the master button + row band so the user gets immediate
+     * feedback on bang during the quant gap (Bar at 120 BPM 4/4 can
+     * be up to 2 s of wait). */
+    for (auto* c : clips_)
+    {
+        if (c->sceneRow != sceneRow) continue;
+        if (c->state.load (std::memory_order_relaxed) == LiveState::WaitingToStart)
             return true;
     }
     return false;
@@ -3303,13 +3351,25 @@ void SessionView::timerCallback()
             repaint (cellBounds (clip->sceneRow, clip->columnIdx));
 
         /* Master launch button + scene row amber both derive from
-         * whether the scene has any Playing clip.  Repaint the master
-         * cell for this clip's scene row when the clip's Playing-state
-         * boundary moves -- otherwise the master button keeps drawing
-         * its old fill until something else triggers a repaint. */
-        if (stateChanged
-            && (cur  == LiveState::Playing
-             || next == LiveState::Playing))
+         * whether the scene has any Playing or WaitingToStart clip.
+         * Repaint conditions:
+         *   - clip transitioned into / out of Playing : reflect the
+         *     solid-amber boundary on the master cell + row band.
+         *   - clip transitioned into / out of WaitingToStart : same
+         *     reason, on the pulsed boundary.
+         *   - clip is currently WaitingToStart : drive the pulse
+         *     animation each tick. */
+        const bool wasWaitingStart  = (cur  == LiveState::WaitingToStart);
+        const bool willWaitingStart = (next == LiveState::WaitingToStart);
+        const bool needMasterPaint =
+            (stateChanged
+             && (cur  == LiveState::Playing
+              || next == LiveState::Playing
+              || wasWaitingStart
+              || willWaitingStart))
+            || wasWaitingStart;
+
+        if (needMasterPaint)
         {
             repaint (masterCellBounds (clip->sceneRow));
             if (clip->sceneRow == currentSceneRow_)
