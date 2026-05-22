@@ -124,6 +124,8 @@ private:
     void bangScene  (int sceneRow);
     void stopAllClips();
     void stopColumn (int columnIdx);   // per-column stop button
+    void toggleColumnMute (int columnIdx);
+    bool isColumnMuted (int columnIdx) const noexcept;
     void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
     void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
@@ -178,6 +180,7 @@ private:
     juce::Rectangle<int> footerBounds() const noexcept;
     juce::Rectangle<int> columnStopRowBounds() const noexcept;
     juce::Rectangle<int> columnStopButtonBounds (int columnIdx) const noexcept;
+    juce::Rectangle<int> columnMuteButtonBounds (int columnIdx) const noexcept;
     juce::Rectangle<int> masterColumnBounds() const noexcept;
     juce::Rectangle<int> masterCellBounds (int sceneRow) const noexcept;
     juce::Rectangle<int> masterLaunchButtonBounds (int sceneRow) const noexcept;
@@ -196,6 +199,7 @@ private:
     bool hitTestPlayButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestEditButton (juce::Point<int> p, int& outRow, int& outCol) const noexcept;
     bool hitTestColumnStop (juce::Point<int> p, int& outCol) const noexcept;
+    bool hitTestColumnMute (juce::Point<int> p, int& outCol) const noexcept;
     bool hitTestMasterCell (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterLaunch (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterTempo  (juce::Point<int> p, int& outRow) const noexcept;
@@ -318,7 +322,7 @@ private:
     static constexpr int kColW          = 132;
     static constexpr int kRowH          = 30;
     static constexpr int kMasterColW    = 220;   // Ableton-style scene master column
-    static constexpr int kColumnStopH   = 24;
+    static constexpr int kColumnStopH   = 32;   // footer strip for STOP + MUTE
     static constexpr int kSceneFooterH  = 22;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SessionView)

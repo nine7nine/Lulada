@@ -362,10 +362,24 @@ Rectangle<int> SessionView::columnStopRowBounds() const noexcept
 
 Rectangle<int> SessionView::columnStopButtonBounds (int columnIdx) const noexcept
 {
+    /* Left half of the column footer cell -- STOP affordance. */
     const auto row = columnStopRowBounds();
-    return Rectangle<int> (row.getX() + kSceneLabelW + columnIdx * kColW + 6,
+    const int cellX = row.getX() + kSceneLabelW + columnIdx * kColW;
+    const int half  = (kColW - 12) / 2;
+    return Rectangle<int> (cellX + 6,
                            row.getY() + 4,
-                           kColW - 12, row.getHeight() - 8);
+                           half - 2, row.getHeight() - 8);
+}
+
+Rectangle<int> SessionView::columnMuteButtonBounds (int columnIdx) const noexcept
+{
+    /* Right half of the column footer cell -- MUTE toggle. */
+    const auto row = columnStopRowBounds();
+    const int cellX = row.getX() + kSceneLabelW + columnIdx * kColW;
+    const int half  = (kColW - 12) / 2;
+    return Rectangle<int> (cellX + 6 + half + 2,
+                           row.getY() + 4,
+                           half - 2, row.getHeight() - 8);
 }
 
 Rectangle<int> SessionView::headerRowBounds() const noexcept
@@ -508,11 +522,23 @@ bool SessionView::hitTestColumnStop (Point<int> p, int& outCol) const noexcept
     const auto row = columnStopRowBounds();
     if (! row.contains (p)) return false;
     if (p.x < row.getX() + kSceneLabelW) return false;
-    /* Stop row stops before the master column. */
     const int gridWidth = row.getWidth() - kSceneLabelW - kMasterColW;
     if (p.x >= row.getX() + kSceneLabelW + gridWidth) return false;
     outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
-    return outCol >= 0 && outCol < columns_.size();
+    if (outCol < 0 || outCol >= columns_.size()) return false;
+    return columnStopButtonBounds (outCol).contains (p);
+}
+
+bool SessionView::hitTestColumnMute (Point<int> p, int& outCol) const noexcept
+{
+    const auto row = columnStopRowBounds();
+    if (! row.contains (p)) return false;
+    if (p.x < row.getX() + kSceneLabelW) return false;
+    const int gridWidth = row.getWidth() - kSceneLabelW - kMasterColW;
+    if (p.x >= row.getX() + kSceneLabelW + gridWidth) return false;
+    outCol = (p.x - row.getX() - kSceneLabelW) / kColW;
+    if (outCol < 0 || outCol >= columns_.size()) return false;
+    return columnMuteButtonBounds (outCol).contains (p);
 }
 
 bool SessionView::hitTestMasterCell (Point<int> p, int& outRow) const noexcept
@@ -924,26 +950,33 @@ void SessionView::paint (Graphics& g)
      * draws into the fixed (non-scrolling) chrome strips. */
     g.restoreState();
 
-    /* --- Per-column stop button row --- */
+    /* --- Per-column track-control footer row (STOP + MUTE) --- */
     const auto stopRow = columnStopRowBounds();
-    g.setColour (kHeaderBgColour);
+    g.setColour (kBgColour);    // match session-view bg (was kHeaderBgColour)
     g.fillRect (stopRow);
     g.setColour (kCellOutlineColour);
     g.drawHorizontalLine (stopRow.getY(), 0.0f, (float) getWidth());
 
+    /* Left "TRACK" label at the scene-labels x-range so the user can
+     * read what the row controls without guessing. */
+    {
+        const Rectangle<int> labelR (stopRow.getX(), stopRow.getY(),
+                                     kSceneLabelW, stopRow.getHeight());
+        g.setColour (kRowTextColour);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      kLabelFontSize, juce::Font::plain));
+        g.drawText ("TRACK", labelR.reduced (8, 0),
+                    juce::Justification::centredLeft, true);
+    }
+
+    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                  10.0f, juce::Font::bold));
+
     for (int c = 0; c < columns_.size(); ++c)
     {
-        const auto btnR = columnStopButtonBounds (c);
-        /* Tint button background by column hue so the user can tell
-         * which column they're hitting at a glance. */
-        const Colour tint = columnTint (c).withMultipliedSaturation (0.6f)
-                                          .withMultipliedBrightness (0.55f);
-        g.setColour (tint);
-        g.fillRect (btnR);
+        const auto stopR = columnStopButtonBounds (c);
+        const auto muteR = columnMuteButtonBounds (c);
 
-        /* Centred stop square -- only filled when the column has at
-         * least one active clip; otherwise just an outline so the
-         * button still reads as a button. */
         bool active = false;
         for (auto* clip : clips_)
             if (clip->columnIdx == c)
@@ -951,10 +984,30 @@ void SessionView::paint (Graphics& g)
                 const LiveState s = clip->state.load (std::memory_order_relaxed);
                 if (s != LiveState::Stopped) { active = true; break; }
             }
-        const auto sq = btnR.withSizeKeepingCentre (8, 8);
+        const bool muted = isColumnMuted (c);
+        const Colour tint = columnTint (c).withMultipliedSaturation (0.6f)
+                                          .withMultipliedBrightness (0.55f);
+
+        /* STOP -- column-tinted background, white "STOP" text;
+         * brighter (full saturation) when the column has at least
+         * one active clip. */
+        g.setColour (active ? tint.withMultipliedBrightness (1.6f) : tint);
+        g.fillRect (stopR);
+        g.setColour (kCellOutlineColour);
+        g.drawRect (stopR, 1);
         g.setColour (active ? juce::Colours::white
-                            : juce::Colours::white.withAlpha (0.35f));
-        g.fillRect (sq);
+                            : juce::Colours::white.withAlpha (0.65f));
+        g.drawText ("STOP", stopR, juce::Justification::centred);
+
+        /* MUTE toggle -- amber-red when muted, otherwise the same
+         * tinted background as STOP. */
+        g.setColour (muted ? Colour { 0xff'c0'30'30 } : tint);
+        g.fillRect (muteR);
+        g.setColour (kCellOutlineColour);
+        g.drawRect (muteR, 1);
+        g.setColour (muted ? juce::Colours::white
+                           : juce::Colours::white.withAlpha (0.65f));
+        g.drawText (muted ? "MUTED" : "MUTE", muteR, juce::Justification::centred);
     }
 
     /* Footer hint strip. */
@@ -1116,12 +1169,16 @@ void SessionView::mouseDown (const MouseEvent& e)
         return;
     }
 
-    /* Column stop button row -- kills the column's active clip(s).
-     * Tested before cell hits so a click on the stop row never
-     * stages a drag. */
+    /* Per-column footer -- STOP / MUTE.  Tested before cell hits
+     * so a click here never stages a drag. */
     if (hitTestColumnStop (e.getPosition(), col))
     {
         stopColumn (col);
+        return;
+    }
+    if (hitTestColumnMute (e.getPosition(), col))
+    {
+        toggleColumnMute (col);
         return;
     }
 
@@ -1750,6 +1807,22 @@ void SessionView::stopColumn (int columnIdx)
         c->state.store (LiveState::Stopped, std::memory_order_relaxed);
     }
     repaint();
+}
+
+bool SessionView::isColumnMuted (int columnIdx) const noexcept
+{
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        return trk->isMuted();
+    return false;
+}
+
+void SessionView::toggleColumnMute (int columnIdx)
+{
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return;
+    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
+        trk->setMuted (! trk->isMuted());
+    repaint (columnStopRowBounds());
 }
 
 void SessionView::addScene()
