@@ -5087,8 +5087,37 @@ private:
         if (slotPtr != lastSlotPtr_)
             waveformView.repaint();
 
-        if (numInst != lastNumInstruments_)
+        /* Detect external bank changes -- count OR per-row name.
+         * The right-side Sample Bank panel (DiskOpView) can both add
+         * banks (numInst delta) and rename existing banks in place
+         * (no count delta).  Without a name watch, an in-place
+         * rename leaves this editor's combo showing the OLD label
+         * until the editor is closed and reopened.  User-reported
+         * 2026-05-22. */
+        bool comboDirty = (numInst != lastNumInstruments_);
+        if (! comboDirty)
+        {
+            for (int i = 0; i < numInst; ++i)
+            {
+                auto inst = node.getInstrument (i);
+                const String n = (inst != nullptr) ? inst->name : String();
+                if (i >= lastInstNames_.size() || lastInstNames_[i] != n)
+                {
+                    comboDirty = true;
+                    break;
+                }
+            }
+        }
+        if (comboDirty)
+        {
             rebuildInstCombo();
+            lastInstNames_.clearQuick();
+            for (int i = 0; i < numInst; ++i)
+            {
+                auto inst = node.getInstrument (i);
+                lastInstNames_.add ((inst != nullptr) ? inst->name : String());
+            }
+        }
 
         const int voices = node.getNumVoices();
         const String slotName = (slot != nullptr) ? slot->name : String ("(empty)");
@@ -5120,6 +5149,7 @@ private:
     int                  lastActiveSlot_      { -1 };
     int                  lastActiveInstrument_{ -1 };
     int                  lastNumInstruments_  { -1 };
+    juce::StringArray    lastInstNames_;     // catches in-place renames
     const SamplerSampleSlot* lastSlotPtr_     { nullptr };
     String               lastSlotName_;
 
