@@ -147,9 +147,18 @@ private:
  *  (default: channel N → instrument N; updated by MIDI program-change).
  *  Per-voice DSP via vendored ft2-clone mixer.  Each instrument carries
  *  its own FT2 vol+pan envelopes, fadeout, and auto-vibrato.  */
-class SamplerNode : public BaseProcessor
+class SamplerNode : public BaseProcessor,
+                    public juce::ChangeBroadcaster
 {
 public:
+    /** Notify listeners (editor + Disk Op pane) that instruments[] or
+     *  any slot contents changed.  Cheap, deferred to message thread
+     *  internally by juce::ChangeBroadcaster.  Called from every
+     *  mutation entry point (addInstrument / removeInstrument /
+     *  loadSampleToSlot / setStateInformation / clearSlot wrappers
+     *  / external clears in DiskOpView etc.). */
+    void notifyBanksChanged() { sendChangeMessage(); }
+
     static constexpr int kMaxInstruments = 128;
     static constexpr int kEnvTickRateHz  = 50;   // FT2 nominal tick rate
     static constexpr int kNumBuses       = 4;    // stereo aux outputs

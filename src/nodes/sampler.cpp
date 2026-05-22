@@ -4462,7 +4462,7 @@ private:
  *   FX     — sample effects (lp/hp/resonance/generators/normalize). [F3]
  * ========================================================================*/
 class SamplerNodeEditor : public AudioProcessorEditor,
-                          private Timer,
+                          private juce::ChangeListener,
                           private ListBoxModel
 {
 public:
@@ -4569,6 +4569,17 @@ public:
             refresh();
         };
         addAndMakeVisible (instDelBtn);
+
+        /* Manual refresh -- explicit re-read of every bank + slot
+         * from the SamplerNode.  Redundant with the
+         * ChangeBroadcaster path under normal operation, but the
+         * user asked for an explicit button so external mutations
+         * the broadcaster doesn't see (e.g. raw memory edits, a
+         * future plugin sideband, debugging) can still be picked
+         * up on demand. */
+        refreshBtn.setButtonText ("Refresh");
+        refreshBtn.onClick = [this] { refreshInstLabel(); refresh(); };
+        addAndMakeVisible (refreshBtn);
 
         slotList.setModel (this);
         slotList.setRowHeight (24);
@@ -4720,10 +4731,32 @@ public:
         rebuildEnvelopeViews();
         switchPage (Page::kBank);
         refresh();
-        startTimerHz (8);
+
+        /* Event-driven sync replaces the old 8 Hz polling timer.
+         * SamplerNode is a ChangeBroadcaster -- it sends a change
+         * message on every mutation (addInstrument, loadSampleToSlot,
+         * setStateInformation, etc.).  We refresh on every callback,
+         * AND on visibility change (so re-opening the editor picks
+         * up anything that happened while it was hidden), AND
+         * manually via the Refresh button. */
+        node.addChangeListener (this);
     }
 
-    ~SamplerNodeEditor() override { stopTimer(); }
+    ~SamplerNodeEditor() override { node.removeChangeListener (this); }
+
+    /** ChangeListener -- fires whenever SamplerNode broadcasts a
+     *  bank/slot mutation.  Single refresh call covers label + slot
+     *  list + waveform + status. */
+    void changeListenerCallback (juce::ChangeBroadcaster*) override { refresh(); }
+
+    /** Pick up any state mutations that happened while the editor
+     *  was hidden (the change-listener path will have already fired
+     *  them, but we refresh here too as a belt-and-braces guarantee
+     *  for the user's "when GUI opens it checks" expectation). */
+    void visibilityChanged() override
+    {
+        if (isVisible()) { refreshInstLabel(); refresh(); }
+    }
 
     void paint (Graphics& g) override
     {
@@ -4987,7 +5020,8 @@ private:
         void resized() override { if (onResized) onResized(); }
     };
 
-    void timerCallback() override { refresh(); }
+    /* Old 8 Hz Timer poll was dropped in favour of the
+     * ChangeBroadcaster path (see ctor) -- no timerCallback here. */
 
     void configureParamSlider (Slider& s, const String& label, double lo, double hi,
                                double step, std::function<void (double)> on)
@@ -5258,6 +5292,7 @@ private:
     Label        instLabel;
     TextButton   instPrevBtn, instNextBtn;
     TextButton   instAddBtn,  instDelBtn;
+    TextButton   refreshBtn;   // manual "re-read everything from node"
 
     ListBox      slotList;
     TextButton   clearBtn;
@@ -5470,31 +5505,41 @@ SamplerInstrument::Ptr SamplerNode::getInstrument (int index) const
 
 SamplerInstrument::Ptr SamplerNode::addInstrument()
 {
-    ScopedLock sl (sampleLock);
-    if ((int) instruments.size() >= kMaxInstruments) return nullptr;
-    auto inst = SamplerInstrument::Ptr (new SamplerInstrument());
-    instruments.push_back (inst);
+    SamplerInstrument::Ptr inst;
+    {
+        ScopedLock sl (sampleLock);
+        if ((int) instruments.size() >= kMaxInstruments) return nullptr;
+        inst = SamplerInstrument::Ptr (new SamplerInstrument());
+        instruments.push_back (inst);
+    }
+    /* Broadcast OUTSIDE the lock -- sendChangeMessage may immediately
+     * dispatch to listeners on the message thread; we don't want any
+     * listener taking sampleLock from us. */
+    notifyBanksChanged();
     return inst;
 }
 
 void SamplerNode::removeInstrument (int index)
 {
-    ScopedLock sl (sampleLock);
-    if (index < 0 || index >= (int) instruments.size()) return;
-    if (instruments.size() <= 1) return; /* always keep at least one */
-
-    /* Drop mono-mode state keyed by the about-to-be-freed raw pointer. */
-    SamplerInstrument* doomed = instruments[(size_t) index].get();
-    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
-        cts->forgetInstrument (doomed);
-
-    instruments.erase (instruments.begin() + index);
-    /* Re-map channel bindings that pointed past the removed index. */
-    for (auto& b : channelBinding)
     {
-        if (b == (int8_t) index) b = -1;
-        else if (b > (int8_t) index) --b;
+        ScopedLock sl (sampleLock);
+        if (index < 0 || index >= (int) instruments.size()) return;
+        if (instruments.size() <= 1) return; /* always keep at least one */
+
+        /* Drop mono-mode state keyed by the about-to-be-freed raw pointer. */
+        SamplerInstrument* doomed = instruments[(size_t) index].get();
+        if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+            cts->forgetInstrument (doomed);
+
+        instruments.erase (instruments.begin() + index);
+        /* Re-map channel bindings that pointed past the removed index. */
+        for (auto& b : channelBinding)
+        {
+            if (b == (int8_t) index) b = -1;
+            else if (b > (int8_t) index) --b;
+        }
     }
+    notifyBanksChanged();
 }
 
 SamplerInstrument::Ptr SamplerNode::getInstrumentForChannel (int channel1to16) const
@@ -5550,8 +5595,13 @@ bool SamplerNode::loadSampleToSlot (int instrumentIndex, int slot, const File& f
     auto loaded = inst->prepareSlot (file, formatManager);
     if (loaded == nullptr) return false;
 
-    const ScopedLock sl (sampleLock);
-    return inst->commitSlot (slot, std::move (loaded));
+    bool ok = false;
+    {
+        const ScopedLock sl (sampleLock);
+        ok = inst->commitSlot (slot, std::move (loaded));
+    }
+    if (ok) notifyBanksChanged();
+    return ok;
 }
 
 void SamplerNode::rebuildInstrument()
@@ -5909,6 +5959,11 @@ void SamplerNode::setStateInformation (const void* data, int size)
 
     synth->clearSounds();
     synth->addSound (new Ft2SamplerSound (*this));
+
+    /* Session-load mutation -- notify listeners so the editor + Disk
+     * Op pane refresh from the freshly-restored state without waiting
+     * for a timer tick. */
+    notifyBanksChanged();
 }
 
 } // namespace element
