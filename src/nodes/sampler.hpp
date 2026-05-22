@@ -33,6 +33,11 @@ struct SamplerSampleSlot
     int     loopStart  = 0;
     int     loopLength = 0;
 
+    /** Which bus this slot routes to (0..SamplerNode::kNumBuses-1 =
+     *  Bus 1..N).  Default Bus 1.  The per-bus master gain lives on
+     *  SamplerNode (busGain[]). */
+    int     busIndex = 0;
+
     bool isLoaded() const noexcept { return data16L != nullptr && numSamples > 0; }
 };
 
@@ -128,6 +133,13 @@ class SamplerNode : public BaseProcessor
 public:
     static constexpr int kMaxInstruments = 128;
     static constexpr int kEnvTickRateHz  = 50;   // FT2 nominal tick rate
+    static constexpr int kNumBuses       = 4;    // stereo aux outputs
+
+    /** Master gain for each of the 4 buses (0..2.0; 1.0 = unity).
+     *  Slot's audio is multiplied by busGain[slot->busIndex] before
+     *  being written to that bus's output channels.  UI: 4 sliders
+     *  below the sample preview on the Bank page. */
+    float busGain[kNumBuses] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
     SamplerNode();
     ~SamplerNode() override;

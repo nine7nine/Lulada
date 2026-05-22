@@ -289,8 +289,12 @@ public:
         jobStart       = s;
         jobEnd         = e;
         renderSubNum   = subNum;
-        workerScratch.clear (0, 0, subNum);
-        if (channels > 1) workerScratch.clear (1, 0, subNum);
+        /* Clear ALL channels — voices write to Main + any of the
+         * kNumBuses aux channels per their slot's busAssign.  Only
+         * clearing 0/1 left bus channels dirty across jobs. */
+        const int n = workerScratch.getNumChannels();
+        for (int c = 0; c < n && c < channels; ++c)
+            workerScratch.clear (c, 0, subNum);
         workReady.signal();
     }
 
@@ -466,14 +470,18 @@ protected:
             if (w * per < N)
                 workers[(size_t) w]->waitForJobCompletion();
 
-        /* Sum worker scratches into output.  outputAudio is the same
-         * buffer the scalar path would have written voice contributions
-         * into; addFrom does +=, matching scalar's semantics. */
+        /* Sum worker scratches into output across ALL channels —
+         * voices write to Main (ch 0/1) and any of the aux bus pairs
+         * per their slot's busAssign.  outputAudio is the same buffer
+         * the scalar path would have written into; addFrom does +=,
+         * matching scalar's semantics. */
+        const int outCh = outputAudio.getNumChannels();
         for (auto& w : workers)
         {
-            outputAudio.addFrom (0, startSample, w->workerScratch, 0, 0, numSamples);
-            if (channels > 1)
-                outputAudio.addFrom (1, startSample, w->workerScratch, 1, 0, numSamples);
+            const int wCh = w->workerScratch.getNumChannels();
+            const int n   = juce::jmin (outCh, wCh, channels);
+            for (int c = 0; c < n; ++c)
+                outputAudio.addFrom (c, startSample, w->workerScratch, c, 0, numSamples);
         }
     }
 
@@ -790,26 +798,37 @@ public:
             }
         }
 
-        /* Mix scratch → out with the JUCE fallback ADSR multiplier (only
-         * active when neither envelope is enabled — in that case the FT2
-         * envelope tickers leave fEnvVolMul at 1.0 and we let the ADSR
-         * shape the tail). */
-        auto* outL = out.getWritePointer (0) + startSample;
-        auto* outR = out.getWritePointer (1) + startSample;
+        /* Mix scratch → slot's assigned bus, scaled by per-bus master
+         * gain.  Output layout:
+         *   ch 0..1 : Bus 1   (first output = JUCE main bus)
+         *   ch 2..3 : Bus 2
+         *   ch 4..5 : Bus 3
+         *   ch 6..7 : Bus 4
+         * Slot's busIndex is set per-slot on the Bank page; the per-
+         * bus master gains (4 sliders below the preview) modulate the
+         * whole bus output. */
         const auto* sL = scratch.getReadPointer (0);
         const auto* sR = scratch.getReadPointer (1);
+
+        const int   bIdx = juce::jlimit (0, SamplerNode::kNumBuses - 1, slotPtr->busIndex);
+        const float gain = juce::jlimit (0.0f, 2.0f, owner.busGain[bIdx]);
+        const int   outCh = out.getNumChannels();
+        const int   chL   = 2 * bIdx;
+        const int   chR   = chL + 1;
+        if (chR >= outCh || gain <= 0.0f) return;
+
+        float* busL = out.getWritePointer (chL) + startSample;
+        float* busR = out.getWritePointer (chR) + startSample;
 
         const bool envEnabled = (instrument != nullptr)
                               && (instrument->volumeEnv.flags & FT2Envelope::kEnabled);
 
         if (envEnabled)
         {
-            /* FT2 envelope path: scratch already carries env-modulated
-             * volume + fadeout via setVoiceGain on each tick. */
             for (int i = 0; i < numSamples; ++i)
             {
-                outL[i] += sL[i];
-                outR[i] += sR[i];
+                busL[i] += sL[i] * gain;
+                busR[i] += sR[i] * gain;
             }
         }
         else
@@ -817,8 +836,8 @@ public:
             for (int i = 0; i < numSamples; ++i)
             {
                 const float env = adsr.getNextSample();
-                outL[i] += sL[i] * env;
-                outR[i] += sR[i] * env;
+                busL[i] += sL[i] * gain * env;
+                busR[i] += sR[i] * gain * env;
             }
         }
 
@@ -4463,6 +4482,19 @@ public:
         configureParamSlider (panSlider, "Pan",   0.0, 1.0, 0.001,
             [this](double v) { if (auto* s = currentSlot()) s->panning = (float) v; });
 
+        /* Per-bus master gain sliders — 4 of them, pinned under the
+         * preview.  Drive SamplerNode::busGain[] directly; voices read
+         * the gain on each render block. */
+        for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+        {
+            configureParamSlider (busGainSliders[b],
+                                  "Bus " + String (b + 1),
+                                  0.0, 2.0, 0.001,
+                                  [this, b] (double v) {
+                                      node.busGain[b] = (float) v;
+                                  });
+        }
+
         loopCombo.addItem ("Loop: Off",      1);
         loopCombo.addItem ("Loop: Forward",  2);
         loopCombo.addItem ("Loop: Ping-pong", 3);
@@ -4614,7 +4646,9 @@ public:
         auto bankR = body;
 
         /* Left column: load/clear pinned at bottom, slot list fills above. */
-        auto leftCol = bankR.removeFromLeft (270);
+        /* Bank list is wider now — it hosts the per-row bus badge
+         * (right edge) in addition to slot number + key range + name. */
+        auto leftCol = bankR.removeFromLeft (380);
         auto leftFooter = leftCol.removeFromBottom (24);
         clearBtn.setBounds (leftFooter.removeFromRight (50)); leftFooter.removeFromRight (4);
         loadBtn .setBounds (leftFooter);
@@ -4637,11 +4671,22 @@ public:
         relSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         fineSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         volSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
-        panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (8);
+        panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
 
-        /* Waveform preview takes the rest of the right column.  Envelope
-         * tabBar + loopCombo are no longer surfaced on Bank — see Inst /
-         * Sample pages. */
+        /* Per-bus master gain strip pinned to the BOTTOM (under the
+         * preview).  Reserves rowH per bus + small gaps; preview takes
+         * the rest. */
+        constexpr int kBusN = SamplerNode::kNumBuses;
+        const int gainsH = kBusN * rowH + (kBusN - 1) * 2 + 6;
+        auto gainsR = bankR.removeFromBottom (gainsH);
+        gainsR.removeFromTop (6);
+        for (int b = 0; b < kBusN; ++b)
+        {
+            busGainSliders[b].setBounds (gainsR.removeFromTop (rowH));
+            if (b + 1 < kBusN) gainsR.removeFromTop (2);
+        }
+
+        /* Waveform preview takes the rest of the right column. */
         waveformView.setBounds (bankR);
     }
 
@@ -4667,6 +4712,7 @@ public:
         fineSlider   .setVisible (bank);
         volSlider    .setVisible (bank);
         panSlider    .setVisible (bank);
+        for (auto& s : busGainSliders) s.setVisible (bank);
         waveformView .setVisible (bank);
         interpCombo  .setVisible (bank);
         status       .setVisible (bank);
@@ -4684,7 +4730,46 @@ public:
 
     /* === ListBoxModel ================================================= */
 
+    static constexpr int kBusBadgeWidth = 56;
+
     int getNumRows() override { return SamplerInstrument::kNumSlots; }
+
+    /** Left-click on the bus badge cycles to the next bus.
+     *  Right-click opens a small popup to pick any of Bus 1..N
+     *  directly.  Click outside the badge falls through to normal
+     *  row selection (handled by the base ListBox). */
+    void listBoxItemClicked (int row, const MouseEvent& e) override
+    {
+        auto inst = node.getInstrument (activeInstrument);
+        auto* slot = inst ? inst->getSlot (row) : nullptr;
+        if (slot == nullptr) return;
+
+        const int rowW = slotList.getWidth();
+        const int badgeLeft = rowW - kBusBadgeWidth - 4;
+        if (e.x < badgeLeft) return;
+
+        if (e.mods.isPopupMenu())
+        {
+            PopupMenu m;
+            for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+                m.addItem (b + 1, "Bus " + String (b + 1), true,
+                           slot->busIndex == b);
+            m.showMenuAsync (PopupMenu::Options(),
+                             [this, row, inst] (int picked) {
+                                 if (picked > 0)
+                                 {
+                                     if (auto* s = inst->getSlot (row))
+                                         s->busIndex = picked - 1;
+                                     slotList.repaint();
+                                 }
+                             });
+        }
+        else
+        {
+            slot->busIndex = (slot->busIndex + 1) % SamplerNode::kNumBuses;
+            slotList.repaint();
+        }
+    }
 
     void paintListBoxItem (int row, Graphics& g, int width, int height,
                            bool rowIsSelected) override
@@ -4729,9 +4814,31 @@ public:
         g.setColour (Colour { 0xff'd0'80'40 });
         g.drawText (rng, 44, 0, 80, height, Justification::centredLeft);
 
+        /* Reserve a compact "Bus N" badge on the right edge — same
+         * width as kBusBadgeWidth (used in listBoxItemClicked for
+         * hit-test).  Name column shrinks to leave room. */
+        const int badgeW = kBusBadgeWidth;
+        const int nameRight = width - badgeW - 6;
+
         g.setColour (slot != nullptr ? Colour { 0xff'b0'b0'b0 } : Colour { 0xff'40'40'40 });
         g.drawText (slot != nullptr ? slot->name : String (juce::CharPointer_UTF8 ("\xe2\x80\x94")),
-                    130, 0, width - 136, height, Justification::centredLeft);
+                    130, 0, juce::jmax (0, nameRight - 130), height,
+                    Justification::centredLeft);
+
+        if (slot != nullptr)
+        {
+            const int bIdx = juce::jlimit (0, SamplerNode::kNumBuses - 1, slot->busIndex);
+            auto badgeR = juce::Rectangle<int> (width - badgeW - 4, 2,
+                                                 badgeW, height - 4);
+            g.setColour (Colour { 0xff'2a'2a'2a });
+            g.fillRoundedRectangle (badgeR.toFloat(), 3.0f);
+            g.setColour (Colour { 0xff'd0'80'40 });
+            g.drawRoundedRectangle (badgeR.toFloat(), 3.0f, 1.0f);
+            g.setColour (Colours::white);
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::bold));
+            g.drawText ("Bus " + String (bIdx + 1), badgeR,
+                        Justification::centred);
+        }
     }
 
     void selectedRowsChanged (int lastRowSelected) override
@@ -4919,6 +5026,10 @@ private:
             panSlider .setValue ((double) slot->panning,      dontSendNotification);
             loopCombo .setSelectedId ((int) slot->loopMode + 1, dontSendNotification);
         }
+        /* Master bus gains live on the node, not the slot — always sync
+         * (independent of which slot is selected). */
+        for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+            busGainSliders[b].setValue ((double) node.busGain[b], dontSendNotification);
         interpCombo.setSelectedId ((int) node.getInterpMode() + 1, dontSendNotification);
 
         const int numLoaded = inst ? inst->numLoaded() : 0;
@@ -4983,6 +5094,11 @@ private:
 
     Slider       rootSlider, relSlider, fineSlider, volSlider, panSlider;
     ComboBox     loopCombo;
+    /* Per-bus MASTER gain sliders — 4 of them, below the preview.
+     * Drive SamplerNode::busGain[]; independent of slot selection.
+     * Per-slot bus assignment lives in the bank-list row badge —
+     * paintListBoxItem + listBoxItemClicked. */
+    Slider       busGainSliders[SamplerNode::kNumBuses];
     SampleWaveformView waveformView;
 
     TabbedComponent tabBar { TabbedButtonBar::TabsAtTop };
@@ -5015,9 +5131,30 @@ AudioProcessorEditor* SamplerNode::createEditor()
 
 /* =========================================================================== */
 
+/* Multi-bus output layout: kNumBuses stereo aux sends, NO separate
+ * Main — Bus 1 is what JUCE/Element treats as the main bus (first
+ * output) but the user-facing label is just "Bus 1".  Each slot
+ * picks ONE bus (busIndex) and a level (busLevel) for that bus.
+ *
+ * Inlined (rather than a free helper) because BusesProperties is
+ * `protected` in juce::AudioProcessor and only accessible from inside
+ * a subclass body. */
 SamplerNode::SamplerNode()
-    : BaseProcessor (BusesProperties()
-                       .withOutput ("Output", AudioChannelSet::stereo(), true))
+    : BaseProcessor ([] {
+          /* withOutput's third arg is `isActivatedByDefault`, NOT
+           * "is main bus".  Pass `true` for every bus so they all
+           * spawn enabled — JUCE's first bus is implicitly the
+           * "main" anyway.  Earlier i==1 conditional left Bus 2/3/4
+           * disabled at construction, which made the graph node
+           * report getTotalNumOutputChannels==2 (just Bus 1) — the
+           * bug you saw on screen. */
+          BusesProperties bp;
+          for (int i = 1; i <= kNumBuses; ++i)
+              bp = bp.withOutput ("Bus " + String (i),
+                                  AudioChannelSet::stereo(),
+                                  true);
+          return bp;
+      }())
 {
     ensureMixerInterpolationTablesReady();
     /* mixFuncDispatch[] is patched with SIMD variants on CPUs that support
@@ -5047,9 +5184,15 @@ void SamplerNode::fillInPluginDescription (PluginDescription& desc) const
 {
     desc.fileOrIdentifier   = EL_NODE_ID_SAMPLER;
     desc.name               = "Sampler";
-    desc.descriptiveName    = "Multi-sample instrument (MIDI-in / stereo audio-out)";
+    desc.descriptiveName    = "Multi-sample instrument (MIDI-in / " +
+                              String (kNumBuses) + " stereo bus outputs)";
     desc.numInputChannels   = 0;
-    desc.numOutputChannels  = 2;
+    /* Total output channel count = 2 (stereo) × kNumBuses.  This is
+     * what Element's internal format reader uses to decide how many
+     * output ports to wire on each instantiation — keeping it in
+     * lockstep with the BusesProperties layout above is what makes
+     * the graph node show the right number of pads. */
+    desc.numOutputChannels  = 2 * kNumBuses;
     desc.hasSharedContainer = false;
     desc.isInstrument       = true;
     desc.category           = "Instrument";
@@ -5068,7 +5211,12 @@ void SamplerNode::prepareToPlay (double sampleRate, int maxBlockSize)
      * downcast: SamplerNode owns the synth and only ever constructs a
      * ChannelTrackingSynth in its ctor — see SamplerNode(). */
     if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
-        cts->prepareWorkers (2, juce::jmax (64, maxBlockSize));
+    {
+        /* Worker scratch covers every aux bus (each stereo) — voices
+         * write to whichever channels their per-bus busSend picks.
+         * Total = 2 * kNumBuses; sized once at prepareToPlay. */
+        cts->prepareWorkers (2 * kNumBuses, juce::jmax (64, maxBlockSize));
+    }
 }
 
 void SamplerNode::releaseResources()
@@ -5103,7 +5251,13 @@ void SamplerNode::processBlock (AudioBuffer<float>& audio_, MidiBuffer& midi)
 
 bool SamplerNode::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    return layouts.getMainOutputChannelSet() == AudioChannelSet::stereo();
+    /* Main + every aux must be stereo.  Returning false for any
+     * non-stereo arrangement keeps the layout immutable so audio-thread
+     * channel-index arithmetic in renderNextBlock is always safe. */
+    if (layouts.outputBuses.size() != 1 + kNumBuses) return false;
+    for (auto& set : layouts.outputBuses)
+        if (set != AudioChannelSet::stereo()) return false;
+    return true;
 }
 
 void SamplerNode::rebuildVoicePool()
@@ -5297,6 +5451,11 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
     tree.setProperty ("adsrSus",  adsrParams.sustain, nullptr);
     tree.setProperty ("adsrRel",  adsrParams.release, nullptr);
 
+    /* Per-bus master gains live on the node (not per-slot). */
+    for (int b = 0; b < kNumBuses; ++b)
+        tree.setProperty (Identifier ("busGain" + String (b + 1)),
+                          (double) busGain[b], nullptr);
+
     for (int b = 0; b < 16; ++b)
         tree.setProperty (Identifier ("bind" + String (b)), (int) channelBinding[(size_t) b], nullptr);
 
@@ -5345,6 +5504,7 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
             slotTree.setProperty ("loopMode",     (int) slot->loopMode, nullptr);
             slotTree.setProperty ("loopStart",    slot->loopStart,      nullptr);
             slotTree.setProperty ("loopLength",   slot->loopLength,     nullptr);
+            slotTree.setProperty ("busIndex",     slot->busIndex,           nullptr);
             instTree.appendChild (slotTree, nullptr);
         }
         tree.appendChild (instTree, nullptr);
@@ -5375,6 +5535,12 @@ void SamplerNode::setStateInformation (const void* data, int size)
     adsrParams.decay   = (float) (double) tree.getProperty ("adsrDec", 0.05);
     adsrParams.sustain = (float) (double) tree.getProperty ("adsrSus", 1.0);
     adsrParams.release = (float) (double) tree.getProperty ("adsrRel", 0.10);
+
+    /* Per-bus master gains.  Default to 1.0 if missing (old sessions). */
+    for (int b = 0; b < kNumBuses; ++b)
+        busGain[b] = (float) (double) tree.getProperty (
+            Identifier ("busGain" + String (b + 1)), 1.0);
+
     rebuildVoicePool();
 
     for (int b = 0; b < 16; ++b)
@@ -5447,6 +5613,33 @@ void SamplerNode::setStateInformation (const void* data, int size)
                 slot->loopMode     = (SamplerLoopMode) (int) slotTree.getProperty ("loopMode", 0);
                 slot->loopStart    = (int) slotTree.getProperty ("loopStart",  0);
                 slot->loopLength   = (int) slotTree.getProperty ("loopLength", 0);
+
+                /* Bus assignment.  Read busIndex if present; older
+                 * intermediate formats (busSend1..N from the multi-
+                 * send experiment / busAssign+busWet) get folded into
+                 * busIndex with a best-effort mapping.  Default if
+                 * none present: Bus 1 (from ctor). */
+                if (slotTree.hasProperty ("busIndex"))
+                {
+                    slot->busIndex = juce::jlimit (0, SamplerNode::kNumBuses - 1,
+                                                   (int) slotTree.getProperty ("busIndex", 0));
+                }
+                else if (slotTree.hasProperty ("busSend1"))
+                {
+                    float best = 0.0f; int bestIdx = 0;
+                    for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+                    {
+                        const float s = (float) (double) slotTree.getProperty (
+                            Identifier ("busSend" + String (b + 1)), 0.0);
+                        if (s > best) { best = s; bestIdx = b; }
+                    }
+                    slot->busIndex = bestIdx;
+                }
+                else if (slotTree.hasProperty ("busAssign"))
+                {
+                    const int oldAssign = (int) slotTree.getProperty ("busAssign", 0);
+                    slot->busIndex = juce::jmax (0, oldAssign - 1);
+                }
             }
         }
         instruments.push_back (inst);
