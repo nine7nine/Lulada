@@ -123,12 +123,13 @@ SessionView::SessionView()
     configureToolbarLabel  (quantNameLabel_,   "QUANT",  false);
     configureToolbarLabel  (quantValueLabel_,  "Bar",    true);    // popup on click
 
-    /* Click-to-edit hooks — match the tracker editor's pattern.
-     * SCENES value: double-click → text edit → commit target count
-     * (grows / shrinks the scenes_ array to match).
-     * QUANT value: click → popup menu (typing enum names is
-     * awkward; menu is one click). */
-    scenesValueLabel_.setEditable (false, true, false);
+    /* Click-to-edit hooks — match the tracker editor's pattern, but
+     * with single-click editing on the SCENES value too (the toolbar
+     * is a top-level chrome strip — double-click-to-edit feels
+     * over-cautious here, as user 2026-05-22 found out the hard way).
+     * QUANT value: click → popup menu (typing enum names is awkward;
+     * menu is one click). */
+    scenesValueLabel_.setEditable (true, true, false);
     scenesValueLabel_.onTextChange = [this] {
         const auto txt = scenesValueLabel_.getText()
                             .retainCharacters ("0123456789").trim();
