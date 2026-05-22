@@ -1210,7 +1210,7 @@ void SessionView::mouseDown (const MouseEvent& e)
             juce::PopupMenu m;
             m.addItem (1, "Launch scene");
             m.addSeparator();
-            m.addItem (5, "Rename...");
+            m.addItem (5, "Scene properties...");
             m.addSeparator();
             m.addItem (2, "Insert scene above");
             m.addItem (3, "Insert scene below");
@@ -1220,11 +1220,11 @@ void SessionView::mouseDown (const MouseEvent& e)
             const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
             switch (r)
             {
-                case 1: bangScene   (row);     break;
-                case 2: insertScene (row);     break;
-                case 3: insertScene (row + 1); break;
-                case 4: deleteScene (row);     break;
-                case 5: renameScene (row);     break;
+                case 1: bangScene     (row);     break;
+                case 2: insertScene   (row);     break;
+                case 3: insertScene   (row + 1); break;
+                case 4: deleteScene   (row);     break;
+                case 5: openSceneView (row);     break;
                 default: break;
             }
         }
@@ -1786,80 +1786,24 @@ void SessionView::applySceneOverridesToTransport (const SessionScene& s)
     }
 }
 
-void SessionView::editSceneTempo (int sceneRow)
+void SessionView::editSceneTempo     (int sceneRow) { openSceneView (sceneRow); }
+void SessionView::editSceneSignature (int sceneRow) { openSceneView (sceneRow); }
+
+void SessionView::notifySceneEdited (int sceneRow)
 {
+    /* Persist the mutation + repaint the visual surfaces that mirror
+     * scene data (left scene label + master cell). */
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
-    const auto& sc = scenes_.getReference (sceneRow);
-
-    const auto initial = sc.tempoOverride > 0.0
-                            ? juce::String (sc.tempoOverride, 2)
-                            : juce::String();
-
-    showInlineEditor (
-        masterTempoFieldBounds (sceneRow),
-        initial,
-        [this, sceneRow] (const juce::String& txt)
-        {
-            if (sceneRow >= scenes_.size()) return;
-            auto& s = scenes_.getReference (sceneRow);
-            const auto trimmed = txt.trim();
-            if (trimmed.isEmpty()) { s.tempoOverride = -1.0; }
-            else
-            {
-                const double v = trimmed.getDoubleValue();
-                s.tempoOverride = (v > 0.0)
-                    ? juce::jlimit (20.0, 999.0, v)
-                    : -1.0;
-            }
-            writeToSession();
-            repaint (masterCellBounds (sceneRow));
-        });
+    writeToSession();
+    refreshToolbarLabels();
+    repaint (sceneLabelBounds  (sceneRow));
+    repaint (masterCellBounds  (sceneRow));
 }
 
-void SessionView::editSceneSignature (int sceneRow)
+SessionView::SessionScene* SessionView::sceneAt (int sceneRow) noexcept
 {
-    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
-    const auto& sc = scenes_.getReference (sceneRow);
-
-    /* Single field, "num/den" format -- much faster than two
-     * AlertWindow inputs.  Empty input clears the override. */
-    const auto initial = (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
-                            ? juce::String (sc.beatsPerBar) + "/" + juce::String (sc.beatDivisor)
-                            : juce::String();
-
-    showInlineEditor (
-        masterSigFieldBounds (sceneRow),
-        initial,
-        [this, sceneRow] (const juce::String& txt)
-        {
-            if (sceneRow >= scenes_.size()) return;
-            auto& s = scenes_.getReference (sceneRow);
-            const auto trimmed = txt.trim();
-            if (trimmed.isEmpty())
-            {
-                s.beatsPerBar = 0;
-                s.beatDivisor = 0;
-            }
-            else
-            {
-                const int slash = trimmed.indexOfChar ('/');
-                int num = 0, den = 0;
-                if (slash > 0)
-                {
-                    num = trimmed.substring (0, slash).getIntValue();
-                    den = trimmed.substring (slash + 1).getIntValue();
-                }
-                else
-                {
-                    num = trimmed.getIntValue();
-                    den = 4;
-                }
-                s.beatsPerBar = juce::jlimit (0, 32, num);
-                s.beatDivisor = juce::jlimit (0, 32, den);
-            }
-            writeToSession();
-            repaint (masterCellBounds (sceneRow));
-        });
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return nullptr;
+    return &scenes_.getReference (sceneRow);
 }
 
 bool SessionView::sceneHasActiveClip (int sceneRow) const noexcept
@@ -2031,31 +1975,10 @@ void SessionView::insertScene (int beforeRow)
 
 void SessionView::renameScene (int row)
 {
-    if (row < 0 || row >= scenes_.size()) return;
-
-    auto* aw = new juce::AlertWindow ("Rename scene",
-                                      "New name for "
-                                      + scenes_.getReference (row).name + ":",
-                                      juce::AlertWindow::NoIcon);
-    aw->addTextEditor ("name", scenes_.getReference (row).name);
-    aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
-    aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-
-    aw->enterModalState (true,
-        juce::ModalCallbackFunction::create (
-            [this, row, aw] (int result) {
-                if (result == 1 && row < scenes_.size())
-                {
-                    const auto newName = aw->getTextEditorContents ("name").trim();
-                    if (newName.isNotEmpty())
-                    {
-                        scenes_.getReference (row).name = newName;
-                        writeToSession();
-                        repaint (sceneLabelBounds (row));
-                    }
-                }
-            }),
-        true /* delete when dismissed */);
+    /* Rename routes through the Scene View popup, per user request:
+     * one window for all scene properties instead of three separate
+     * AlertWindow / inline-editor flows. */
+    openSceneView (row);
 }
 
 void SessionView::renameClip (SessionClip& clip)
@@ -2348,6 +2271,242 @@ public:
     }
     void closeButtonPressed() override { delete this; }
 };
+
+/* === SceneView popup ===================================================
+ * Dedicated floating window for editing scene properties (name, tempo
+ * override, time-signature override).  Replaces the inline tempo/sig
+ * editors AND the rename AlertWindow with a single non-modal surface
+ * the user opens once and edits in.
+ *
+ * Per feedback_inline_edit_cancel_on_click_away: Return commits a
+ * field, Escape + focus-loss revert.  Per the dedicated-window pattern
+ * the popup is non-modal so the user can interact with the main app
+ * (transport, other scenes) while it's open.  Window is self-deleting
+ * via the close button.  SafePointer<SessionView> guards against the
+ * view being torn down while the window is open. */
+class SceneViewContent : public juce::Component,
+                         private juce::TextEditor::Listener
+{
+public:
+    SceneViewContent (juce::Component::SafePointer<SessionView> view, int sceneRow)
+        : view_ (view), sceneRow_ (sceneRow)
+    {
+        setSize (320, 200);
+
+        configureLabel (titleLabel_,  "Scene " + juce::String (sceneRow + 1),
+                        14.0f, juce::Font::bold);
+        configureLabel (nameLabel_,   "Name",      11.0f, juce::Font::plain);
+        configureLabel (tempoLabel_,  "Tempo",     11.0f, juce::Font::plain);
+        configureLabel (sigLabel_,    "Signature", 11.0f, juce::Font::plain);
+        configureLabel (sigSlashLbl_, "/",         12.0f, juce::Font::bold);
+        configureLabel (hintLabel_,
+            "Tempo / sig left blank = inherit session value.",
+            10.0f, juce::Font::plain);
+        hintLabel_.setColour (juce::Label::textColourId, juce::Colour { 0xff'70'70'70 });
+
+        configureEditor (nameEditor_);
+        configureEditor (tempoEditor_);
+        configureEditor (sigNumEditor_);
+        configureEditor (sigDenEditor_);
+
+        nameEditor_  .setInputRestrictions (0);
+        tempoEditor_ .setInputRestrictions (8,   "0123456789.");
+        sigNumEditor_.setInputRestrictions (2,   "0123456789");
+        sigDenEditor_.setInputRestrictions (2,   "0123456789");
+
+        refreshFromScene();
+    }
+
+    void resized() override
+    {
+        const int margin = 12;
+        const int rowH   = 24;
+        const int labelW = 78;
+        const int colGap = 8;
+
+        auto r = getLocalBounds().reduced (margin);
+        titleLabel_.setBounds (r.removeFromTop (rowH));
+        r.removeFromTop (6);
+
+        auto layoutRow = [&] (juce::Label& lab, juce::Component& field) {
+            auto row = r.removeFromTop (rowH);
+            lab.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            field.setBounds (row);
+            r.removeFromTop (4);
+        };
+
+        layoutRow (nameLabel_,  nameEditor_);
+        layoutRow (tempoLabel_, tempoEditor_);
+
+        /* Signature row -- two narrow fields with a / between. */
+        {
+            auto row = r.removeFromTop (rowH);
+            sigLabel_.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            const int fieldW = 46;
+            sigNumEditor_.setBounds (row.removeFromLeft (fieldW));
+            row.removeFromLeft (6);
+            sigSlashLbl_.setBounds (row.removeFromLeft (10));
+            row.removeFromLeft (6);
+            sigDenEditor_.setBounds (row.removeFromLeft (fieldW));
+            r.removeFromTop (4);
+        }
+
+        r.removeFromTop (6);
+        hintLabel_.setBounds (r.removeFromTop (rowH));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour { 0xff'18'18'18 });
+    }
+
+private:
+    void configureLabel (juce::Label& l, const juce::String& text,
+                         float pt, int style)
+    {
+        l.setText (text, juce::dontSendNotification);
+        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      pt, style));
+        l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
+        addAndMakeVisible (l);
+    }
+
+    void configureEditor (juce::TextEditor& e)
+    {
+        e.setMultiLine (false);
+        e.setReturnKeyStartsNewLine (false);
+        e.setSelectAllWhenFocused (true);
+        e.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      12.0f, juce::Font::plain));
+        e.setColour (juce::TextEditor::backgroundColourId, juce::Colour { 0xff'20'20'20 });
+        e.setColour (juce::TextEditor::textColourId,       juce::Colour { 0xff'ff'ff'ff });
+        e.setColour (juce::TextEditor::outlineColourId,    juce::Colour { 0xff'3a'3a'3a });
+        e.setColour (juce::TextEditor::focusedOutlineColourId,
+                                                            juce::Colour { 0xff'ff'a0'40 });
+        e.addListener (this);
+        addAndMakeVisible (e);
+    }
+
+    void refreshFromScene()
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* sc = v->sceneAt (sceneRow_);
+        if (sc == nullptr) return;
+
+        nameEditor_.setText (sc->name, juce::dontSendNotification);
+        tempoEditor_.setText (sc->tempoOverride > 0.0
+                                  ? juce::String (sc->tempoOverride, 2)
+                                  : juce::String(),
+                              juce::dontSendNotification);
+        sigNumEditor_.setText (sc->beatsPerBar > 0
+                                   ? juce::String (sc->beatsPerBar)
+                                   : juce::String(),
+                               juce::dontSendNotification);
+        sigDenEditor_.setText (sc->beatDivisor > 0
+                                   ? juce::String (sc->beatDivisor)
+                                   : juce::String(),
+                               juce::dontSendNotification);
+    }
+
+    void textEditorReturnKeyPressed (juce::TextEditor& e) override
+    {
+        commit (e);
+    }
+
+    void textEditorEscapeKeyPressed (juce::TextEditor& e) override
+    {
+        juce::ignoreUnused (e);
+        refreshFromScene();   // revert
+    }
+
+    void textEditorFocusLost (juce::TextEditor& e) override
+    {
+        /* Per feedback_inline_edit_cancel_on_click_away: focus loss
+         * REVERTS, doesn't commit.  User has to press Return to lock
+         * the value in. */
+        juce::ignoreUnused (e);
+        refreshFromScene();
+    }
+
+    void commit (juce::TextEditor& e)
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* sc = v->sceneAt (sceneRow_);
+        if (sc == nullptr) return;
+
+        if (&e == &nameEditor_)
+        {
+            const auto n = e.getText().trim();
+            if (n.isNotEmpty()) sc->name = n;
+        }
+        else if (&e == &tempoEditor_)
+        {
+            const auto t = e.getText().trim();
+            if (t.isEmpty()) { sc->tempoOverride = -1.0; }
+            else
+            {
+                const double bpm = t.getDoubleValue();
+                sc->tempoOverride = (bpm > 0.0)
+                    ? juce::jlimit (20.0, 999.0, bpm)
+                    : -1.0;
+            }
+        }
+        else if (&e == &sigNumEditor_)
+        {
+            const auto n = e.getText().trim();
+            sc->beatsPerBar = n.isEmpty() ? 0
+                                          : juce::jlimit (0, 32, n.getIntValue());
+        }
+        else if (&e == &sigDenEditor_)
+        {
+            const auto d = e.getText().trim();
+            sc->beatDivisor = d.isEmpty() ? 0
+                                          : juce::jlimit (0, 32, d.getIntValue());
+        }
+
+        v->notifySceneEdited (sceneRow_);
+        refreshFromScene();
+    }
+
+    juce::Component::SafePointer<SessionView> view_;
+    int sceneRow_;
+
+    juce::Label titleLabel_, nameLabel_, tempoLabel_, sigLabel_, sigSlashLbl_, hintLabel_;
+    juce::TextEditor nameEditor_, tempoEditor_, sigNumEditor_, sigDenEditor_;
+};
+
+class SceneViewWindow : public juce::DocumentWindow
+{
+public:
+    SceneViewWindow (juce::Component* content, const juce::String& title)
+        : juce::DocumentWindow (title,
+                                juce::Colour { 0xff'18'18'18 },
+                                juce::DocumentWindow::closeButton)
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (content, true);
+        setResizable (false, false);
+        centreWithSize (340, 220);
+        setVisible (true);
+    }
+    void closeButtonPressed() override { delete this; }
+};
+
+/* openSceneView is defined here so SceneViewContent / SceneViewWindow
+ * are complete types at the point of `new`.  All other SessionView
+ * method definitions live above. */
+void SessionView::openSceneView (int sceneRow)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    auto* content = new SceneViewContent (this, sceneRow);
+    auto* win = new SceneViewWindow (content,
+                                     "Scene " + juce::String (sceneRow + 1));
+    juce::ignoreUnused (win);   // self-deletes on close
+}
 
 void SessionView::openPatternEditor (SessionClip& clip)
 {
