@@ -119,9 +119,23 @@ SessionView::SessionView()
                             [this] { rescanColumns(); });
 
     configureToolbarLabel  (scenesNameLabel_,  "SCENES", false);
-    configureToolbarLabel  (scenesValueLabel_, "8",      false);
+    configureToolbarLabel  (scenesValueLabel_, "8",      true);    // editable
     configureToolbarLabel  (quantNameLabel_,   "QUANT",  false);
-    configureToolbarLabel  (quantValueLabel_,  "Bar",    false);
+    configureToolbarLabel  (quantValueLabel_,  "Bar",    true);    // popup on click
+
+    /* Click-to-edit hooks — match the tracker editor's pattern.
+     * SCENES value: double-click → text edit → commit target count
+     * (grows / shrinks the scenes_ array to match).
+     * QUANT value: click → popup menu (typing enum names is
+     * awkward; menu is one click). */
+    scenesValueLabel_.setEditable (false, true, false);
+    scenesValueLabel_.onTextChange = [this] {
+        const auto txt = scenesValueLabel_.getText()
+                            .retainCharacters ("0123456789").trim();
+        if (txt.isNotEmpty()) commitScenesCount (txt.getIntValue());
+        refreshToolbarLabels();
+    };
+    quantValueLabel_.onClick = [this] { showQuantMenu(); };
 
     /* Seed with 8 empty scenes so the user always has a target grid
      * to click into; persistence may overwrite this. */
@@ -199,6 +213,35 @@ void SessionView::cycleDefaultQuant (int delta)
     defaultLaunchQuant_ = static_cast<LaunchQuant> (idx);
     refreshToolbarLabels();
     writeToSession();
+}
+
+void SessionView::showQuantMenu()
+{
+    juce::PopupMenu m;
+    const auto q = defaultLaunchQuant_;
+    m.addItem (10, "Off",     true, q == LaunchQuant::Off);
+    m.addItem (11, "1 Beat",  true, q == LaunchQuant::Beat);
+    m.addItem (12, "1 Bar",   true, q == LaunchQuant::Bar);
+    m.addItem (13, "2 Bars",  true, q == LaunchQuant::TwoBars);
+    m.addItem (14, "4 Bars",  true, q == LaunchQuant::FourBars);
+
+    const int r = m.showAt (quantValueLabel_.getScreenBounds());
+    if (r >= 10 && r <= 14)
+    {
+        defaultLaunchQuant_ = static_cast<LaunchQuant> (r - 10);
+        refreshToolbarLabels();
+        writeToSession();
+    }
+}
+
+void SessionView::commitScenesCount (int target)
+{
+    /* Grow / shrink scenes_ to match the requested count.  Shrink
+     * deletes from the end via the existing deleteScene path so any
+     * clips on doomed rows get stopped + cleaned up properly. */
+    target = juce::jlimit (1, 256, target);
+    while (scenes_.size() < target) addScene();
+    while (scenes_.size() > target) deleteScene (scenes_.size() - 1);
 }
 
 SessionView::~SessionView() = default;

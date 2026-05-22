@@ -196,6 +196,20 @@ private:
     Services* services_ = nullptr;
     Transport::MonitorPtr monitor_;
 
+    /* Label subclass that fires a callback on click.  Used for the
+     * QUANT value display — clicking pops a menu of enum options
+     * rather than dropping into a text editor (typing "2 Bars" exact
+     * is awkward; menu is one click). */
+    class ClickableLabel : public juce::Label
+    {
+    public:
+        std::function<void()> onClick;
+        void mouseDown (const juce::MouseEvent&) override
+        {
+            if (onClick) onClick();
+        }
+    };
+
     /* Top toolbar — tracker-editor-styled (juce::TextButton with the
      * same palette + juce::Label for static name / editable value
      * pairs).  Mirrors `TrackerEditor::Toolbar` so the two views
@@ -204,7 +218,8 @@ private:
     juce::TextButton sceneMinusBtn_, scenePlusBtn_;
     juce::TextButton quantPrevBtn_,  quantNextBtn_;
     juce::Label scenesNameLabel_, scenesValueLabel_;
-    juce::Label quantNameLabel_,  quantValueLabel_;
+    juce::Label quantNameLabel_;
+    ClickableLabel quantValueLabel_;
 
     /* Default launch quant applied to NEW clips when they're added
      * (right-click "Add new pattern" / "Assign existing pattern" or
@@ -215,6 +230,8 @@ private:
     void configureToolbarLabel  (juce::Label&, const juce::String& text, bool editable);
     void refreshToolbarLabels();
     void cycleDefaultQuant (int delta);   // +1 next / -1 prev
+    void showQuantMenu();                 // popup picker for default quant
+    void commitScenesCount (int target);  // grow / shrink to match
     juce::String formatLaunchQuant (LaunchQuant) const noexcept;
 
     juce::Array<SessionColumn>      columns_;
