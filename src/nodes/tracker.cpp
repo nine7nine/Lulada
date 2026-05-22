@@ -31,7 +31,7 @@ void TrackerNode::prepareToRender (double sampleRate, int maxBufferSize)
     if (mod_ == nullptr)
     {
         mod_ = module_new();
-        installTestPattern();
+        installDefaultPattern();
     }
 
     mod_->clt->jack_sample_rate = (jack_nframes_t) sampleRate;
@@ -208,32 +208,20 @@ void TrackerNode::drainEngineToMidi (RenderContext& rc, int numSamples)
     midi_buff_excl_out (mod_->clt);
 }
 
-void TrackerNode::installTestPattern()
+void TrackerNode::installDefaultPattern()
 {
-    /* 16-row × 2-track demo. Both tracks emit on the single MIDI output
-     * port; they separate downstream by MIDI channel (1 vs 2). Use a
-     * MidiChannelSplitter / MidiRouter to fan out per-channel. */
+    /* Empty 16-row × 2-track default pattern, created on first
+     * prepareToPlay when no saved state exists.  Both tracks emit on
+     * the single MIDI output port and separate downstream by MIDI
+     * channel (1 vs 2); a MidiChannelSplitter / MidiRouter fans them
+     * out.  Pattern is rowless — the user fills it in. */
     constexpr int kLen = 16;
     sequence* seq = sequence_new (kLen);
 
-    /* Track 0 — port 0, MIDI channel 1, descending bass line. */
-    track* trk0 = track_new (0, 0, kLen, kLen, TRACK_DEF_CTRLPR);
-    track_set_row (trk0, 0,  0, 1, 36, 110, 0); // C2
-    track_set_row (trk0, 0,  4, 1, 43, 100, 0); // G2
-    track_set_row (trk0, 0,  8, 1, 41,  95, 0); // F2
-    track_set_row (trk0, 0, 12, 1, 39,  90, 0); // D#2
+    track* trk0 = track_new (0, 0, kLen, kLen, TRACK_DEF_CTRLPR);  /* ch 1 */
     sequence_add_track (seq, trk0);
 
-    /* Track 1 — port 0 (shared), MIDI channel 2, melodic 8th-note arp. */
-    track* trk1 = track_new (0, 1, kLen, kLen, TRACK_DEF_CTRLPR);
-    track_set_row (trk1, 0,  0, 1, 60, 100, 0); // C4
-    track_set_row (trk1, 0,  2, 1, 64, 100, 0); // E4
-    track_set_row (trk1, 0,  4, 1, 67, 100, 0); // G4
-    track_set_row (trk1, 0,  6, 1, 72, 100, 0); // C5
-    track_set_row (trk1, 0,  8, 1, 67, 100, 0); // G4
-    track_set_row (trk1, 0, 10, 1, 64, 100, 0); // E4
-    track_set_row (trk1, 0, 12, 1, 60, 100, 0); // C4
-    track_set_row (trk1, 0, 14, 1, 64, 100, 0); // E4
+    track* trk1 = track_new (0, 1, kLen, kLen, TRACK_DEF_CTRLPR);  /* ch 2 */
     sequence_add_track (seq, trk1);
 
     module_add_sequence (mod_, seq);

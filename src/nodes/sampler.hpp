@@ -33,6 +33,11 @@ struct SamplerSampleSlot
     int     loopStart  = 0;
     int     loopLength = 0;
 
+    /** Which bus this slot routes to (0..SamplerNode::kNumBuses-1 =
+     *  Bus 1..N).  Default Bus 1.  The per-bus master gain lives on
+     *  SamplerNode (busGain[]). */
+    int     busIndex = 0;
+
     bool isLoaded() const noexcept { return data16L != nullptr && numSamples > 0; }
 };
 
@@ -104,6 +109,21 @@ public:
     uint16_t      fadeoutRate = 0;   // 0 = no fadeout (sample plays out)
     AutoVibParams autoVib;
 
+    /** Mono mode: only one voice plays per channel binding at any time;
+     *  re-triggering on a held key glides pitch (last-note priority with
+     *  legato release).  Portamento time is in milliseconds — 0 means
+     *  instantaneous (which is a glissando but mono-stealing only). */
+    bool          mono = false;
+    float         portamentoTimeMs = 80.0f;
+
+    /** When true, FT2 envelope ticks are scaled at note-on so the
+     *  envelope's last point lines up with the end of the playing
+     *  slot's sample — instead of running in absolute 50 Hz ticks
+     *  (max ~6.5 s).  Reflects the actual musical "shape this sample"
+     *  use case; default ON since envelopes are unusable as-shipped
+     *  for short one-shots without this scaling. */
+    bool          envSampleRelative = true;
+
 private:
     std::array<std::unique_ptr<SamplerSampleSlot>, kNumSlots> slots;
     uint8_t noteToSlot[128] {};
@@ -121,6 +141,13 @@ class SamplerNode : public BaseProcessor
 public:
     static constexpr int kMaxInstruments = 128;
     static constexpr int kEnvTickRateHz  = 50;   // FT2 nominal tick rate
+    static constexpr int kNumBuses       = 4;    // stereo aux outputs
+
+    /** Master gain for each of the 4 buses (0..2.0; 1.0 = unity).
+     *  Slot's audio is multiplied by busGain[slot->busIndex] before
+     *  being written to that bus's output channels.  UI: 4 sliders
+     *  below the sample preview on the Bank page. */
+    float busGain[kNumBuses] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
     SamplerNode();
     ~SamplerNode() override;

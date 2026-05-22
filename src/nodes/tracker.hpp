@@ -22,12 +22,7 @@ namespace element {
 /** Internal tracker / pattern sequencer node, MIDI-only.
  *
  * Wraps the vendored vht engine (src/engine/tracker/*.c) as a JUCE-side
- * AudioProcessor. Phase 1 smoke-test surface: 1 MIDI output, hardcoded
- * test pattern at 120 BPM, plays on load. Real UI / multi-port / state
- * persistence land in Phase 2+.
- *
- * See ~/wine-nspa-notes/tracker-research/DESIGN.md +
- * vht-engine-notes.md for architecture context. */
+ * AudioProcessor. */
 class TrackerNode : public MidiFilterNode
 {
 public:
@@ -87,9 +82,9 @@ protected:
     void refreshPorts() override;
 
 private:
-    /** Build a hardcoded 4-row test pattern so Phase 1 emits MIDI without
-     *  needing a UI. Real authoring lands in Phase 2. */
-    void installTestPattern();
+    /** Build the empty default pattern (2 tracks, 16 rows, no notes)
+     *  on first prepareToPlay so the module starts in a valid state. */
+    void installDefaultPattern();
 
     /** Drain engine output buffers into per-port JUCE MidiBuffers. Replaces
      *  vht's jack_process.c midi_buffer_flush. */

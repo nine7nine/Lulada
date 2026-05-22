@@ -289,8 +289,12 @@ public:
         jobStart       = s;
         jobEnd         = e;
         renderSubNum   = subNum;
-        workerScratch.clear (0, 0, subNum);
-        if (channels > 1) workerScratch.clear (1, 0, subNum);
+        /* Clear ALL channels — voices write to Main + any of the
+         * kNumBuses aux channels per their slot's busAssign.  Only
+         * clearing 0/1 left bus channels dirty across jobs. */
+        const int n = workerScratch.getNumChannels();
+        for (int c = 0; c < n && c < channels; ++c)
+            workerScratch.clear (c, 0, subNum);
         workReady.signal();
     }
 
@@ -336,17 +340,40 @@ private:
     int                      renderSubNum = 0;
 };
 
+class Ft2SamplerVoice;
+
 class ChannelTrackingSynth : public Synthesiser
 {
 public:
     explicit ChannelTrackingSynth (SamplerNode& owner) : node (owner) {}
     ~ChannelTrackingSynth() override { stopWorkers(); }
 
-    void noteOn (int midiChannel, int midiNoteNumber, float velocity) override
+    /** Mono-mode per-instrument tracking.  Held-notes vector holds keys
+     *  in press order for last-note-priority + legato release.  active
+     *  voice is the single sounding voice for this instrument; cleared
+     *  by noteOff once the held set empties (the underlying Synthesiser
+     *  noteOff fades the voice out and we stop tracking it). */
+    struct MonoState
     {
-        node.setLastNoteChannel (midiChannel);
-        Synthesiser::noteOn (midiChannel, midiNoteNumber, velocity);
+        std::vector<int>    heldNotes;
+        Ft2SamplerVoice*    activeVoice = nullptr;
+    };
+
+    /* Bodies defined out-of-line after Ft2SamplerVoice's class — they
+     * need its complete type for dynamic_cast + member access. */
+    void noteOn  (int midiChannel, int midiNoteNumber, float velocity) override;
+    void noteOff (int midiChannel, int midiNoteNumber, float velocity,
+                  bool allowTailOff) override;
+
+    /** Clear mono state for a specific instrument — called from
+     *  SamplerNode::removeInstrument so the raw-pointer key doesn't
+     *  dangle.  Voice pointers in the cleared state are dropped to
+     *  avoid use-after-free if a stale lookup ever fires. */
+    void forgetInstrument (SamplerInstrument* inst) noexcept
+    {
+        monoStates.erase (inst);
     }
+
     /* JUCE's Synthesiser swallows program-change events without exposing
      * an override hook — we run our own MIDI scan in SamplerNode::processBlock
      * before renderNextBlock to handle them.  See SamplerNode::processBlock. */
@@ -443,14 +470,18 @@ protected:
             if (w * per < N)
                 workers[(size_t) w]->waitForJobCompletion();
 
-        /* Sum worker scratches into output.  outputAudio is the same
-         * buffer the scalar path would have written voice contributions
-         * into; addFrom does +=, matching scalar's semantics. */
+        /* Sum worker scratches into output across ALL channels —
+         * voices write to Main (ch 0/1) and any of the aux bus pairs
+         * per their slot's busAssign.  outputAudio is the same buffer
+         * the scalar path would have written into; addFrom does +=,
+         * matching scalar's semantics. */
+        const int outCh = outputAudio.getNumChannels();
         for (auto& w : workers)
         {
-            outputAudio.addFrom (0, startSample, w->workerScratch, 0, 0, numSamples);
-            if (channels > 1)
-                outputAudio.addFrom (1, startSample, w->workerScratch, 1, 0, numSamples);
+            const int wCh = w->workerScratch.getNumChannels();
+            const int n   = juce::jmin (outCh, wCh, channels);
+            for (int c = 0; c < n; ++c)
+                outputAudio.addFrom (c, startSample, w->workerScratch, c, 0, numSamples);
         }
     }
 
@@ -458,6 +489,12 @@ private:
     SamplerNode&                                 node;
     std::vector<std::unique_ptr<SamplerWorker>>  workers;
     juce::Array<juce::SynthesiserVoice*>         voicePtrs;
+
+    /* Mono-mode per-instrument state.  Keyed by raw SamplerInstrument*;
+     * forgetInstrument cleans up on removeInstrument so the key never
+     * dangles.  Touched only from the audio thread (noteOn/noteOff fire
+     * from Synthesiser::renderNextBlock). */
+    std::unordered_map<SamplerInstrument*, MonoState> monoStates;
 };
 
 
@@ -556,10 +593,16 @@ public:
         voice.active     = true;
         voice.mixFuncOffset = (uint8_t) owner.getMixFuncIndexForCurrentMode (loop, pingpong);
 
-        /* Pitch: 12tet semitones + slot finetune + slot relativeNote. */
+        /* Pitch: 12tet semitones + slot finetune + slot relativeNote.
+         * currentSemis tracks the live (possibly mid-glide) semitone
+         * offset; beginGlideTo updates targetSemis + glide step. */
         const double semis    = (double) (midiNote - slot->rootNote)
                               + (double) slot->relativeNote
                               + (double) slot->finetune / 128.0;
+        currentSemis  = semis;
+        targetSemis   = semis;
+        glideStepSemisPerTick = 0.0;
+        glideTicksRemaining   = 0;
         basePitchMul = std::pow (2.0, semis / 12.0);
         setVoiceDelta (basePitchMul);
 
@@ -569,12 +612,41 @@ public:
         slotPan = pan;
         setVoiceGain (gain, pan);
 
-        /* Reset FT2 envelope + fadeout + autoVib state. */
+        /* Reset FT2 envelope + fadeout + autoVib state.
+         *
+         * Pre-seed the envelope state to "we just arrived at points[0]"
+         * instead of (pos=0, tick=0, value=0).  advanceEnvelope does
+         * ++tick BEFORE the `tick == points[pos].x` check, so the
+         * landing-on-point-0 case (typical: points[0].x == 0) could
+         * never fire and value sat at 0 forever.  Combined with
+         * applyEnvelopeToVoice multiplying fEnvVol(=0) into gain,
+         * the voice played at full baseline gain for one tick then
+         * snapped to zero — audible click on every note when
+         * envelopes were enabled.
+         *
+         * Seeded state: tick = points[0].x, value = points[0].y * 256,
+         * pos = 1 (next target), delta = lerp slope to points[1]
+         * (or 0 if it's a single-point envelope). */
         keyOff = false;
-        volEnvPos = 0;  volEnvTick = 0;  volEnvDelta = 0;
-        panEnvPos = 0;  panEnvTick = 0;  panEnvDelta = 0;
-        volEnvValue = 0;
-        panEnvValue = 0;
+        auto seedEnv = [] (const FT2Envelope& env, uint8_t& pos, uint16_t& tick,
+                           int16_t& value, int16_t& delta)
+        {
+            pos = 0; tick = 0; value = 0; delta = 0;
+            if (! (env.flags & FT2Envelope::kEnabled)) return;
+            if (env.length == 0) return;
+
+            tick  = (uint16_t) env.points[0].x;
+            value = (int16_t) ((int8_t) env.points[0].y << 8);
+            pos   = 1;
+            if (pos < env.length)
+            {
+                const int16_t xDiff = (int16_t) (env.points[1].x - env.points[0].x);
+                const int8_t  yDiff = (int8_t)  (env.points[1].y - env.points[0].y);
+                if (xDiff > 0) delta = (int16_t) ((yDiff << 8) / xDiff);
+            }
+        };
+        seedEnv (instrument->volumeEnv, volEnvPos, volEnvTick, volEnvValue, volEnvDelta);
+        seedEnv (instrument->panEnv,    panEnvPos, panEnvTick, panEnvValue, panEnvDelta);
         fadeoutVol = 32768;
         autoVibPos = 0;  autoVibAmp = 0;  autoVibSweepCounter = 0;
         if (instrument != nullptr && instrument->autoVib.depth > 0)
@@ -592,6 +664,26 @@ public:
         }
         envSampleAccum = 0;
 
+        /* Per-voice envelope tick rate.  Default 0 = "use owner's
+         * absolute 50 Hz tick rate".  When the instrument opts into
+         * envSampleRelative, scale so the longest enabled envelope's
+         * last point lines up with sample end — short one-shots get
+         * a fast envelope, long pads get a slow one, all from the
+         * same envelope shape. */
+        envSamplesPerTickOverride = 0;
+        if (instrument != nullptr && instrument->envSampleRelative && slot->numSamples > 0)
+        {
+            int lastX = 0;
+            auto take = [&] (const FT2Envelope& e) {
+                if ((e.flags & FT2Envelope::kEnabled) && e.length > 0)
+                    lastX = juce::jmax<int> (lastX, e.points[e.length - 1].x);
+            };
+            take (instrument->volumeEnv);
+            take (instrument->panEnv);
+            if (lastX > 0)
+                envSamplesPerTickOverride = juce::jmax (1, slot->numSamples / lastX);
+        }
+
         /* FT2 envelope path uses sample-position-driven envelopes; the
          * fallback ADSR is only used when both vol+pan envelopes are
          * disabled. */
@@ -601,6 +693,13 @@ public:
         adsr.setParameters (p);
         adsr.reset();
         adsr.noteOn();
+
+        /* Apply envelope multiplier to voice gain BEFORE the first
+         * mixChunk so the initial samples already reflect
+         * points[0].y — otherwise the first tick boundary inside
+         * renderNextBlock would jump from baseline gain to env-scaled
+         * gain, producing a step discontinuity on every note. */
+        applyEnvelopeToVoice();
     }
 
     void stopNote (float /*velocity*/, bool allowTailOff) override
@@ -620,8 +719,29 @@ public:
         }
     }
 
-    void pitchWheelMoved (int)            override {}
-    void controllerMoved (int, int)       override {}
+    /** MIDI pitch wheel.  JUCE passes the raw 14-bit value (0..16383,
+     *  centre 8192).  Convert to a fractional-semitone pitch ratio
+     *  (±kPitchBendSemis full range — hardcoded to 2 for now) and
+     *  fold it into the per-voice pitchBendMul; applyEnvelopeToVoice
+     *  multiplies it into voice.delta every envelope tick. */
+    void pitchWheelMoved (int value) override
+    {
+        constexpr double kPitchBendSemis = 2.0;     /* ± range */
+        const double norm  = (value - 8192) / 8192.0;       /* -1..+1 */
+        const double semis = norm * kPitchBendSemis;
+        pitchBendMul = std::pow (2.0, semis / 12.0);
+    }
+
+    /** MIDI CC.  We implement CC1 (mod wheel) → vibrato amount.  If
+     *  the instrument has autoVib configured, mod wheel scales /
+     *  augments its amplitude; if not, mod wheel synthesises a default
+     *  sine vibrato at rate=8 so "wiggle the wheel, hear vibrato"
+     *  works out of the box.  All other CCs are ignored for now. */
+    void controllerMoved (int controllerNumber, int newValue) override
+    {
+        if (controllerNumber == 1)
+            modWheelAmount = juce::jlimit (0.0f, 1.0f, newValue / 127.0f);
+    }
 
     void renderNextBlock (AudioBuffer<float>& out,
                           int startSample, int numSamples) override
@@ -654,7 +774,12 @@ public:
         if (voice.base16 == nullptr) { voice.active = false; clearCurrentNote(); return; }
         slotIsStereo = curSlot->isStereo && curSlot->data16R != nullptr;
 
-        const int samplesPerTick = owner.getSamplesPerEnvTick();
+        /* Use the per-voice override (sample-relative envelope) when
+         * set in startNote; otherwise fall back to the owner's
+         * absolute 50 Hz tick rate. */
+        const int samplesPerTick = envSamplesPerTickOverride > 0
+                                    ? envSamplesPerTickOverride
+                                    : owner.getSamplesPerEnvTick();
 
         AudioBuffer<float> scratch (2, numSamples);
         scratch.clear();
@@ -677,6 +802,7 @@ public:
             {
                 envSampleAccum -= samplesPerTick;
                 tickEnvelopes();
+                advanceGlide();
                 applyEnvelopeToVoice();
                 continue;
             }
@@ -692,30 +818,42 @@ public:
             {
                 envSampleAccum -= samplesPerTick;
                 tickEnvelopes();
+                advanceGlide();
                 applyEnvelopeToVoice();
             }
         }
 
-        /* Mix scratch → out with the JUCE fallback ADSR multiplier (only
-         * active when neither envelope is enabled — in that case the FT2
-         * envelope tickers leave fEnvVolMul at 1.0 and we let the ADSR
-         * shape the tail). */
-        auto* outL = out.getWritePointer (0) + startSample;
-        auto* outR = out.getWritePointer (1) + startSample;
+        /* Mix scratch → slot's assigned bus, scaled by per-bus master
+         * gain.  Output layout:
+         *   ch 0..1 : Bus 1   (first output = JUCE main bus)
+         *   ch 2..3 : Bus 2
+         *   ch 4..5 : Bus 3
+         *   ch 6..7 : Bus 4
+         * Slot's busIndex is set per-slot on the Bank page; the per-
+         * bus master gains (4 sliders below the preview) modulate the
+         * whole bus output. */
         const auto* sL = scratch.getReadPointer (0);
         const auto* sR = scratch.getReadPointer (1);
+
+        const int   bIdx = juce::jlimit (0, SamplerNode::kNumBuses - 1, slotPtr->busIndex);
+        const float gain = juce::jlimit (0.0f, 2.0f, owner.busGain[bIdx]);
+        const int   outCh = out.getNumChannels();
+        const int   chL   = 2 * bIdx;
+        const int   chR   = chL + 1;
+        if (chR >= outCh || gain <= 0.0f) return;
+
+        float* busL = out.getWritePointer (chL) + startSample;
+        float* busR = out.getWritePointer (chR) + startSample;
 
         const bool envEnabled = (instrument != nullptr)
                               && (instrument->volumeEnv.flags & FT2Envelope::kEnabled);
 
         if (envEnabled)
         {
-            /* FT2 envelope path: scratch already carries env-modulated
-             * volume + fadeout via setVoiceGain on each tick. */
             for (int i = 0; i < numSamples; ++i)
             {
-                outL[i] += sL[i];
-                outR[i] += sR[i];
+                busL[i] += sL[i] * gain;
+                busR[i] += sR[i] * gain;
             }
         }
         else
@@ -723,8 +861,8 @@ public:
             for (int i = 0; i < numSamples; ++i)
             {
                 const float env = adsr.getNextSample();
-                outL[i] += sL[i] * env;
-                outR[i] += sR[i] * env;
+                busL[i] += sL[i] * gain * env;
+                busR[i] += sR[i] * gain * env;
             }
         }
 
@@ -829,7 +967,14 @@ private:
             if (amp >= cap) { autoVibAmp = (uint16_t) cap; autoVibSweepCounter = 0; }
             else            { autoVibAmp = (uint16_t) amp; }
         }
-        autoVibPos = (uint8_t) (autoVibPos + instrument->autoVib.rate);
+        /* Mod wheel synthesises a default-rate vibrato when the
+         * instrument has no autoVib rate configured — so wiggling the
+         * wheel produces audible motion out of the box.  Otherwise
+         * autoVib.rate drives the phase as before. */
+        const uint8_t rate = (instrument->autoVib.rate > 0)
+                              ? instrument->autoVib.rate
+                              : (modWheelAmount > 0.001f ? (uint8_t) 8 : (uint8_t) 0);
+        autoVibPos = (uint8_t) (autoVibPos + rate);
     }
 
     /* Advance an envelope state by one FT2 tick.  Mirrors the per-tick
@@ -949,10 +1094,22 @@ private:
             pan = juce::jlimit (0.0f, 1.0f, slotPan + delta * panMul);
         }
 
-        setVoiceGain (gain, pan);
+        /* Ramp gain change from current to new target over one
+         * envelope tick — kills the periodic 50 Hz step-discontinuity
+         * buzz that piecewise-constant per-tick gain produces.  See
+         * setVoiceGain doc above. */
+        setVoiceGain (gain, pan, /*useRamp=*/true);
 
-        /* autoVib pitch modulation. */
-        if (instrument->autoVib.depth > 0)
+        /* autoVib pitch modulation + mod-wheel synthesised vibrato.
+         * Always call setVoiceDelta so basePitchMul / pitchBendMul
+         * changes (glide, MIDI pitch wheel) reach the mixer even when
+         * vibrato is off — previously the no-autoVib path left
+         * voice.delta stuck at startNote's value. */
+        double mult = 1.0;
+        const bool useAutoVib = instrument->autoVib.depth > 0;
+        const bool useModVib  = modWheelAmount > 0.001f;
+
+        if (useAutoVib || useModVib)
         {
             int16_t vibVal;
             switch (instrument->autoVib.type)
@@ -962,16 +1119,83 @@ private:
                 case 3: vibVal = (int16_t) (((-(autoVibPos >> 1) + 64) & 127) - 64); break;
                 default: vibVal = kAutoVibSineTab[autoVibPos];
             }
-            const int32_t scaled = (vibVal * (int16_t) autoVibAmp) >> (6 + 8);
+            /* Effective amp combines the swept autoVibAmp with a
+             * mod-wheel contribution scaled to be musically usable at
+             * full deflection (~50% of max autoVib range = ~50 cents
+             * peak at the sine peak). */
+            const uint32_t modAmp     = (uint32_t) (modWheelAmount * 8192.0f);
+            const uint32_t effAmp     = juce::jmin (65535u,
+                                                    (uint32_t) autoVibAmp + modAmp);
+            const int32_t scaled = (vibVal * (int16_t) effAmp) >> (6 + 8);
             /* scaled is in "period" units; for our delta-driven voice
              * apply as a fractional semitone perturbation.  64 ~= ±1 semi
              * at full depth at the sine peak; scale to cents:
              * cents ≈ scaled * (100/64). */
             const double cents = scaled * (100.0 / 64.0);
-            const double mult  = std::pow (2.0, cents / 1200.0);
-            setVoiceDelta (basePitchMul * mult);
+            mult = std::pow (2.0, cents / 1200.0);
+        }
+        setVoiceDelta (basePitchMul * mult * pitchBendMul);
+    }
+
+    /* ChannelTrackingSynth.noteOn / .noteOff call the glide helpers + the
+     * voice-status accessors below.  All other callers are inside this
+     * class.  Friend the synth class to keep the helpers private (no
+     * public surface change). */
+    friend class ChannelTrackingSynth;
+
+    /** Begin gliding pitch + velocity toward a new MIDI note over
+     *  @p portamentoMs.  Does NOT reset envelopes / fadeout — the
+     *  voice continues as one continuous note (mono+legato semantics).
+     *  Glide is linear in the semitone domain so the rate is musically
+     *  perceptible (constant cents/sec); basePitchMul is recomputed on
+     *  each tick from currentSemis. */
+    void beginGlideTo (int newMidiNote, float velocity, float portamentoMs)
+    {
+        if (slotPtr == nullptr) return;
+
+        playedNote   = newMidiNote;
+        velocityLin  = juce::jlimit (0.0f, 1.0f, velocity);
+
+        const double newSemis = (double) (newMidiNote - slotPtr->rootNote)
+                              + (double) slotPtr->relativeNote
+                              + (double) slotPtr->finetune / 128.0;
+        targetSemis = newSemis;
+
+        if (portamentoMs <= 0.001f)
+        {
+            currentSemis          = newSemis;
+            glideStepSemisPerTick = 0.0;
+            glideTicksRemaining   = 0;
+            basePitchMul          = std::pow (2.0, currentSemis / 12.0);
+        }
+        else
+        {
+            const double tickRate = (double) SamplerNode::kEnvTickRateHz;
+            const double ticks    = (portamentoMs / 1000.0) * tickRate;
+            glideTicksRemaining   = juce::jmax (1, (int) std::ceil (ticks));
+            glideStepSemisPerTick = (targetSemis - currentSemis)
+                                  / (double) glideTicksRemaining;
         }
     }
+
+    /** Advance the mono-portamento glide by one envelope tick.  Called
+     *  from renderNextBlock's per-tick loop, between tickEnvelopes and
+     *  applyEnvelopeToVoice so the new basePitchMul flows into the
+     *  mixer through applyEnvelopeToVoice's unconditional setVoiceDelta. */
+    void advanceGlide()
+    {
+        if (glideTicksRemaining <= 0) return;
+        --glideTicksRemaining;
+        if (glideTicksRemaining == 0)
+            currentSemis = targetSemis;
+        else
+            currentSemis += glideStepSemisPerTick;
+        basePitchMul = std::pow (2.0, currentSemis / 12.0);
+    }
+
+    /** Read-only access for ChannelTrackingSynth's mono-mode lookup. */
+    const SamplerInstrument*    getInstrumentPtr() const noexcept { return instrument.get(); }
+    float                       getVelocityLin()   const noexcept { return velocityLin; }
 
     void setVoiceDelta (double pitchMul)
     {
@@ -979,9 +1203,26 @@ private:
         voice.delta = (uint64_t) jlimit (0.0, 1e18, playRate * 4294967296.0);
     }
 
-    void setVoiceGain (float gain, float pan)
+    /** Update voice L/R gain.  When @p useRamp is true, set fCurrVolume
+     *  alone and configure the ft2 mixer's per-sample ramp (fVolume*Delta
+     *  + volumeRampLength) to glide toward the new fTargetVolume over one
+     *  envelope tick worth of samples.  When false, snap the new gain
+     *  instantly (clear ramp fields).
+     *
+     *  Why: the ft2 mixer's RENDER_*_SMP macros already increment
+     *  fVolumeL/R by fVolume*Delta on every output sample (see
+     *  src/engine/sampler/ft2_mix_macros.h).  By zeroing the ramp fields
+     *  on every gain update we forced piecewise-constant gain — every
+     *  FT2 envelope tick (50 Hz) became a hard step change, producing a
+     *  periodic 50 Hz buzz / clicking train during held notes (worse
+     *  during live envelope edits when the deltas are larger).
+     *  Targeting one-tick rampLength makes the next tick's update land
+     *  right as the previous ramp finishes → continuous gain envelope. */
+    void setVoiceGain (float gain, float pan, bool useRamp = false)
     {
         voice.fVolume = gain;
+
+        float newL, newR;
         if (slotIsStereo)
         {
             const float r = jmax (0.0f, 2.0f * (pan - 0.5f));
@@ -990,19 +1231,41 @@ private:
             gRR = gain * (1.0f - l);
             gLR = gain * r;
             gRL = gain * l;
-            voice.fCurrVolumeL = gLL;
-            voice.fCurrVolumeR = gLR;
+            newL = gLL;
+            newR = gLR;
+
+            /* Stereo path can't honour the per-sample ramp because
+             * mixChunk overwrites voice.fCurrVolume{L,R} from the
+             * per-pass cross-mix terms (gLL/gLR/gRL/gRR) on every
+             * block.  Force instant set here; stereo smoothing would
+             * need per-cross-mix persistent current values + ramped
+             * targets — TODO. */
+            useRamp = false;
         }
         else
         {
-            voice.fCurrVolumeL = gain * (1.0f - pan);
-            voice.fCurrVolumeR = gain *          pan;
+            newL = gain * (1.0f - pan);
+            newR = gain *          pan;
         }
-        voice.fTargetVolumeL = voice.fCurrVolumeL;
-        voice.fTargetVolumeR = voice.fCurrVolumeR;
-        voice.fVolumeLDelta  = 0.0f;
-        voice.fVolumeRDelta  = 0.0f;
-        voice.volumeRampLength = 0;
+
+        voice.fTargetVolumeL = newL;
+        voice.fTargetVolumeR = newR;
+
+        if (useRamp)
+        {
+            const int rampSamples = juce::jmax (1, owner.getSamplesPerEnvTick());
+            voice.volumeRampLength = (uint32_t) rampSamples;
+            voice.fVolumeLDelta = (newL - voice.fCurrVolumeL) / (float) rampSamples;
+            voice.fVolumeRDelta = (newR - voice.fCurrVolumeR) / (float) rampSamples;
+        }
+        else
+        {
+            voice.fCurrVolumeL = newL;
+            voice.fCurrVolumeR = newR;
+            voice.fVolumeLDelta = 0.0f;
+            voice.fVolumeRDelta = 0.0f;
+            voice.volumeRampLength = 0;
+        }
     }
 
     SamplerNode& owner;
@@ -1018,6 +1281,24 @@ private:
     float velocityLin = 1.0f;
     float slotPan = 0.5f;
     double basePitchMul = 1.0;
+
+    /** Glide state for mono+portamento.  semitone-domain so the glide
+     *  is musically linear (constant rate in semis/sec); basePitchMul
+     *  is the live ratio recomputed from currentSemis on each step.
+     *  When glideTicksRemaining == 0 the voice is at its target. */
+    double currentSemis = 0.0;
+    double targetSemis  = 0.0;
+    double glideStepSemisPerTick = 0.0;
+    int    glideTicksRemaining   = 0;
+
+    /** MIDI controller state — JUCE calls pitchWheelMoved /
+     *  controllerMoved per voice when the host dispatches channel
+     *  events through Synthesiser.  Carried across notes so a long-
+     *  held bend or sustained mod-wheel position persists between
+     *  legato notes (we DON'T reset in startNote — channel-wide CCs
+     *  should outlive individual notes). */
+    double pitchBendMul   = 1.0;      /* multiplied into voice.delta */
+    float  modWheelAmount = 0.0f;     /* 0..1 — drives extra vibrato */
 
     /* Stereo render-gain cache. */
     float gLL = 1.0f, gLR = 0.0f, gRL = 0.0f, gRR = 1.0f;
@@ -1039,7 +1320,125 @@ private:
 
     /* Tick-quantizer: samples since last envelope tick. */
     int       envSampleAccum = 0;
+    /* 0 = use SamplerNode::getSamplesPerEnvTick() (50 Hz absolute).
+     * >0 = per-voice override computed in startNote when the
+     * instrument has envSampleRelative on. */
+    int       envSamplesPerTickOverride = 0;
 };
+
+
+/* ===========================================================================
+ * ChannelTrackingSynth out-of-line method bodies.  Defined here so the
+ * Ft2SamplerVoice methods they invoke (beginGlideTo, getInstrumentPtr,
+ * getVelocityLin) see the complete type.
+ * ========================================================================*/
+
+void ChannelTrackingSynth::noteOn (int midiChannel, int midiNoteNumber, float velocity)
+{
+    node.setLastNoteChannel (midiChannel);
+
+    const auto instrument = node.getInstrumentForChannel (midiChannel);
+    const bool monoMode   = (instrument != nullptr) && instrument->mono;
+
+    if (monoMode)
+    {
+        auto& state = monoStates[instrument.get()];
+
+        /* Last-note priority: remove dups, append new key. */
+        state.heldNotes.erase (std::remove (state.heldNotes.begin(),
+                                            state.heldNotes.end(),
+                                            midiNoteNumber),
+                               state.heldNotes.end());
+        state.heldNotes.push_back (midiNoteNumber);
+
+        /* Re-trigger on a held voice: retune in place (glide), keep
+         * envelope / fadeout / autoVib state — mono+legato semantics. */
+        if (state.activeVoice != nullptr
+            && state.activeVoice->isVoiceActive()
+            && state.activeVoice->getInstrumentPtr() == instrument.get())
+        {
+            state.activeVoice->beginGlideTo (midiNoteNumber,
+                                             velocity,
+                                             instrument->portamentoTimeMs);
+            return;
+        }
+
+        /* No live voice — standard noteOn allocates one, then capture it. */
+        Synthesiser::noteOn (midiChannel, midiNoteNumber, velocity);
+
+        for (int i = 0; i < getNumVoices(); ++i)
+        {
+            auto* v = dynamic_cast<Ft2SamplerVoice*> (getVoice (i));
+            if (v == nullptr) continue;
+            if (! v->isVoiceActive()) continue;
+            if (v->getCurrentlyPlayingNote() != midiNoteNumber) continue;
+            if (v->getInstrumentPtr() != instrument.get())      continue;
+            state.activeVoice = v;
+            break;
+        }
+        return;
+    }
+
+    Synthesiser::noteOn (midiChannel, midiNoteNumber, velocity);
+}
+
+void ChannelTrackingSynth::noteOff (int midiChannel, int midiNoteNumber,
+                                    float velocity, bool allowTailOff)
+{
+    const auto instrument = node.getInstrumentForChannel (midiChannel);
+    const bool monoMode   = (instrument != nullptr) && instrument->mono;
+
+    if (monoMode)
+    {
+        auto it = monoStates.find (instrument.get());
+        if (it != monoStates.end())
+        {
+            auto& state = it->second;
+            state.heldNotes.erase (std::remove (state.heldNotes.begin(),
+                                                state.heldNotes.end(),
+                                                midiNoteNumber),
+                                   state.heldNotes.end());
+
+            /* Legato release: glide back to most-recent held key, no
+             * release-envelope, voice keeps sounding. */
+            if (! state.heldNotes.empty()
+                && state.activeVoice != nullptr
+                && state.activeVoice->isVoiceActive())
+            {
+                state.activeVoice->beginGlideTo (state.heldNotes.back(),
+                                                 state.activeVoice->getVelocityLin(),
+                                                 instrument->portamentoTimeMs);
+                return;
+            }
+
+            /* No keys held — stop the active voice DIRECTLY.  We can't
+             * route through Synthesiser::noteOff here: that helper
+             * iterates voices matching on getCurrentlyPlayingNote(),
+             * but our glide updates the voice's pitch + our internal
+             * playedNote without touching JUCE's currentlyPlayingNote
+             * (which stays at the note that started the voice via
+             * Synthesiser::noteOn).  So if the user pressed C then E
+             * and releases E, JUCE looks for a voice playing E, finds
+             * none (the live voice's JUCE-side note is still C), and
+             * the voice runs forever.  We hold the activeVoice ptr
+             * already from noteOn — call stopNote on it directly.
+             *
+             * Trade-off: bypasses Synthesiser's sustain-pedal /
+             * sostenuto bookkeeping for this voice.  Acceptable for
+             * mono lead/bass usage; revisit if sustain-pedal+mono
+             * interaction becomes important. */
+            if (state.activeVoice != nullptr && state.activeVoice->isVoiceActive())
+            {
+                state.activeVoice->stopNote (velocity, allowTailOff);
+                state.activeVoice = nullptr;
+                return;
+            }
+            state.activeVoice = nullptr;
+        }
+    }
+
+    Synthesiser::noteOff (midiChannel, midiNoteNumber, velocity, allowTailOff);
+}
 
 
 /* ===========================================================================
@@ -2073,6 +2472,31 @@ public:
             keymap.setBaseOctave (keymap.getBaseOctave() + 1);
         });
 
+        /* Mono toggle + portamento time.  Mono is a toggle on the Inst
+         * (per-instrument); portamento glides pitch when retriggering a
+         * held mono voice.  Engine: ChannelTrackingSynth + voice
+         * beginGlideTo. */
+        configureFlag (monoBtn, "Mono", [this] (bool v) {
+            if (auto inst = getInst()) inst->mono = v;
+        });
+
+        portaLbl.setText ("Porta", dontSendNotification);
+        portaLbl.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
+        portaLbl.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+        addAndMakeVisible (portaLbl);
+
+        configureSlider (portamentoSlider, 0.0, 1000.0, 1.0, [this] (double v) {
+            if (auto inst = getInst()) inst->portamentoTimeMs = (float) v;
+        });
+        portamentoSlider.setTextValueSuffix (" ms");
+
+        /* "Env follows sample" — when on, envelope ticks scale at note-on
+         * so the longest enabled envelope's last point lines up with
+         * sample end (per voice). */
+        configureFlag (envFollowBtn, "Env~Smp", [this] (bool v) {
+            if (auto inst = getInst()) inst->envSampleRelative = v;
+        });
+
         rebuildEnvViews();
     }
 
@@ -2106,6 +2530,7 @@ public:
             avDepthSlider.setValue ((double) inst->autoVib.depth, dontSendNotification);
             avSweepSlider.setValue ((double) inst->autoVib.sweep, dontSendNotification);
             avTypeCombo  .setSelectedId ((int) inst->autoVib.type + 1, dontSendNotification);
+            portamentoSlider.setValue ((double) inst->portamentoTimeMs, dontSendNotification);
             refreshFlagStates();
         }
         slotPickValue.setText (String::formatted ("%02d", getActiveSlot() + 1),
@@ -2143,15 +2568,19 @@ public:
 
         /* Per-instrument params row. */
         auto row = r.removeFromTop (24);
+        monoBtn      .setBounds (row.removeFromLeft (60));  row.removeFromLeft (8);
+        portaLbl     .setBounds (row.removeFromLeft (40));
+        portamentoSlider.setBounds (row.removeFromLeft (110));  row.removeFromLeft (12);
+        envFollowBtn .setBounds (row.removeFromLeft (76));  row.removeFromLeft (12);
         fadeLbl    .setBounds (row.removeFromLeft (60));
-        fadeoutSlider.setBounds (row.removeFromLeft (140)); row.removeFromLeft (12);
+        fadeoutSlider.setBounds (row.removeFromLeft (120)); row.removeFromLeft (12);
         avSpeedLbl .setBounds (row.removeFromLeft (70));
-        avRateSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
+        avRateSlider.setBounds (row.removeFromLeft (90));  row.removeFromLeft (12);
         avDepthLbl .setBounds (row.removeFromLeft (80));
-        avDepthSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
+        avDepthSlider.setBounds (row.removeFromLeft (90));  row.removeFromLeft (12);
         avSweepLbl .setBounds (row.removeFromLeft (80));
-        avSweepSlider.setBounds (row.removeFromLeft (100));  row.removeFromLeft (12);
-        avTypeCombo.setBounds (row.removeFromLeft (90));
+        avSweepSlider.setBounds (row.removeFromLeft (90));  row.removeFromLeft (12);
+        avTypeCombo.setBounds (row.removeFromLeft (80));
         r.removeFromTop (10);
 
         /* Keymap header (label + oct controls). */
@@ -2269,6 +2698,8 @@ private:
         panEnabledBtn.setToggleState (pe.flags & FT2Envelope::kEnabled, dontSendNotification);
         panSustainBtn.setToggleState (pe.flags & FT2Envelope::kSustain, dontSendNotification);
         panLoopBtn   .setToggleState (pe.flags & FT2Envelope::kLoop,    dontSendNotification);
+        monoBtn      .setToggleState (inst->mono,                       dontSendNotification);
+        envFollowBtn .setToggleState (inst->envSampleRelative,          dontSendNotification);
     }
 
     /** Append a sensible new point at xMax+20, y = previous point's y.
@@ -2417,6 +2848,14 @@ private:
     Slider fadeoutSlider, avRateSlider, avDepthSlider, avSweepSlider;
     ComboBox avTypeCombo;
     TextButton octDownBtn, octUpBtn;
+
+    /* Mono mode + portamento (Inst-level).  See SamplerInstrument::mono /
+     * portamentoTimeMs + ChannelTrackingSynth::noteOn for the engine
+     * side. */
+    TextButton monoBtn;
+    Label      portaLbl;
+    Slider     portamentoSlider;
+    TextButton envFollowBtn;
 };
 
 
@@ -2427,11 +2866,13 @@ private:
  * [viewStart_..viewEnd_).  Renders only the visible window.
  * ========================================================================*/
 class SampleEditCanvas : public Component,
-                         private juce::ScrollBar::Listener
+                         private juce::ScrollBar::Listener,
+                         private juce::Timer
 {
 public:
     using GetSlot = std::function<SamplerSampleSlot*()>;
     using RangeChangedCb = std::function<void()>;
+    using PlayheadQuery  = std::function<std::vector<int>(const SamplerSampleSlot*)>;
 
     explicit SampleEditCanvas (GetSlot gs, RangeChangedCb cb = {})
         : getSlot (std::move (gs)), onRangeChanged (std::move (cb)),
@@ -2441,7 +2882,18 @@ public:
         hScroll_.setAutoHide (false);
         addAndMakeVisible (hScroll_);
     }
-    ~SampleEditCanvas() override { hScroll_.removeListener (this); }
+    ~SampleEditCanvas() override { stopTimer(); hScroll_.removeListener (this); }
+
+    /** Provide a callback returning the current per-voice playhead
+     *  sample positions for this slot.  When set, the canvas polls at
+     *  30 Hz and repaints when positions change — same model as
+     *  SampleWaveformView's live indicator on the Bank page. */
+    void setPlayheadQuery (PlayheadQuery q)
+    {
+        playheadsFor_ = std::move (q);
+        if (playheadsFor_) startTimerHz (30);
+        else               stopTimer();
+    }
 
     void resized() override
     {
@@ -2599,7 +3051,9 @@ public:
             g.fillRect (bounds.getX() + sx1 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
         }
 
-        /* Loop region markers. */
+        /* Loop region markers + draggable handle dots — matches the
+         * Bank-page SampleWaveformView so the visual affordance is
+         * consistent across the two surfaces. */
         if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
         {
             const float lx0 = sampleToPixel (slot->loopStart, w);
@@ -2607,6 +3061,22 @@ public:
             g.setColour (Colour { 0xff'ff'a0'40 });
             g.fillRect (bounds.getX() + lx0 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
             g.fillRect (bounds.getX() + lx1 - 1.0f, bounds.getY(), 2.0f, bounds.getHeight());
+            g.fillEllipse (bounds.getX() + lx0 - 4.0f, bounds.getY(),                 8.0f, 8.0f);
+            g.fillEllipse (bounds.getX() + lx1 - 4.0f, bounds.getBottom() - 8.0f,     8.0f, 8.0f);
+        }
+
+        /* Live playheads (per-voice sample positions) — green vertical
+         * tick lines, clipped to the current viewport. */
+        if (playheadsFor_)
+        {
+            const auto positions = playheadsFor_ (slot);
+            g.setColour (Colour { 0xff'40'ff'80 });
+            for (int pos : positions)
+            {
+                if (pos < viewStart_ || pos >= viewEnd_) continue;
+                const float x = bounds.getX() + sampleToPixel (pos, w);
+                g.fillRect (x - 0.5f, bounds.getY(), 1.5f, bounds.getHeight());
+            }
         }
     }
 
@@ -2614,6 +3084,31 @@ public:
     {
         auto* slot = getSlot ? getSlot() : nullptr;
         if (slot == nullptr || ! slot->isLoaded()) return;
+
+        /* If a loop is configured, check for hit on either of its
+         * handles BEFORE falling through to selection drag.  Hit zone
+         * is the half-width of the handle dot plus a bit of slop.
+         * Either handle can be grabbed independently of the
+         * selection — selection-based loop set (the toolbar's
+         * "Loop=Sel" button) still works as the convenience path. */
+        if (slot->loopMode != SamplerLoopMode::kNone && slot->loopLength > 0)
+        {
+            const auto bounds = getLocalBounds().reduced (2);
+            bounds.toFloat();
+            const int w     = bounds.getWidth();
+            const int xL    = bounds.getX() + (int) sampleToPixel (slot->loopStart, w);
+            const int xR    = bounds.getX() + (int) sampleToPixel (slot->loopStart + slot->loopLength, w);
+            const int dxL   = std::abs (e.x - xL);
+            const int dxR   = std::abs (e.x - xR);
+            constexpr int kLoopHitTolPx = 8;
+
+            if (dxL <= kLoopHitTolPx || dxR <= kLoopHitTolPx)
+            {
+                draggingLoopMarker_ = (dxL <= dxR) ? 0 : 1;
+                return;
+            }
+        }
+
         const int s = pixelToSample (e.x);
         if (e.mods.isShiftDown() && hasSelection())
             setSelection (selStart_, s);
@@ -2624,10 +3119,35 @@ public:
     {
         auto* slot = getSlot ? getSlot() : nullptr;
         if (slot == nullptr || ! slot->isLoaded()) return;
+
+        if (draggingLoopMarker_ >= 0)
+        {
+            const int newPos = pixelToSample (e.x);
+            if (draggingLoopMarker_ == 0)
+            {
+                const int oldEnd  = slot->loopStart + slot->loopLength;
+                slot->loopStart   = juce::jlimit (0, oldEnd - 1, newPos);
+                slot->loopLength  = oldEnd - slot->loopStart;
+            }
+            else
+            {
+                slot->loopLength  = juce::jlimit (1,
+                                                  slot->numSamples - slot->loopStart,
+                                                  newPos - slot->loopStart);
+            }
+            if (onRangeChanged) onRangeChanged();
+            repaint();
+            return;
+        }
+
         if (dragAnchor_ < 0) return;
         setSelection (dragAnchor_, pixelToSample (e.x));
     }
-    void mouseUp (const MouseEvent&) override { dragAnchor_ = -1; }
+    void mouseUp (const MouseEvent&) override
+    {
+        draggingLoopMarker_ = -1;
+        dragAnchor_         = -1;
+    }
     void mouseDoubleClick (const MouseEvent&) override
     {
         auto* slot = getSlot ? getSlot() : nullptr;
@@ -2723,11 +3243,26 @@ private:
         repaint();
     }
 
+    void timerCallback() override
+    {
+        if (! isShowing()) return;        /* free CPU when off-screen */
+        if (! playheadsFor_) return;
+        auto* slot = getSlot ? getSlot() : nullptr;
+        std::vector<int> cur = slot != nullptr ? playheadsFor_ (slot)
+                                                : std::vector<int>();
+        if (cur == lastPlayheads_) return;
+        lastPlayheads_ = std::move (cur);
+        repaint();
+    }
+
     GetSlot getSlot;
     RangeChangedCb onRangeChanged;
+    PlayheadQuery  playheadsFor_;
+    std::vector<int> lastPlayheads_;
     int viewStart_ = 0, viewEnd_ = 0;
     int selStart_  = -1, selEnd_  = -1;
-    int dragAnchor_ = -1;
+    int dragAnchor_         = -1;
+    int draggingLoopMarker_ = -1;  /* -1 none, 0 = loopStart, 1 = loopEnd */
 };
 
 
@@ -2745,6 +3280,11 @@ class SamplerSamplePage : public Component
 public:
     using GetSlot = std::function<SamplerSampleSlot*()>;
     using OnChange = std::function<void()>;
+    using PlayheadQuery = SampleEditCanvas::PlayheadQuery;
+
+    /** Pass-through to the underlying SampleEditCanvas — see its
+     *  setPlayheadQuery for behaviour. */
+    void setPlayheadQuery (PlayheadQuery q) { canvas.setPlayheadQuery (std::move (q)); }
 
     SamplerSamplePage (GetSlot gs, OnChange cb)
         : getSlot (std::move (gs)),
@@ -3914,6 +4454,9 @@ public:
 
         addChildComponent (instPage_);
         addChildComponent (samplePage_);
+        samplePage_.setPlayheadQuery ([this] (const SamplerSampleSlot* slot) {
+            return node.collectPlayheadsForSlot (slot);
+        });
         addChildComponent (fxPage_);
         instCombo.onChange = [this] {
             const int sel = instCombo.getSelectedId() - 1;
@@ -3978,6 +4521,19 @@ public:
         configureParamSlider (panSlider, "Pan",   0.0, 1.0, 0.001,
             [this](double v) { if (auto* s = currentSlot()) s->panning = (float) v; });
 
+        /* Per-bus master gain sliders — 4 of them, pinned under the
+         * preview.  Drive SamplerNode::busGain[] directly; voices read
+         * the gain on each render block. */
+        for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+        {
+            configureParamSlider (busGainSliders[b],
+                                  "Bus " + String (b + 1),
+                                  0.0, 2.0, 0.001,
+                                  [this, b] (double v) {
+                                      node.busGain[b] = (float) v;
+                                  });
+        }
+
         loopCombo.addItem ("Loop: Off",      1);
         loopCombo.addItem ("Loop: Forward",  2);
         loopCombo.addItem ("Loop: Ping-pong", 3);
@@ -3986,16 +4542,23 @@ public:
                 s->loopMode = (SamplerLoopMode) (loopCombo.getSelectedId() - 1);
             waveformView.repaint();
         };
-        addAndMakeVisible (loopCombo);
+        /* loopCombo is no longer surfaced on Bank — loop mode + range
+         * editing lives on the Sample page (SamplerSamplePage::loopRadio
+         * + canvas).  Object kept for reuse in case Bank-side quick-loop
+         * comes back; not added to the page. */
 
         addAndMakeVisible (waveformView);
 
-        /* Tab strip: Vol Env / Pan Env / AutoVib+Fadeout. */
+        /* Envelope tabs (Vol / Pan / AutoVib) live on the Inst page
+         * (SamplerInstPage) — the duplicate set on Bank was confusing,
+         * so we leave the tab content components wired (for state
+         * round-trip across page switches) but don't surface the tab
+         * strip on Bank.  Bank focuses on the slot grid + sample
+         * preview waveform; per-slot params row above stays. */
         tabBar.addTab ("Vol",     Colour { 0xff'18'18'18 }, &volEnvWrap,    false);
         tabBar.addTab ("Pan",     Colour { 0xff'18'18'18 }, &panEnvWrap,    false);
         tabBar.addTab ("AutoVib", Colour { 0xff'18'18'18 }, &autoVibWrap,   false);
         tabBar.setTabBarDepth (22);
-        addAndMakeVisible (tabBar);
 
         /* Add / Del envelope-point buttons inside the Bank-page Vol/Pan
          * tabs.  Shared logic with the Inst page so envelopes are
@@ -4122,7 +4685,9 @@ public:
         auto bankR = body;
 
         /* Left column: load/clear pinned at bottom, slot list fills above. */
-        auto leftCol = bankR.removeFromLeft (270);
+        /* Bank list is wider now — it hosts the per-row bus badge
+         * (right edge) in addition to slot number + key range + name. */
+        auto leftCol = bankR.removeFromLeft (380);
         auto leftFooter = leftCol.removeFromBottom (24);
         clearBtn.setBounds (leftFooter.removeFromRight (50)); leftFooter.removeFromRight (4);
         loadBtn .setBounds (leftFooter);
@@ -4145,15 +4710,23 @@ public:
         relSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         fineSlider .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
         volSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
-        panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (4);
-        loopCombo.setBounds (bankR.removeFromTop (rowH));   bankR.removeFromTop (6);
+        panSlider  .setBounds (bankR.removeFromTop (rowH)); bankR.removeFromTop (2);
 
-        /* Remaining vertical splits 55% waveform / 45% tabbed envelope. */
-        const int splitH = bankR.getHeight();
-        const int waveH = juce::jmax (140, (splitH - 8) * 11 / 20);
-        waveformView.setBounds (bankR.removeFromTop (waveH));
-        bankR.removeFromTop (8);
-        tabBar.setBounds (bankR);
+        /* Per-bus master gain strip pinned to the BOTTOM (under the
+         * preview).  Reserves rowH per bus + small gaps; preview takes
+         * the rest. */
+        constexpr int kBusN = SamplerNode::kNumBuses;
+        const int gainsH = kBusN * rowH + (kBusN - 1) * 2 + 6;
+        auto gainsR = bankR.removeFromBottom (gainsH);
+        gainsR.removeFromTop (6);
+        for (int b = 0; b < kBusN; ++b)
+        {
+            busGainSliders[b].setBounds (gainsR.removeFromTop (rowH));
+            if (b + 1 < kBusN) gainsR.removeFromTop (2);
+        }
+
+        /* Waveform preview takes the rest of the right column. */
+        waveformView.setBounds (bankR);
     }
 
     /** Switch the visible body page and update tab toggle state. */
@@ -4178,11 +4751,12 @@ public:
         fineSlider   .setVisible (bank);
         volSlider    .setVisible (bank);
         panSlider    .setVisible (bank);
-        loopCombo    .setVisible (bank);
+        for (auto& s : busGainSliders) s.setVisible (bank);
         waveformView .setVisible (bank);
-        tabBar       .setVisible (bank);
         interpCombo  .setVisible (bank);
         status       .setVisible (bank);
+        /* loopCombo + tabBar are no longer added to the Bank page — see
+         * note in the ctor where the addAndMakeVisible was removed. */
 
         instPage_   .setVisible (inst);
         samplePage_ .setVisible (sample);
@@ -4195,7 +4769,46 @@ public:
 
     /* === ListBoxModel ================================================= */
 
+    static constexpr int kBusBadgeWidth = 56;
+
     int getNumRows() override { return SamplerInstrument::kNumSlots; }
+
+    /** Left-click on the bus badge cycles to the next bus.
+     *  Right-click opens a small popup to pick any of Bus 1..N
+     *  directly.  Click outside the badge falls through to normal
+     *  row selection (handled by the base ListBox). */
+    void listBoxItemClicked (int row, const MouseEvent& e) override
+    {
+        auto inst = node.getInstrument (activeInstrument);
+        auto* slot = inst ? inst->getSlot (row) : nullptr;
+        if (slot == nullptr) return;
+
+        const int rowW = slotList.getWidth();
+        const int badgeLeft = rowW - kBusBadgeWidth - 4;
+        if (e.x < badgeLeft) return;
+
+        if (e.mods.isPopupMenu())
+        {
+            PopupMenu m;
+            for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+                m.addItem (b + 1, "Bus " + String (b + 1), true,
+                           slot->busIndex == b);
+            m.showMenuAsync (PopupMenu::Options(),
+                             [this, row, inst] (int picked) {
+                                 if (picked > 0)
+                                 {
+                                     if (auto* s = inst->getSlot (row))
+                                         s->busIndex = picked - 1;
+                                     slotList.repaint();
+                                 }
+                             });
+        }
+        else
+        {
+            slot->busIndex = (slot->busIndex + 1) % SamplerNode::kNumBuses;
+            slotList.repaint();
+        }
+    }
 
     void paintListBoxItem (int row, Graphics& g, int width, int height,
                            bool rowIsSelected) override
@@ -4240,9 +4853,31 @@ public:
         g.setColour (Colour { 0xff'd0'80'40 });
         g.drawText (rng, 44, 0, 80, height, Justification::centredLeft);
 
+        /* Reserve a compact "Bus N" badge on the right edge — same
+         * width as kBusBadgeWidth (used in listBoxItemClicked for
+         * hit-test).  Name column shrinks to leave room. */
+        const int badgeW = kBusBadgeWidth;
+        const int nameRight = width - badgeW - 6;
+
         g.setColour (slot != nullptr ? Colour { 0xff'b0'b0'b0 } : Colour { 0xff'40'40'40 });
         g.drawText (slot != nullptr ? slot->name : String (juce::CharPointer_UTF8 ("\xe2\x80\x94")),
-                    130, 0, width - 136, height, Justification::centredLeft);
+                    130, 0, juce::jmax (0, nameRight - 130), height,
+                    Justification::centredLeft);
+
+        if (slot != nullptr)
+        {
+            const int bIdx = juce::jlimit (0, SamplerNode::kNumBuses - 1, slot->busIndex);
+            auto badgeR = juce::Rectangle<int> (width - badgeW - 4, 2,
+                                                 badgeW, height - 4);
+            g.setColour (Colour { 0xff'2a'2a'2a });
+            g.fillRoundedRectangle (badgeR.toFloat(), 3.0f);
+            g.setColour (Colour { 0xff'd0'80'40 });
+            g.drawRoundedRectangle (badgeR.toFloat(), 3.0f, 1.0f);
+            g.setColour (Colours::white);
+            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::bold));
+            g.drawText ("Bus " + String (bIdx + 1), badgeR,
+                        Justification::centred);
+        }
     }
 
     void selectedRowsChanged (int lastRowSelected) override
@@ -4430,6 +5065,10 @@ private:
             panSlider .setValue ((double) slot->panning,      dontSendNotification);
             loopCombo .setSelectedId ((int) slot->loopMode + 1, dontSendNotification);
         }
+        /* Master bus gains live on the node, not the slot — always sync
+         * (independent of which slot is selected). */
+        for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+            busGainSliders[b].setValue ((double) node.busGain[b], dontSendNotification);
         interpCombo.setSelectedId ((int) node.getInterpMode() + 1, dontSendNotification);
 
         const int numLoaded = inst ? inst->numLoaded() : 0;
@@ -4494,6 +5133,11 @@ private:
 
     Slider       rootSlider, relSlider, fineSlider, volSlider, panSlider;
     ComboBox     loopCombo;
+    /* Per-bus MASTER gain sliders — 4 of them, below the preview.
+     * Drive SamplerNode::busGain[]; independent of slot selection.
+     * Per-slot bus assignment lives in the bank-list row badge —
+     * paintListBoxItem + listBoxItemClicked. */
+    Slider       busGainSliders[SamplerNode::kNumBuses];
     SampleWaveformView waveformView;
 
     TabbedComponent tabBar { TabbedButtonBar::TabsAtTop };
@@ -4526,9 +5170,30 @@ AudioProcessorEditor* SamplerNode::createEditor()
 
 /* =========================================================================== */
 
+/* Multi-bus output layout: kNumBuses stereo aux sends, NO separate
+ * Main — Bus 1 is what JUCE/Element treats as the main bus (first
+ * output) but the user-facing label is just "Bus 1".  Each slot
+ * picks ONE bus (busIndex) and a level (busLevel) for that bus.
+ *
+ * Inlined (rather than a free helper) because BusesProperties is
+ * `protected` in juce::AudioProcessor and only accessible from inside
+ * a subclass body. */
 SamplerNode::SamplerNode()
-    : BaseProcessor (BusesProperties()
-                       .withOutput ("Output", AudioChannelSet::stereo(), true))
+    : BaseProcessor ([] {
+          /* withOutput's third arg is `isActivatedByDefault`, NOT
+           * "is main bus".  Pass `true` for every bus so they all
+           * spawn enabled — JUCE's first bus is implicitly the
+           * "main" anyway.  Earlier i==1 conditional left Bus 2/3/4
+           * disabled at construction, which made the graph node
+           * report getTotalNumOutputChannels==2 (just Bus 1) — the
+           * bug you saw on screen. */
+          BusesProperties bp;
+          for (int i = 1; i <= kNumBuses; ++i)
+              bp = bp.withOutput ("Bus " + String (i),
+                                  AudioChannelSet::stereo(),
+                                  true);
+          return bp;
+      }())
 {
     ensureMixerInterpolationTablesReady();
     /* mixFuncDispatch[] is patched with SIMD variants on CPUs that support
@@ -4558,9 +5223,15 @@ void SamplerNode::fillInPluginDescription (PluginDescription& desc) const
 {
     desc.fileOrIdentifier   = EL_NODE_ID_SAMPLER;
     desc.name               = "Sampler";
-    desc.descriptiveName    = "Multi-sample instrument (MIDI-in / stereo audio-out)";
+    desc.descriptiveName    = "Multi-sample instrument (MIDI-in / " +
+                              String (kNumBuses) + " stereo bus outputs)";
     desc.numInputChannels   = 0;
-    desc.numOutputChannels  = 2;
+    /* Total output channel count = 2 (stereo) × kNumBuses.  This is
+     * what Element's internal format reader uses to decide how many
+     * output ports to wire on each instantiation — keeping it in
+     * lockstep with the BusesProperties layout above is what makes
+     * the graph node show the right number of pads. */
+    desc.numOutputChannels  = 2 * kNumBuses;
     desc.hasSharedContainer = false;
     desc.isInstrument       = true;
     desc.category           = "Instrument";
@@ -4579,7 +5250,12 @@ void SamplerNode::prepareToPlay (double sampleRate, int maxBlockSize)
      * downcast: SamplerNode owns the synth and only ever constructs a
      * ChannelTrackingSynth in its ctor — see SamplerNode(). */
     if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
-        cts->prepareWorkers (2, juce::jmax (64, maxBlockSize));
+    {
+        /* Worker scratch covers every aux bus (each stereo) — voices
+         * write to whichever channels their per-bus busSend picks.
+         * Total = 2 * kNumBuses; sized once at prepareToPlay. */
+        cts->prepareWorkers (2 * kNumBuses, juce::jmax (64, maxBlockSize));
+    }
 }
 
 void SamplerNode::releaseResources()
@@ -4614,7 +5290,13 @@ void SamplerNode::processBlock (AudioBuffer<float>& audio_, MidiBuffer& midi)
 
 bool SamplerNode::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    return layouts.getMainOutputChannelSet() == AudioChannelSet::stereo();
+    /* Main + every aux must be stereo.  Returning false for any
+     * non-stereo arrangement keeps the layout immutable so audio-thread
+     * channel-index arithmetic in renderNextBlock is always safe. */
+    if (layouts.outputBuses.size() != 1 + kNumBuses) return false;
+    for (auto& set : layouts.outputBuses)
+        if (set != AudioChannelSet::stereo()) return false;
+    return true;
 }
 
 void SamplerNode::rebuildVoicePool()
@@ -4669,6 +5351,12 @@ void SamplerNode::removeInstrument (int index)
     ScopedLock sl (sampleLock);
     if (index < 0 || index >= (int) instruments.size()) return;
     if (instruments.size() <= 1) return; /* always keep at least one */
+
+    /* Drop mono-mode state keyed by the about-to-be-freed raw pointer. */
+    SamplerInstrument* doomed = instruments[(size_t) index].get();
+    if (auto* cts = dynamic_cast<ChannelTrackingSynth*> (synth.get()))
+        cts->forgetInstrument (doomed);
+
     instruments.erase (instruments.begin() + index);
     /* Re-map channel bindings that pointed past the removed index. */
     for (auto& b : channelBinding)
@@ -4802,6 +5490,11 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
     tree.setProperty ("adsrSus",  adsrParams.sustain, nullptr);
     tree.setProperty ("adsrRel",  adsrParams.release, nullptr);
 
+    /* Per-bus master gains live on the node (not per-slot). */
+    for (int b = 0; b < kNumBuses; ++b)
+        tree.setProperty (Identifier ("busGain" + String (b + 1)),
+                          (double) busGain[b], nullptr);
+
     for (int b = 0; b < 16; ++b)
         tree.setProperty (Identifier ("bind" + String (b)), (int) channelBinding[(size_t) b], nullptr);
 
@@ -4817,6 +5510,9 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
         instTree.setProperty ("avSweep", (int) inst->autoVib.sweep, nullptr);
         instTree.setProperty ("avDepth", (int) inst->autoVib.depth, nullptr);
         instTree.setProperty ("avRate",  (int) inst->autoVib.rate,  nullptr);
+        instTree.setProperty ("mono",            inst->mono,              nullptr);
+        instTree.setProperty ("portamentoMs",    (double) inst->portamentoTimeMs, nullptr);
+        instTree.setProperty ("envSampleRel",    inst->envSampleRelative, nullptr);
 
         auto writeEnv = [&](const FT2Envelope& e, const String& prefix)
         {
@@ -4848,6 +5544,7 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
             slotTree.setProperty ("loopMode",     (int) slot->loopMode, nullptr);
             slotTree.setProperty ("loopStart",    slot->loopStart,      nullptr);
             slotTree.setProperty ("loopLength",   slot->loopLength,     nullptr);
+            slotTree.setProperty ("busIndex",     slot->busIndex,           nullptr);
             instTree.appendChild (slotTree, nullptr);
         }
         tree.appendChild (instTree, nullptr);
@@ -4878,6 +5575,12 @@ void SamplerNode::setStateInformation (const void* data, int size)
     adsrParams.decay   = (float) (double) tree.getProperty ("adsrDec", 0.05);
     adsrParams.sustain = (float) (double) tree.getProperty ("adsrSus", 1.0);
     adsrParams.release = (float) (double) tree.getProperty ("adsrRel", 0.10);
+
+    /* Per-bus master gains.  Default to 1.0 if missing (old sessions). */
+    for (int b = 0; b < kNumBuses; ++b)
+        busGain[b] = (float) (double) tree.getProperty (
+            Identifier ("busGain" + String (b + 1)), 1.0);
+
     rebuildVoicePool();
 
     for (int b = 0; b < 16; ++b)
@@ -4897,6 +5600,12 @@ void SamplerNode::setStateInformation (const void* data, int size)
         inst->autoVib.sweep = (uint8_t) (int) instTree.getProperty ("avSweep", 0);
         inst->autoVib.depth = (uint8_t) (int) instTree.getProperty ("avDepth", 0);
         inst->autoVib.rate  = (uint8_t) (int) instTree.getProperty ("avRate",  0);
+        inst->mono            = (bool)  instTree.getProperty ("mono", false);
+        inst->portamentoTimeMs = (float) (double) instTree.getProperty ("portamentoMs", 80.0);
+        /* Default ON for sessions that pre-date this field — matches
+         * the SamplerInstrument ctor default and is the "intended
+         * usage" per the design discussion. */
+        inst->envSampleRelative = (bool) instTree.getProperty ("envSampleRel", true);
 
         auto readEnv = [&](FT2Envelope& e, const String& prefix)
         {
@@ -4948,6 +5657,33 @@ void SamplerNode::setStateInformation (const void* data, int size)
                 slot->loopMode     = (SamplerLoopMode) (int) slotTree.getProperty ("loopMode", 0);
                 slot->loopStart    = (int) slotTree.getProperty ("loopStart",  0);
                 slot->loopLength   = (int) slotTree.getProperty ("loopLength", 0);
+
+                /* Bus assignment.  Read busIndex if present; older
+                 * intermediate formats (busSend1..N from the multi-
+                 * send experiment / busAssign+busWet) get folded into
+                 * busIndex with a best-effort mapping.  Default if
+                 * none present: Bus 1 (from ctor). */
+                if (slotTree.hasProperty ("busIndex"))
+                {
+                    slot->busIndex = juce::jlimit (0, SamplerNode::kNumBuses - 1,
+                                                   (int) slotTree.getProperty ("busIndex", 0));
+                }
+                else if (slotTree.hasProperty ("busSend1"))
+                {
+                    float best = 0.0f; int bestIdx = 0;
+                    for (int b = 0; b < SamplerNode::kNumBuses; ++b)
+                    {
+                        const float s = (float) (double) slotTree.getProperty (
+                            Identifier ("busSend" + String (b + 1)), 0.0);
+                        if (s > best) { best = s; bestIdx = b; }
+                    }
+                    slot->busIndex = bestIdx;
+                }
+                else if (slotTree.hasProperty ("busAssign"))
+                {
+                    const int oldAssign = (int) slotTree.getProperty ("busAssign", 0);
+                    slot->busIndex = juce::jmax (0, oldAssign - 1);
+                }
             }
         }
         instruments.push_back (inst);
