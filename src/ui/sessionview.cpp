@@ -450,25 +450,36 @@ Rectangle<int> SessionView::masterLaunchButtonBounds (int sceneRow) const noexce
 
 Rectangle<int> SessionView::masterTempoFieldBounds (int sceneRow) const noexcept
 {
-    /* Master cell layout: [launch button] [tempo field] [sig field]
-     * Tempo + sig get a balanced split of the remaining width with a
-     * 4 px gap; tempo gets slightly more because BPM strings ("120.00")
-     * are typically wider than sig strings ("4/4"). */
+    /* Master cell layout: [launch] [tempo field] [sig field] [edit].
+     * Reserve 22 px each for launch (left) and edit (right) with
+     * 4 px gaps; tempo + sig split the rest 55/45 (BPM strings are
+     * typically wider). */
     auto inner = masterCellBounds (sceneRow).reduced (3, 3);
-    inner.removeFromLeft (22 + 4);            // launch button + spacing
+    inner.removeFromLeft  (22 + 4);
+    inner.removeFromRight (22 + 4);
     const int remaining = inner.getWidth();
-    const int tempoW = (remaining - 4) * 11 / 20;  // ~55%
+    const int tempoW = (remaining - 4) * 11 / 20;
     return inner.removeFromLeft (tempoW);
 }
 
 Rectangle<int> SessionView::masterSigFieldBounds (int sceneRow) const noexcept
 {
     auto inner = masterCellBounds (sceneRow).reduced (3, 3);
-    inner.removeFromLeft (22 + 4);
+    inner.removeFromLeft  (22 + 4);
+    inner.removeFromRight (22 + 4);
     const int remaining = inner.getWidth();
     const int tempoW = (remaining - 4) * 11 / 20;
-    inner.removeFromLeft (tempoW + 4);        // skip tempo + gap
+    inner.removeFromLeft (tempoW + 4);
     return inner;
+}
+
+Rectangle<int> SessionView::masterEditButtonBounds (int sceneRow) const noexcept
+{
+    /* Rightmost 22 px of the master cell -- opens the Scene View
+     * popup, mirroring the clip cell's edit button which opens the
+     * tracker pattern editor. */
+    auto inner = masterCellBounds (sceneRow).reduced (3, 3);
+    return inner.removeFromRight (22);
 }
 
 Rectangle<int> SessionView::cellBounds (int sceneRow, int columnIdx) const noexcept
@@ -599,6 +610,12 @@ bool SessionView::hitTestMasterSig (Point<int> p, int& outRow) const noexcept
 {
     if (! hitTestMasterCell (p, outRow)) return false;
     return masterSigFieldBounds (outRow).contains (p);
+}
+
+bool SessionView::hitTestMasterEdit (Point<int> p, int& outRow) const noexcept
+{
+    if (! hitTestMasterCell (p, outRow)) return false;
+    return masterEditButtonBounds (outRow).contains (p);
 }
 
 int SessionView::maxGridScrollY() const noexcept
@@ -1024,6 +1041,23 @@ void SessionView::paint (Graphics& g)
                             : String (curBpb) + "/" + String (curBd),
                        sc.beatsPerBar > 0 && sc.beatDivisor > 0);
 
+            /* Edit button -- three horizontal lines glyph (same as
+             * clip cell edit button) opens the Scene View popup. */
+            const auto editR = masterEditButtonBounds (r);
+            g.setColour (juce::Colours::black.withAlpha (0.20f));
+            g.fillRect (editR);
+            g.setColour (juce::Colour { 0xff'd0'd0'd0 });
+            {
+                const int cx = editR.getCentreX();
+                const int cy = editR.getCentreY();
+                const int lineW = 9;
+                const int xL = cx - lineW / 2;
+                const int xR = cx + lineW / 2;
+                g.drawHorizontalLine (cy - 4, (float) xL, (float) xR);
+                g.drawHorizontalLine (cy,     (float) xL, (float) xR);
+                g.drawHorizontalLine (cy + 4, (float) xL, (float) xR);
+            }
+
             /* Row divider. */
             g.setColour (kCellOutlineColour);
             g.drawHorizontalLine (cell.getBottom() - 1,
@@ -1112,49 +1146,21 @@ void SessionView::mouseDown (const MouseEvent& e)
         {
             if (auto* clip = findClip (row, col))
             {
-                juce::PopupMenu quant;
-                const auto cq = clip->launchQuant;
-                quant.addItem (10, "Off",     true, cq == LaunchQuant::Off);
-                quant.addItem (11, "1 Beat",  true, cq == LaunchQuant::Beat);
-                quant.addItem (12, "1 Bar",   true, cq == LaunchQuant::Bar);
-                quant.addItem (13, "2 Bars",  true, cq == LaunchQuant::TwoBars);
-                quant.addItem (14, "4 Bars",  true, cq == LaunchQuant::FourBars);
-
-                juce::PopupMenu follow;
-                const auto cf = clip->followAction;
-                follow.addItem (20, "None (loop)",      true, cf == FollowAction::None);
-                follow.addItem (21, "Stop",             true, cf == FollowAction::Stop);
-                follow.addItem (22, "Restart",          true, cf == FollowAction::RestartClip);
-                follow.addItem (23, "Next clip",        true, cf == FollowAction::NextClip);
-                follow.addItem (24, "First clip",       true, cf == FollowAction::FirstClip);
-
+                /* Right-click clip menu is now STRUCTURAL only:
+                 *   - Clip properties... (opens Clip View popup with
+                 *     Name + Colour + Launch quant + Follow action)
+                 *   - Delete clip
+                 * Per-property edits live inside the Clip View popup. */
                 juce::PopupMenu m;
-                m.addItem (2, "Rename...");
-                m.addItem (3, "Cycle colour");
-                m.addItem (4, "Colour...");
-                m.addSeparator();
-                m.addSubMenu ("Launch quantisation", quant);
-                m.addSubMenu ("Follow action",       follow);
+                m.addItem (5, "Clip properties...");
                 m.addSeparator();
                 m.addItem (1, "Delete clip");
 
                 const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
                 switch (r)
                 {
-                    case 1: deleteClip (*clip); break;
-                    case 2: renameClip (*clip); break;
-                    case 3: cycleClipColor (*clip); break;
-                    case 4: pickClipColour (*clip); break;
-                    case 10: clip->launchQuant = LaunchQuant::Off;       writeToSession(); break;
-                    case 11: clip->launchQuant = LaunchQuant::Beat;      writeToSession(); break;
-                    case 12: clip->launchQuant = LaunchQuant::Bar;       writeToSession(); break;
-                    case 13: clip->launchQuant = LaunchQuant::TwoBars;   writeToSession(); break;
-                    case 14: clip->launchQuant = LaunchQuant::FourBars;  writeToSession(); break;
-                    case 20: clip->followAction = FollowAction::None;        writeToSession(); break;
-                    case 21: clip->followAction = FollowAction::Stop;        writeToSession(); break;
-                    case 22: clip->followAction = FollowAction::RestartClip; writeToSession(); break;
-                    case 23: clip->followAction = FollowAction::NextClip;    writeToSession(); break;
-                    case 24: clip->followAction = FollowAction::FirstClip;   writeToSession(); break;
+                    case 1: deleteClip   (*clip); break;
+                    case 5: openClipView (*clip); break;
                     default: break;
                 }
             }
@@ -1231,6 +1237,11 @@ void SessionView::mouseDown (const MouseEvent& e)
     if (hitTestMasterLaunch (e.getPosition(), row))
     {
         bangScene (row);
+        return;
+    }
+    if (hitTestMasterEdit (e.getPosition(), row))
+    {
+        openSceneView (row);
         return;
     }
     if (hitTestMasterTempo (e.getPosition(), row))
@@ -1421,9 +1432,9 @@ void SessionView::mouseDoubleClick (const MouseEvent& e)
 {
     int row = -1, col = -1;
 
-    /* Double-click on the middle of a clip cell renames it.  The play
-     * and edit buttons swallow their own clicks via mouseDown, so the
-     * double event only reaches the cell body. */
+    /* Double-click on the middle of a clip cell opens the Clip View
+     * popup.  The play + edit buttons swallow their own clicks via
+     * mouseDown, so the double event only reaches the cell body. */
     if (hitTestCell (e.getPosition(), row, col))
     {
         if (auto* clip = findClip (row, col))
@@ -1431,7 +1442,7 @@ void SessionView::mouseDoubleClick (const MouseEvent& e)
             if (! playButtonBounds (row, col).contains (e.getPosition())
              && ! editButtonBounds (row, col).contains (e.getPosition()))
             {
-                renameClip (*clip);
+                openClipView (*clip);
                 return;
             }
         }
@@ -1763,8 +1774,74 @@ void SessionView::applySceneOverridesToTransport (const SessionScene& s)
     }
 }
 
-void SessionView::editSceneTempo     (int sceneRow) { openSceneView (sceneRow); }
-void SessionView::editSceneSignature (int sceneRow) { openSceneView (sceneRow); }
+void SessionView::editSceneTempo (int sceneRow)
+{
+    /* Inline editor for fast in-place edits.  Scene View popup
+     * (opened via the master cell edit button) is the full editor
+     * for name + tempo + sig together. */
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    const auto& sc = scenes_.getReference (sceneRow);
+    const auto initial = sc.tempoOverride > 0.0
+                            ? juce::String (sc.tempoOverride, 2)
+                            : juce::String();
+    showInlineEditor (
+        masterTempoFieldBounds (sceneRow),
+        initial,
+        [this, sceneRow] (const juce::String& txt)
+        {
+            if (sceneRow >= scenes_.size()) return;
+            auto& s = scenes_.getReference (sceneRow);
+            const auto trimmed = txt.trim();
+            if (trimmed.isEmpty()) s.tempoOverride = -1.0;
+            else
+            {
+                const double v = trimmed.getDoubleValue();
+                s.tempoOverride = (v > 0.0) ? juce::jlimit (20.0, 999.0, v) : -1.0;
+            }
+            notifySceneEdited (sceneRow);
+        });
+}
+
+void SessionView::editSceneSignature (int sceneRow)
+{
+    if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
+    const auto& sc = scenes_.getReference (sceneRow);
+    const auto initial = (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
+                            ? juce::String (sc.beatsPerBar) + "/" + juce::String (sc.beatDivisor)
+                            : juce::String();
+    showInlineEditor (
+        masterSigFieldBounds (sceneRow),
+        initial,
+        [this, sceneRow] (const juce::String& txt)
+        {
+            if (sceneRow >= scenes_.size()) return;
+            auto& s = scenes_.getReference (sceneRow);
+            const auto trimmed = txt.trim();
+            if (trimmed.isEmpty())
+            {
+                s.beatsPerBar = 0;
+                s.beatDivisor = 0;
+            }
+            else
+            {
+                const int slash = trimmed.indexOfChar ('/');
+                int num = 0, den = 0;
+                if (slash > 0)
+                {
+                    num = trimmed.substring (0, slash).getIntValue();
+                    den = trimmed.substring (slash + 1).getIntValue();
+                }
+                else
+                {
+                    num = trimmed.getIntValue();
+                    den = 4;
+                }
+                s.beatsPerBar = juce::jlimit (0, 32, num);
+                s.beatDivisor = juce::jlimit (0, 32, den);
+            }
+            notifySceneEdited (sceneRow);
+        });
+}
 
 void SessionView::notifySceneEdited (int sceneRow)
 {
@@ -2445,6 +2522,7 @@ private:
                                    ? juce::String (sc->beatDivisor)
                                    : juce::String(),
                                juce::dontSendNotification);
+
     }
 
     void textEditorReturnKeyPressed (juce::TextEditor& e) override
@@ -2532,9 +2610,287 @@ public:
     void closeButtonPressed() override { delete this; }
 };
 
-/* openSceneView is defined here so SceneViewContent / SceneViewWindow
- * are complete types at the point of `new`.  All other SessionView
- * method definitions live above. */
+/* === ClipView popup ====================================================
+ * Mirror of SceneView for clips.  Replaces the right-click Rename /
+ * Cycle colour / Colour... / Launch quantisation submenu / Follow
+ * action submenu items with a single dedicated window.  Right-click
+ * still carries the STRUCTURAL ops (Add new / Assign existing /
+ * Delete clip).
+ *
+ * SafePointer<SessionView> + clip Uuid for lifetime safety; per
+ * feedback_inline_edit_cancel_on_click_away the name TextEditor
+ * commits on Return, reverts on Escape + focus loss. */
+class ClipViewContent : public juce::Component,
+                        private juce::TextEditor::Listener,
+                        private juce::ChangeListener
+{
+public:
+    ClipViewContent (juce::Component::SafePointer<SessionView> view,
+                     const juce::Uuid& clipId)
+        : view_ (view), clipId_ (clipId)
+    {
+        setSize (340, 240);
+
+        configureLabel (titleLabel_, "Clip", 14.0f, juce::Font::bold);
+        configureLabel (nameLabel_,   "Name",       11.0f, juce::Font::plain);
+        configureLabel (colourLabel_, "Colour",     11.0f, juce::Font::plain);
+        configureLabel (quantLabel_,  "Quant",      11.0f, juce::Font::plain);
+        configureLabel (followLabel_, "Follow",     11.0f, juce::Font::plain);
+        configureLabel (hintLabel_,
+            "Click the colour swatch to pick a new colour.",
+            10.0f, juce::Font::plain);
+        hintLabel_.setColour (juce::Label::textColourId, juce::Colour { 0xff'70'70'70 });
+
+        configureEditor (nameEditor_);
+        nameEditor_.setInputRestrictions (0);
+
+        configureCombo (quantCombo_,  { "Off", "1 Beat", "1 Bar", "2 Bars", "4 Bars" });
+        configureCombo (followCombo_, { "None (loop)", "Stop", "Restart", "Next clip", "First clip" });
+
+        addAndMakeVisible (swatch_);
+        swatch_.onClick = [this] { openColourPicker(); };
+
+        refreshFromClip();
+    }
+
+    ~ClipViewContent() override { detachColourPicker(); }
+
+    void resized() override
+    {
+        const int margin = 12;
+        const int rowH   = 24;
+        const int labelW = 78;
+        const int colGap = 8;
+
+        auto r = getLocalBounds().reduced (margin);
+        titleLabel_.setBounds (r.removeFromTop (rowH));
+        r.removeFromTop (6);
+
+        auto layoutRow = [&] (juce::Label& lab, juce::Component& field) {
+            auto row = r.removeFromTop (rowH);
+            lab.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            field.setBounds (row);
+            r.removeFromTop (4);
+        };
+
+        layoutRow (nameLabel_,   nameEditor_);
+
+        /* Colour row: label + swatch (24x16) + room. */
+        {
+            auto row = r.removeFromTop (rowH);
+            colourLabel_.setBounds (row.removeFromLeft (labelW));
+            row.removeFromLeft (colGap);
+            swatch_.setBounds (row.removeFromLeft (60).withSizeKeepingCentre (60, 18));
+            r.removeFromTop (4);
+        }
+
+        layoutRow (quantLabel_,  quantCombo_);
+        layoutRow (followLabel_, followCombo_);
+
+        r.removeFromTop (6);
+        hintLabel_.setBounds (r.removeFromTop (rowH));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour { 0xff'18'18'18 });
+    }
+
+private:
+    void configureLabel (juce::Label& l, const juce::String& text,
+                         float pt, int style)
+    {
+        l.setText (text, juce::dontSendNotification);
+        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      pt, style));
+        l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
+        addAndMakeVisible (l);
+    }
+
+    void configureEditor (juce::TextEditor& e)
+    {
+        e.setMultiLine (false);
+        e.setReturnKeyStartsNewLine (false);
+        e.setSelectAllWhenFocused (true);
+        e.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      12.0f, juce::Font::plain));
+        e.setColour (juce::TextEditor::backgroundColourId, juce::Colour { 0xff'20'20'20 });
+        e.setColour (juce::TextEditor::textColourId,       juce::Colour { 0xff'ff'ff'ff });
+        e.setColour (juce::TextEditor::outlineColourId,    juce::Colour { 0xff'3a'3a'3a });
+        e.setColour (juce::TextEditor::focusedOutlineColourId,
+                                                            juce::Colour { 0xff'ff'a0'40 });
+        e.addListener (this);
+        addAndMakeVisible (e);
+    }
+
+    void configureCombo (juce::ComboBox& cb, const juce::StringArray& items)
+    {
+        for (int i = 0; i < items.size(); ++i)
+            cb.addItem (items[i], i + 1);     // 1-based
+        cb.setColour (juce::ComboBox::backgroundColourId, juce::Colour { 0xff'20'20'20 });
+        cb.setColour (juce::ComboBox::textColourId,       juce::Colour { 0xff'ff'ff'ff });
+        cb.setColour (juce::ComboBox::outlineColourId,    juce::Colour { 0xff'3a'3a'3a });
+        cb.onChange = [this, &cb] { commitCombo (cb); };
+        addAndMakeVisible (cb);
+    }
+
+    void refreshFromClip()
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* clip = v->clipByUuid (clipId_);
+        if (clip == nullptr) return;
+
+        titleLabel_.setText ("Clip - " + clip->name, juce::dontSendNotification);
+        nameEditor_.setText (clip->name, juce::dontSendNotification);
+        swatch_.setSwatchColour (clip->color);
+        quantCombo_ .setSelectedId ((int) clip->launchQuant  + 1, juce::dontSendNotification);
+        followCombo_.setSelectedId ((int) clip->followAction + 1, juce::dontSendNotification);
+    }
+
+    /* TextEditor::Listener */
+    void textEditorReturnKeyPressed (juce::TextEditor& e) override
+    {
+        if (&e != &nameEditor_) return;
+        if (auto* v = view_.getComponent())
+            if (auto* clip = v->clipByUuid (clipId_))
+            {
+                const auto n = e.getText().trim();
+                if (n.isNotEmpty()) clip->name = n;
+                v->notifyClipEdited (*clip);
+            }
+        refreshFromClip();
+    }
+    void textEditorEscapeKeyPressed (juce::TextEditor&) override { refreshFromClip(); }
+    void textEditorFocusLost (juce::TextEditor&) override         { refreshFromClip(); }
+
+    /* ComboBox commit */
+    void commitCombo (juce::ComboBox& cb)
+    {
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* clip = v->clipByUuid (clipId_);
+        if (clip == nullptr) return;
+        const int idx = cb.getSelectedId() - 1;
+        if (idx < 0) return;
+        if (&cb == &quantCombo_)
+            clip->launchQuant = static_cast<SessionView::LaunchQuant> (juce::jlimit (0, 4, idx));
+        else if (&cb == &followCombo_)
+            clip->followAction = static_cast<SessionView::FollowAction> (juce::jlimit (0, 4, idx));
+        v->notifyClipEdited (*clip);
+    }
+
+    /* --- Colour picker ----------------------------------------------- */
+
+    class Swatch : public juce::Component
+    {
+    public:
+        std::function<void()> onClick;
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (juce::Colour { 0xff'10'10'10 });
+            g.setColour (current_);
+            g.fillRect (getLocalBounds().reduced (2));
+            g.setColour (juce::Colour { 0xff'3a'3a'3a });
+            g.drawRect (getLocalBounds().reduced (2), 1);
+        }
+        void mouseDown (const juce::MouseEvent&) override { if (onClick) onClick(); }
+        void setSwatchColour (juce::Colour c) { current_ = c; repaint(); }
+    private:
+        juce::Colour current_ { 0xff'4a'7a'b5 };
+    };
+
+    void openColourPicker()
+    {
+        detachColourPicker();
+        auto* cs = new juce::ColourSelector (juce::ColourSelector::showColourspace
+                                             | juce::ColourSelector::showSliders
+                                             | juce::ColourSelector::showAlphaChannel);
+        cs->setSize (300, 360);
+        if (auto* v = view_.getComponent())
+            if (auto* clip = v->clipByUuid (clipId_))
+                cs->setCurrentColour (clip->color);
+        cs->addChangeListener (this);
+        activeColourSel_ = cs;
+        juce::CallOutBox::launchAsynchronously (
+            std::unique_ptr<juce::Component> (cs),
+            swatch_.getScreenBounds(),
+            nullptr);
+    }
+
+    void detachColourPicker()
+    {
+        if (activeColourSel_ != nullptr)
+            activeColourSel_->removeChangeListener (this);
+        activeColourSel_ = nullptr;
+    }
+
+    void changeListenerCallback (juce::ChangeBroadcaster* src) override
+    {
+        auto* cs = dynamic_cast<juce::ColourSelector*> (src);
+        if (cs == nullptr) return;
+        auto* v = view_.getComponent();
+        if (v == nullptr) return;
+        auto* clip = v->clipByUuid (clipId_);
+        if (clip == nullptr) return;
+        clip->color = cs->getCurrentColour();
+        swatch_.setSwatchColour (clip->color);
+        v->notifyClipEdited (*clip);
+    }
+
+    juce::Component::SafePointer<SessionView> view_;
+    juce::Uuid clipId_;
+
+    juce::Label titleLabel_, nameLabel_, colourLabel_, quantLabel_, followLabel_, hintLabel_;
+    juce::TextEditor nameEditor_;
+    juce::ComboBox quantCombo_, followCombo_;
+    Swatch swatch_;
+    juce::ColourSelector* activeColourSel_ = nullptr;
+};
+
+class ClipViewWindow : public juce::DocumentWindow
+{
+public:
+    ClipViewWindow (juce::Component* content, const juce::String& title)
+        : juce::DocumentWindow (title,
+                                juce::Colour { 0xff'18'18'18 },
+                                juce::DocumentWindow::closeButton)
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (content, true);
+        setResizable (false, false);
+        centreWithSize (360, 270);
+        setVisible (true);
+    }
+    void closeButtonPressed() override { delete this; }
+};
+
+/* openSceneView + openClipView are defined here so their content +
+ * window classes are complete types at the point of `new`.  All
+ * other SessionView method definitions live above. */
+
+void SessionView::openClipView (SessionClip& clip)
+{
+    auto* content = new ClipViewContent (this, clip.id);
+    auto* win = new ClipViewWindow (content, "Clip - " + clip.name);
+    juce::ignoreUnused (win);
+}
+
+void SessionView::notifyClipEdited (SessionClip& clip)
+{
+    writeToSession();
+    repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+}
+
+SessionView::SessionClip* SessionView::clipByUuid (const juce::Uuid& clipId) noexcept
+{
+    for (auto* c : clips_)
+        if (c->id == clipId)
+            return c;
+    return nullptr;
+}
+
 void SessionView::openSceneView (int sceneRow)
 {
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;

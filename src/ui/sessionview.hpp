@@ -55,10 +55,12 @@ public:
     void mouseWheelMove (const juce::MouseEvent&,
                          const juce::MouseWheelDetails&) override;
 
-private:
+public:
     /* Per-clip launch state.  Driven by the message thread on bang(),
      * reconciled toward engine truth in the UI timer once the audio
-     * thread flips seq->playing at the scheduled boundary. */
+     * thread flips seq->playing at the scheduled boundary.  Public
+     * because the Clip View popup component (declared in
+     * sessionview.cpp at file scope) needs to name the type. */
     enum class LiveState : uint8_t { Stopped, WaitingToStart, Playing, WaitingToStop };
 
     /* Per-clip launch quantisation.  Off = immediate (next render
@@ -74,6 +76,8 @@ private:
      *    same column.  If none exists, falls back to Stop.
      *  - FirstClip: bang the lowest-sceneRow clip on the same column. */
     enum class FollowAction : uint8_t { None, Stop, RestartClip, NextClip, FirstClip };
+
+private:
 
     struct SessionClip {
         juce::Uuid     id;
@@ -196,6 +200,7 @@ private:
     juce::Rectangle<int> masterLaunchButtonBounds (int sceneRow) const noexcept;
     juce::Rectangle<int> masterTempoFieldBounds  (int sceneRow) const noexcept;
     juce::Rectangle<int> masterSigFieldBounds    (int sceneRow) const noexcept;
+    juce::Rectangle<int> masterEditButtonBounds  (int sceneRow) const noexcept;
     juce::Rectangle<int> headerRowBounds() const noexcept;
     juce::Rectangle<int> sceneLabelStripBounds() const noexcept;
     juce::Rectangle<int> gridBodyBounds() const noexcept;
@@ -215,6 +220,7 @@ private:
     bool hitTestMasterLaunch (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterTempo  (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterSig    (juce::Point<int> p, int& outRow) const noexcept;
+    bool hitTestMasterEdit   (juce::Point<int> p, int& outRow) const noexcept;
 
     /* Scene property editors -- master cell tempo/sig clicks AND the
      * scene-label "Properties..." menu both open the dedicated
@@ -234,10 +240,18 @@ private:
 public:
     void notifySceneEdited (int sceneRow);
     SessionScene* sceneAt  (int sceneRow) noexcept;
-    /* Used by floating popup windows (tracker pattern editor, future
-     * Clip View) so they can wire spacebar to the global transport. */
+    /* Used by floating popup windows (tracker pattern editor, Clip
+     * View) so they can wire spacebar to the global transport. */
     void transportTogglePlay() noexcept;
     void bangClipByUuid (const juce::Uuid& clipId);
+
+    /* Clip View popup support -- mirrors Scene View.  Right-click /
+     * double-click on a clip routes here instead of the AlertWindow
+     * rename / cycle-colour / etc. menu items.  Structural ops
+     * (Add / Assign / Delete) stay on the right-click menu. */
+    void openClipView (SessionClip&);
+    void notifyClipEdited (SessionClip&);
+    SessionClip* clipByUuid (const juce::Uuid&) noexcept;
 private:
 
     /* Inline editor -- shared single TextEditor positioned over the
