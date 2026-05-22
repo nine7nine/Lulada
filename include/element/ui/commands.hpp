@@ -44,6 +44,7 @@ public:
         showConsole,
         showArrangement,
         showTrackerHost,
+        showSessionView,
         showDiskOp,
         toggleMeterBridge,
 
@@ -127,6 +128,7 @@ public:
             showConsole,
             showArrangement,
             showTrackerHost,
+            showSessionView,
             showDiskOp,
 
             sessionClose,
@@ -237,6 +239,10 @@ public:
                 break;
             case Commands::showTrackerHost:
                 return "showTrackerHost";
+                break;
+            case Commands::showSessionView:
+                return "showSessionView";
+                break;
             case Commands::showDiskOp:
                 return "showDiskOp";
                 break;
@@ -314,6 +320,8 @@ public:
             return Commands::showArrangement;
         if (str == "showTrackerHost")
             return Commands::showTrackerHost;
+        if (str == "showSessionView")
+            return Commands::showSessionView;
         if (str == "showDiskOp")
             return Commands::showDiskOp;
 

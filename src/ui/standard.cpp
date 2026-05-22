@@ -19,6 +19,7 @@
 #include "ui/audioiopanelview.hpp"
 #include "ui/connectiongrid.hpp"
 #include "ui/arrangementview.hpp"
+#include "ui/sessionview.hpp"
 #include "ui/controllersview.hpp"
 #include "ui/trackerhostview.hpp"
 #include "ui/diskopview.hpp"
@@ -595,6 +596,10 @@ void StandardContent::setMainView (const String& name)
     {
         setContentView (new TrackerHostView());
     }
+    else if (name == EL_VIEW_SESSION_VIEW)
+    {
+        setContentView (new SessionView());
+    }
     else if (name == EL_VIEW_DISK_OP)
     {
         setContentView (new DiskOpContentView());
@@ -998,6 +1003,7 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::showConsole,
         Commands::showArrangement,
         Commands::showTrackerHost,
+        Commands::showSessionView,
         Commands::showDiskOp,
         Commands::toggleVirtualKeyboard,
         Commands::toggleMeterBridge,
@@ -1100,6 +1106,14 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
                 flags |= Info::isTicked;
             result.addDefaultKeypress (KeyPress::F4Key, 0);
             result.setInfo ("Trackers", "Show the tabbed tracker editors", "UI", flags);
+            break;
+        }
+        case Commands::showSessionView: {
+            int flags = 0;
+            if (getMainViewName() == EL_VIEW_SESSION_VIEW)
+                flags |= Info::isTicked;
+            result.addDefaultKeypress (KeyPress::F6Key, 0);
+            result.setInfo ("Session", "Show the clip-launcher session view", "UI", flags);
             break;
         }
         case Commands::showDiskOp: {
@@ -1212,6 +1226,9 @@ bool StandardContent::perform (const InvocationInfo& info)
             break;
         case Commands::showTrackerHost:
             setMainView (EL_VIEW_TRACKER_HOST);
+            break;
+        case Commands::showSessionView:
+            setMainView (EL_VIEW_SESSION_VIEW);
             break;
 
         case Commands::toggleVirtualKeyboard:
