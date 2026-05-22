@@ -41,7 +41,7 @@ const Colour kRowTextColour     { 0xff'6a'6a'6a };
 const Colour kLabelTextColour   { 0xff'a0'a0'a0 };
 const Colour kPlayheadAccent    { 0xff'ff'a0'40 };  // amber
 
-/* Column-tint palette, cycling — same hues as trackereditor's track
+/* Column-tint palette, cycling -- same hues as trackereditor's track
  * tints so a column on the session view feels visually adjacent to
  * its tracker. */
 const Colour kColumnTints[] = {
@@ -123,13 +123,40 @@ SessionView::SessionView()
     configureToolbarLabel  (quantNameLabel_,   "QUANT",  false);
     configureToolbarLabel  (quantValueLabel_,  "Bar",    true);    // popup on click
 
-    /* Click-to-edit hooks — match the tracker editor's pattern, but
+    /* Click-to-edit hooks -- match the tracker editor's pattern, but
      * with single-click editing on the SCENES value too (the toolbar
-     * is a top-level chrome strip — double-click-to-edit feels
+     * is a top-level chrome strip -- double-click-to-edit feels
      * over-cautious here, as user 2026-05-22 found out the hard way).
-     * QUANT value: click → popup menu (typing enum names is awkward;
+     * QUANT value: click -> popup menu (typing enum names is awkward;
      * menu is one click). */
     scenesValueLabel_.setEditable (true, true, false);
+
+    /* Inline editor -- one shared TextEditor reused by every editable
+     * field on the view (scene tempo, scene sig, future clip inspector).
+     * Hidden until showInlineEditor positions + populates it. */
+    inlineEditor_.setMultiLine (false);
+    inlineEditor_.setReturnKeyStartsNewLine (false);
+    inlineEditor_.setSelectAllWhenFocused (true);
+    inlineEditor_.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                              12.0f, juce::Font::plain));
+    inlineEditor_.setColour (juce::TextEditor::backgroundColourId,
+                             juce::Colour { 0xff'18'18'18 });
+    inlineEditor_.setColour (juce::TextEditor::textColourId,
+                             juce::Colour { 0xff'ff'ff'ff });
+    inlineEditor_.setColour (juce::TextEditor::outlineColourId,
+                             juce::Colour { 0xff'40'40'40 });
+    inlineEditor_.setColour (juce::TextEditor::focusedOutlineColourId,
+                             juce::Colour { 0xff'ff'a0'40 });
+    inlineEditor_.onReturnKey = [this] {
+        if (inlineEditorCommit_) inlineEditorCommit_ (inlineEditor_.getText());
+        hideInlineEditor();
+    };
+    inlineEditor_.onEscapeKey = [this] { hideInlineEditor(); };
+    inlineEditor_.onFocusLost = [this] {
+        if (inlineEditorCommit_) inlineEditorCommit_ (inlineEditor_.getText());
+        hideInlineEditor();
+    };
+    addChildComponent (inlineEditor_);
     scenesValueLabel_.onTextChange = [this] {
         const auto txt = scenesValueLabel_.getText()
                             .retainCharacters ("0123456789").trim();
@@ -157,7 +184,7 @@ void SessionView::configureToolbarButton (juce::TextButton& b,
 {
     b.setButtonText (text);
     b.onClick = std::move (onClick);
-    /* Same palette as TrackerEditor::Toolbar — keeps the two views
+    /* Same palette as TrackerEditor::Toolbar -- keeps the two views
      * visually adjacent. */
     b.setColour (juce::TextButton::buttonColourId,  juce::Colour { 0xff'2c'2c'2c });
     b.setColour (juce::TextButton::textColourOffId, juce::Colour { 0xff'd0'd0'd0 });
@@ -276,7 +303,7 @@ void SessionView::stabilizeContent()
 
 void SessionView::resized()
 {
-    /* Toolbar layout — tracker-editor-styled groups, left-aligned.
+    /* Toolbar layout -- tracker-editor-styled groups, left-aligned.
      * Each group: [name label] [value label] [- btn] [+ btn].  6 px
      * gutters at the toolbar edges, 8 px gap between groups, 2 px
      * gap within a group. */
@@ -434,14 +461,14 @@ Rectangle<int> SessionView::columnHeaderBounds (int columnIdx) const noexcept
 
 Rectangle<int> SessionView::playButtonBounds (int sceneRow, int columnIdx) const noexcept
 {
-    /* Left ~18px of the inner cell rect — play/stop glyph. */
+    /* Left ~18px of the inner cell rect -- play/stop glyph. */
     auto inner = cellBounds (sceneRow, columnIdx).reduced (2, 2);
     return inner.removeFromLeft (18);
 }
 
 Rectangle<int> SessionView::editButtonBounds (int sceneRow, int columnIdx) const noexcept
 {
-    /* Right ~18px of the inner cell rect — opens tracker pattern popup. */
+    /* Right ~18px of the inner cell rect -- opens tracker pattern popup. */
     auto inner = cellBounds (sceneRow, columnIdx).reduced (2, 2);
     return inner.removeFromRight (18);
 }
@@ -532,7 +559,7 @@ void SessionView::paint (Graphics& g)
 {
     g.fillAll (kBgColour);
 
-    /* Toolbar background — sits above the column-header row. */
+    /* Toolbar background -- sits above the column-header row. */
     g.setColour (kHeaderBgColour);
     g.fillRect (toolbarBounds());
     g.setColour (kCellOutlineColour);
@@ -559,11 +586,11 @@ void SessionView::paint (Graphics& g)
         const auto h    = columnHeaderBounds (c);
         const auto tint = columnTint (c);
 
-        /* Top tint band, à la trackereditor track header. */
+        /* Top tint band, a la trackereditor track header. */
         g.setColour (tint);
         g.fillRect (h.getX(), h.getY(), h.getWidth() - 1, 4);
 
-        /* Body of header — translucent tint over header bg. */
+        /* Body of header -- translucent tint over header bg. */
         g.setColour (tint.withAlpha (0.10f));
         g.fillRect (h.getX(), h.getY() + 4, h.getWidth() - 1, h.getHeight() - 4);
 
@@ -580,7 +607,7 @@ void SessionView::paint (Graphics& g)
      * the column header / column-stop area.  Explicit save/restore
      * so we can close the clip region at a known point further down.
      *
-     * NOTE: master column MUST be in this union — earlier it was
+     * NOTE: master column MUST be in this union -- earlier it was
      * left out and the column drew into a clipped-away region,
      * making it invisible. */
     const auto masterCol = masterColumnBounds();
@@ -600,7 +627,7 @@ void SessionView::paint (Graphics& g)
         const auto sb = sceneLabelBounds (r);
 
         /* Subtle alternating row tint, matching trackereditor's beat
-         * highlight rhythm — every 4th row gets a faint stripe. */
+         * highlight rhythm -- every 4th row gets a faint stripe. */
         if ((r & 3) == 0)
         {
             g.setColour (Colour { 0xff'1f'1f'1f });
@@ -633,7 +660,7 @@ void SessionView::paint (Graphics& g)
             SessionClip* clip = findClip (r, c);
             if (clip == nullptr)
             {
-                /* Empty cell — flat dark with thin outline. */
+                /* Empty cell -- flat dark with thin outline. */
                 g.setColour (kEmptyCellColour);
                 g.fillRect (inner);
                 g.setColour (kCellOutlineColour);
@@ -678,7 +705,7 @@ void SessionView::paint (Graphics& g)
                 g.fillPath (p);
             }
 
-            /* --- Edit button (RIGHT) — three horizontal lines as a
+            /* --- Edit button (RIGHT) -- three horizontal lines as a
              * tracker-pattern hint glyph. */
             g.setColour (juce::Colours::black.withAlpha (0.18f));
             g.fillRect (editR);
@@ -712,7 +739,7 @@ void SessionView::paint (Graphics& g)
                     const float frac  = (float) juce::jlimit (0.0, 1.0, pos / (double) total);
                     const int barW    = juce::jmax (1, (int) (frac * cb.getWidth()));
                     /* Translucent track underneath so the playhead reads
-                     * as a moving fill on a dim runway — easier to spot
+                     * as a moving fill on a dim runway -- easier to spot
                      * at a glance than a bare 3 px line over the cell
                      * colour. */
                     g.setColour (juce::Colours::black.withAlpha (0.30f));
@@ -751,7 +778,7 @@ void SessionView::paint (Graphics& g)
         }
     }
 
-    /* Clip-drag drop-target highlight — drawn over an empty cell that
+    /* Clip-drag drop-target highlight -- drawn over an empty cell that
      * the cursor is hovering during an active drag.  Same-column
      * drops are accepted; cross-column ones are silently rejected
      * by moveClip, but the highlight still appears so the user gets
@@ -780,7 +807,7 @@ void SessionView::paint (Graphics& g)
         }
     }
 
-    /* Scene-reorder insertion indicator — thin amber line at the row
+    /* Scene-reorder insertion indicator -- thin amber line at the row
      * boundary the source scene will land on. */
     if (sceneDragActive_ && sceneDragSource_ >= 0 && sceneDragHoverRow_ >= 0
         && sceneDragHoverRow_ != sceneDragSource_)
@@ -794,15 +821,16 @@ void SessionView::paint (Graphics& g)
     }
 
     /* --- Master column (rightmost, scrolls with grid) ------------
-     * Ableton-style "scene master" — each row shows a launch button
+     * Ableton-style "scene master" -- each row shows a launch button
      * + tempo + signature.  Drawn inside the scrollable clip region
      * so it scrolls in lock-step with grid rows.  See
      * project_session_view_ableton_scene_master_column memory. */
     {
         const auto masterCol = masterColumnBounds();
-        /* Strip background — slightly darker than the gutter so it
-         * reads as a chrome column rather than a content cell. */
-        g.setColour (Colour { 0xff'10'10'10 });
+        /* Master column shares the main session-view background --
+         * one continuous surface so it doesn't read as a separate
+         * panel.  Same kBgColour, same kCellOutlineColour family. */
+        g.setColour (kBgColour);
         g.fillRect (masterCol);
         g.setColour (kCellOutlineColour);
         g.drawVerticalLine (masterCol.getX(),
@@ -820,19 +848,24 @@ void SessionView::paint (Graphics& g)
             const auto sigR    = masterSigFieldBounds (r);
             const auto& sc     = scenes_.getReference (r);
 
-            /* Row alternation hint mirrors the scene-label strip. */
+            /* Row alternation hint mirrors the scene-label strip's
+             * every-4th-row stripe so they line up. */
             if ((r & 3) == 0)
             {
-                g.setColour (Colour { 0xff'14'14'14 });
+                g.setColour (Colour { 0xff'1f'1f'1f });
                 g.fillRect (cell);
             }
 
-            /* Launch button — small bordered play triangle.  Mirrors
-             * the per-clip play button visually so the affordance
-             * reads as the same gesture. */
-            g.setColour (Colour { 0xff'2c'2c'2c });
+            /* Launch button -- styled to match clip play buttons so
+             * the user reads it as the same gesture.  Lights up
+             * amber when any clip in the scene is currently active. */
+            const bool sceneActive = sceneHasActiveClip (r);
+            g.setColour (sceneActive
+                            ? kPlayheadAccent.withAlpha (0.30f)
+                            : juce::Colours::black.withAlpha (0.20f));
             g.fillRect (launchR);
-            g.setColour (Colours::white.withAlpha (0.80f));
+            g.setColour (sceneActive ? kPlayheadAccent
+                                     : Colour { 0xff'd0'd0'd0 });
             {
                 juce::Path p;
                 const float gx = (float) launchR.getX() + 6.0f;
@@ -845,30 +878,31 @@ void SessionView::paint (Graphics& g)
                 g.fillPath (p);
             }
 
-            /* Tempo + sig fields — show value or "—" when no override
-             * is set.  Editable via click (handled in mouseDown via
-             * AlertWindow prompts); editable affordance is the dark
-             * inset background + bright text. */
+            /* Tempo + sig fields -- match the empty-cell visual
+             * family (kEmptyCellColour bg + kCellOutlineColour
+             * outline) so they look like editable inputs that share
+             * the session-view widget vocabulary. */
             auto drawField = [&] (const Rectangle<int>& rr, const String& text,
                                   bool overrideSet)
             {
-                g.setColour (overrideSet ? Colour { 0xff'18'18'18 }
-                                         : Colour { 0xff'13'13'13 });
+                g.setColour (kEmptyCellColour);
                 g.fillRect (rr);
-                g.setColour (overrideSet ? Colour { 0xff'ff'ff'ff }
-                                         : Colour { 0xff'70'70'70 });
+                g.setColour (kCellOutlineColour);
+                g.drawRect (rr, 1);
+                g.setColour (overrideSet ? Colour { 0xff'd4'd4'd4 }
+                                         : kRowTextColour);
                 g.drawText (text, rr.reduced (4, 0),
                             juce::Justification::centred, true);
             };
 
             drawField (tempoR,
                        sc.tempoOverride > 0.0 ? String (sc.tempoOverride, 1)
-                                              : String ("—"),
+                                              : String ("--"),
                        sc.tempoOverride > 0.0);
             drawField (sigR,
                        (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
                             ? String (sc.beatsPerBar) + "/" + String (sc.beatDivisor)
-                            : String ("—"),
+                            : String ("--"),
                        sc.beatsPerBar > 0 && sc.beatDivisor > 0);
 
             /* Row divider. */
@@ -879,7 +913,7 @@ void SessionView::paint (Graphics& g)
         }
     }
 
-    /* Close the scrollable-area clip region — everything after this
+    /* Close the scrollable-area clip region -- everything after this
      * draws into the fixed (non-scrolling) chrome strips. */
     g.restoreState();
 
@@ -900,7 +934,7 @@ void SessionView::paint (Graphics& g)
         g.setColour (tint);
         g.fillRect (btnR);
 
-        /* Centred stop square — only filled when the column has at
+        /* Centred stop square -- only filled when the column has at
          * least one active clip; otherwise just an outline so the
          * button still reads as a button. */
         bool active = false;
@@ -931,9 +965,9 @@ void SessionView::paint (Graphics& g)
         hint = "Add a Tracker node to the graph to populate columns";
     else
         hint = String (columns_.size()) + " column"  + (columns_.size() == 1 ? "" : "s")
-             + " · "
+             + " | "
              + String (scenes_.size())  + " scene"  + (scenes_.size()  == 1 ? "" : "s")
-             + " · right-click a cell or scene label for more";
+             + " | right-click a cell or scene label for more";
     const auto hintR = footer.withTrimmedLeft (kSceneLabelW + 8);
     g.drawText (hint, hintR, juce::Justification::centredLeft, true);
 }
@@ -946,7 +980,7 @@ void SessionView::mouseDown (const MouseEvent& e)
 
     if (e.mods.isPopupMenu())
     {
-        /* Master column right-click — scene transport overrides. */
+        /* Master column right-click -- scene transport overrides. */
         if (hitTestMasterCell (e.getPosition(), row))
         {
             const auto& sc = scenes_.getReference (row);
@@ -1075,7 +1109,7 @@ void SessionView::mouseDown (const MouseEvent& e)
         return;
     }
 
-    /* Column stop button row — kills the column's active clip(s).
+    /* Column stop button row -- kills the column's active clip(s).
      * Tested before cell hits so a click on the stop row never
      * stages a drag. */
     if (hitTestColumnStop (e.getPosition(), col))
@@ -1084,8 +1118,8 @@ void SessionView::mouseDown (const MouseEvent& e)
         return;
     }
 
-    /* Master column launch button → bang scene.
-     * Master column tempo/sig fields → click-to-edit prompts. */
+    /* Master column launch button -> bang scene.
+     * Master column tempo/sig fields -> click-to-edit prompts. */
     if (hitTestMasterLaunch (e.getPosition(), row))
     {
         bangScene (row);
@@ -1124,7 +1158,7 @@ void SessionView::mouseDown (const MouseEvent& e)
         }
     }
 
-    /* Middle of a filled cell — stage a potential clip drag. */
+    /* Middle of a filled cell -- stage a potential clip drag. */
     if (hitTestCell (e.getPosition(), row, col))
     {
         if (auto* clip = findClip (row, col))
@@ -1138,7 +1172,7 @@ void SessionView::mouseDown (const MouseEvent& e)
         }
     }
 
-    /* Scene label click — stage a potential reorder.  mouseUp fires
+    /* Scene label click -- stage a potential reorder.  mouseUp fires
      * bangScene if the click never moved past the drag threshold;
      * otherwise it performs the reorder. */
     if (hitTestSceneLabel (e.getPosition(), row))
@@ -1251,7 +1285,7 @@ void SessionView::mouseUp (const MouseEvent& e)
         }
         else
         {
-            /* Static click — bang the scene. */
+            /* Static click -- bang the scene. */
             bangScene (sceneDragSource_);
         }
 
@@ -1267,7 +1301,7 @@ void SessionView::mouseWheelMove (const MouseEvent& e, const juce::MouseWheelDet
     juce::ignoreUnused (e);
     if (maxGridScrollY() <= 0) return;
     /* Convert wheel delta to pixels.  3 rows per "tick" feels natural
-     * — matches the usual JUCE default for list scrolling. */
+     * -- matches the usual JUCE default for list scrolling. */
     const int delta = (int) std::round (-wheel.deltaY * kRowH * 3.0f);
     const int prev  = gridScrollY_;
     gridScrollY_ = juce::jlimit (0, maxGridScrollY(), gridScrollY_ + delta);
@@ -1350,7 +1384,7 @@ double SessionView::computeTargetBeat (double curBeat, LaunchQuant q) const
     if (qb <= 0.0) return -1.0;
 
     /* Strictly future boundary.  If curBeat sits exactly on the
-     * boundary, jump to the NEXT one — pressing bang on the bar
+     * boundary, jump to the NEXT one -- pressing bang on the bar
      * line should land on the next bar, not "right now" with
      * zero waiting time (UX gives the user a moment of feedback). */
     constexpr double kEps = 1e-6;
@@ -1382,8 +1416,8 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
 
     const bool wantPlaying = (cur != LiveState::Playing);
 
-    /* Same-column mutual exclusion at the shared targetBeat — A→stop
-     * and B→start hit the audio thread in the same render block, so
+    /* Same-column mutual exclusion at the shared targetBeat -- A->stop
+     * and B->start hit the audio thread in the same render block, so
      * the flip is atomic.  Skip self.  Also skip clips that point at
      * the SAME underlying sequence as us: two clips sharing a
      * sequence are functionally one engine-level voice, so banging
@@ -1449,7 +1483,7 @@ void SessionView::applyFollowAction (SessionClip& clip)
 
         case FollowAction::RestartClip:
             /* schedulePlaying(_, true) rewinds pos to 0 even when the
-             * sequence is already playing — see applyPendingForBlock
+             * sequence is already playing -- see applyPendingForBlock
              * in tracker.cpp.  Effectively a re-trigger on wrap. */
             trk->schedulePlaying (clip.sequenceIdx, -1.0, true);
             break;
@@ -1469,7 +1503,7 @@ void SessionView::applyFollowAction (SessionClip& clip)
                 bangClip (*nextClip);   // mutual-exclusion stops this one
             else
             {
-                /* No further clip — fall through to Stop. */
+                /* No further clip -- fall through to Stop. */
                 trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
                 clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
                 repaint (cellBounds (clip.sceneRow, clip.columnIdx));
@@ -1505,7 +1539,7 @@ void SessionView::bangScene (int sceneRow)
     applySceneOverridesToTransport (scenes_.getReference (sceneRow));
 
     /* Pick the slowest quant among this scene's clips so they all
-     * snap to the same target beat — Bitwig convention.  If clips
+     * snap to the same target beat -- Bitwig convention.  If clips
      * use heterogeneous quants the per-clip values are ignored for
      * the duration of this bang; subsequent solo bangs use the
      * clip's own quant again. */
@@ -1536,14 +1570,14 @@ void SessionView::applySceneOverridesToTransport (const SessionScene& s)
     auto sess = services_->context().session();
     if (sess == nullptr) return;
 
-    /* Session::setProperty is protected — go through the public
+    /* Session::setProperty is protected -- go through the public
      * data() ValueTree directly.  Same effect: the audio engine's
      * ValueTree::Listener picks up the change and routes it to the
      * Transport monitor. */
     auto tree = sess->data();
     if (! tree.isValid()) return;
     /* ValueTree property writes broadcast through the session's
-     * ObjectModel listener chain — same path the Session Settings
+     * ObjectModel listener chain -- same path the Session Settings
      * panel uses to nudge BPM at runtime.  No notifyChanged() poke
      * needed (it's private and the listener path runs anyway). */
     if (s.tempoOverride > 0.0)
@@ -1557,65 +1591,108 @@ void SessionView::applySceneOverridesToTransport (const SessionScene& s)
 void SessionView::editSceneTempo (int sceneRow)
 {
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
-    auto& sc = scenes_.getReference (sceneRow);
+    const auto& sc = scenes_.getReference (sceneRow);
 
-    auto* aw = new juce::AlertWindow ("Scene tempo",
-                                      "Enter tempo in BPM (blank or 0 = no override):",
-                                      juce::AlertWindow::NoIcon);
-    aw->addTextEditor ("tempo", sc.tempoOverride > 0.0
-                                    ? juce::String (sc.tempoOverride, 2)
-                                    : juce::String());
-    aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
-    aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    const auto initial = sc.tempoOverride > 0.0
+                            ? juce::String (sc.tempoOverride, 2)
+                            : juce::String();
 
-    aw->enterModalState (true,
-        juce::ModalCallbackFunction::create (
-            [this, sceneRow, aw] (int result) {
-                if (result != 1 || sceneRow >= scenes_.size()) return;
-                const auto txt = aw->getTextEditorContents ("tempo").trim();
-                auto& s = scenes_.getReference (sceneRow);
-                if (txt.isEmpty()) { s.tempoOverride = -1.0; }
-                else
-                {
-                    const double v = txt.getDoubleValue();
-                    s.tempoOverride = (v > 0.0)
-                        ? juce::jlimit (20.0, 999.0, v)
-                        : -1.0;
-                }
-                writeToSession();
-                repaint (masterCellBounds (sceneRow));
-            }),
-        true);
+    showInlineEditor (
+        masterTempoFieldBounds (sceneRow),
+        initial,
+        [this, sceneRow] (const juce::String& txt)
+        {
+            if (sceneRow >= scenes_.size()) return;
+            auto& s = scenes_.getReference (sceneRow);
+            const auto trimmed = txt.trim();
+            if (trimmed.isEmpty()) { s.tempoOverride = -1.0; }
+            else
+            {
+                const double v = trimmed.getDoubleValue();
+                s.tempoOverride = (v > 0.0)
+                    ? juce::jlimit (20.0, 999.0, v)
+                    : -1.0;
+            }
+            writeToSession();
+            repaint (masterCellBounds (sceneRow));
+        });
 }
 
 void SessionView::editSceneSignature (int sceneRow)
 {
     if (sceneRow < 0 || sceneRow >= scenes_.size()) return;
-    auto& sc = scenes_.getReference (sceneRow);
+    const auto& sc = scenes_.getReference (sceneRow);
 
-    auto* aw = new juce::AlertWindow ("Scene time signature",
-                                      "Numerator / denominator (blank = no override):",
-                                      juce::AlertWindow::NoIcon);
-    aw->addTextEditor ("num", sc.beatsPerBar > 0 ? juce::String (sc.beatsPerBar)
-                                                 : juce::String());
-    aw->addTextEditor ("den", sc.beatDivisor > 0 ? juce::String (sc.beatDivisor)
-                                                 : juce::String());
-    aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
-    aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    /* Single field, "num/den" format -- much faster than two
+     * AlertWindow inputs.  Empty input clears the override. */
+    const auto initial = (sc.beatsPerBar > 0 && sc.beatDivisor > 0)
+                            ? juce::String (sc.beatsPerBar) + "/" + juce::String (sc.beatDivisor)
+                            : juce::String();
 
-    aw->enterModalState (true,
-        juce::ModalCallbackFunction::create (
-            [this, sceneRow, aw] (int result) {
-                if (result != 1 || sceneRow >= scenes_.size()) return;
-                auto& s = scenes_.getReference (sceneRow);
-                const int num = aw->getTextEditorContents ("num").trim().getIntValue();
-                const int den = aw->getTextEditorContents ("den").trim().getIntValue();
+    showInlineEditor (
+        masterSigFieldBounds (sceneRow),
+        initial,
+        [this, sceneRow] (const juce::String& txt)
+        {
+            if (sceneRow >= scenes_.size()) return;
+            auto& s = scenes_.getReference (sceneRow);
+            const auto trimmed = txt.trim();
+            if (trimmed.isEmpty())
+            {
+                s.beatsPerBar = 0;
+                s.beatDivisor = 0;
+            }
+            else
+            {
+                const int slash = trimmed.indexOfChar ('/');
+                int num = 0, den = 0;
+                if (slash > 0)
+                {
+                    num = trimmed.substring (0, slash).getIntValue();
+                    den = trimmed.substring (slash + 1).getIntValue();
+                }
+                else
+                {
+                    num = trimmed.getIntValue();
+                    den = 4;
+                }
                 s.beatsPerBar = juce::jlimit (0, 32, num);
                 s.beatDivisor = juce::jlimit (0, 32, den);
-                writeToSession();
-                repaint (masterCellBounds (sceneRow));
-            }),
-        true);
+            }
+            writeToSession();
+            repaint (masterCellBounds (sceneRow));
+        });
+}
+
+bool SessionView::sceneHasActiveClip (int sceneRow) const noexcept
+{
+    for (auto* c : clips_)
+    {
+        if (c->sceneRow != sceneRow) continue;
+        const auto s = c->state.load (std::memory_order_relaxed);
+        if (s != LiveState::Stopped)
+            return true;
+    }
+    return false;
+}
+
+void SessionView::showInlineEditor (juce::Rectangle<int> bounds,
+                                    const juce::String& initial,
+                                    std::function<void (const juce::String&)> commit)
+{
+    inlineEditorCommit_ = std::move (commit);
+    inlineEditor_.setBounds (bounds);
+    inlineEditor_.setText (initial, juce::dontSendNotification);
+    inlineEditor_.setVisible (true);
+    inlineEditor_.toFront (true);
+    inlineEditor_.grabKeyboardFocus();
+    inlineEditor_.selectAll();
+}
+
+void SessionView::hideInlineEditor()
+{
+    inlineEditorCommit_ = nullptr;
+    inlineEditor_.setVisible (false);
 }
 
 void SessionView::clearSceneTempo (int sceneRow)
@@ -1638,7 +1715,7 @@ void SessionView::clearSceneSignature (int sceneRow)
 
 void SessionView::stopAllClips()
 {
-    /* Immediate stop — bypass quantisation.  Schedules through the
+    /* Immediate stop -- bypass quantisation.  Schedules through the
      * audio-thread FIFO with beatTarget=-1 so every clip stops on
      * the next render block.  Resets message-thread state to Stopped
      * straight away; UI tick will confirm. */
@@ -1739,7 +1816,7 @@ void SessionView::renameClip (SessionClip& clip)
     aw->enterModalState (true,
         juce::ModalCallbackFunction::create (
             [this, clipPtr, aw] (int result) {
-                /* Verify the clip pointer is still in clips_ — user
+                /* Verify the clip pointer is still in clips_ -- user
                  * may have deleted it while the dialog was open. */
                 bool stillValid = false;
                 for (auto* c : clips_)
@@ -1762,7 +1839,7 @@ void SessionView::cycleClipColor (SessionClip& clip)
 {
     /* Cycle through the tracker-tint palette (8 colours, defined at
      * the top of this file).  v1 leaves full ColourSelector for a
-     * later polish pass — the cycle gives the user enough colour
+     * later polish pass -- the cycle gives the user enough colour
      * differentiation between clips without juggling a modal. */
     int curIdx = -1;
     for (int i = 0; i < 8; ++i)
@@ -1790,7 +1867,7 @@ void SessionView::moveClip (SessionClip& clip, int newSceneRow, int newColumnIdx
      * `sequence` (changing its `clt` + back-pointer to a different
      * `module`); deferred until a dedicated adoptSequence API lands.
      * v1: silently reject cross-tracker drops.  In practice columns
-     * are 1:1 with TrackerNodes today, so cross-column ⇒ cross-
+     * are 1:1 with TrackerNodes today, so cross-column ==> cross-
      * tracker; same-column drag inside a single column is the only
      * case that actually fires. */
     if (targetTrackerId != clip.trackerNodeId) return;
@@ -1848,7 +1925,7 @@ void SessionView::reorderScene (int fromRow, int toRow)
 
     /* Remap clip sceneRows.  Whatever was at fromRow now lives at
      * toRow; rows between shift.  Easier to just rebuild each
-     * clip's sceneRow by remapping using the old → new permutation. */
+     * clip's sceneRow by remapping using the old -> new permutation. */
     if (fromRow < toRow)
     {
         for (auto* c : clips_)
@@ -1925,7 +2002,7 @@ void SessionView::changeListenerCallback (juce::ChangeBroadcaster* src)
     auto* cs = dynamic_cast<juce::ColourSelector*> (src);
     if (cs == nullptr) return;
 
-    /* Confirm the clip is still alive — user may have deleted it
+    /* Confirm the clip is still alive -- user may have deleted it
      * while the picker was open. */
     bool stillValid = false;
     for (auto* c : clips_)
@@ -1994,6 +2071,29 @@ void SessionView::addClipAt (int sceneRow, int columnIdx)
     repaint (cellBounds (sceneRow, columnIdx));
 }
 
+/* Self-deleting non-modal floating window for the pattern editor.
+ * juce::DialogWindow::launchAsync enters a modal state that steals
+ * keyboard focus from the main app -- user can't hit spacebar for
+ * transport or interact with the underlying SessionView.  A plain
+ * DocumentWindow with the close button wired to delete-self keeps
+ * the editor floating without capturing focus. */
+class TrackerPatternWindow : public juce::DocumentWindow
+{
+public:
+    TrackerPatternWindow (juce::Component* content, const juce::String& title)
+        : juce::DocumentWindow (title,
+                                juce::Colour { 0xff'18'18'18 },
+                                juce::DocumentWindow::allButtons)
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (content, true);
+        setResizable (true, false);
+        centreWithSize (820, 540);
+        setVisible (true);
+    }
+    void closeButtonPressed() override { delete this; }
+};
+
 void SessionView::openPatternEditor (SessionClip& clip)
 {
     if (services_ == nullptr) return;
@@ -2008,7 +2108,7 @@ void SessionView::openPatternEditor (SessionClip& clip)
     auto* editor = new TrackerEditor (n);
     editor->setSize (820, 540);
 
-    /* Jump to the clip's sequence index — TrackerEditor exposes only
+    /* Jump to the clip's sequence index -- TrackerEditor exposes only
      * a relative switchPattern (delta), so compute the offset from
      * its current pattern.  Clamp against the live pattern count to
      * avoid jumping past the end if the sequence vanished. */
@@ -2022,14 +2122,12 @@ void SessionView::openPatternEditor (SessionClip& clip)
             editor->switchPattern (delta);
     }
 
-    juce::DialogWindow::LaunchOptions opts;
-    opts.content.setOwned (editor);
-    opts.dialogTitle = "Tracker — " + clip.name;
-    opts.dialogBackgroundColour = Colour { 0xff'18'18'18 };
-    opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
-    opts.resizable = true;
-    opts.launchAsync();
+    /* ASCII hyphen in the title -- native title bars on some systems
+     * (Wine here, plus a few Linux WMs) garble multi-byte UTF-8 chars
+     * when the title is set as a system call.  The em-dash showed up
+     * as "a" in testing. */
+    auto* win = new TrackerPatternWindow (editor, "Tracker - " + clip.name);
+    juce::ignoreUnused (win);   // self-deletes on close
 }
 
 void SessionView::deleteClip (SessionClip& clip)
@@ -2037,7 +2135,7 @@ void SessionView::deleteClip (SessionClip& clip)
     if (auto* trk = lookupTracker (clip.trackerNodeId))
         trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
 
-    /* Note: we do NOT call trk->removeSequence() — the underlying vht
+    /* Note: we do NOT call trk->removeSequence() -- the underlying vht
      * sequence may be referenced by other clips or by the arrangement
      * view.  Phase 3 keeps the sequence behind; Phase 7+ adds a
      * "delete unreferenced sequences" sweep. */
@@ -2290,9 +2388,9 @@ void SessionView::timerCallback()
 
         /* State reconciliation: the audio thread flips seq->playing
          * at the scheduled boundary; the UI tick observes the result
-         * and transitions WaitingTo* → final state.  Crucially, we
+         * and transitions WaitingTo* -> final state.  Crucially, we
          * do NOT clobber WaitingTo* with an engine snapshot that
-         * disagrees — those states represent "we're waiting for the
+         * disagrees -- those states represent "we're waiting for the
          * boundary," which means engine has NOT changed yet. */
         LiveState next = cur;
         switch (cur)
@@ -2336,7 +2434,7 @@ void SessionView::timerCallback()
         /* Follow-action edge: only check after state reconciliation
          * so a freshly-launched clip doesn't immediately fire its
          * follow action on the first poll.  sequenceWrappedSinceLastQuery
-         * consumes the wrap edge — repeated calls in the same wrap
+         * consumes the wrap edge -- repeated calls in the same wrap
          * window return false. */
         if (next == LiveState::Playing
             && clip->followAction != FollowAction::None
