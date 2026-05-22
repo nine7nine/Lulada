@@ -664,6 +664,26 @@ public:
         }
         envSampleAccum = 0;
 
+        /* Per-voice envelope tick rate.  Default 0 = "use owner's
+         * absolute 50 Hz tick rate".  When the instrument opts into
+         * envSampleRelative, scale so the longest enabled envelope's
+         * last point lines up with sample end — short one-shots get
+         * a fast envelope, long pads get a slow one, all from the
+         * same envelope shape. */
+        envSamplesPerTickOverride = 0;
+        if (instrument != nullptr && instrument->envSampleRelative && slot->numSamples > 0)
+        {
+            int lastX = 0;
+            auto take = [&] (const FT2Envelope& e) {
+                if ((e.flags & FT2Envelope::kEnabled) && e.length > 0)
+                    lastX = juce::jmax<int> (lastX, e.points[e.length - 1].x);
+            };
+            take (instrument->volumeEnv);
+            take (instrument->panEnv);
+            if (lastX > 0)
+                envSamplesPerTickOverride = juce::jmax (1, slot->numSamples / lastX);
+        }
+
         /* FT2 envelope path uses sample-position-driven envelopes; the
          * fallback ADSR is only used when both vol+pan envelopes are
          * disabled. */
@@ -754,7 +774,12 @@ public:
         if (voice.base16 == nullptr) { voice.active = false; clearCurrentNote(); return; }
         slotIsStereo = curSlot->isStereo && curSlot->data16R != nullptr;
 
-        const int samplesPerTick = owner.getSamplesPerEnvTick();
+        /* Use the per-voice override (sample-relative envelope) when
+         * set in startNote; otherwise fall back to the owner's
+         * absolute 50 Hz tick rate. */
+        const int samplesPerTick = envSamplesPerTickOverride > 0
+                                    ? envSamplesPerTickOverride
+                                    : owner.getSamplesPerEnvTick();
 
         AudioBuffer<float> scratch (2, numSamples);
         scratch.clear();
@@ -1295,6 +1320,10 @@ private:
 
     /* Tick-quantizer: samples since last envelope tick. */
     int       envSampleAccum = 0;
+    /* 0 = use SamplerNode::getSamplesPerEnvTick() (50 Hz absolute).
+     * >0 = per-voice override computed in startNote when the
+     * instrument has envSampleRelative on. */
+    int       envSamplesPerTickOverride = 0;
 };
 
 
@@ -2461,6 +2490,13 @@ public:
         });
         portamentoSlider.setTextValueSuffix (" ms");
 
+        /* "Env follows sample" — when on, envelope ticks scale at note-on
+         * so the longest enabled envelope's last point lines up with
+         * sample end (per voice). */
+        configureFlag (envFollowBtn, "Env~Smp", [this] (bool v) {
+            if (auto inst = getInst()) inst->envSampleRelative = v;
+        });
+
         rebuildEnvViews();
     }
 
@@ -2534,7 +2570,8 @@ public:
         auto row = r.removeFromTop (24);
         monoBtn      .setBounds (row.removeFromLeft (60));  row.removeFromLeft (8);
         portaLbl     .setBounds (row.removeFromLeft (40));
-        portamentoSlider.setBounds (row.removeFromLeft (120));  row.removeFromLeft (12);
+        portamentoSlider.setBounds (row.removeFromLeft (110));  row.removeFromLeft (12);
+        envFollowBtn .setBounds (row.removeFromLeft (76));  row.removeFromLeft (12);
         fadeLbl    .setBounds (row.removeFromLeft (60));
         fadeoutSlider.setBounds (row.removeFromLeft (120)); row.removeFromLeft (12);
         avSpeedLbl .setBounds (row.removeFromLeft (70));
@@ -2662,6 +2699,7 @@ private:
         panSustainBtn.setToggleState (pe.flags & FT2Envelope::kSustain, dontSendNotification);
         panLoopBtn   .setToggleState (pe.flags & FT2Envelope::kLoop,    dontSendNotification);
         monoBtn      .setToggleState (inst->mono,                       dontSendNotification);
+        envFollowBtn .setToggleState (inst->envSampleRelative,          dontSendNotification);
     }
 
     /** Append a sensible new point at xMax+20, y = previous point's y.
@@ -2817,6 +2855,7 @@ private:
     TextButton monoBtn;
     Label      portaLbl;
     Slider     portamentoSlider;
+    TextButton envFollowBtn;
 };
 
 
@@ -5473,6 +5512,7 @@ void SamplerNode::getStateInformation (MemoryBlock& dest)
         instTree.setProperty ("avRate",  (int) inst->autoVib.rate,  nullptr);
         instTree.setProperty ("mono",            inst->mono,              nullptr);
         instTree.setProperty ("portamentoMs",    (double) inst->portamentoTimeMs, nullptr);
+        instTree.setProperty ("envSampleRel",    inst->envSampleRelative, nullptr);
 
         auto writeEnv = [&](const FT2Envelope& e, const String& prefix)
         {
@@ -5562,6 +5602,10 @@ void SamplerNode::setStateInformation (const void* data, int size)
         inst->autoVib.rate  = (uint8_t) (int) instTree.getProperty ("avRate",  0);
         inst->mono            = (bool)  instTree.getProperty ("mono", false);
         inst->portamentoTimeMs = (float) (double) instTree.getProperty ("portamentoMs", 80.0);
+        /* Default ON for sessions that pre-date this field — matches
+         * the SamplerInstrument ctor default and is the "intended
+         * usage" per the design discussion. */
+        inst->envSampleRelative = (bool) instTree.getProperty ("envSampleRel", true);
 
         auto readEnv = [&](FT2Envelope& e, const String& prefix)
         {

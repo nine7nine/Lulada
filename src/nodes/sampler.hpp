@@ -116,6 +116,14 @@ public:
     bool          mono = false;
     float         portamentoTimeMs = 80.0f;
 
+    /** When true, FT2 envelope ticks are scaled at note-on so the
+     *  envelope's last point lines up with the end of the playing
+     *  slot's sample — instead of running in absolute 50 Hz ticks
+     *  (max ~6.5 s).  Reflects the actual musical "shape this sample"
+     *  use case; default ON since envelopes are unusable as-shipped
+     *  for short one-shots without this scaling. */
+    bool          envSampleRelative = true;
+
 private:
     std::array<std::unique_ptr<SamplerSampleSlot>, kNumSlots> slots;
     uint8_t noteToSlot[128] {};
