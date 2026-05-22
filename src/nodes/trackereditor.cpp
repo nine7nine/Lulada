@@ -1892,12 +1892,52 @@ public:
         configureButton (undoBtn, "UND", [this]{ editor.undoOp(); });
         configureButton (redoBtn, "RED", [this]{ editor.redoOp(); });
 
-        configureLabel (octLabel);
-        configureLabel (stepLabel);
-        configureLabel (lenLabel);
-        configureLabel (trkLabel);
-        configureLabel (patLabel);
+        /* Static "name" labels — always show the setting name only. */
+        configureLabel (octLabel);  octLabel .setText ("OCT",  juce::dontSendNotification);
+        configureLabel (stepLabel); stepLabel.setText ("STEP", juce::dontSendNotification);
+        configureLabel (lenLabel);  lenLabel .setText ("LEN",  juce::dontSendNotification);
+        configureLabel (trkLabel);  trkLabel .setText ("TRK",  juce::dontSendNotification);
+        configureLabel (patLabel);  patLabel .setText ("PAT",  juce::dontSendNotification);
         configureLabel (bpmLabel);
+
+        /* Editable value labels — double-click to type a target value
+         * directly (so e.g. LEN 64 doesn't need 48 nudge clicks).
+         * Apply on commit by delta'ing from the current value through
+         * the existing change* path. */
+        auto setupEditable = [this] (juce::Label& l, std::function<void (int)> commit) {
+            l.setJustificationType (juce::Justification::centred);
+            l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                          12.0f, juce::Font::bold));
+            l.setColour (juce::Label::textColourId,           juce::Colour { 0xff'ff'ff'ff });
+            l.setColour (juce::Label::backgroundColourId,     juce::Colour { 0xff'18'18'18 });
+            l.setColour (juce::Label::backgroundWhenEditingColourId, juce::Colour { 0xff'30'30'30 });
+            l.setColour (juce::Label::outlineColourId,        juce::Colour { 0xff'40'40'40 });
+            l.setEditable (false, /*onDoubleClick*/ true, /*lossOfFocusDiscards*/ false);
+            l.onTextChange = [&l, commit = std::move (commit)] {
+                /* Strip brackets / non-digits, parse, hand to caller. */
+                const auto txt = l.getText().retainCharacters ("0123456789-").trim();
+                if (txt.isNotEmpty()) commit (txt.getIntValue());
+            };
+            addAndMakeVisible (l);
+        };
+        setupEditable (octValue,  [this] (int v) { editor.changeOctave        (v - editor.getOctave()); });
+        setupEditable (stepValue, [this] (int v) { editor.changeEditStep      (v - editor.getEditStep()); });
+        setupEditable (lenValue,  [this] (int v) { editor.changePatternLength (v - editor.getPatternLength()); });
+        /* TRK + PAT also editable.  Per-step mutations are slightly
+         * heavier (add/remove tracks; switch pattern jumps) but the
+         * editable surface is the same UX win as direct LEN edit. */
+        setupEditable (trkValue,  [this] (int v) {
+            const int target = juce::jlimit (1, 32, v);
+            int cur = editor.getTrackCount();
+            while (cur < target) { editor.addTrack();            ++cur; }
+            while (cur > target) { editor.deleteCurrentTrack();  --cur; }
+        });
+        setupEditable (patValue,  [this] (int v) {
+            const int patCount = juce::jmax (1, editor.getPatternCount());
+            const int target   = juce::jlimit (1, patCount, v);   /* user types 1-based */
+            const int cur      = editor.getPatternIndex() + 1;
+            editor.switchPattern (target - cur);
+        });
 
         refresh();
     }
@@ -1915,14 +1955,20 @@ public:
         undoBtn.setEnabled (editor.canUndo());
         redoBtn.setEnabled (editor.canRedo());
 
-        octLabel .setText (juce::String::formatted ("OCT %d",   editor.getOctave()),       juce::dontSendNotification);
-        stepLabel.setText (juce::String::formatted ("STEP %d",  editor.getEditStep()),     juce::dontSendNotification);
-        lenLabel .setText (juce::String::formatted ("LEN %d",   editor.getPatternLength()),juce::dontSendNotification);
-        trkLabel .setText (juce::String::formatted ("TRK %d",   editor.getTrackCount()),   juce::dontSendNotification);
-        patLabel .setText (juce::String::formatted ("PAT %d/%d", editor.getPatternIndex() + 1,
-                                                                 juce::jmax (1, editor.getPatternCount())),
-                           juce::dontSendNotification);
-        bpmLabel .setText (juce::String::formatted ("BPM %.1f", editor.getBPM()),          juce::dontSendNotification);
+        /* Name labels stay static; only value labels need refresh.
+         * Skip pushing into a label that's currently being edited (the
+         * focused editor would otherwise be reset mid-keystroke). */
+        auto pushValue = [] (juce::Label& l, const juce::String& s) {
+            if (! l.isBeingEdited())
+                l.setText (s, juce::dontSendNotification);
+        };
+        pushValue (octValue,  juce::String (editor.getOctave()));
+        pushValue (stepValue, juce::String (editor.getEditStep()));
+        pushValue (lenValue,  juce::String (editor.getPatternLength()));
+        pushValue (trkValue,  juce::String (editor.getTrackCount()));
+        pushValue (patValue,  juce::String::formatted ("%d/%d",
+                                                       editor.getPatternIndex() + 1,
+                                                       juce::jmax (1, editor.getPatternCount())));
     }
 
     void paint (juce::Graphics& g) override
@@ -1937,9 +1983,10 @@ public:
         int x = 6;
         const int y = 4;
         const int h = getHeight() - 8;
-        const int btnW  = 24;
-        const int lblW  = 64;
-        const int wideW = 48;
+        const int btnW   = 20;     /* tight nudge buttons */
+        const int nameW  = 32;     /* "OCT" / "STEP" / etc. */
+        const int valW   = 42;     /* "[16]" / "[1/1]" */
+        const int wideW  = 48;
 
         auto place = [&] (juce::Component& c, int w) {
             c.setBounds (x, y, w, h);
@@ -1947,19 +1994,32 @@ public:
         };
         auto sep = [&] { x += 8; };
 
+        /* Per-setting group layout: NAME  [VALUE]  <  >
+         * Compact + readable: name on the left, double-clickable value
+         * in brackets, then both nudge buttons grouped on the right. */
+        auto group = [&] (juce::Component& name, juce::Component& value,
+                          juce::Component& minus, juce::Component& plus,
+                          int valWidth) {
+            place (name, nameW);
+            place (value, valWidth);
+            place (minus, btnW);
+            place (plus,  btnW);
+            sep();
+        };
+
         place (editBtn, wideW); sep();
-        place (octMinusBtn, btnW);  place (octLabel, lblW);  place (octPlusBtn, btnW);  sep();
-        place (stepMinusBtn, btnW); place (stepLabel, lblW); place (stepPlusBtn, btnW); sep();
-        place (lenMinusBtn, btnW);  place (lenLabel, lblW);  place (lenPlusBtn, btnW);  sep();
-        place (trkRemoveBtn, btnW); place (trkLabel, lblW);  place (trkAddBtn, btnW);   sep();
-        place (patPrevBtn, btnW);   place (patLabel, 72);    place (patNextBtn, btnW);
-        place (patNewBtn, 40);
-        place (patDupBtn, 40);
-        place (patDelBtn, 40);
+        group (octLabel,  octValue,  octMinusBtn,   octPlusBtn,    valW);
+        group (stepLabel, stepValue, stepMinusBtn,  stepPlusBtn,   valW);
+        group (lenLabel,  lenValue,  lenMinusBtn,   lenPlusBtn,    valW);
+        group (trkLabel,  trkValue,  trkRemoveBtn,  trkAddBtn,     valW);
+        group (patLabel,  patValue,  patPrevBtn,    patNextBtn,    52);
+        place (patNewBtn, 36);
+        place (patDupBtn, 36);
+        place (patDelBtn, 36);
         sep();
         place (followBtn, 56); sep();
-        place (undoBtn, 36); place (redoBtn, 36); sep();
-        place (bpmLabel, 80); sep();
+        place (undoBtn, 32); place (redoBtn, 32); sep();
+        place (bpmLabel, 76); sep();
         place (helpBtn, btnW);
     }
 
@@ -1993,6 +2053,9 @@ private:
     juce::TextButton followBtn;
     juce::TextButton undoBtn, redoBtn;
     juce::Label octLabel, stepLabel, lenLabel, trkLabel, patLabel, bpmLabel;
+    /* Editable value displays (boxed "[N]" beside the name label).
+     * Double-click to type a target value directly. */
+    juce::Label octValue, stepValue, lenValue, trkValue, patValue;
 };
 
 
