@@ -574,11 +574,16 @@ void SessionView::paint (Graphics& g)
     }
 
     /* Everything from here through the cell loop draws inside the
-     * scrollable strip (scene labels + grid body).  Clip to that
-     * union so scroll-shifted rows can't bleed into the column
-     * header or column-stop area.  Explicit save/restore so we can
-     * close the clip region at a known point further down. */
-    const auto scrollableArea = labels.getUnion (body);
+     * scrollable strip (scene labels + grid body + master column).
+     * Clip to that union so scroll-shifted rows can't bleed into
+     * the column header / column-stop area.  Explicit save/restore
+     * so we can close the clip region at a known point further down.
+     *
+     * NOTE: master column MUST be in this union — earlier it was
+     * left out and the column drew into a clipped-away region,
+     * making it invisible. */
+    const auto masterCol = masterColumnBounds();
+    const auto scrollableArea = labels.getUnion (body).getUnion (masterCol);
     g.saveState();
     g.reduceClipRegion (scrollableArea);
 
