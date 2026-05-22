@@ -69,6 +69,46 @@ public:
     int currentPatternIndex() const noexcept;
     int numPatterns() const noexcept;
 
+    /* ---------------------------------------------------------------
+     * Session-view API — operates on vht's per-sequence `playing` flag
+     * directly, distinct from `advanceToPattern` which uses the
+     * pattern-switch (single-playhead) model.  Multiple sequences in
+     * the same module can have playing=1 concurrently; module_advance
+     * iterates all of them and each one's emitted events land in the
+     * shared per-port MIDI buffer, time-sorted in drainEngineToMidi.
+     *
+     * All methods acquire engineLock_.  Safe to call from the message
+     * thread; calls are infrequent (UI click rate / 30 Hz poll). */
+
+    /** Append a new empty sequence (one track, default channel/port)
+     *  with `rowsLength` rows.  Returns the new sequence's index, or
+     *  -1 if the engine isn't initialised.  The new sequence starts
+     *  with playing=0 — clip launcher arms it explicitly. */
+    int  createSequence (int rowsLength = 16);
+
+    /** Remove a sequence by index.  No-op when nseq <= 1 (vht needs
+     *  at least one sequence) or when the index is out of range.  If
+     *  the removed sequence was `curr_seq`, the module's `curr_seq`
+     *  rolls over to a sibling so vht's internal state stays valid. */
+    void removeSequence (int sequenceIdx);
+
+    /** Flip a single sequence's playing flag without touching
+     *  `curr_seq`.  This is the session-view launch primitive.  When
+     *  turning a clip on, the sequence + all its tracks rewind to
+     *  position 0 — Bitwig/Ableton "launch restarts from start". */
+    void setSequencePlaying (int sequenceIdx, bool on);
+
+    bool   isSequencePlaying       (int sequenceIdx) const noexcept;
+    double getSequencePositionRows (int sequenceIdx) const noexcept;
+    int    getSequenceLengthRows   (int sequenceIdx) const noexcept;
+
+    /** Edge-trigger: returns true once per wrap of the sequence's
+     *  playhead (used for followAction at clip end).  Consumes the
+     *  wrap on read — repeated calls in the same wrap window return
+     *  false until the next wrap.  Internally tracks the previous
+     *  song-relative row position per sequence. */
+    bool   sequenceWrappedSinceLastQuery (int sequenceIdx) noexcept;
+
     /** Undo / redo.  Snapshots whole-module state into a memento stack.
      *  Editor calls pushUndo() before any mutation. */
     void pushUndo();
@@ -104,6 +144,12 @@ private:
     enum { kMaxUndo = 64 };
     juce::Array<juce::MemoryBlock> undoStack_;
     juce::Array<juce::MemoryBlock> redoStack_;
+
+    /* Per-sequence previous song_pos cache for wrap-edge detection
+     * in sequenceWrappedSinceLastQuery().  Lazily grown to mod_->nseq;
+     * indices follow vht's seq[] array.  Updated only when the
+     * session-view scheduler polls; not touched by render(). */
+    juce::Array<double> lastSeqPos_;
 };
 
 } // namespace element

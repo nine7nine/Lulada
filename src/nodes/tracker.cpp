@@ -398,6 +398,133 @@ int TrackerNode::numPatterns() const noexcept
     return mod_ != nullptr ? mod_->nseq : 0;
 }
 
+/* === Session-view API ================================================== */
+
+int TrackerNode::createSequence (int rowsLength)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr) return -1;
+
+    const int len = juce::jlimit (1, SEQUENCE_MAX_LENGTH, rowsLength);
+    sequence* seq = sequence_new (len);
+    if (seq == nullptr) return -1;
+
+    /* One track per sequence — matches the "one clip = one track"
+     * mapping the session-view design rests on (see §2.2 of
+     * ~/wine-nspa-notes/session-view-design.md).  Multi-track clip
+     * groups can be a later feature. */
+    track* trk = track_new (0, 0, len, len, TRACK_DEF_CTRLPR);
+    sequence_add_track (seq, trk);
+    module_add_sequence (mod_, seq);
+
+    /* sequence_new defaults playing=0; the clip launcher flips it
+     * when the clip is banged.  Leave it untouched here. */
+    return mod_->nseq - 1;
+}
+
+void TrackerNode::removeSequence (int sequenceIdx)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr || mod_->nseq <= 1) return;
+    if (sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return;
+
+    sequence* doomed = mod_->seq[sequenceIdx];
+    const bool removingCurr = (mod_->curr_seq == doomed);
+
+    /* Capture the replacement curr_seq pointer BEFORE module_del_sequence
+     * runs — afterwards the splice has shifted everything and seq[1]
+     * doesn't exist if we removed index 0.  After deletion, what was
+     * seq[1] occupies seq[0]; the pointer we stored still resolves. */
+    sequence* nextCurr = removingCurr
+        ? mod_->seq[sequenceIdx == 0 ? 1 : 0]
+        : nullptr;
+
+    module_del_sequence (mod_, sequenceIdx);
+
+    if (removingCurr)
+        mod_->curr_seq = nextCurr;
+
+    /* Keep wrap-detection cache aligned with vht's seq[] indexing. */
+    if (sequenceIdx < lastSeqPos_.size())
+        lastSeqPos_.remove (sequenceIdx);
+}
+
+void TrackerNode::setSequencePlaying (int sequenceIdx, bool on)
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr) return;
+    if (sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return;
+
+    sequence* seq = mod_->seq[sequenceIdx];
+    if (seq == nullptr) return;
+
+    sequence_set_playing (seq, on ? 1 : 0);
+
+    if (on)
+    {
+        /* Launch = rewind to row 0 (Ableton/Bitwig convention).  Reset
+         * sequence pos + every track's pos so track_advance starts at
+         * the top on the next module_advance pass. */
+        seq->pos = 0.0;
+        for (int t = 0; t < seq->ntrk; ++t)
+            if (seq->trk[t] != nullptr)
+                seq->trk[t]->pos = 0.0;
+    }
+
+    /* Reset wrap-cache for this index so the next wrap query sees the
+     * fresh pos rather than reporting a phantom wrap from the previous
+     * playthrough. */
+    if (sequenceIdx < lastSeqPos_.size())
+        lastSeqPos_.set (sequenceIdx, 0.0);
+}
+
+bool TrackerNode::isSequencePlaying (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return false;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    return seq != nullptr && seq->playing != 0;
+}
+
+double TrackerNode::getSequencePositionRows (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return 0.0;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    return seq != nullptr ? seq->pos : 0.0;
+}
+
+int TrackerNode::getSequenceLengthRows (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return 0;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    return seq != nullptr ? seq->length : 0;
+}
+
+bool TrackerNode::sequenceWrappedSinceLastQuery (int sequenceIdx) noexcept
+{
+    juce::ScopedLock sl (engineLock_);
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return false;
+
+    /* Lazy grow the per-sequence cache to current nseq.  Shrinks
+     * happen in removeSequence; this only ever appends zeros. */
+    while (lastSeqPos_.size() < mod_->nseq)
+        lastSeqPos_.add (0.0);
+
+    const sequence* seq = mod_->seq[sequenceIdx];
+    if (seq == nullptr) return false;
+
+    const double cur  = seq->pos;
+    const double prev = lastSeqPos_.getUnchecked (sequenceIdx);
+    lastSeqPos_.set (sequenceIdx, cur);
+
+    /* sequence_advance resets pos to 0 at the end of a sequence (or
+     * loop point).  Wrap = current pos strictly less than the prior
+     * pos.  False on fresh launches where prev was reset to 0. */
+    return cur < prev;
+}
+
 /* ===================================================================== */
 
 void TrackerNode::setState (const void* data, int size)
