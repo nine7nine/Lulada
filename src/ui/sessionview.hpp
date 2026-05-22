@@ -216,15 +216,25 @@ private:
     bool hitTestMasterTempo  (juce::Point<int> p, int& outRow) const noexcept;
     bool hitTestMasterSig    (juce::Point<int> p, int& outRow) const noexcept;
 
-    /* Scene property editors -- invoked from the master column's
-     * right-click menu and direct clicks.  Editors are inline
-     * (TextEditor positioned over the field, no modal AlertWindow)
-     * so they don't steal focus from the main app. */
-    void editSceneTempo    (int sceneRow);
-    void editSceneSignature (int sceneRow);
+    /* Scene property editors -- master cell tempo/sig clicks AND the
+     * scene-label "Properties..." menu both open the dedicated
+     * floating Scene View (juce::DocumentWindow, non-modal,
+     * self-deleting on close), matching the tracker pattern editor
+     * popup convention. */
+    void editSceneTempo    (int sceneRow);   // delegates to openSceneView
+    void editSceneSignature (int sceneRow);  // delegates to openSceneView
     void clearSceneTempo    (int sceneRow);
     void clearSceneSignature (int sceneRow);
+    void openSceneView      (int sceneRow);
     void applySceneOverridesToTransport (const SessionScene&);
+
+    /* Public helpers used by the SceneView popup -- it edits scene
+     * fields in our scenes_ array, then asks us to persist + repaint
+     * the master cell. */
+public:
+    void notifySceneEdited (int sceneRow);
+    SessionScene* sceneAt  (int sceneRow) noexcept;
+private:
 
     /* Inline editor -- shared single TextEditor positioned over the
      * field being edited.  Replaces AlertWindow prompts so the user

@@ -148,15 +148,16 @@ SessionView::SessionView()
                              juce::Colour { 0xff'40'40'40 });
     inlineEditor_.setColour (juce::TextEditor::focusedOutlineColourId,
                              juce::Colour { 0xff'ff'a0'40 });
+    /* Return commits, Escape + focus-loss REVERT (per
+     * feedback_inline_edit_cancel_on_click_away memory note).
+     * Click-away on a value editor that the user is unsure about
+     * should leave the original value alone. */
     inlineEditor_.onReturnKey = [this] {
         if (inlineEditorCommit_) inlineEditorCommit_ (inlineEditor_.getText());
         hideInlineEditor();
     };
     inlineEditor_.onEscapeKey = [this] { hideInlineEditor(); };
-    inlineEditor_.onFocusLost = [this] {
-        if (inlineEditorCommit_) inlineEditorCommit_ (inlineEditor_.getText());
-        hideInlineEditor();
-    };
+    inlineEditor_.onFocusLost = [this] { hideInlineEditor(); };
     addChildComponent (inlineEditor_);
     scenesValueLabel_.onTextChange = [this] {
         const auto txt = scenesValueLabel_.getText()
