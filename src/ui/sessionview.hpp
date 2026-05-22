@@ -49,6 +49,9 @@ public:
     void resized() override;
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp   (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
 
 private:
     /* Per-clip launch state.  Driven by the message thread on bang(),
@@ -121,6 +124,19 @@ private:
     void addScene();                  // append at end
     void insertScene (int beforeRow);
     void deleteScene (int row);
+    void renameScene (int row);
+
+    void renameClip      (SessionClip&);
+    void cycleClipColor  (SessionClip&);
+
+    /* Drag-and-drop within the grid.  Move = drop on another cell on
+     * the SAME column (sequenceIdx remains valid).  Copy (Shift+drag) =
+     * clone the underlying vht sequence via TrackerNode::cloneSequence
+     * and place a new clip at the target.  Cross-column drags are no-ops
+     * for v1 — sequenceIdx is tracker-scoped, so the migration story is
+     * still TBD. */
+    void moveClip (SessionClip&, int newSceneRow, int newColumnIdx);
+    void copyClip (SessionClip&, int newSceneRow, int newColumnIdx);
 
     TrackerNode* lookupTracker (juce::uint32 nodeId) const;
     SessionClip* findClip (int sceneRow, int columnIdx) const;
@@ -172,6 +188,14 @@ private:
 
     /* Phase animation for WaitingTo* outline pulse (Phase 4 will exercise). */
     int   pulsePhase_ = 0;
+
+    /* Drag state for clip-move/copy.  dragSource_ is set on mouseDown
+     * over a clip's body (not its play/edit zones); dragActive_ trips
+     * once the cursor moves past the drag threshold.  mouseUp clears
+     * both. */
+    SessionClip*       dragSource_ = nullptr;
+    juce::Point<int>   dragStart_  {};
+    bool               dragActive_ = false;
 
     /* Layout constants — sized to match the tracker editor's visual
      * rhythm (monospaced, dense, dark). */

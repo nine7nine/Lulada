@@ -88,6 +88,12 @@ public:
      *  with playing=0 — clip launcher arms it explicitly. */
     int  createSequence (int rowsLength = 16);
 
+    /** Clone an existing sequence (deep-copy via vht's sequence_clone)
+     *  and append it to the module.  Returns the new sequence's index,
+     *  or -1 if the source index is invalid.  The clone starts with
+     *  playing=0 regardless of source state. */
+    int  cloneSequence  (int sourceIdx);
+
     /** Remove a sequence by index.  No-op when nseq <= 1 (vht needs
      *  at least one sequence) or when the index is out of range.  If
      *  the removed sequence was `curr_seq`, the module's `curr_seq`
