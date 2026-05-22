@@ -6,7 +6,10 @@
 
 #include <pthread.h>
 #include <sched.h>
-#include <unistd.h>      // ::access for native POSIX file-existence checks
+#include <unistd.h>      // ::access ::open ::read ::close (native POSIX file I/O)
+#include <fcntl.h>       // O_RDONLY O_CLOEXEC
+#include <sys/stat.h>    // ::fstat for file size
+#include <cerrno>        // errno EINTR
 
 /* Vendored ft2-clone mixer (BSD-3-Clause). See src/engine/sampler/. */
 extern "C" {
@@ -126,11 +129,63 @@ SamplerInstrument::SamplerInstrument()
 std::unique_ptr<SamplerSampleSlot>
 SamplerInstrument::prepareSlot (const File& file, AudioFormatManager& fmt)
 {
-    /* Pure file I/O + decode → memory allocation.  No mutation of any
-     * SamplerInstrument state.  Safe to run with no lock held. */
-    if (! file.existsAsFile()) return nullptr;
+    /* Native POSIX file I/O on the Linux side -- ::open / ::read /
+     * ::close, never juce::File methods that would round-trip through
+     * wineserver on winelib.  juce::File is used ONLY to extract the
+     * path string + display name; no fs operations on it.  Audio
+     * decode runs on the in-memory buffer via juce::MemoryInputStream
+     * so the AudioFormatManager never touches the fs after this
+     * function returns. */
+    const std::string path = file.getFullPathName().toRawUTF8();
+    if (path.empty()) return nullptr;
 
-    std::unique_ptr<AudioFormatReader> reader (fmt.createReaderFor (file));
+    const int fd = ::open (path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+
+    struct stat st {};
+    if (::fstat (fd, &st) != 0 || st.st_size <= 0)
+    {
+        ::close (fd);
+        return nullptr;
+    }
+    /* Bound memory at 1 GiB for malformed / truncated files.  Matches
+     * the "10 min at 48 kHz @ 16-bit stereo = ~110 MB" worst case the
+     * old code implicitly capped via maxLen below, with headroom. */
+    static constexpr off_t kMaxBytes = (off_t) 1024 * 1024 * 1024;
+    if (st.st_size > kMaxBytes)
+    {
+        ::close (fd);
+        return nullptr;
+    }
+
+    const size_t bytes = (size_t) st.st_size;
+    MemoryBlock buf (bytes, false /*initialiseToZero*/);
+
+    size_t total = 0;
+    while (total < bytes)
+    {
+        const ssize_t r = ::read (fd, (char*) buf.getData() + total, bytes - total);
+        if (r < 0)
+        {
+            if (errno == EINTR) continue;
+            ::close (fd);
+            return nullptr;
+        }
+        if (r == 0) break;
+        total += (size_t) r;
+    }
+    ::close (fd);
+    if (total != bytes) return nullptr;   // short read -- bail
+
+    /* Decode from in-memory buffer.  This juce overload takes a
+     * unique_ptr<InputStream> and consumes it whether or not a
+     * format matches.  The MemoryInputStream references buf without
+     * copying; buf must outlive the reader (it does -- both go out
+     * of scope at the end of this function, reader first). */
+    std::unique_ptr<InputStream> mis (
+        new MemoryInputStream (buf.getData(), buf.getSize(),
+                               false /*keepInternalCopyOfData*/));
+    std::unique_ptr<AudioFormatReader> reader (fmt.createReaderFor (std::move (mis)));
     if (reader == nullptr) return nullptr;
 
     const int64_t maxLen = (int64_t) 10 * 60 * (int64_t) reader->sampleRate;
@@ -143,11 +198,7 @@ SamplerInstrument::prepareSlot (const File& file, AudioFormatManager& fmt)
 
     auto s = std::make_unique<SamplerSampleSlot>();
     s->name             = file.getFileNameWithoutExtension();
-    /* Capture the absolute path as a native POSIX string for session
-     * persistence (see SamplerSampleSlot::sourceFile docs).  toRawUTF8
-     * + toStdString round-trips through juce::String without keeping
-     * a juce::File alive. */
-    s->sourceFile       = file.getFullPathName().toRawUTF8();
+    s->sourceFile       = path;   // native POSIX path for persistence
     s->numSamples       = n;
     s->sourceSampleRate = reader->sampleRate;
     s->rootNote         = 60;
@@ -5740,17 +5791,18 @@ void SamplerNode::setStateInformation (const void* data, int size)
             const std::string savedPath =
                 slotTree.getProperty ("sourceFile", "").toString().toRawUTF8();
 
-            if (! savedPath.empty()
-                && ::access (savedPath.c_str(), R_OK) == 0)
+            /* Native POSIX existence check.  No juce::File ops on the
+             * fs side -- those go through wineserver on winelib.  We
+             * pass the path to prepareSlot which does its own native
+             * ::open/::read for the decode-source bytes. */
+            if (! savedPath.empty() && ::access (savedPath.c_str(), R_OK) == 0)
             {
-                const File f { String (savedPath) };   // brace-init avoids most-vexing-parse
+                /* juce::File construction is a pure string wrap (no fs
+                 * call) -- prepareSlot extracts the path string + name
+                 * back out and does all real I/O via ::open. */
+                const File f { String (savedPath) };
                 if (auto loaded = inst->prepareSlot (f, formatManager))
                 {
-                    /* Move only the AUDIO buffers + decode-derived
-                     * metadata over to our slot; keep the persisted
-                     * tuning/loop/etc. for the metadata block below
-                     * to apply.  This way "saved volume / loop /
-                     * pan" wins over "fresh-decode defaults." */
                     fresh->data16L          = std::move (loaded->data16L);
                     fresh->data16R          = std::move (loaded->data16R);
                     fresh->isStereo         = loaded->isStereo;
@@ -5760,7 +5812,7 @@ void SamplerNode::setStateInformation (const void* data, int size)
                 }
                 else
                 {
-                    fresh->sourceFile = savedPath;
+                    fresh->sourceFile = savedPath;   // decode failed -- keep path for diag
                 }
             }
             else
