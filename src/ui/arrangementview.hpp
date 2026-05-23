@@ -5,6 +5,12 @@
 
 #include <element/juce/gui_basics.hpp>
 #include <element/juce/data_structures.hpp>
+#include <element/juce/audio_formats.hpp>
+/* AudioThumbnail / AudioThumbnailCache live in juce_audio_utils;
+ * Element doesn't ship an element/juce/audio_utils.hpp wrapper but
+ * the module is linked (see src/CMakeLists.txt) so direct include
+ * via the JUCE module path works. */
+#include <juce_audio_utils/juce_audio_utils.h>
 #include <element/node.hpp>
 #include <element/ui/content.hpp>
 #include <element/services.hpp>

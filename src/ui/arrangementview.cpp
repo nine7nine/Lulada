@@ -19,6 +19,8 @@
 #include "services/sources/sourceregistry.hpp"
 #include "services/timeline/audiolaneadapter.hpp"
 
+#include <unordered_map>
+
 namespace element {
 
 using juce::Colour;
@@ -60,14 +62,44 @@ bool anyAudioFileIn (const juce::StringArray& files) noexcept
 /* ===================================================================== */
 
 class ArrangementView::Body : public juce::Component,
-                              public juce::FileDragAndDropTarget
+                              public juce::FileDragAndDropTarget,
+                              private juce::ChangeListener
 {
 public:
-    explicit Body (ArrangementView& o) : owner (o)
+    explicit Body (ArrangementView& o)
+        : owner (o),
+          thumbnailCache_ (kThumbnailCacheEntries)
     {
         setOpaque (true);
         setWantsKeyboardFocus (true);   // Delete key handling
+
+        /* Register stock audio formats once.  Same shape Sampler /
+         * AudioFilePlayerNode use; libsndfile is the underlying
+         * reader for WAV/AIF/FLAC under JUCE_LINUX (no wineserver). */
+        formatManager_.registerBasicFormats();
     }
+
+    ~Body() override
+    {
+        /* Detach as a listener from any thumbnails we built so their
+         * background-thread completion doesn't fire callbacks into a
+         * dying Body. */
+        for (auto& kv : thumbnails_)
+            if (kv.second)
+                kv.second->removeChangeListener (this);
+    }
+
+private:
+    /** juce::AudioThumbnail emits a change notification each time the
+     *  background reader updates its peak-data window.  Repaint the
+     *  whole body when any thumbnail progresses -- cheap, JUCE
+     *  invalidates only what changed at the windowing layer. */
+    void changeListenerCallback (juce::ChangeBroadcaster*) override
+    {
+        repaint();
+    }
+
+public:
 
     void paint (Graphics& g) override
     {
@@ -466,6 +498,14 @@ public:
     static constexpr int kDragThresholdPx = 4;   /* pixels before mouseDown -> drag */
     static constexpr double kMinRegionBeats = 0.25;
 
+    /* AudioThumbnail config: 1024 source samples per thumbnail
+     * sample -- standard for DAW-style waveform overviews at the
+     * zoom levels arrangement view uses.  Cache holds up to 256
+     * recently-rendered sources; enough headroom that thumbnails
+     * survive across multiple lane-add cycles without reload. */
+    static constexpr int kThumbnailSamplesPerPixel = 1024;
+    static constexpr int kThumbnailCacheEntries    = 256;
+
 private:
     /** Bounding box of the arm-toggle dot within a lane's label area.
      *  Small square in the top-right corner; used by mouseDown to
@@ -562,6 +602,39 @@ private:
             g.setColour (fill);
             g.fillRect (rect);
 
+            /* Waveform overlay for audio regions (sequenceIdx < 0).
+             * Tracker regions paint label-only.  Thumbnail rendering
+             * scales the source's audible span (startBeats ->
+             * startBeats+lengthBeats) into the region rect; on first
+             * access the thumbnail builds asynchronously and emits a
+             * change message that triggers a repaint -- so freshly
+             * dropped regions look flat for a tick, then fill in. */
+            if (isAudio && r.sequenceIdx < 0)
+            {
+                if (auto* thumb = const_cast<Body*> (this)->getThumbnail (r.sourceId))
+                {
+                    const double totalSeconds = thumb->getTotalLength();
+                    if (totalSeconds > 0.0)
+                    {
+                        /* Map region.startBeats .. endBeats() into
+                         * seconds within the source.  v1 assumes the
+                         * source's intrinsic sample rate matches the
+                         * playback rate; tempo mapping is a v2 task. */
+                        const double bpm = owner.monitor_ != nullptr
+                                              ? (double) owner.monitor_->tempo.get()
+                                              : 120.0;
+                        const double srcStartSec = r.startBeats * 60.0 / bpm;
+                        const double srcLenSec   = r.lengthBeats * 60.0 / bpm;
+                        const double srcEndSec   = juce::jmin (totalSeconds,
+                                                                srcStartSec + srcLenSec);
+
+                        g.setColour (fill.brighter (0.45f));
+                        thumb->drawChannels (g, rect.reduced (2, 4),
+                                              srcStartSec, srcEndSec, 0.85f);
+                    }
+                }
+            }
+
             const bool selected = (laneIdx == selectedLane_ && r.id == selectedRegion_);
             if (selected)
             {
@@ -573,7 +646,7 @@ private:
                 g.setColour (fill.brighter (0.4f));
                 g.drawRect (rect, 1);
             }
-            g.setColour (Colours::white);
+            g.setColour (Colours::white.withAlpha (0.95f));
             g.setFont (juce::FontOptions (11.0f));
 
             const juce::String tag = r.sequenceIdx >= 0
@@ -609,6 +682,37 @@ private:
         return needW != getWidth() || needH != getHeight();
     }
 
+    /** Lookup or lazily-create the juce::AudioThumbnail for the given
+     *  AudioFileSource uuid.  Returns nullptr if the source isn't
+     *  registered (region might point at a missing source, e.g.
+     *  imported from a session whose source paths have moved). */
+    juce::AudioThumbnail* getThumbnail (juce::Uuid sourceId)
+    {
+        if (sourceId.isNull()) return nullptr;
+
+        UuidHashKey key { sourceId };
+        auto it = thumbnails_.find (key);
+        if (it != thumbnails_.end())
+            return it->second.get();
+
+        auto src = SourceRegistry::get().findAudioFile (sourceId);
+        if (src == nullptr)
+            return nullptr;
+
+        auto thumb = std::make_unique<juce::AudioThumbnail> (
+            kThumbnailSamplesPerPixel, formatManager_, thumbnailCache_);
+        /* setSource owns the InputSource; FileInputSource opens via
+         * juce::File which lives on the Linux path under our winelib
+         * build (_WIN32 undefined by winelib_compat.h).  Background-
+         * thread reader, not the audio thread. */
+        thumb->setSource (new juce::FileInputSource (src->file()));
+        thumb->addChangeListener (this);
+
+        auto* raw = thumb.get();
+        thumbnails_.emplace (key, std::move (thumb));
+        return raw;
+    }
+
     ArrangementView& owner;
 
     /* Drop hover state for visual feedback during external file drag. */
@@ -632,6 +736,25 @@ private:
         bool       dragActive      = false;
     };
     Gesture gesture_;
+
+    /* Thumbnail infrastructure.  AudioFormatManager + AudioThumbnailCache
+     * are per-Body; thumbnails_ is keyed by AudioFileSource uuid so
+     * regions referencing the same source share the same waveform
+     * peak data (cheap; one decode per source not per region). */
+    struct UuidHashKey {
+        juce::Uuid uuid;
+        bool operator== (const UuidHashKey& o) const noexcept { return uuid == o.uuid; }
+    };
+    struct UuidHashKeyHash {
+        std::size_t operator() (const UuidHashKey& k) const noexcept
+        {
+            return std::hash<std::string>{} (k.uuid.toString().toStdString());
+        }
+    };
+
+    juce::AudioFormatManager   formatManager_;
+    juce::AudioThumbnailCache  thumbnailCache_;
+    std::unordered_map<UuidHashKey, std::unique_ptr<juce::AudioThumbnail>, UuidHashKeyHash> thumbnails_;
 };
 
 /* ===================================================================== */
