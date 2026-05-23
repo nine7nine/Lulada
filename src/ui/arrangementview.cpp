@@ -440,6 +440,37 @@ public:
         {
             if (! r.containsBeat (beat)) continue;
 
+            /* Envelope-point hit test (Select tool, audio regions
+             * only).  Takes priority over region-body click so
+             * clicking on a breakpoint dot starts a point drag
+             * instead of moving the region.  Right-click on a point
+             * opens the curve-type / delete menu. */
+            if (activeTool_ == Tool::Select
+                && runtime.isAudioLane()
+                && r.sequenceIdx < 0
+                && ! r.volumeEnvelope.empty())
+            {
+                const int ptIdx = envPointHitAt (laneIdx, r, e.x, e.y);
+                if (ptIdx >= 0)
+                {
+                    const auto pointId = r.volumeEnvelope[(size_t) ptIdx].id;
+                    if (e.mods.isPopupMenu())
+                    {
+                        showEnvPointContextMenu (laneIdx, r.id, pointId);
+                        return;
+                    }
+                    envGesture_.laneIdx    = laneIdx;
+                    envGesture_.regionId   = r.id;
+                    envGesture_.pointId    = pointId;
+                    envGesture_.dragActive = false;
+                    selectedLane_   = laneIdx;
+                    selectedRegion_ = r.id;
+                    grabKeyboardFocus();
+                    repaintLane (laneIdx);
+                    return;
+                }
+            }
+
             /* Right-click context menu works in every tool. */
             if (e.mods.isPopupMenu())
             {
@@ -506,6 +537,186 @@ public:
         repaint();
     }
 
+    /** Compute the body rect of a region (the area BELOW its title
+     *  strip).  Mirrors the paintLane layout maths so hit-tests +
+     *  envelope edits sit precisely on the painted curve. */
+    Rectangle<int> regionBodyRect (int laneIdx, const Region& r) const noexcept
+    {
+        constexpr int kTitleH = 13;
+        const int laneTopY = kRulerH + laneIdx * kLaneH;
+        const int xs = kLabelW + (int) (r.positionBeats * kPxPerBeat);
+        const int ws = juce::jmax (4, (int) (r.lengthBeats * kPxPerBeat));
+        const int innerTopY = laneTopY + 4 + kTitleH;
+        const int innerH    = juce::jmax (1, kLaneH - 8 - kTitleH);
+        return Rectangle<int> (xs, innerTopY, ws, innerH).reduced (3, 2);
+    }
+
+    /** Inverse of paintVolumeEnvelope's gainToY -- map a Y inside
+     *  a body rect back to a gain in dB over the [+6, -24] window. */
+    float envYToGainDb (int y, const Rectangle<int>& body) const noexcept
+    {
+        constexpr float kTopDb = 6.0f;
+        constexpr float kBotDb = -24.0f;
+        const int yPad = 3;
+        const int H = juce::jmax (1, body.getHeight() - yPad * 2);
+        const float t = juce::jlimit (0.0f, 1.0f,
+            (float) (y - body.getY() - yPad) / (float) H);
+        return kTopDb - t * (kTopDb - kBotDb);
+    }
+
+    /** Inverse of beatToX -- map an X to a beat offset within the
+     *  region's local timeline.  Clamped to [0, lengthBeats]. */
+    double envXToBeatOffset (int x, const Rectangle<int>& body,
+                              const Region& r) const noexcept
+    {
+        if (r.lengthBeats <= 1e-6) return 0.0;
+        const double t = juce::jlimit (0.0, 1.0,
+            (double) (x - body.getX()) / juce::jmax (1.0, (double) body.getWidth()));
+        return t * r.lengthBeats;
+    }
+
+    /** Hit-test for envelope breakpoint dots.  5 px radius -- matches
+     *  the visual dot size when selected, with a small slop for
+     *  finger / trackpad use.  Returns the matching point's index in
+     *  the region's envelope, or -1 if none. */
+    int envPointHitAt (int laneIdx, const Region& r, int x, int y) const noexcept
+    {
+        if (r.volumeEnvelope.empty()) return -1;
+        const auto body = regionBodyRect (laneIdx, r);
+        constexpr float kTopDb = 6.0f, kBotDb = -24.0f;
+        const int yPad = 3;
+        const int H = juce::jmax (1, body.getHeight() - yPad * 2);
+        for (size_t i = 0; i < r.volumeEnvelope.size(); ++i)
+        {
+            const auto& pt = r.volumeEnvelope[i];
+            const float px = body.getX()
+                + (float) (pt.beatOffset / juce::jmax (1e-9, r.lengthBeats))
+                  * (float) body.getWidth();
+            const float t  = juce::jlimit (0.0f, 1.0f,
+                (kTopDb - pt.gainDb) / (kTopDb - kBotDb));
+            const float py = body.getY() + yPad + t * (float) H;
+            const float dx = (float) x - px;
+            const float dy = (float) y - py;
+            if (dx * dx + dy * dy <= 25.0f) return (int) i;
+        }
+        return -1;
+    }
+
+    /** Insert a breakpoint at the clicked beat + gain.  When the
+     *  envelope was empty, ALSO seed start + end anchors at the
+     *  region's static gainDb so the user gets a visible curve out
+     *  of one double-click instead of an invisible single point. */
+    void insertEnvelopePoint (int laneIdx, juce::Uuid regionId,
+                                double beatOffset, float gainDb)
+    {
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& lane = owner.lanes_.getReference (laneIdx);
+        auto* r = lane.playlist.findRegion (regionId);
+        if (r == nullptr) return;
+
+        if (r->volumeEnvelope.empty())
+        {
+            EnvelopePoint anchor0; anchor0.id = juce::Uuid();
+            anchor0.beatOffset = 0.0; anchor0.gainDb = (float) r->gainDb;
+            EnvelopePoint anchorN; anchorN.id = juce::Uuid();
+            anchorN.beatOffset = r->lengthBeats; anchorN.gainDb = (float) r->gainDb;
+            r->volumeEnvelope.push_back (anchor0);
+            r->volumeEnvelope.push_back (anchorN);
+        }
+        EnvelopePoint pt;
+        pt.id         = juce::Uuid();
+        pt.beatOffset = juce::jlimit (0.0, r->lengthBeats, beatOffset);
+        pt.gainDb     = juce::jlimit (-60.0f, 12.0f, gainDb);
+        pt.curve      = EnvelopeCurve::Linear;
+        r->volumeEnvelope.push_back (pt);
+        r->sortEnvelope();
+        owner.writeLanesToSession();
+        repaintLane (laneIdx);
+    }
+
+    /** Right-click context menu on an envelope point.  Curve type
+     *  + delete.  Async so the menu can outlive its trigger event
+     *  without keeping mouse state alive. */
+    void showEnvPointContextMenu (int laneIdx, juce::Uuid regionId,
+                                    juce::Uuid pointId)
+    {
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& lane = owner.lanes_.getReference (laneIdx);
+        auto* r = lane.playlist.findRegion (regionId);
+        if (r == nullptr) return;
+
+        EnvelopePoint* match = nullptr;
+        for (auto& pt : r->volumeEnvelope)
+            if (pt.id == pointId) { match = &pt; break; }
+        if (match == nullptr) return;
+
+        enum { ItemLinear = 1, ItemExp, ItemSmooth, ItemHold, ItemDelete = 10 };
+
+        juce::PopupMenu menu;
+        menu.addSectionHeader ("Curve to next point");
+        menu.addItem (ItemLinear, "Linear", true, match->curve == EnvelopeCurve::Linear);
+        menu.addItem (ItemExp,    "Exponential", true, match->curve == EnvelopeCurve::Exponential);
+        menu.addItem (ItemSmooth, "Smooth",       true, match->curve == EnvelopeCurve::Smooth);
+        menu.addItem (ItemHold,   "Hold (step)",  true, match->curve == EnvelopeCurve::Hold);
+        menu.addSeparator();
+        menu.addItem (ItemDelete, "Delete point");
+
+        juce::Component::SafePointer<Body> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options(),
+            [safe, laneIdx, regionId, pointId] (int result)
+            {
+                auto* self = safe.getComponent();
+                if (self == nullptr || result == 0) return;
+                if (laneIdx < 0 || laneIdx >= self->owner.lanes_.size()) return;
+                auto& l = self->owner.lanes_.getReference (laneIdx);
+                auto* rr = l.playlist.findRegion (regionId);
+                if (rr == nullptr) return;
+
+                if (result == ItemDelete)
+                {
+                    rr->volumeEnvelope.erase (
+                        std::remove_if (rr->volumeEnvelope.begin(),
+                                         rr->volumeEnvelope.end(),
+                                         [pointId] (const EnvelopePoint& p)
+                                         { return p.id == pointId; }),
+                        rr->volumeEnvelope.end());
+                }
+                else
+                {
+                    EnvelopeCurve nc = EnvelopeCurve::Linear;
+                    if (result == ItemExp)    nc = EnvelopeCurve::Exponential;
+                    if (result == ItemSmooth) nc = EnvelopeCurve::Smooth;
+                    if (result == ItemHold)   nc = EnvelopeCurve::Hold;
+                    for (auto& pt : rr->volumeEnvelope)
+                        if (pt.id == pointId) { pt.curve = nc; break; }
+                }
+                self->owner.writeLanesToSession();
+                self->repaintLane (laneIdx);
+            });
+    }
+
+    void mouseDoubleClick (const MouseEvent& e) override
+    {
+        if (e.y < kRulerH) return;
+        const int laneIdx = (e.y - kRulerH) / kLaneH;
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        const auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+        if (! runtime.isAudioLane()) return;
+
+        const auto& lane = owner.lanes_.getReference (laneIdx);
+        const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+        for (const auto& r : lane.playlist.regions())
+        {
+            if (! r.containsBeat (beat) || r.sequenceIdx >= 0) continue;
+            const auto body = regionBodyRect (laneIdx, r);
+            if (! body.contains (e.x, e.y)) continue;
+            const double off = envXToBeatOffset (e.x, body, r);
+            const float  db  = envYToGainDb     (e.y, body);
+            insertEnvelopePoint (laneIdx, r.id, off, db);
+            return;
+        }
+    }
+
     /** Audition helper -- routes a region launch through TrackerNode /
      *  AudioClipNode the same way the mouseUp click-launch does, but
      *  factored so the Audition tool can call it from mouseDown. */
@@ -541,6 +752,31 @@ public:
 
     void mouseDrag (const MouseEvent& e) override
     {
+        /* Envelope point drag -- updates the point's beat + gain.
+         * Sort happens at mouseUp so neighbours don't reshuffle
+         * mid-drag (would break the pointer to the in-flight
+         * pt for subsequent drag events). */
+        if (envGesture_.laneIdx >= 0)
+        {
+            envGesture_.dragActive = true;
+            if (envGesture_.laneIdx >= owner.lanes_.size()) return;
+            auto& lane = owner.lanes_.getReference (envGesture_.laneIdx);
+            auto* r = lane.playlist.findRegion (envGesture_.regionId);
+            if (r == nullptr) return;
+            EnvelopePoint* pt = nullptr;
+            for (auto& p : r->volumeEnvelope)
+                if (p.id == envGesture_.pointId) { pt = &p; break; }
+            if (pt == nullptr) return;
+
+            const auto body = regionBodyRect (envGesture_.laneIdx, *r);
+            pt->beatOffset = juce::jlimit (0.0, r->lengthBeats,
+                                            envXToBeatOffset (e.x, body, *r));
+            pt->gainDb     = juce::jlimit (-60.0f, 12.0f,
+                                            envYToGainDb (e.y, body));
+            repaintLane (envGesture_.laneIdx);
+            return;
+        }
+
         /* Range drag (lane strip OR ruler) is independent of the
          * region-gesture path -- it updates the range overlay and
          * skips lane mutation. */
@@ -605,6 +841,25 @@ public:
 
     void mouseUp (const MouseEvent& e) override
     {
+        /* Finish envelope point drag -- sort the envelope (in case
+         * the point passed neighbours) + persist.  Clicks without
+         * drag still consumed by the env path, no fallthrough to
+         * region-launch. */
+        if (envGesture_.laneIdx >= 0)
+        {
+            if (envGesture_.dragActive
+                && envGesture_.laneIdx < owner.lanes_.size())
+            {
+                auto& lane = owner.lanes_.getReference (envGesture_.laneIdx);
+                if (auto* r = lane.playlist.findRegion (envGesture_.regionId))
+                    r->sortEnvelope();
+                owner.writeLanesToSession();
+                repaintLane (envGesture_.laneIdx);
+            }
+            envGesture_ = EnvGesture {};
+            return;
+        }
+
         /* Finish range drag (lane strip OR ruler).  Empty range
          * (start == end) collapses to no-range; non-empty range
          * stays armed for loop / future delete-in-range. */
@@ -1055,6 +1310,112 @@ private:
         return Rectangle<int> (laneButtonX(), y, kBtnW, kBtnH);
     }
 
+    /** Paint a volume envelope curve over the audio region body.
+     *  Always renders SOMETHING when the region is audio + body has
+     *  enough height: empty envelope -> single horizontal line at
+     *  the static gainDb; >=2 points -> connected segments coloured
+     *  per their curve type with breakpoint dots at each vertex.
+     *  Envelope sits on top of the waveform but below the borders
+     *  so the title strip + selection ring stay clean. */
+    void paintVolumeEnvelope (Graphics& g,
+                                const Rectangle<int>& body,
+                                const Region& r,
+                                juce::Colour tint,
+                                bool selected) const
+    {
+        if (body.getWidth() < 4 || body.getHeight() < 6) return;
+        if (r.lengthBeats <= 1e-6) return;
+
+        /* Map gainDb to Y over a [+6, -24] dB window.  0 dB sits at
+         * 80 % up the body; clipping the range keeps the line from
+         * leaving the rect on extreme gains. */
+        constexpr float kTopDb = 6.0f;
+        constexpr float kBotDb = -24.0f;
+        const int yPad = 3;
+        auto gainToY = [&] (float dB) noexcept
+        {
+            const float t = juce::jlimit (0.0f, 1.0f,
+                (kTopDb - dB) / (kTopDb - kBotDb));
+            return (float) body.getY() + yPad
+                 + t * (float) juce::jmax (1, body.getHeight() - yPad * 2);
+        };
+        auto beatToX = [&] (double localBeat) noexcept
+        {
+            const double t = juce::jlimit (0.0, 1.0, localBeat / r.lengthBeats);
+            return (float) body.getX() + (float) (t * body.getWidth());
+        };
+
+        const juce::Colour lineCol = selected
+            ? juce::Colours::white
+            : tint.brighter (0.45f).withAlpha (0.85f);
+
+        if (r.volumeEnvelope.empty())
+        {
+            /* No breakpoints -> show the static gain as a horizontal
+             * line.  Double-click promotes this to an editable curve
+             * (Body::mouseDoubleClick inserts two anchor points). */
+            const float y = gainToY ((float) r.gainDb);
+            g.setColour (lineCol.withAlpha (0.55f));
+            g.drawLine ((float) body.getX(), y,
+                        (float) body.getRight(), y, 1.0f);
+            return;
+        }
+
+        /* Build the curve path.  N=12 segments per breakpoint pair
+         * is enough resolution for any of our curve shapes at typical
+         * zoom levels and stays cheap to repaint. */
+        juce::Path path;
+        const auto& first = r.volumeEnvelope.front();
+        path.startNewSubPath (beatToX (first.beatOffset), gainToY (first.gainDb));
+
+        constexpr int kSubdiv = 12;
+        for (size_t i = 0; i + 1 < r.volumeEnvelope.size(); ++i)
+        {
+            const auto& a = r.volumeEnvelope[i];
+            const auto& b = r.volumeEnvelope[i + 1];
+            if (a.curve == EnvelopeCurve::Hold)
+            {
+                path.lineTo (beatToX (b.beatOffset), gainToY (a.gainDb));
+                path.lineTo (beatToX (b.beatOffset), gainToY (b.gainDb));
+                continue;
+            }
+            if (a.curve == EnvelopeCurve::Linear)
+            {
+                path.lineTo (beatToX (b.beatOffset), gainToY (b.gainDb));
+                continue;
+            }
+            for (int k = 1; k <= kSubdiv; ++k)
+            {
+                const double t = (double) k / (double) kSubdiv;
+                double shaped = t;
+                if (a.curve == EnvelopeCurve::Exponential) shaped = t * t;
+                if (a.curve == EnvelopeCurve::Smooth)
+                    shaped = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * t);
+                const double beat = a.beatOffset + t * (b.beatOffset - a.beatOffset);
+                const double db   = a.gainDb + shaped * (b.gainDb - a.gainDb);
+                path.lineTo (beatToX (beat), gainToY ((float) db));
+            }
+        }
+
+        g.setColour (lineCol);
+        g.strokePath (path, juce::PathStrokeType (selected ? 1.5f : 1.0f));
+
+        /* Breakpoint dots -- larger + ringed when selected. */
+        const float dotR = selected ? 3.0f : 2.5f;
+        for (const auto& pt : r.volumeEnvelope)
+        {
+            const float x = beatToX (pt.beatOffset);
+            const float y = gainToY (pt.gainDb);
+            g.setColour (lineCol);
+            g.fillEllipse (x - dotR, y - dotR, dotR * 2, dotR * 2);
+            if (selected)
+            {
+                g.setColour (juce::Colours::black);
+                g.drawEllipse (x - dotR, y - dotR, dotR * 2, dotR * 2, 1.0f);
+            }
+        }
+    }
+
     /** Paint a piano-roll style overview of a tracker sequence into
      *  the region body.  Walks every note_on row across every track
      *  of the sequence; maps row index -> X, MIDI pitch -> inverted
@@ -1424,6 +1785,21 @@ private:
                                     r.sequenceIdx, borderTint);
             }
 
+            /* Volume envelope -- audio regions only.  Empty envelope
+             * still draws a flat line at the static gainDb so the
+             * surface is always there to double-click on. */
+            if (isAudio && r.sequenceIdx < 0 && bodyRect.getHeight() > 6)
+            {
+                juce::Graphics::ScopedSaveState save (g);
+                juce::Path clipPath;
+                clipPath.addRoundedRectangle (
+                    rect.toFloat().reduced (2.0f, 2.0f),
+                    juce::jmax (0.5f, kCornerSize - 1.0f));
+                g.reduceClipRegion (clipPath);
+                paintVolumeEnvelope (g, bodyRect.reduced (3, 2),
+                                       r, borderTint, selected);
+            }
+
             /* Graph-block borders: tinted outer stroke + black inner
              * ring with rounded corners.  Selected region overrides
              * the outer stroke with bright white to stay visible
@@ -1575,6 +1951,18 @@ private:
         bool       dragActive      = false;
     };
     Gesture gesture_;
+
+    /** Live drag of an envelope breakpoint.  Set in mouseDown when
+     *  the cursor lands on a breakpoint dot; updated in mouseDrag;
+     *  cleared in mouseUp.  Decoupled from the region-Gesture so a
+     *  Select-tool click on a dot doesn't also start a move/resize. */
+    struct EnvGesture {
+        int        laneIdx    = -1;
+        juce::Uuid regionId;
+        juce::Uuid pointId;
+        bool       dragActive = false;
+    };
+    EnvGesture envGesture_;
 
     /* Active tool + loop-range state.  See the comment block on the
      * Tool enum declaration for the per-tool gesture mapping. */

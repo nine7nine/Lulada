@@ -7,7 +7,34 @@
 #include <element/juce/data_structures.hpp>
 #include <element/juce/graphics.hpp>
 
+#include <vector>
+
 namespace element {
+
+/** Per-segment interpolation shape for envelope breakpoints.  Curve
+ *  applies from THIS point to the NEXT point.  The last point's
+ *  curve is unused (no segment past it).
+ *
+ *  Linear      -- straight line between gainDbs.
+ *  Exponential -- gainDb^2 weighting; slow start / fast finish.
+ *  Smooth      -- cosine-based S-curve; symmetric ease in/out.
+ *  Hold        -- step (no interpolation); next point's gain steps
+ *                 in instantly when its beat is reached. */
+enum class EnvelopeCurve : int { Linear = 0, Exponential = 1, Smooth = 2, Hold = 3 };
+
+/** Single breakpoint on a clip envelope.
+ *
+ *  beatOffset is measured from the region's local start (0 ==
+ *  positionBeats).  gainDb in dB (typical range -60..+12; the audio
+ *  thread clamps to a safe range before applying).  curve applies
+ *  to the segment between this point and the next-by-beatOffset. */
+struct EnvelopePoint
+{
+    juce::Uuid    id;
+    double        beatOffset { 0.0 };
+    float         gainDb     { 0.0f };
+    EnvelopeCurve curve      { EnvelopeCurve::Linear };
+};
 
 /** Pure-data Region.  A thin metadata wrapper pointing at a Source by
  *  uuid with beat-domain placement and per-region cosmetics.
@@ -50,6 +77,24 @@ struct Region
     bool          looped        { false };
     juce::Colour  colour        { 0xff'4a'7a'b5 };
     juce::String  name;
+
+    /** Volume envelope -- ordered by beatOffset ascending after
+     *  every mutation.  Empty == use static gainDb as constant gain
+     *  (existing behaviour preserved).  Two or more points enable
+     *  per-sample interpolated gain.  Points outside [0, lengthBeats]
+     *  are clamped on paint + evaluation. */
+    std::vector<EnvelopePoint> volumeEnvelope;
+
+    /** Sample the envelope's gain (dB) at a beat-offset inside the
+     *  region.  Falls back to `gainDb` when the envelope is empty.
+     *  Out-of-range offsets extrapolate as the nearest endpoint
+     *  (no wrap).  Safe to call from the audio thread; pure on the
+     *  Region copy held by the audio FIFO entry. */
+    float gainAtBeatOffset (double localBeat) const noexcept;
+
+    /** Sort envelope points by beatOffset.  Call after any mutation
+     *  that could break the invariant (insert / drag past neighbour). */
+    void sortEnvelope() noexcept;
 
     /** End position on the timeline (positionBeats + lengthBeats).
      *  Pure -- safe from any thread. */
