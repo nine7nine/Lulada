@@ -185,13 +185,26 @@ private:
 
     void timerCallback() override;
 
+    /** Opens an in-process juce::FileChooser for audio import.
+     *  Workaround affordance for the external file drop path while
+     *  XDND-under-XWayland routing is being debugged.  On selection,
+     *  routes through the same importAudioFileToLane(-1, 0.0) path
+     *  the drop handler uses so persisted state stays consistent. */
+    void promptLoadAudioFile();
+
     Services* services_ = nullptr;
-    BlockToolButton rescanBtn_   { "Rescan" };
-    BlockToolButton addAudioBtn_ { "+ Audio" };
+    BlockToolButton rescanBtn_     { "Rescan" };
+    BlockToolButton addAudioBtn_   { "+ Audio" };
+    BlockToolButton loadAudioBtn_  { "Load..." };
     juce::Label posLabel_;
     juce::Label bpmLabel_;
     juce::Viewport viewport_;
     std::unique_ptr<Body> body_;
+
+    /** juce::FileChooser is async; the dialog holds a Ptr so it
+     *  outlives the calling function.  promptLoadAudioFile resets
+     *  this each invocation; closing the dialog clears it. */
+    std::unique_ptr<juce::FileChooser> audioChooser_;
 
     juce::Array<Lane>              lanes_;
     juce::Array<LaneRuntimeState>  laneRuntime_;

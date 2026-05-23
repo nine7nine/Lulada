@@ -426,6 +426,7 @@ ArrangementView::ArrangementView()
 
     addAndMakeVisible (rescanBtn_);
     addAndMakeVisible (addAudioBtn_);
+    addAndMakeVisible (loadAudioBtn_);
     addAndMakeVisible (posLabel_);
     addAndMakeVisible (bpmLabel_);
     addAndMakeVisible (viewport_);
@@ -439,8 +440,9 @@ ArrangementView::ArrangementView()
     bpmLabel_.setText ("BPM: 120.0", juce::dontSendNotification);
     bpmLabel_.setColour (juce::Label::textColourId, Colors::textColor);
 
-    rescanBtn_.onClick   = [this]() { rescanLaneTargets(); };
-    addAudioBtn_.onClick = [this]() { createEmptyAudioLane (true /*stereo*/); };
+    rescanBtn_.onClick    = [this]() { rescanLaneTargets(); };
+    addAudioBtn_.onClick  = [this]() { createEmptyAudioLane (true /*stereo*/); };
+    loadAudioBtn_.onClick = [this]() { promptLoadAudioFile(); };
 }
 
 ArrangementView::~ArrangementView()
@@ -522,10 +524,11 @@ void ArrangementView::resized()
 {
     auto r = getLocalBounds();
     auto top = r.removeFromTop (kHeaderH).reduced (4, 4);
-    rescanBtn_  .setBounds (top.removeFromLeft (56)); top.removeFromLeft (6);
-    addAudioBtn_.setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
-    bpmLabel_   .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
-    posLabel_   .setBounds (top.removeFromLeft (96));
+    rescanBtn_    .setBounds (top.removeFromLeft (56)); top.removeFromLeft (6);
+    addAudioBtn_  .setBounds (top.removeFromLeft (72)); top.removeFromLeft (6);
+    loadAudioBtn_ .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
+    bpmLabel_     .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
+    posLabel_     .setBounds (top.removeFromLeft (96));
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
 }
@@ -1059,6 +1062,45 @@ bool ArrangementView::importAudioFileToLane (const juce::File& file,
         body_->repaintLane (laneIdx);
     }
     return true;
+}
+
+void ArrangementView::promptLoadAudioFile()
+{
+    /* JUCE-NSPA forces NonNative (in-process) file chooser under
+     * __WINE__ via the existing patches to
+     * juce_FileSearchPathListComponent.cpp.  juce::FileChooser
+     * itself honours that path; we pass useOSNativeBox=false
+     * explicitly to be safe across JUCE versions. */
+    const juce::String wildcard ("*.wav;*.aiff;*.aif;*.flac;*.ogg;*.mp3;*.w64;*.au");
+    const juce::File start = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
+
+    audioChooser_ = std::make_unique<juce::FileChooser> (
+        "Load audio file into arrangement",
+        start,
+        wildcard,
+        false /*useOSNativeBox*/);
+
+    const int flags = juce::FileBrowserComponent::openMode
+                    | juce::FileBrowserComponent::canSelectFiles;
+
+    juce::Component::SafePointer<ArrangementView> safe (this);
+    audioChooser_->launchAsync (flags,
+        [safe] (const juce::FileChooser& fc)
+        {
+            auto* self = safe.getComponent();
+            if (self == nullptr) return;
+
+            const juce::File file = fc.getResult();
+            self->audioChooser_.reset();
+
+            if (! file.existsAsFile())
+                return;
+
+            const bool ok = self->importAudioFileToLane (file, -1 /*new lane*/, 0.0);
+            juce::Logger::writeToLog (
+                juce::String ("[ArrangementView] promptLoadAudioFile -> importAudioFileToLane(")
+                + file.getFileName() + ") = " + (ok ? "OK" : "FAIL"));
+        });
 }
 
 int ArrangementView::laneIdxFromY (int yPx) const noexcept
