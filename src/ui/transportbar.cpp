@@ -148,33 +148,55 @@ void TransportBar::timerCallback()
 
 void TransportBar::paint (Graphics& g)
 {
+    /* LCD-style faceplate frame matching MainDisplayPanel.  Outer
+     * matte-black bezel + cool-grey vertical gradient inside.  The
+     * 4 transport buttons sit on top of this inset, so the whole
+     * cluster reads as one hardware-style panel just like the
+     * central digital display. */
+    const auto frect = getLocalBounds().toFloat();
+
+    g.setColour (juce::Colour (0xff'08'08'08));
+    g.fillRoundedRectangle (frect, 4.0f);
+    g.setColour (juce::Colour (0xff'3a'3a'3a));
+    g.drawRoundedRectangle (frect.reduced (0.5f), 4.0f, 1.0f);
+
+    const auto inner = frect.reduced (3.0f);
+    juce::ColourGradient lcdGrad (
+        juce::Colour (0xff'14'19'1e),
+        inner.getX(), inner.getY(),
+        juce::Colour (0xff'0c'0f'12),
+        inner.getX(), inner.getBottom(),
+        false);
+    g.setGradientFill (lcdGrad);
+    g.fillRoundedRectangle (inner, 3.0f);
 }
 
 void TransportBar::resized()
 {
-    /* Height-driven layout.  Each transport button is a square that
-     * matches the row height + a 4-px gap between siblings so the
-     * cluster breathes (Bitwig has visible spacing between Play,
-     * Stop, Record).  When labels are shown they precede the
-     * buttons with a wider gap for visual grouping. */
-    const int h = getHeight();
+    /* Children inset by kFramePad on every side so the LCD frame
+     * painted in paint() stays visible around them.  Each button is
+     * a square with a 4-px gap between siblings. */
+    constexpr int kFramePad = 5;
+    const int outerH = getHeight();
+    const int h = juce::jmax (16, outerH - kFramePad * 2);
     const int labelW = juce::jmax (24, juce::roundToInt (h * 1.6f));
     const int btnW   = h;
     constexpr int gap = 4;
     constexpr int groupGap = 10;
 
-    int x = 0;
+    int x = kFramePad;
+    const int y = kFramePad;
     if (showPositionLabels_)
     {
-        barLabel->setBounds  (x, 0, labelW, h); x += labelW + 2;
-        beatLabel->setBounds (x, 0, labelW, h); x += labelW + 2;
-        subLabel->setBounds  (x, 0, labelW, h); x += labelW + groupGap;
+        barLabel->setBounds  (x, y, labelW, h); x += labelW + 2;
+        beatLabel->setBounds (x, y, labelW, h); x += labelW + 2;
+        subLabel->setBounds  (x, y, labelW, h); x += labelW + groupGap;
     }
 
-    play->setBounds   (x, 0, btnW, h); x += btnW + gap;
-    stop->setBounds   (x, 0, btnW, h); x += btnW + gap;
-    record->setBounds (x, 0, btnW, h); x += btnW + gap;
-    toZero->setBounds (x, 0, btnW, h);
+    play->setBounds   (x, y, btnW, h); x += btnW + gap;
+    stop->setBounds   (x, y, btnW, h); x += btnW + gap;
+    record->setBounds (x, y, btnW, h); x += btnW + gap;
+    toZero->setBounds (x, y, btnW, h);
 }
 
 void TransportBar::setShowPositionLabels (bool show)
@@ -243,7 +265,9 @@ void TransportBar::stabilize()
 
 void TransportBar::updateWidth()
 {
-    setSize (toZero->getRight(), getHeight());
+    /* +5 px on the right so the LCD frame's right padding matches
+     * the left.  kFramePad in resized() is the same value. */
+    setSize (toZero->getRight() + 5, getHeight());
 }
 
 } // namespace element

@@ -603,11 +603,19 @@ public:
         }
         r.removeFromRight (kGap);
 
-        /* ---- CENTRE: digital display fills the remaining mid-band ---- */
+        /* ---- CENTRE: digital display anchored to the toolbar's
+                actual centre (not the leftover-area centre, which
+                shifts as side clusters resize).  Slimmer than the
+                rest of the bar by 6 px (3 px above + 3 px below)
+                so the LCD reads as a recessed faceplate. */
         {
-            const int dispW = juce::jmin (kDisplayW, juce::jmax (240, r.getWidth() - 8));
-            const int dispX = r.getX() + (r.getWidth() - dispW) / 2;
-            display_.setBounds (dispX, top, dispW, rowH);
+            const int fullW = getLocalBounds().getWidth();
+            const int dispW = juce::jmin (kDisplayW,
+                                            juce::jmax (240, r.getWidth() - 8));
+            const int dispH = juce::jmax (24, rowH - 6);
+            const int dispX = (fullW - dispW) / 2;
+            const int dispY = r.getY() + (H - dispH) / 2;
+            display_.setBounds (dispX, dispY, dispW, dispH);
         }
     }
 
