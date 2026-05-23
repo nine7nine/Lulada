@@ -417,10 +417,10 @@ public:
         transport.setShowPositionLabels (false);
         transport.updateWidth();
 
-        /* Migrated-from-menus icon buttons.  Each is a BlockToolButton
-         * with an icon drawer + tooltip.  The legacy MenuBarModel can
-         * stay for keyboard discovery, but the toolbar makes the same
-         * commands reachable without ever opening a menu. */
+        /* Undo / Redo migrate from the Edit menu to the toolbar.
+         * File menu + plugin-windows buttons were pulled per user
+         * feedback (file ops live in Disk Op, plugin windows are
+         * reachable via the system Window menu when needed). */
         using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
         auto wireBtn = [&] (BlockToolButton& b, const juce::String& tip,
                               IconFn icon, std::function<void()> action)
@@ -431,14 +431,10 @@ public:
             b.onClick = std::move (action);
             addAndMakeVisible (b);
         };
-        wireBtn (fileMenuBtn_, "File / Session menu", &ui::iconMenu,
-                  [this]() { runFileMenu(); });
-        wireBtn (undoBtn_,     "Undo",                 &ui::iconUndo,
+        wireBtn (undoBtn_, "Undo", &ui::iconUndo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::undo, true); });
-        wireBtn (redoBtn_,     "Redo",                 &ui::iconRedo,
+        wireBtn (redoBtn_, "Redo", &ui::iconRedo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
-        wireBtn (pluginWinBtn_,"Show / hide plugin windows", &ui::iconWindows,
-                  [this]() { runPluginWindowsMenu(); });
     }
 
     ~Toolbar()
@@ -504,12 +500,10 @@ public:
         r.reduce (kSidePad, 0);
         const int top = r.getY() + innerPad;
 
-        /* ---- LEFT: file menu / undo / redo trio ---- */
-        fileMenuBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        /* ---- LEFT: undo / redo pair ---- */
+        undoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (2);
-        undoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (2);
-        redoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        redoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (kGap);
 
         /* ---- Transport (Play / Stop / Record / SeekZero) ---- */
@@ -547,8 +541,6 @@ public:
             viewSelector.setBounds (r.removeFromRight (rowH * 7)
                                        .withSizeKeepingCentre (rowH * 7, rowH));
         }
-        r.removeFromRight (kGap / 2);
-        pluginWinBtn_.setBounds (r.removeFromRight (kIconBtnW).withY (top).withHeight (rowH));
         if (mapButton.isVisible())
         {
             r.removeFromRight (4);
@@ -625,38 +617,10 @@ private:
      * transport monitor + session. */
     MainDisplayPanel display_ { &owner.services() };
 
-    /* Icon buttons that absorb the legacy menu-bar's most-used items
-     * so the main toolbar reads as the primary affordance surface
-     * and the system MenuBar can eventually be hidden. */
-    BlockToolButton fileMenuBtn_  { "" };
-    BlockToolButton undoBtn_      { "" };
-    BlockToolButton redoBtn_      { "" };
-    BlockToolButton pluginWinBtn_ { "" };
-
-    void runFileMenu()
-    {
-        auto* ui = owner.services().find<UI>();
-        if (ui == nullptr) return;
-        auto& cm = ui->commands();
-        juce::PopupMenu menu;
-        MainMenu::buildSessionMenu (cm, menu);
-        menu.addSeparator();
-        menu.addCommandItem (&cm, Commands::showPreferences, "Preferences...");
-        menu.addSeparator();
-        menu.addCommandItem (&cm, juce::StandardApplicationCommandIDs::quit);
-        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&fileMenuBtn_));
-    }
-
-    void runPluginWindowsMenu()
-    {
-        juce::PopupMenu menu;
-        auto* ui = owner.services().find<UI>();
-        if (ui == nullptr) return;
-        auto& cm = ui->commands();
-        menu.addCommandItem (&cm, Commands::showAllPluginWindows,  "Show plugin windows");
-        menu.addCommandItem (&cm, Commands::hideAllPluginWindows,  "Hide plugin windows");
-        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pluginWinBtn_));
-    }
+    /* Edit Undo / Redo migrated onto the toolbar.  File-menu +
+     * plugin-windows buttons removed per user feedback. */
+    BlockToolButton undoBtn_ { "" };
+    BlockToolButton redoBtn_ { "" };
 
     void runPluginMenu()
     {

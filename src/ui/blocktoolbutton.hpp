@@ -54,82 +54,115 @@ public:
 
     void paintButton (juce::Graphics& g, bool isOver, bool isDown) override
     {
-        const float cornerSize = 2.0f;
+        const float cornerSize = 3.0f;
         const bool active = getToggleState();
         const bool tinted = ! tint_.isTransparent();
         const bool hasActiveTint = ! activeTint_.isTransparent();
 
-        const auto bodyOff = juce::Colour (0xff2c2c2c);
-        const auto bodyOnDefault = juce::Colour (0xff3a3a3a);
-        const auto neutralBorder = juce::Colour (0xff8a8a8a);
+        const auto bodyOff = juce::Colour (0xff'2c'2c'2c);
+        const auto bodyOnDefault = juce::Colour (0xff'3a'3a'3a);
+        const auto neutralBorder = juce::Colour (0xff'5a'5a'5a);
 
         const juce::Colour bodyCol = active
             ? (hasActiveTint ? activeTint_ : bodyOnDefault)
             : bodyOff;
         const juce::Colour borderCol = tinted
-            ? (active ? tint_ : tint_.withMultipliedBrightness (0.85f))
+            ? (active ? tint_ : tint_.withMultipliedBrightness (0.75f))
             : (active && hasActiveTint
-                  ? activeTint_.brighter (0.25f)
+                  ? activeTint_.brighter (0.20f)
                   : neutralBorder);
 
         auto box = getLocalBounds().reduced (1);
+        const auto frect = box.toFloat();
 
-        g.setColour (bodyCol);
-        g.fillRoundedRectangle (box.toFloat(), cornerSize);
+        /* Subtle vertical gradient on the body -- top edge a hair
+         * brighter than the bottom so the button reads as having
+         * depth.  Matches the tracker EDIT / FOLLOW button family. */
+        juce::ColourGradient bodyGrad (bodyCol.brighter (0.12f),
+                                         frect.getX(), frect.getY(),
+                                         bodyCol.darker (0.18f),
+                                         frect.getX(), frect.getBottom(),
+                                         false);
+        g.setGradientFill (bodyGrad);
+        g.fillRoundedRectangle (frect, cornerSize);
 
+        /* Top 1-px highlight line for an even subtler "lit from
+         * above" depth cue. */
+        g.setColour (juce::Colours::white.withAlpha (0.06f));
+        g.drawLine (frect.getX() + 1.5f, frect.getY() + 1.0f,
+                    frect.getRight() - 1.5f, frect.getY() + 1.0f, 1.0f);
+
+        /* Outer border + inner dark ring (graph-block aesthetic). */
         g.setColour (borderCol);
-        g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.5f);
-
-        g.setColour (juce::Colours::black.withAlpha (0.6f));
-        g.drawRoundedRectangle (box.toFloat().reduced (1.5f, 1.5f),
-                                juce::jmax (0.5f, cornerSize - 1.5f),
+        g.drawRoundedRectangle (frect, cornerSize, 1.2f);
+        g.setColour (juce::Colours::black.withAlpha (0.55f));
+        g.drawRoundedRectangle (frect.reduced (1.2f, 1.2f),
+                                juce::jmax (0.5f, cornerSize - 1.2f),
                                 1.0f);
 
-        /* Foreground colour: tracker's white-on / 0xffd0d0d0 off
-         * pattern, with an exception for active-with-tint where we
-         * use near-black so the colour pops. */
         const auto isLightTint = active && hasActiveTint
-                                && activeTint_.getPerceivedBrightness() > 0.5f;
+                                && activeTint_.getPerceivedBrightness() > 0.55f;
         const juce::Colour fg = active
             ? (isLightTint ? juce::Colour (0xff'10'10'10) : juce::Colours::white)
-            : juce::Colour (0xffd0d0d0);
+            : juce::Colour (0xff'd0'd0'd0);
 
         auto inner = box.reduced (4, 0);
+        const bool hasLabel = label_.isNotEmpty();
 
         if (iconDrawer_)
         {
-            /* Icon-left, label-right.  Icon claims a square chunk
-             * sized to the button height; label fills the remainder. */
-            const int iconSide = juce::jmin (inner.getHeight() - 2,
-                                              juce::jmax (10, inner.getHeight() - 4));
-            const auto iconBox = juce::Rectangle<int> (inner.getX(),
-                                                        inner.getY() + (inner.getHeight() - iconSide) / 2,
-                                                        iconSide, iconSide).toFloat();
-            iconDrawer_ (g, iconBox, fg);
+            if (hasLabel)
+            {
+                /* Icon-left, label-right.  Icon claims a square chunk
+                 * sized to the button height; label fills remainder. */
+                const int iconSide = juce::jmin (inner.getHeight() - 4,
+                                                  juce::jmax (10, inner.getHeight() - 6));
+                const auto iconBox = juce::Rectangle<int> (
+                    inner.getX(),
+                    inner.getY() + (inner.getHeight() - iconSide) / 2,
+                    iconSide, iconSide).toFloat();
+                iconDrawer_ (g, iconBox, fg);
 
-            const auto textBox = inner.withTrimmedLeft (iconSide + 3);
-            g.setColour (fg);
-            const float fontPx = juce::jmin (11.0f, textBox.getHeight() * 0.58f);
-            g.setFont (juce::FontOptions (juce::jmax (9.0f, fontPx), juce::Font::bold));
-            g.drawText (label_, textBox, juce::Justification::centredLeft, false);
+                const auto textBox = inner.withTrimmedLeft (iconSide + 3);
+                g.setColour (fg);
+                const float fontPx = juce::jmin (11.0f, textBox.getHeight() * 0.55f);
+                g.setFont (juce::FontOptions (juce::jmax (9.0f, fontPx), juce::Font::bold));
+                g.drawText (label_, textBox, juce::Justification::centredLeft, false);
+            }
+            else
+            {
+                /* Icon-only: square, centred horizontally + vertically
+                 * with comfortable padding so the glyph never crowds
+                 * the border.  Pad = 22 % of the smaller dimension --
+                 * matches the look of the tracker editor's EDIT pill. */
+                const int side = juce::jmin (inner.getWidth(), inner.getHeight());
+                const int pad  = juce::jmax (3, side / 5);
+                const int iconSide = juce::jmax (8, side - pad * 2);
+                const auto iconBox = juce::Rectangle<int> (
+                    inner.getX() + (inner.getWidth()  - iconSide) / 2,
+                    inner.getY() + (inner.getHeight() - iconSide) / 2,
+                    iconSide, iconSide).toFloat();
+                iconDrawer_ (g, iconBox, fg);
+            }
         }
         else
         {
             g.setColour (fg);
-            const float fontPx = juce::jmin (12.0f, inner.getHeight() * 0.62f);
+            const float fontPx = juce::jmin (12.0f, inner.getHeight() * 0.55f);
             g.setFont (juce::FontOptions (juce::jmax (9.0f, fontPx), juce::Font::bold));
             g.drawText (label_, inner, juce::Justification::centred);
         }
 
+        /* Hover / pressed overlay on top of body + icon. */
         if (isDown)
         {
-            g.setColour (juce::Colours::white.withAlpha (0.08f));
-            g.fillRoundedRectangle (box.toFloat(), cornerSize);
+            g.setColour (juce::Colours::black.withAlpha (0.18f));
+            g.fillRoundedRectangle (frect, cornerSize);
         }
         else if (isOver)
         {
-            g.setColour (juce::Colours::white.withAlpha (0.04f));
-            g.fillRoundedRectangle (box.toFloat(), cornerSize);
+            g.setColour (juce::Colours::white.withAlpha (0.06f));
+            g.fillRoundedRectangle (frect, cornerSize);
         }
     }
 

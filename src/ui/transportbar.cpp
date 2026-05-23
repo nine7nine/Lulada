@@ -45,12 +45,13 @@ public:
 
 TransportBar::TransportBar()
 {
-    /* Modernised transport cluster -- chunkier glyphs (pathReduction
-     * dropped from 4.4 -> 2.0 so the icon fills ~75 % of the
-     * button) + Bitwig-inspired colour palette: bright orange Play,
-     * white Stop, red Record, white rewind chevron.  Toggle-on body
-     * wash highlights Play when running + Record when armed. */
-    constexpr float kIconPad = 2.0f;
+    /* Modernised transport cluster -- icons sized at ~55 % of the
+     * button via pathReduction = 10 px so they sit inset like the
+     * tracker EDIT pill rather than crowding the borders.  Bitwig
+     * palette: bright orange Play, warm-white Stop, bright red
+     * Record, soft-white SeekZero.  Toggle-on body wash highlights
+     * Play when running + Record when armed. */
+    constexpr float kIconPad = 10.0f;
     play = std::make_unique<PlayButton>();
     addAndMakeVisible (play.get());
     play->setPath (getIcons().fasPlay, kIconPad);
