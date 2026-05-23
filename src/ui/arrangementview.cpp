@@ -277,6 +277,18 @@ public:
         {
             if (! r.containsBeat (beat)) continue;
 
+            /* Right-click on a region: temporary context menu (loop
+             * toggle / split / delete) until the proper Ardour-style
+             * tool-mode toolbar lands.  No drag gesture started. */
+            if (e.mods.isPopupMenu())
+            {
+                selectedLane_   = laneIdx;
+                selectedRegion_ = r.id;
+                repaintLane (laneIdx);
+                showRegionContextMenu (laneIdx, r.id, beat);
+                return;
+            }
+
             /* Begin a gesture; whether it ends in move/resize/click
              * is decided by what happens between mouseDown and
              * mouseUp. */
@@ -445,6 +457,74 @@ public:
             }
         }
         setMouseCursor (juce::MouseCursor::NormalCursor);
+    }
+
+    /** Build + show the region right-click popup.  Stop-gap UI until
+     *  the Ardour-style tool-mode toolbar lands -- once the toolbar
+     *  exists, tool selection determines mouseDown behaviour and
+     *  this menu goes away.  Until then, it's the only way to expose
+     *  Region.looped toggling + Split. */
+    void showRegionContextMenu (int laneIdx, juce::Uuid regionId, double atBeat)
+    {
+        auto& lane = owner.lanes_.getReference (laneIdx);
+        const auto* r = lane.playlist.findRegion (regionId);
+        if (r == nullptr) return;
+
+        enum { ItemLoop = 1, ItemSplit = 2, ItemDelete = 3 };
+
+        juce::PopupMenu menu;
+        menu.addItem (ItemLoop,  "Loop",   true, r->looped);
+        menu.addItem (ItemSplit, "Split at click",
+                       atBeat > r->positionBeats + 0.0625
+                       && atBeat < r->endBeats() - 0.0625);
+        menu.addSeparator();
+        menu.addItem (ItemDelete, "Delete");
+
+        juce::Component::SafePointer<Body> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options(),
+            [safe, laneIdx, regionId, atBeat] (int result)
+            {
+                auto* self = safe.getComponent();
+                if (self == nullptr || result == 0) return;
+
+                if (laneIdx < 0 || laneIdx >= self->owner.lanes_.size()) return;
+                auto& l = self->owner.lanes_.getReference (laneIdx);
+
+                bool changed = false;
+                switch (result)
+                {
+                    case ItemLoop:
+                        if (auto* m = l.playlist.findRegion (regionId))
+                        {
+                            m->looped = ! m->looped;
+                            changed = true;
+                        }
+                        break;
+                    case ItemSplit:
+                        if (! l.playlist.splitRegion (regionId, atBeat).isNull())
+                            changed = true;
+                        break;
+                    case ItemDelete:
+                        if (l.playlist.removeRegion (regionId))
+                        {
+                            if (self->selectedRegion_ == regionId)
+                            {
+                                self->selectedLane_   = -1;
+                                self->selectedRegion_ = juce::Uuid::null();
+                            }
+                            changed = true;
+                        }
+                        break;
+                    default: break;
+                }
+
+                if (changed)
+                {
+                    self->owner.writeLanesToSession();
+                    self->resizeForLanes();
+                    self->repaintLane (laneIdx);
+                }
+            });
     }
 
     bool keyPressed (const juce::KeyPress& key) override
