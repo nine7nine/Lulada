@@ -1580,14 +1580,17 @@ void ArrangementView::rescanLaneTargets()
 
                     auto& lane = self->lanes_.getReference (idx);
 
-                    /* Append a Region at the end of the existing
-                     * playlist.  positionBeats = max region endBeats,
-                     * or 0 if empty.  lengthBeats derived from file
-                     * duration + session bpm; defaults to 120 bpm
-                     * when no monitor is available. */
-                    double position = 0.0;
+                    /* Position the new Region at recordStartBeat_ --
+                     * where the transport playhead was when record
+                     * started -- so the audio lands at the spot the
+                     * user actually triggered, not appended after
+                     * the last existing region.  If the target slot
+                     * overlaps an existing region, nudge forward to
+                     * the next free spot (defensive). */
+                    double position = self->recordStartBeat_;
                     for (const auto& r : lane.playlist.regions())
-                        position = juce::jmax (position, r.endBeats());
+                        if (r.containsBeat (position))
+                            position = juce::jmax (position, r.endBeats());
 
                     const double bpm = self->monitor_ != nullptr
                                           ? (double) self->monitor_->tempo.get()

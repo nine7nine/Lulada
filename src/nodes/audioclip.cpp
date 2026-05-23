@@ -254,14 +254,25 @@ AudioClipNode::handleRecordingFromTransport (const juce::AudioBuffer<float>& in,
                                              int                              numFrames) noexcept
 {
     bool transportRecording = false;
+    bool transportPlaying   = false;
     if (auto* ph = getPlayHead())
     {
         if (auto pos = ph->getPosition())
+        {
             transportRecording = pos->getIsRecording();
+            transportPlaying   = pos->getIsPlaying();
+        }
     }
 
-    const bool armed     = armed_.load (std::memory_order_acquire);
-    const bool wantingCapture = armed && transportRecording;
+    /* Capture requires armed lane AND transport in record mode AND
+     * transport actually playing.  The third condition matches
+     * Ardour / Ableton / Bitwig behaviour: hitting Stop finalises
+     * the recording (transport.isPlaying drops to false even if
+     * .isRecording stays true).  Otherwise the user would have to
+     * click the record toggle separately to commit -- non-standard
+     * DAW UX. */
+    const bool armed          = armed_.load (std::memory_order_acquire);
+    const bool wantingCapture = armed && transportRecording && transportPlaying;
 
     /* Rising edge: ask message thread to instantiate Record_DS. */
     if (wantingCapture && ! wasRecording_)
