@@ -65,8 +65,19 @@ public:
         {
             if (r.containsBeat (beat))
             {
+                /* Click-launch routes through the same audio-thread FIFO
+                 * the timer-driven dispatch uses (Phase 2 -- see
+                 * timeline-audio-design.md Section 2.3 + the precedent
+                 * SessionView already proved at tracker.hpp:197-223).
+                 * Manual click = treat as immediate (beatTarget = -1). */
                 if (r.sequenceIdx >= 0)
-                    runtime.trackerCache->advanceToPattern (r.sequenceIdx);
+                {
+                    if (runtime.lastDispatchedSeqIdx >= 0
+                        && runtime.lastDispatchedSeqIdx != r.sequenceIdx)
+                        runtime.trackerCache->schedulePlaying (
+                            runtime.lastDispatchedSeqIdx, -1.0, false);
+                    runtime.trackerCache->schedulePlaying (r.sequenceIdx, -1.0, true);
+                }
                 runtime.lastDispatchedRegion  = r.id;
                 runtime.lastDispatchedSeqIdx  = r.sequenceIdx;
                 repaintLane (laneIdx);
@@ -498,8 +509,20 @@ double ArrangementView::computePlayheadBeats() const
 
 void ArrangementView::dispatchAtBeat (double beat)
 {
-    /* Idempotent per region: the same region won't dispatch twice on
-     * consecutive ticks (runtime.lastDispatchedRegion gates).
+    /* Phase 2: launches route through TrackerNode's audio-thread SPSC
+     * FIFO (schedulePlaying) instead of the message-thread
+     * pending_pattern_jump path (advanceToPattern).  Detection still
+     * runs on the 30 Hz UI timer; the actual sequence flip is
+     * audio-thread + sample-accurate within one render block (~5-10 ms).
+     *
+     * Per-lane idempotency: lastDispatchedRegion gates re-fires;
+     * lastDispatchedSeqIdx tracks "what's currently playing so we
+     * can stop it at the next region boundary."  Same-sequence
+     * transitions (region B reuses region A's pattern) write a
+     * stop+start to the FIFO; the per-sequence latest-wins drain
+     * collapses these into a single keep-playing entry, so no
+     * audible glitch.
+     *
      * Orphaned lanes (trackerCache == nullptr) skip silently. */
     for (int laneIdx = 0; laneIdx < lanes_.size(); ++laneIdx)
     {
@@ -512,7 +535,13 @@ void ArrangementView::dispatchAtBeat (double beat)
         if (active->id == runtime.lastDispatchedRegion) continue;
 
         if (active->sequenceIdx >= 0)
-            runtime.trackerCache->advanceToPattern (active->sequenceIdx);
+        {
+            if (runtime.lastDispatchedSeqIdx >= 0
+                && runtime.lastDispatchedSeqIdx != active->sequenceIdx)
+                runtime.trackerCache->schedulePlaying (
+                    runtime.lastDispatchedSeqIdx, -1.0, false);
+            runtime.trackerCache->schedulePlaying (active->sequenceIdx, -1.0, true);
+        }
         runtime.lastDispatchedRegion = active->id;
         runtime.lastDispatchedSeqIdx = active->sequenceIdx;
         if (body_ != nullptr) body_->repaintLane (laneIdx);

@@ -25,9 +25,11 @@ class TrackerNode;
  *  Multi-lane timeline where each lane is bound to one TrackerNode in
  *  the active graph via targetNodeUuid.  Per lane, a Playlist of
  *  Regions is laid out left-to-right; on playback the view drives
- *  each tracker via direct C++ calls (TrackerNode::advanceToPattern).
- *  Phase 2 swaps to the sample-accurate TrackerNode::schedulePlaying
- *  path -- the dispatch site is the only thing that changes.
+ *  each tracker via the audio-thread SPSC FIFO (TrackerNode::
+ *  schedulePlaying).  Detection runs on the 30 Hz UI timer; the
+ *  actual sequence flip is sample-accurate within one render block.
+ *  Same path SessionView clip-launch uses (timeline-audio-design.md
+ *  Section 2.3).
  *
  *  Phase 1e (this commit): refactored onto the shared
  *  element::Lane / element::Playlist / element::Region data model
