@@ -485,6 +485,11 @@ AudioClipNode::timerCallback()
         if (wasRecordingFinalising_ && ! nowRecording)
         {
             const auto file = record_->finalised_file();
+            juce::Logger::writeToLog (
+                juce::String ("[AudioClipNode::timerCallback] recording finalised file=")
+                + file.getFullPathName()
+                + " existsAsFile=" + (file.existsAsFile() ? "yes" : "no"));
+
             std::function<void (const juce::File&)> cb;
             {
                 const juce::ScopedLock sl (engineLock_);
@@ -493,7 +498,17 @@ AudioClipNode::timerCallback()
             record_.reset();
             wasRecordingFinalising_ = false;
             if (cb && file.existsAsFile())
+            {
+                juce::Logger::writeToLog (" -> firing onRecordingCommitted handler");
                 cb (file);
+            }
+            else
+            {
+                juce::Logger::writeToLog (
+                    juce::String (" -> NOT firing handler: cb=")
+                    + (cb ? "set" : "null")
+                    + " file_exists=" + (file.existsAsFile() ? "yes" : "no"));
+            }
         }
         else
         {
@@ -510,12 +525,22 @@ AudioClipNode::handleAsyncUpdate()
     if (! pendingRecordStart_.exchange (false, std::memory_order_acquire))
         return;
 
+    juce::Logger::writeToLog ("[AudioClipNode::handleAsyncUpdate] record start requested");
+
     /* If pendingFreshRecord_ already holds one we didn't pick up,
      * drop it (the audio thread will swap in the new one). */
     if (auto* stale = pendingFreshRecord_.exchange (nullptr))
+    {
+        juce::Logger::writeToLog (" -> dropping stale pendingFreshRecord_");
         delete stale;
+    }
 
     const juce::File basename = composeRecordingBasename();
+    juce::Logger::writeToLog (
+        juce::String (" -> basename=") + basename.getFullPathName()
+        + " sr=" + juce::String (sampleRate_, 0)
+        + " block=" + juce::String (blockSize_)
+        + " ch=" + juce::String (numChannels_));
 
     auto fresh = Record_DS::create (basename,
                                     juce::String (kCaptureFormat),
@@ -526,13 +551,15 @@ AudioClipNode::handleAsyncUpdate()
     if (fresh == nullptr)
     {
         juce::Logger::writeToLog (
-            juce::String ("AudioClipNode: Record_DS::create failed for ")
+            juce::String (" -> Record_DS::create FAILED for ")
             + basename.getFullPathName());
         return;
     }
 
     fresh->start (0 /*start_source_frame -- new file starts at 0*/);
 
+    juce::Logger::writeToLog (
+        " -> Record_DS armed, handed off to audio thread via pendingFreshRecord_");
     pendingFreshRecord_.store (fresh.release(), std::memory_order_release);
 }
 

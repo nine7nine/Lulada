@@ -1277,6 +1277,8 @@ double ArrangementView::computePlayheadBeats() const
 
 void ArrangementView::dispatchAtBeat (double beat)
 {
+    const double bpm = monitor_ != nullptr ? (double) monitor_->tempo.get() : 120.0;
+
     for (int laneIdx = 0; laneIdx < lanes_.size(); ++laneIdx)
     {
         const auto& lane    = lanes_.getReference (laneIdx);
@@ -1284,8 +1286,43 @@ void ArrangementView::dispatchAtBeat (double beat)
         if (runtime.isOrphan()) continue;
 
         const Region* active = lane.playlist.regionAt (beat);
-        if (active == nullptr) continue;
-        if (active->id == runtime.lastDispatchedRegion) continue;
+
+        /* Case 1: playhead is outside any region.  Stop whatever was
+         * playing on this lane.  Tracker lanes don't auto-stop on
+         * gaps -- vht state persists between regions and the next
+         * region launch re-fires; audio lanes DO stop (DAW
+         * convention: gaps = silence). */
+        if (active == nullptr)
+        {
+            if (! runtime.lastDispatchedRegion.isNull())
+            {
+                if (runtime.isAudioLane())
+                    runtime.audioClipCache->scheduleStop (
+                        runtime.lastDispatchedRegion, -1.0);
+                runtime.lastDispatchedRegion = juce::Uuid::null();
+                runtime.lastDispatchedSeqIdx = -1;
+                if (body_ != nullptr) body_->repaintLane (laneIdx);
+            }
+            continue;
+        }
+
+        /* Case 2: still inside the same region the lane is already
+         * playing.  No state change. */
+        if (active->id == runtime.lastDispatchedRegion)
+            continue;
+
+        /* Case 3: entering a new region (either first region under
+         * the playhead OR transitioning from a different region).
+         * Stop the prior + launch the new. */
+        if (! runtime.lastDispatchedRegion.isNull())
+        {
+            if (runtime.isAudioLane())
+                runtime.audioClipCache->scheduleStop (
+                    runtime.lastDispatchedRegion, -1.0);
+            /* Tracker lanes: existing pattern stays "playing" in
+             * vht state; the new schedulePlaying below explicitly
+             * stops the old sequence + starts the new. */
+        }
 
         if (runtime.isTrackerLane())
         {
@@ -1295,13 +1332,35 @@ void ArrangementView::dispatchAtBeat (double beat)
                     && runtime.lastDispatchedSeqIdx != active->sequenceIdx)
                     runtime.trackerCache->schedulePlaying (
                         runtime.lastDispatchedSeqIdx, -1.0, false);
-                runtime.trackerCache->schedulePlaying (active->sequenceIdx, -1.0, true);
+                runtime.trackerCache->schedulePlaying (
+                    active->sequenceIdx, -1.0, true);
             }
         }
         else if (runtime.isAudioLane())
         {
+            /* Mid-region launch: compute the source-sample offset so
+             * the playback head matches where the transport is
+             * within the region.  bumping into a region from beat 0
+             * fires the source from its beginning (modulo startBeats
+             * trim); bumping in at beat 2 of a 4-beat region whose
+             * startBeats=0 fires from 2 beats into the source. */
+            const double beatIntoRegion = juce::jmax (
+                0.0, beat - active->positionBeats);
+            const double sourceBeat = active->startBeats + beatIntoRegion;
+
+            juce::int64 sampleOffset = 0;
+            if (auto src = SourceRegistry::get().findAudioFile (active->sourceId))
+            {
+                if (src->sourceSampleRate() > 0 && bpm > 0.0)
+                {
+                    const double sourceSec = sourceBeat * (60.0 / bpm);
+                    sampleOffset = (juce::int64) (sourceSec
+                        * (double) src->sourceSampleRate());
+                }
+            }
+
             runtime.audioClipCache->schedulePlay (
-                active->id, active->sourceId, -1.0, 0 /*sampleOffset*/);
+                active->id, active->sourceId, -1.0, sampleOffset);
         }
 
         runtime.lastDispatchedRegion = active->id;
