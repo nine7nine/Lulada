@@ -5,9 +5,12 @@
 
 #include <element/node.hpp>
 
+namespace juce { class File; }
+
 namespace element {
 
 class EngineService;
+class Services;
 class Session;
 
 /** Lookup + lazy-create + accessor helpers for the ArrangementTracks
@@ -49,6 +52,30 @@ struct ArrangementTracksService
     static Node addAudioClipNode (EngineService& engine,
                                   const Node&    subgraph,
                                   bool           stereo = true);
+
+    /** End-to-end audio-file import, decoupled from ArrangementView's
+     *  lifecycle.  Opens `file` via libsndfile, registers as an
+     *  AudioFileSource, finds-or-creates the ArrangementTracks
+     *  subgraph, adds a fresh AudioClipNode inside, then appends a
+     *  new Lane (with one Region for `file`) directly into the
+     *  session's tags::arrangement/lanes ValueTree.
+     *
+     *  Designed for callbacks that fire AFTER a view switch has
+     *  destroyed the calling ArrangementView (the DiskOp Request
+     *  flow does this -- setMainView(DISK_OP) destroys the previous
+     *  ContentView before the user clicks Confirm).  Captures only
+     *  Services (lifetime-stable) so view destruction is irrelevant.
+     *
+     *  Side effect: if the new AudioClipNode is reachable as an
+     *  Element-format Processor, calls schedulePlay immediately so
+     *  the user gets audible confirmation (assuming the subgraph
+     *  output is wired to a sink -- manual today, auto in Phase 5).
+     *
+     *  Returns true on full success; false if any step failed
+     *  (file unopenable, source registration failed, subgraph
+     *  creation failed, node add failed). */
+    static bool importAudioFileAsNewLane (const juce::File& file,
+                                          Services&         services);
 };
 
 } // namespace element

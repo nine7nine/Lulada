@@ -797,6 +797,13 @@ void ArrangementView::rescanLaneTargets()
                               ? nullptr
                               : resolveAudioClipByUuid (l.targetNodeUuid);
 
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::rescanLaneTargets] lane[")
+            + juce::String (i) + "] name=" + l.name
+            + " targetUuid=" + l.targetNodeUuid.toString()
+            + " tracker=" + (s.trackerCache   ? "yes" : "no")
+            + " audio="   + (s.audioClipCache ? "yes" : "no"));
+
         if (s.audioClipCache != nullptr)
         {
             s.audioAdapter.setTargetNode (s.audioClipCache);
@@ -965,16 +972,40 @@ void ArrangementView::stopAllAudioLanes()
 
 int ArrangementView::createEmptyAudioLane (bool stereo)
 {
-    if (services_ == nullptr) return -1;
+    if (services_ == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyAudioLane] services_ null");
+        return -1;
+    }
     auto sess = services_->context().session();
-    if (sess == nullptr) return -1;
+    if (sess == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyAudioLane] session null");
+        return -1;
+    }
     auto* engineService = services_->find<EngineService>();
-    if (engineService == nullptr) return -1;
+    if (engineService == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyAudioLane] EngineService null");
+        return -1;
+    }
 
     Node subgraph = ArrangementTracksService::findOrCreateSubgraph (*engineService, *sess);
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView::createEmptyAudioLane] subgraph valid=")
+        + (subgraph.isValid() ? "yes" : "no")
+        + " isGraph=" + (subgraph.isValid() && subgraph.isGraph() ? "yes" : "no")
+        + " uuid=" + (subgraph.isValid() ? subgraph.getUuid().toString() : juce::String ("(none)"))
+        + " numChildren=" + juce::String (subgraph.isValid() ? subgraph.getNumNodes() : 0));
     if (! subgraph.isValid()) return -1;
 
     Node clip = ArrangementTracksService::addAudioClipNode (*engineService, subgraph, stereo);
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView::createEmptyAudioLane] clip valid=")
+        + (clip.isValid() ? "yes" : "no")
+        + " uuid=" + (clip.isValid() ? clip.getUuid().toString() : juce::String ("(none)"))
+        + " name=" + (clip.isValid() ? clip.getName() : juce::String ("(none)"))
+        + " parentIsGraph=" + (clip.isValid() ? clip.getParentGraph().getUuid().toString() : juce::String ("(none)")));
     if (! clip.isValid()) return -1;
 
     Lane lane;
@@ -1067,37 +1098,49 @@ bool ArrangementView::importAudioFileToLane (const juce::File& file,
 
 void ArrangementView::promptLoadAudioFile()
 {
-    /* juce::FileChooser is broken under winelib; route through the
-     * Disk Op Request pattern instead.  GuiService::requestFile arms
-     * a DiskOpService::Request + navigates to the Disk Op page.  The
-     * RequestPane handles Confirm/Cancel; our onAccept callback
-     * fires with the chosen file.  Same pattern session save/load +
-     * controller import use today.  See
-     * [[diskop-request-pattern-validated]]. */
+    /* The DiskOp Request pattern navigates to the Disk Op page via
+     * setMainView, which DESTROYS the previous ContentView (i.e.
+     * THIS ArrangementView; see standard.cpp:181 primary.reset).
+     * So the onAccept callback fires AFTER this view is gone --
+     * we cannot capture `this` or even SafePointer<ArrangementView>
+     * and expect to do work on it.
+     *
+     * Capture Services* instead (lifetime-stable; lives in Element's
+     * Context) and route through the view-independent helper
+     * ArrangementTracksService::importAudioFileAsNewLane.  That
+     * helper writes the new Lane + Region directly into the
+     * session's tags::arrangement/lanes ValueTree; the next time
+     * ArrangementView opens (or didBecomeActive is called), its
+     * loadLanesFromSession picks the lane up. */
     if (services_ == nullptr) return;
     auto* gui = services_->find<GuiService>();
     if (gui == nullptr) return;
 
+    Services* svc = services_;
     const juce::String wildcard ("*.wav;*.aiff;*.aif;*.flac;*.ogg;*.mp3;*.w64;*.au");
     const juce::File start = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
 
-    juce::Component::SafePointer<ArrangementView> safe (this);
+    juce::Logger::writeToLog ("[ArrangementView::promptLoadAudioFile] arming Disk Op Request");
+
     gui->requestFile (
         "Load audio file into arrangement",
         wildcard,
         start,
         juce::String() /*initialFilename*/,
         false /*isSave*/,
-        [safe] (const juce::File& file)
+        [svc] (const juce::File& file)
         {
-            auto* self = safe.getComponent();
-            if (self == nullptr) return;
-            if (! file.existsAsFile()) return;
-
-            const bool ok = self->importAudioFileToLane (file, -1 /*new lane*/, 0.0);
             juce::Logger::writeToLog (
-                juce::String ("[ArrangementView] requestFile accepted -> importAudioFileToLane(")
-                + file.getFileName() + ") = " + (ok ? "OK" : "FAIL"));
+                juce::String ("[ArrangementView::promptLoadAudioFile] callback fired: ")
+                + file.getFullPathName());
+
+            if (svc == nullptr) return;
+            if (! file.existsAsFile())
+            {
+                juce::Logger::writeToLog (" -> chosen file does not exist; abort");
+                return;
+            }
+            ArrangementTracksService::importAudioFileAsNewLane (file, *svc);
         },
         nullptr /*onCancel*/);
 }
