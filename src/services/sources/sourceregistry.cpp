@@ -3,8 +3,14 @@
 
 #include "services/sources/sourceregistry.hpp"
 
+#include "services/audiostreaming/audio_file_sf.hpp"
+
 #include <element/session.hpp>
 #include <element/node.hpp>
+
+#include <sndfile.h>
+
+#include <cstring>
 
 namespace element {
 
@@ -37,6 +43,50 @@ AudioFileSource::Ptr SourceRegistry::registerAudioFile (juce::Uuid uuid,
     if (existing != nullptr) return existing;
     sendChangeMessage();
     return fresh;
+}
+
+AudioFileSource::Ptr SourceRegistry::importFromFile (const juce::File& file)
+{
+    if (! file.existsAsFile())
+    {
+        juce::Logger::writeToLog (
+            juce::String ("SourceRegistry::importFromFile: file not found: ")
+            + file.getFullPathName());
+        return nullptr;
+    }
+
+    /* libsndfile open just for metadata.  POSIX-backed; no
+     * juce::File operations on the hot path.  See
+     * timeline-audio-design.md Section 0a (Linux-native I/O rule). */
+    SF_INFO si;
+    std::memset (&si, 0, sizeof (si));
+    SNDFILE* sf = sf_open (file.getFullPathName().toRawUTF8(), SFM_READ, &si);
+    if (sf == nullptr)
+    {
+        juce::Logger::writeToLog (
+            juce::String ("SourceRegistry::importFromFile: sf_open failed: ")
+            + file.getFullPathName() + " (" + sf_strerror (nullptr) + ")");
+        return nullptr;
+    }
+
+    const int        sr  = si.samplerate;
+    const int        ch  = si.channels;
+    const juce::int64 dur = (juce::int64) si.frames;
+    sf_close (sf);
+
+    if (sr <= 0 || ch <= 0 || dur <= 0)
+    {
+        juce::Logger::writeToLog (
+            juce::String ("SourceRegistry::importFromFile: invalid metadata for ")
+            + file.getFullPathName());
+        return nullptr;
+    }
+
+    /* Fresh uuid for each import.  Dedup by path could be a v2
+     * optimisation but two regions referencing the same file via
+     * distinct uuids already share libsndfile reads at the
+     * Playback_DS layer (each opens its own fd anyway). */
+    return registerAudioFile (juce::Uuid(), file, sr, ch, dur);
 }
 
 AudioFileSource::Ptr SourceRegistry::findAudioFile (juce::Uuid uuid) const

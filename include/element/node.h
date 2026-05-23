@@ -50,6 +50,7 @@ extern "C" {
 #define EL_NODE_ID_VOLUME             "element.volume"
 
 // Processor subclass
+#define EL_NODE_ID_ARRANGEMENT_TRACKS    "element.arrangementTracks"
 #define EL_NODE_ID_AUDIO_ROUTER          "element.audioRouter"
 #define EL_NODE_ID_GRAPH                 "element.graph"
 #define EL_NODE_ID_MIDI_CHANNEL_SPLITTER "element.midiChannelSplitter"
@@ -100,6 +101,7 @@ extern "C" {
 #define EL_NODE_UID_JACK_MIDI_OUTPUT_ALL  1032
 #define EL_NODE_UID_AUDIO_CLIP            1033
 #define EL_NODE_UID_AUDIO_CLIP_MONO       1034
+#define EL_NODE_UID_ARRANGEMENT_TRACKS    1035
 
 #ifdef __cplusplus
 }

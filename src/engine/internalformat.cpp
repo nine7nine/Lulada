@@ -338,6 +338,14 @@ Processor* InternalNodes::create (const String& ID)
     {
         return new GraphNode (_context);
     }
+    else if (ID == EL_NODE_ID_ARRANGEMENT_TRACKS)
+    {
+        /* Same backing class as EL_NODE_ID_GRAPH; the distinct ID is
+         * what lets ArrangementTracksService find the timeline's
+         * subgraph in the active root graph without confusing it with
+         * user-added Graph nodes.  See timeline-audio-design.md §3.3. */
+        return new GraphNode (_context);
+    }
     else if (ID == EL_NODE_ID_MIDI_SET_LIST)
     {
         return new MidiSetListProcessor (_context);
@@ -348,7 +356,7 @@ Processor* InternalNodes::create (const String& ID)
 
 StringArray InternalNodes::findTypes (const juce::FileSearchPath&, bool, bool)
 {
-    return { EL_NODE_ID_GRAPH, EL_NODE_ID_MIDI_SET_LIST };
+    return { EL_NODE_ID_GRAPH, EL_NODE_ID_ARRANGEMENT_TRACKS, EL_NODE_ID_MIDI_SET_LIST };
 }
 
 StringArray InternalNodes::getHiddenTypes() { return {}; }

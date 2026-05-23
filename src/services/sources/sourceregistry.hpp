@@ -61,6 +61,21 @@ public:
                                             int numChannels,
                                             juce::int64 durationSamples);
 
+    /** Convenience importer: opens `file` via libsndfile to read the
+     *  intrinsic metadata (sample rate, channel count, length in
+     *  frames), then calls registerAudioFile with a fresh uuid.
+     *  Returns nullptr if the file can't be opened (missing,
+     *  unsupported format, permission denied).
+     *
+     *  Used by ArrangementView's external-file-drop path and the
+     *  recording-commit path -- both need to turn a freshly-available
+     *  juce::File into a registered AudioFileSource without callers
+     *  having to repeat the libsndfile dance.
+     *
+     *  Threading: message thread only.  Opens + closes the file
+     *  synchronously (libsndfile is POSIX-backed; no wineserver). */
+    AudioFileSource::Ptr importFromFile (const juce::File& file);
+
     /** Look up an AudioFileSource by uuid.  Returns nullptr if not
      *  registered. */
     AudioFileSource::Ptr findAudioFile (juce::Uuid uuid) const;

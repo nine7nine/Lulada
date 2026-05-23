@@ -5,13 +5,19 @@
 
 #include <element/audioengine.hpp>
 #include <element/context.hpp>
+#include <element/engine.hpp>
 #include <element/node.hpp>
 #include <element/session.hpp>
 #include <element/services.hpp>
 #include <element/tags.hpp>
+#include <element/ui.hpp>
 #include <element/ui/style.hpp>
 
+#include "nodes/audioclip.hpp"
 #include "nodes/tracker.hpp"
+#include "services/arrangementtracksservice.hpp"
+#include "services/sources/sourceregistry.hpp"
+#include "services/timeline/audiolaneadapter.hpp"
 
 namespace element {
 
@@ -22,13 +28,39 @@ using juce::Rectangle;
 using juce::String;
 namespace Colours = juce::Colours;
 
+namespace {
+
+/** Acceptable audio extensions for external file drop.  Lowercase
+ *  comparison via String::endsWithIgnoreCase. */
+const char* const kAudioDropExtensions[] = {
+    ".wav", ".aiff", ".aif", ".flac", ".ogg", ".mp3", ".w64", ".au"
+};
+
+bool isAcceptableAudioFile (const juce::String& path) noexcept
+{
+    for (const char* ext : kAudioDropExtensions)
+        if (path.endsWithIgnoreCase (ext))
+            return true;
+    return false;
+}
+
+bool anyAudioFileIn (const juce::StringArray& files) noexcept
+{
+    for (const auto& f : files)
+        if (isAcceptableAudioFile (f))
+            return true;
+    return false;
+}
+
+} // namespace
+
 /* ===================================================================== */
-/* Body: single inline-paint component that draws every lane in one      */
-/* paint() pass.  Cheaper than a tree of LaneStrip children for the      */
-/* common case of small lane counts; partial repaints are surgical.     */
+/* Body: inline-paint component drawing every lane in one paint() pass.  */
+/* Also the FileDragAndDropTarget so external file drops hit the lanes.  */
 /* ===================================================================== */
 
-class ArrangementView::Body : public juce::Component
+class ArrangementView::Body : public juce::Component,
+                              public juce::FileDragAndDropTarget
 {
 public:
     explicit Body (ArrangementView& o) : owner (o) { setOpaque (true); }
@@ -45,11 +77,127 @@ public:
         {
             g.setColour (Colors::textColor.withAlpha (0.5f));
             g.setFont (juce::FontOptions (14.0f));
-            g.drawText ("No Tracker nodes in graph. Add one to see lanes.",
+            g.drawText ("Drop an audio file here, or click + Audio to add a track.",
                         getLocalBounds(),
                         juce::Justification::centred);
         }
+
+        if (dropHover_)
+        {
+            const Rectangle<int> hover = dropHoverLaneIdx_ >= 0
+                ? Rectangle<int> (kLabelW, dropHoverLaneIdx_ * kLaneH,
+                                   getWidth() - kLabelW, kLaneH)
+                : Rectangle<int> (kLabelW, laneCount * kLaneH,
+                                   getWidth() - kLabelW, kLaneH);
+            g.setColour (Colours::limegreen.withAlpha (0.18f));
+            g.fillRect (hover);
+            g.setColour (Colours::limegreen);
+            g.drawRect (hover, 2);
+        }
     }
+
+    //==========================================================================
+    // FileDragAndDropTarget
+
+    bool isInterestedInFileDrag (const juce::StringArray& files) override
+    {
+        const bool interested = anyAudioFileIn (files);
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::Body] isInterestedInFileDrag count=")
+            + juce::String (files.size())
+            + (interested ? " ACCEPT" : " REJECT"));
+        return interested;
+    }
+
+    void fileDragEnter (const juce::StringArray& files, int x, int y) override
+    {
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::Body] fileDragEnter x=")
+            + juce::String (x) + " y=" + juce::String (y)
+            + " count=" + juce::String (files.size()));
+        if (! anyAudioFileIn (files)) return;
+        dropHover_         = true;
+        dropHoverLaneIdx_  = owner.laneIdxFromY (y);
+        juce::ignoreUnused (x);
+        repaint();
+    }
+
+    void fileDragMove (const juce::StringArray&, int /*x*/, int y) override
+    {
+        const int li = owner.laneIdxFromY (y);
+        if (li == dropHoverLaneIdx_) return;
+        dropHoverLaneIdx_ = li;
+        repaint();
+    }
+
+    void fileDragExit (const juce::StringArray&) override
+    {
+        dropHover_        = false;
+        dropHoverLaneIdx_ = -1;
+        repaint();
+    }
+
+    void filesDropped (const juce::StringArray& files, int x, int y) override
+    {
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::Body] filesDropped x=")
+            + juce::String (x) + " y=" + juce::String (y)
+            + " count=" + juce::String (files.size()));
+
+        dropHover_        = false;
+        dropHoverLaneIdx_ = -1;
+        repaint();
+
+        const int targetLane = owner.laneIdxFromY (y);
+        const double dropBeats =
+            juce::jmax (0.0, (double) (x - kLabelW) / (double) kPxPerBeat);
+
+        /* If dropping on a tracker lane, force-create a fresh audio
+         * lane below it instead of trying to mix kinds.  -1 = create
+         * new. */
+        int laneIdx = targetLane;
+        if (laneIdx >= 0 && laneIdx < owner.lanes_.size())
+        {
+            const auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+            if (! runtime.isAudioLane())
+                laneIdx = -1;
+        }
+        else
+        {
+            laneIdx = -1;
+        }
+
+        double cursor = dropBeats;
+        for (const auto& path : files)
+        {
+            if (! isAcceptableAudioFile (path)) continue;
+            const juce::File f (path);
+            if (! f.existsAsFile()) continue;
+
+            const bool ok = owner.importAudioFileToLane (f, laneIdx, cursor);
+            if (! ok) continue;
+
+            /* First file may have created the lane; subsequent files
+             * append into the same lane.  Lookup by file path is
+             * fragile; the simplest re-target is "the last lane in
+             * the array" since createEmptyAudioLane appends. */
+            if (laneIdx < 0)
+                laneIdx = owner.lanes_.size() - 1;
+
+            /* Walk past the just-appended region for the next file.
+             * Each Region's lengthBeats was computed from file
+             * duration + session bpm. */
+            if (laneIdx >= 0 && laneIdx < owner.lanes_.size())
+            {
+                const auto& regs = owner.lanes_.getReference (laneIdx).playlist.regions();
+                if (! regs.empty())
+                    cursor = regs.back().endBeats();
+            }
+        }
+    }
+
+    //==========================================================================
+    // Mouse interaction
 
     void mouseDown (const MouseEvent& e) override
     {
@@ -57,36 +205,55 @@ public:
         if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
         auto& lane    = owner.lanes_.getReference (laneIdx);
         auto& runtime = owner.laneRuntime_.getReference (laneIdx);
-        if (e.x < kLabelW || runtime.trackerCache == nullptr) return;
+
+        /* Click on the label column = arm toggle for audio lanes;
+         * no-op for tracker lanes (tracker arming is a Phase 4 item). */
+        if (e.x < kLabelW)
+        {
+            if (runtime.isAudioLane() && armToggleRect (laneIdx).contains (e.x, e.y))
+            {
+                lane.armed = ! lane.armed;
+                runtime.audioClipCache->setArmed (lane.armed);
+                owner.writeLanesToSession();
+                repaintLane (laneIdx);
+            }
+            return;
+        }
+
+        /* Orphan lanes don't dispatch. */
+        if (runtime.isOrphan()) return;
 
         const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
         const auto& regions = lane.playlist.regions();
         for (const auto& r : regions)
         {
-            if (r.containsBeat (beat))
+            if (! r.containsBeat (beat)) continue;
+
+            if (runtime.isTrackerLane() && r.sequenceIdx >= 0)
             {
-                /* Click-launch routes through the same audio-thread FIFO
-                 * the timer-driven dispatch uses (Phase 2 -- see
-                 * timeline-audio-design.md Section 2.3 + the precedent
-                 * SessionView already proved at tracker.hpp:197-223).
-                 * Manual click = treat as immediate (beatTarget = -1). */
-                if (r.sequenceIdx >= 0)
-                {
-                    if (runtime.lastDispatchedSeqIdx >= 0
-                        && runtime.lastDispatchedSeqIdx != r.sequenceIdx)
-                        runtime.trackerCache->schedulePlaying (
-                            runtime.lastDispatchedSeqIdx, -1.0, false);
-                    runtime.trackerCache->schedulePlaying (r.sequenceIdx, -1.0, true);
-                }
-                runtime.lastDispatchedRegion  = r.id;
-                runtime.lastDispatchedSeqIdx  = r.sequenceIdx;
-                repaintLane (laneIdx);
-                return;
+                if (runtime.lastDispatchedSeqIdx >= 0
+                    && runtime.lastDispatchedSeqIdx != r.sequenceIdx)
+                    runtime.trackerCache->schedulePlaying (
+                        runtime.lastDispatchedSeqIdx, -1.0, false);
+                runtime.trackerCache->schedulePlaying (r.sequenceIdx, -1.0, true);
             }
+            else if (runtime.isAudioLane())
+            {
+                /* Audio click-launch = immediate.  beatTarget=-1
+                 * fires on the next render block. */
+                runtime.audioClipCache->schedulePlay (
+                    r.id, r.sourceId, -1.0, 0 /*sampleOffset*/);
+            }
+            runtime.lastDispatchedRegion  = r.id;
+            runtime.lastDispatchedSeqIdx  = r.sequenceIdx;
+            repaintLane (laneIdx);
+            return;
         }
     }
 
-    /** Recompute size based on current lanes_ + longest region strip. */
+    //==========================================================================
+    // Layout helpers
+
     void resizeForLanes()
     {
         int maxBeats = 32;
@@ -106,7 +273,6 @@ public:
             repaint();
     }
 
-    /** Partial repaint of a single lane + playhead vertical sweep. */
     void repaintLane (int idx)
     {
         if (idx < 0) { repaint(); return; }
@@ -128,6 +294,18 @@ public:
     static constexpr int kPxPerBeat = 24;
 
 private:
+    /** Bounding box of the arm-toggle dot within a lane's label area.
+     *  Small square in the top-right corner; used by mouseDown to
+     *  detect clicks. */
+    Rectangle<int> armToggleRect (int laneIdx) const noexcept
+    {
+        constexpr int sz   = 12;
+        constexpr int pad  = 6;
+        const int y = laneIdx * kLaneH + pad;
+        const int x = kLabelW - sz - pad;
+        return Rectangle<int> (x, y, sz, sz);
+    }
+
     void paintLane (Graphics& g, int laneIdx)
     {
         const auto& lane    = owner.lanes_.getReference (laneIdx);
@@ -140,18 +318,35 @@ private:
                          : Colors::widgetBackgroundColor.darker (0.25f));
         g.fillRect (bounds);
 
-        /* Label column.  Orphaned lanes (target tracker missing) paint
-         * dimmed so the user can tell they don't dispatch. */
         const Rectangle<int> labelArea (0, y, kLabelW, kLaneH);
         g.setColour (Colors::widgetBackgroundColor.darker (0.6f));
         g.fillRect (labelArea);
-        const bool orphaned = (runtime.trackerCache == nullptr);
-        g.setColour (orphaned ? Colors::textColor.withAlpha (0.45f)
-                              : Colors::textColor);
+
+        const bool orphan = runtime.isOrphan();
+        const bool isAudio = runtime.isAudioLane();
+
+        /* Lane name + (orphan) / [audio] tags. */
+        g.setColour (orphan ? Colors::textColor.withAlpha (0.45f)
+                            : Colors::textColor);
         g.setFont (juce::FontOptions (12.0f));
-        const juce::String label = orphaned ? (lane.name + " (orphan)") : lane.name;
+        juce::String label = lane.name.isNotEmpty()
+                                ? lane.name
+                                : (isAudio ? juce::String ("Audio") : juce::String ("Tracker"));
+        if (orphan) label += " (orphan)";
         g.drawText (label, labelArea.reduced (8, 0),
                     juce::Justification::centredLeft, true);
+
+        /* Arm toggle (audio lanes only). */
+        if (isAudio)
+        {
+            const auto rect = armToggleRect (laneIdx);
+            g.setColour (lane.armed ? Colour::fromRGB (220, 70, 70)
+                                    : Colour::fromRGB (60, 60, 60));
+            g.fillRect (rect);
+            g.setColour (lane.armed ? Colour::fromRGB (255, 120, 120)
+                                    : Colour::fromRGB (90, 90, 90));
+            g.drawRect (rect, 1);
+        }
 
         /* Strip background + beat grid. */
         const Rectangle<int> stripArea (kLabelW, y, getWidth() - kLabelW, kLaneH);
@@ -164,36 +359,48 @@ private:
                                 (float) stripArea.getY(),
                                 (float) stripArea.getBottom());
 
-        /* Regions. */
+        /* Regions.  Color scheme branches on lane kind:
+         *   Tracker idle  = blue (90, 130, 170)
+         *   Tracker active= orange (220, 140, 60)
+         *   Audio idle    = green (90, 170, 130)
+         *   Audio active  = cyan (60, 180, 200)
+         *   Orphan        = desaturated darker
+         */
         for (const auto& r : lane.playlist.regions())
         {
             const int xs = stripArea.getX() + (int) (r.positionBeats * kPxPerBeat);
             const int ws = juce::jmax (4, (int) (r.lengthBeats * kPxPerBeat));
-            Rectangle<int> rect (xs, stripArea.getY() + 4, ws, stripArea.getHeight() - 8);
+            Rectangle<int> rect (xs, stripArea.getY() + 4,
+                                 ws, stripArea.getHeight() - 8);
 
             const bool active = (r.id == runtime.lastDispatchedRegion);
-            Colour fill = active ? Colour::fromRGB (220, 140, 60)
-                                 : Colour::fromRGB (90, 130, 170);
-            if (orphaned) fill = fill.withMultipliedSaturation (0.3f)
-                                     .withMultipliedBrightness (0.6f);
+            Colour fill;
+            if (isAudio)
+                fill = active ? Colour::fromRGB ( 60, 180, 200)
+                              : Colour::fromRGB ( 90, 170, 130);
+            else
+                fill = active ? Colour::fromRGB (220, 140,  60)
+                              : Colour::fromRGB ( 90, 130, 170);
+
+            if (orphan)
+                fill = fill.withMultipliedSaturation (0.3f)
+                           .withMultipliedBrightness (0.6f);
+
             g.setColour (fill);
             g.fillRect (rect);
             g.setColour (fill.brighter (0.4f));
             g.drawRect (rect, 1);
             g.setColour (Colours::white);
             g.setFont (juce::FontOptions (11.0f));
-            /* For tracker regions the meaningful display is the
-             * sequence index ("P0", "P1", ...).  Audio regions
-             * (Phase 3+) will use r.name. */
+
             const juce::String tag = r.sequenceIdx >= 0
                                         ? "P" + String (r.sequenceIdx)
-                                        : (r.name.isNotEmpty() ? r.name
-                                                               : String ("Audio"));
+                                        : (r.name.isNotEmpty() ? r.name : String ("Audio"));
             g.drawText (tag, rect.reduced (4, 0),
                         juce::Justification::centredLeft, true);
         }
 
-        /* Playhead overlay -- single thin vertical line. */
+        /* Playhead overlay. */
         const double phb = owner.lastBeat_;
         const int phx = stripArea.getX() + (int) (phb * kPxPerBeat);
         if (phx >= stripArea.getX() && phx < stripArea.getRight())
@@ -206,6 +413,10 @@ private:
     }
 
     ArrangementView& owner;
+
+    /* Drop hover state for visual feedback during external file drag. */
+    bool dropHover_         = false;
+    int  dropHoverLaneIdx_  = -1;
 };
 
 /* ===================================================================== */
@@ -215,6 +426,8 @@ ArrangementView::ArrangementView()
     setName (EL_VIEW_ARRANGEMENT);
 
     addAndMakeVisible (rescanBtn_);
+    addAndMakeVisible (addAudioBtn_);
+    addAndMakeVisible (loadAudioBtn_);
     addAndMakeVisible (posLabel_);
     addAndMakeVisible (bpmLabel_);
     addAndMakeVisible (viewport_);
@@ -228,13 +441,23 @@ ArrangementView::ArrangementView()
     bpmLabel_.setText ("BPM: 120.0", juce::dontSendNotification);
     bpmLabel_.setColour (juce::Label::textColourId, Colors::textColor);
 
-    rescanBtn_.onClick = [this]() { rescanTrackers(); };
+    rescanBtn_.onClick    = [this]() { rescanLaneTargets(); };
+    addAudioBtn_.onClick  = [this]() { createEmptyAudioLane (true /*stereo*/); };
+    loadAudioBtn_.onClick = [this]() { promptLoadAudioFile(); };
 }
 
 ArrangementView::~ArrangementView()
 {
     stopTimer();
     detachFromActiveGraph();
+
+    /* Drop record-committed handlers so AudioClipNodes don't try to
+     * invoke us during teardown.  Bound lambdas captured `this`; the
+     * AudioClipNode instances outlive the ArrangementView while the
+     * graph is being torn down. */
+    for (auto& rs : laneRuntime_)
+        if (rs.audioClipCache != nullptr)
+            rs.audioClipCache->setRecordingCommittedHandler (nullptr);
 }
 
 void ArrangementView::initializeView (Services& s)
@@ -247,7 +470,7 @@ void ArrangementView::initializeView (Services& s)
 void ArrangementView::didBecomeActive()
 {
     attachToActiveGraph();
-    rescanTrackers();
+    rescanLaneTargets();
     startTimerHz (30);
 }
 
@@ -260,7 +483,7 @@ void ArrangementView::willBeRemoved()
 void ArrangementView::stabilizeContent()
 {
     attachToActiveGraph();
-    rescanTrackers();
+    rescanLaneTargets();
 }
 
 void ArrangementView::attachToActiveGraph()
@@ -289,26 +512,117 @@ void ArrangementView::detachFromActiveGraph()
 void ArrangementView::valueTreeChildAdded (juce::ValueTree&, juce::ValueTree& child)
 {
     if (child.hasType (types::Node) || child.hasType (tags::nodes))
-        rescanTrackers();
+        rescanLaneTargets();
 }
 
 void ArrangementView::valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree& child, int)
 {
     if (child.hasType (types::Node) || child.hasType (tags::nodes))
-        rescanTrackers();
+        rescanLaneTargets();
 }
 
 void ArrangementView::resized()
 {
-    /* Transport (play/stop/record) lives in the global top toolbar —
-     * don't duplicate it here.  Tight tracker-toolbar-style spacing. */
     auto r = getLocalBounds();
     auto top = r.removeFromTop (kHeaderH).reduced (4, 4);
-    rescanBtn_.setBounds (top.removeFromLeft (56)); top.removeFromLeft (10);
-    bpmLabel_ .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
-    posLabel_ .setBounds (top.removeFromLeft (96));
+    rescanBtn_    .setBounds (top.removeFromLeft (56)); top.removeFromLeft (6);
+    addAudioBtn_  .setBounds (top.removeFromLeft (72)); top.removeFromLeft (6);
+    loadAudioBtn_ .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
+    bpmLabel_     .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
+    posLabel_     .setBounds (top.removeFromLeft (96));
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
+}
+
+/* =====================================================================
+ * Outer FileDragAndDropTarget on the ContentView itself.  Belt-and-
+ * suspenders alongside Body's same interface (Body lives inside a
+ * Viewport which can rarely swallow X11 XDND routing in some peer
+ * configurations).
+ * ===================================================================== */
+
+bool ArrangementView::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    const bool interested = anyAudioFileIn (files);
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView] isInterestedInFileDrag count=")
+        + juce::String (files.size())
+        + (interested ? " ACCEPT" : " REJECT"));
+    return interested;
+}
+
+void ArrangementView::fileDragEnter (const juce::StringArray& files, int x, int y)
+{
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView] fileDragEnter x=") + juce::String (x)
+        + " y=" + juce::String (y)
+        + " count=" + juce::String (files.size()));
+}
+
+void ArrangementView::fileDragExit (const juce::StringArray&)
+{
+    juce::Logger::writeToLog ("[ArrangementView] fileDragExit");
+}
+
+void ArrangementView::filesDropped (const juce::StringArray& files, int x, int y)
+{
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView] filesDropped x=") + juce::String (x)
+        + " y=" + juce::String (y)
+        + " count=" + juce::String (files.size()));
+
+    /* Translate ArrangementView-local coords to Body-local coords:
+     * subtract header height + add viewport scroll offset.  body_'s
+     * (0,0) is at the top of the lanes area. */
+    if (body_ == nullptr) return;
+
+    const int bodyY = (y - kHeaderH) + viewport_.getViewPositionY();
+    const int bodyX =  x              + viewport_.getViewPositionX();
+
+    const int laneIdx = laneIdxFromY (bodyY);
+    const double dropBeats =
+        juce::jmax (0.0, (double) (bodyX - kLabelW) / (double) kPxPerBeat);
+
+    int targetLane = laneIdx;
+    if (targetLane >= 0 && targetLane < lanes_.size())
+    {
+        const auto& runtime = laneRuntime_.getReference (targetLane);
+        if (! runtime.isAudioLane())
+            targetLane = -1;   // tracker lane -> create new audio
+    }
+    else
+    {
+        targetLane = -1;       // empty area -> create new audio
+    }
+
+    double cursor = dropBeats;
+    for (const auto& path : files)
+    {
+        const juce::File f (path);
+        if (! f.existsAsFile())
+        {
+            juce::Logger::writeToLog (
+                juce::String ("[ArrangementView] skipping non-existent file: ") + path);
+            continue;
+        }
+
+        const bool ok = importAudioFileToLane (f, targetLane, cursor);
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView] importAudioFileToLane(")
+            + f.getFileName() + ", " + juce::String (targetLane) + ", "
+            + juce::String (cursor, 2) + ") = " + (ok ? "OK" : "FAIL"));
+        if (! ok) continue;
+
+        if (targetLane < 0)
+            targetLane = lanes_.size() - 1;
+
+        if (targetLane >= 0 && targetLane < lanes_.size())
+        {
+            const auto& regs = lanes_.getReference (targetLane).playlist.regions();
+            if (! regs.empty())
+                cursor = regs.back().endBeats();
+        }
+    }
 }
 
 void ArrangementView::paint (Graphics& g)
@@ -321,12 +635,14 @@ void ArrangementView::paint (Graphics& g)
 /* ===================================================================== */
 
 namespace {
-/** Recursive: append (Node, TrackerNode*) pairs for every TrackerNode
- *  reachable from `graph` (including subgraphs).  Used to seed lanes
- *  for trackers the user adds. */
-void collectTrackersFromGraph (const Node& graph,
-                                juce::Array<Node>&         outNodes,
-                                juce::Array<TrackerNode*>& outProcs)
+
+/** Recursive: collects every TrackerNode AND AudioClipNode reachable
+ *  from `graph`, including subgraphs.  Used to seed / rebind lanes
+ *  against the live graph. */
+void collectLaneTargetsFromGraph (const Node& graph,
+                                  juce::Array<Node>&           outNodes,
+                                  juce::Array<TrackerNode*>&   outTrackers,
+                                  juce::Array<AudioClipNode*>& outAudioClips)
 {
     const int n = graph.getNumNodes();
     for (int i = 0; i < n; ++i)
@@ -338,17 +654,23 @@ void collectTrackersFromGraph (const Node& graph,
             if (auto* t = dynamic_cast<TrackerNode*> (proc))
             {
                 outNodes.add (child);
-                outProcs.add (t);
+                outTrackers.add (t);
+                outAudioClips.add (nullptr);
+                continue;
+            }
+            if (auto* a = dynamic_cast<AudioClipNode*> (proc))
+            {
+                outNodes.add (child);
+                outTrackers.add (nullptr);
+                outAudioClips.add (a);
                 continue;
             }
         }
         if (child.isGraph())
-            collectTrackersFromGraph (child, outNodes, outProcs);
+            collectLaneTargetsFromGraph (child, outNodes, outTrackers, outAudioClips);
     }
 }
 
-/** Recursive: find the first node with `targetUuid`.  Returns
- *  default Node() on miss.  O(graph size); cheap. */
 Node findNodeByUuid (const Node& graph, juce::Uuid target)
 {
     const int n = graph.getNumNodes();
@@ -365,6 +687,7 @@ Node findNodeByUuid (const Node& graph, juce::Uuid target)
     }
     return Node();
 }
+
 } // namespace
 
 TrackerNode* ArrangementView::resolveTrackerByUuid (juce::Uuid targetNodeUuid) const
@@ -380,13 +703,30 @@ TrackerNode* ArrangementView::resolveTrackerByUuid (juce::Uuid targetNodeUuid) c
     return dynamic_cast<TrackerNode*> (target.getObject());
 }
 
+AudioClipNode* ArrangementView::resolveAudioClipByUuid (juce::Uuid targetNodeUuid) const
+{
+    if (services_ == nullptr) return nullptr;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return nullptr;
+    const Node active = sess->getActiveGraph();
+    if (! active.isValid()) return nullptr;
+
+    const Node target = findNodeByUuid (active, targetNodeUuid);
+    if (! target.isValid()) return nullptr;
+
+    /* Two-step unwrap: AudioClipNode is a juce::AudioPluginInstance,
+     * so Element wraps it in an AudioProcessorNode (element::Processor).
+     * Node::getObject() returns the wrapper -- we have to go through
+     * its getAudioProcessor() to reach the underlying AudioClipNode.
+     * (TrackerNode IS an element::Processor directly, so the
+     * resolveTrackerByUuid path doesn't need this dance.) */
+    auto* proc = target.getObject();
+    if (proc == nullptr) return nullptr;
+    return dynamic_cast<AudioClipNode*> (proc->getAudioProcessor());
+}
+
 void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)
 {
-    /* One Region per existing sequence, 4 beats each, end-to-end.
-     * Same shape as the v0 auto-fill but expressed via the shared
-     * Region model.  sourceId = tracker's uuid (so resolvers can
-     * map back to the owning TrackerNode); sequenceIdx is the
-     * canonical "which pattern" pointer. */
     if (trk == nullptr) return;
     const int numPatterns = trk->numPatterns();
     double cursor = 0.0;
@@ -404,35 +744,37 @@ void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)
     }
 }
 
-void ArrangementView::rescanTrackers()
+void ArrangementView::rescanLaneTargets()
 {
-    /* First-ever activation: pull persisted lanes off the session.
-     * Empty result is the normal case for pre-Phase-1e sessions --
-     * graph-walk auto-fill below fills in defaults for any tracker
-     * that doesn't yet have a lane. */
     if (! lanesLoadedFromSession_)
     {
         loadLanesFromSession();
         lanesLoadedFromSession_ = true;
     }
 
-    /* Collect current trackers + decide which need a new lane.
-     * Lanes already pointing at an existing tracker stay put. */
-    juce::Array<Node>           foundNodes;
-    juce::Array<TrackerNode*>   foundProcs;
+    juce::Array<Node>            foundNodes;
+    juce::Array<TrackerNode*>    foundTrackers;
+    juce::Array<AudioClipNode*>  foundAudioClips;
+
     if (services_ != nullptr)
     {
         if (auto sess = services_->context().session())
         {
             const Node active = sess->getActiveGraph();
             if (active.isValid())
-                collectTrackersFromGraph (active, foundNodes, foundProcs);
+                collectLaneTargetsFromGraph (active, foundNodes,
+                                              foundTrackers, foundAudioClips);
         }
     }
 
+    /* Auto-fill: tracker nodes get a default lane on first discovery.
+     * AudioClipNodes do NOT auto-fill -- they're created explicitly
+     * via "+ Audio Track" or file drop, both of which create the lane
+     * inline. */
     bool mutated = false;
     for (int i = 0; i < foundNodes.size(); ++i)
     {
+        if (foundTrackers[i] == nullptr) continue;   // skip audio clips here
         const juce::Uuid uuid = foundNodes.getReference (i).getUuid();
         bool alreadyBound = false;
         for (const auto& l : lanes_)
@@ -445,20 +787,111 @@ void ArrangementView::rescanTrackers()
         lane.name           = foundNodes.getReference (i).getName().isNotEmpty()
                                 ? foundNodes.getReference (i).getName()
                                 : juce::String ("Tracker");
-        autoFillLaneForTracker (lane, foundProcs[i]);
+        autoFillLaneForTracker (lane, foundTrackers[i]);
         lanes_.add (std::move (lane));
         mutated = true;
     }
 
-    /* Resync the parallel runtime-state array + resolve each lane's
-     * TrackerNode* cache via uuid lookup.  Cheap O(lanes * graph
-     * size); runs on graph topology change, not per render block. */
+    /* Rebuild runtime state in lockstep.  For each persisted lane,
+     * resolve which kind of node it binds to + wire up the
+     * AudioLaneAdapter / record commit handler if applicable. */
     laneRuntime_.clearQuick();
-    for (const auto& l : lanes_)
+    laneRuntime_.ensureStorageAllocated (lanes_.size());
+    for (int i = 0; i < lanes_.size(); ++i)
     {
+        const auto& l = lanes_.getReference (i);
         LaneRuntimeState s;
-        s.trackerCache = resolveTrackerByUuid (l.targetNodeUuid);
-        laneRuntime_.add (s);
+        s.trackerCache   = resolveTrackerByUuid (l.targetNodeUuid);
+        s.audioClipCache = (s.trackerCache != nullptr)
+                              ? nullptr
+                              : resolveAudioClipByUuid (l.targetNodeUuid);
+
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::rescanLaneTargets] lane[")
+            + juce::String (i) + "] name=" + l.name
+            + " targetUuid=" + l.targetNodeUuid.toString()
+            + " tracker=" + (s.trackerCache   ? "yes" : "no")
+            + " audio="   + (s.audioClipCache ? "yes" : "no"));
+
+        if (s.audioClipCache != nullptr)
+        {
+            s.audioAdapter.setTargetNode (s.audioClipCache);
+
+            /* Propagate persisted Lane.armed onto the freshly-bound
+             * node so re-opening a session restores arm state. */
+            s.audioClipCache->setArmed (l.armed);
+
+            /* Capture lane id by value (survives lane-index shifts)
+             * and the ArrangementView via Component::SafePointer so
+             * the lambda is safe to invoke after this view has been
+             * destroyed (graph-teardown race: AudioClipNode's Timer
+             * may fire after the view is already gone). */
+            const juce::Uuid laneId = l.id;
+            juce::Component::SafePointer<ArrangementView> safe (this);
+            s.audioClipCache->setRecordingCommittedHandler (
+                [safe, laneId] (const juce::File& file)
+                {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr) return;
+
+                    /* Resolve lane by id (linear scan).  If user
+                     * deleted the lane mid-capture, drop the file
+                     * silently -- the .wav stays on disk for
+                     * recovery but no Region is created. */
+                    int idx = -1;
+                    for (int k = 0; k < self->lanes_.size(); ++k)
+                        if (self->lanes_.getReference (k).id == laneId) { idx = k; break; }
+                    if (idx < 0) return;
+
+                    auto src = SourceRegistry::get().importFromFile (file);
+                    if (src == nullptr) return;
+
+                    auto& lane = self->lanes_.getReference (idx);
+
+                    /* Append a Region at the end of the existing
+                     * playlist.  positionBeats = max region endBeats,
+                     * or 0 if empty.  lengthBeats derived from file
+                     * duration + session bpm; defaults to 120 bpm
+                     * when no monitor is available. */
+                    double position = 0.0;
+                    for (const auto& r : lane.playlist.regions())
+                        position = juce::jmax (position, r.endBeats());
+
+                    const double bpm = self->monitor_ != nullptr
+                                          ? (double) self->monitor_->tempo.get()
+                                          : 120.0;
+                    const double lengthSeconds = src->sourceSampleRate() > 0
+                        ? (double) src->durationSamples() / (double) src->sourceSampleRate()
+                        : 0.0;
+                    const double lengthBeats = juce::jmax (
+                        0.25,
+                        lengthSeconds * (bpm / 60.0));
+
+                    Region r;
+                    r.id            = juce::Uuid();
+                    r.sourceId      = src->uuid();
+                    r.positionBeats = position;
+                    r.lengthBeats   = lengthBeats;
+                    r.name          = file.getFileNameWithoutExtension();
+                    r.colour        = juce::Colour::fromRGB (90, 170, 130);
+                    lane.playlist.addRegion (std::move (r));
+
+                    self->writeLanesToSession();
+                    if (self->body_ != nullptr)
+                    {
+                        self->body_->resizeForLanes();
+                        self->body_->repaintLane (idx);
+                    }
+                });
+        }
+        else if (s.trackerCache == nullptr)
+        {
+            /* Orphan lane: defensively detach any previous adapter
+             * binding so dispatch silently skips. */
+            s.audioAdapter.setTargetNode (nullptr);
+        }
+
+        laneRuntime_.add (std::move (s));
     }
 
     if (mutated) writeLanesToSession();
@@ -493,9 +926,6 @@ void ArrangementView::writeLanesToSession()
 
     auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
     auto lanesTree = tree.getOrCreateChildWithName ("lanes", nullptr);
-    /* Rebuild from scratch -- simpler than diff-edit + only runs on
-     * mutation, not per frame.  No undo support yet (Phase 1e ships
-     * read+auto-fill+persist; authoring + undo come later). */
     lanesTree.removeAllChildren (nullptr);
     for (const auto& l : lanes_)
         lanesTree.appendChild (l.toValueTree(), nullptr);
@@ -509,43 +939,227 @@ double ArrangementView::computePlayheadBeats() const
 
 void ArrangementView::dispatchAtBeat (double beat)
 {
-    /* Phase 2: launches route through TrackerNode's audio-thread SPSC
-     * FIFO (schedulePlaying) instead of the message-thread
-     * pending_pattern_jump path (advanceToPattern).  Detection still
-     * runs on the 30 Hz UI timer; the actual sequence flip is
-     * audio-thread + sample-accurate within one render block (~5-10 ms).
-     *
-     * Per-lane idempotency: lastDispatchedRegion gates re-fires;
-     * lastDispatchedSeqIdx tracks "what's currently playing so we
-     * can stop it at the next region boundary."  Same-sequence
-     * transitions (region B reuses region A's pattern) write a
-     * stop+start to the FIFO; the per-sequence latest-wins drain
-     * collapses these into a single keep-playing entry, so no
-     * audible glitch.
-     *
-     * Orphaned lanes (trackerCache == nullptr) skip silently. */
     for (int laneIdx = 0; laneIdx < lanes_.size(); ++laneIdx)
     {
         const auto& lane    = lanes_.getReference (laneIdx);
         auto&       runtime = laneRuntime_.getReference (laneIdx);
-        if (runtime.trackerCache == nullptr) continue;
+        if (runtime.isOrphan()) continue;
 
         const Region* active = lane.playlist.regionAt (beat);
         if (active == nullptr) continue;
         if (active->id == runtime.lastDispatchedRegion) continue;
 
-        if (active->sequenceIdx >= 0)
+        if (runtime.isTrackerLane())
         {
-            if (runtime.lastDispatchedSeqIdx >= 0
-                && runtime.lastDispatchedSeqIdx != active->sequenceIdx)
-                runtime.trackerCache->schedulePlaying (
-                    runtime.lastDispatchedSeqIdx, -1.0, false);
-            runtime.trackerCache->schedulePlaying (active->sequenceIdx, -1.0, true);
+            if (active->sequenceIdx >= 0)
+            {
+                if (runtime.lastDispatchedSeqIdx >= 0
+                    && runtime.lastDispatchedSeqIdx != active->sequenceIdx)
+                    runtime.trackerCache->schedulePlaying (
+                        runtime.lastDispatchedSeqIdx, -1.0, false);
+                runtime.trackerCache->schedulePlaying (active->sequenceIdx, -1.0, true);
+            }
         }
+        else if (runtime.isAudioLane())
+        {
+            runtime.audioClipCache->schedulePlay (
+                active->id, active->sourceId, -1.0, 0 /*sampleOffset*/);
+        }
+
         runtime.lastDispatchedRegion = active->id;
         runtime.lastDispatchedSeqIdx = active->sequenceIdx;
         if (body_ != nullptr) body_->repaintLane (laneIdx);
     }
+}
+
+void ArrangementView::stopAllAudioLanes()
+{
+    for (auto& rs : laneRuntime_)
+        if (rs.isAudioLane())
+            rs.audioClipCache->scheduleStop (juce::Uuid::null(), -1.0);
+}
+
+int ArrangementView::createEmptyAudioLane (bool stereo)
+{
+    if (services_ == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyAudioLane] services_ null");
+        return -1;
+    }
+    auto sess = services_->context().session();
+    if (sess == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyAudioLane] session null");
+        return -1;
+    }
+    auto* engineService = services_->find<EngineService>();
+    if (engineService == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyAudioLane] EngineService null");
+        return -1;
+    }
+
+    Node subgraph = ArrangementTracksService::findOrCreateSubgraph (*engineService, *sess);
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView::createEmptyAudioLane] subgraph valid=")
+        + (subgraph.isValid() ? "yes" : "no")
+        + " isGraph=" + (subgraph.isValid() && subgraph.isGraph() ? "yes" : "no")
+        + " uuid=" + (subgraph.isValid() ? subgraph.getUuid().toString() : juce::String ("(none)"))
+        + " numChildren=" + juce::String (subgraph.isValid() ? subgraph.getNumNodes() : 0));
+    if (! subgraph.isValid()) return -1;
+
+    Node clip = ArrangementTracksService::addAudioClipNode (*engineService, subgraph, stereo);
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView::createEmptyAudioLane] clip valid=")
+        + (clip.isValid() ? "yes" : "no")
+        + " uuid=" + (clip.isValid() ? clip.getUuid().toString() : juce::String ("(none)"))
+        + " name=" + (clip.isValid() ? clip.getName() : juce::String ("(none)"))
+        + " parentIsGraph=" + (clip.isValid() ? clip.getParentGraph().getUuid().toString() : juce::String ("(none)")));
+    if (! clip.isValid()) return -1;
+
+    Lane lane;
+    lane.id             = juce::Uuid();
+    lane.targetNodeUuid = clip.getUuid();
+    lane.name           = juce::String ("Audio ") + juce::String (lanes_.size() + 1);
+    lane.colour         = juce::Colour::fromRGB (90, 170, 130);
+    lanes_.add (std::move (lane));
+
+    rescanLaneTargets();   // resolves the new lane's audioClipCache
+    writeLanesToSession();
+    if (body_ != nullptr) body_->resizeForLanes();
+    return lanes_.size() - 1;
+}
+
+bool ArrangementView::importAudioFileToLane (const juce::File& file,
+                                             int               laneIdx,
+                                             double            positionBeats)
+{
+    if (! file.existsAsFile())
+        return false;
+
+    auto src = SourceRegistry::get().importFromFile (file);
+    if (src == nullptr) return false;
+
+    /* Create lane if requested.  -1 = always create new. */
+    if (laneIdx < 0 || laneIdx >= lanes_.size())
+    {
+        const int newIdx = createEmptyAudioLane (true /*stereo*/);
+        if (newIdx < 0)
+            return false;
+        laneIdx = newIdx;
+    }
+    else
+    {
+        const auto& runtime = laneRuntime_.getReference (laneIdx);
+        if (! runtime.isAudioLane())
+            return false;
+    }
+
+    auto& lane = lanes_.getReference (laneIdx);
+
+    /* Compute lengthBeats from file duration + current session bpm. */
+    const double bpm = monitor_ != nullptr
+                          ? (double) monitor_->tempo.get()
+                          : 120.0;
+    const double lengthSeconds = src->sourceSampleRate() > 0
+        ? (double) src->durationSamples() / (double) src->sourceSampleRate()
+        : 0.0;
+    const double lengthBeats = juce::jmax (
+        0.25,
+        lengthSeconds * (bpm / 60.0));
+
+    Region r;
+    r.id            = juce::Uuid();
+    r.sourceId      = src->uuid();
+    r.positionBeats = juce::jmax (0.0, positionBeats);
+    r.lengthBeats   = lengthBeats;
+    r.name          = file.getFileNameWithoutExtension();
+    r.colour        = juce::Colour::fromRGB (90, 170, 130);
+
+    if (! lane.playlist.addRegion (Region (r)))
+    {
+        /* Overlap rejected; nudge to next free spot beyond the last
+         * region's end. */
+        double cursor = 0.0;
+        for (const auto& existing : lane.playlist.regions())
+            cursor = juce::jmax (cursor, existing.endBeats());
+        r.positionBeats = cursor;
+        if (! lane.playlist.addRegion (Region (r)))
+            return false;   // shouldn't happen; defensive
+    }
+
+    /* Fire immediately so the user gets audible confirmation.
+     * Subsequent transport playback will re-dispatch at the region
+     * boundary. */
+    auto& runtime = laneRuntime_.getReference (laneIdx);
+    if (runtime.isAudioLane())
+        runtime.audioClipCache->schedulePlay (
+            r.id, r.sourceId, -1.0, 0);
+
+    writeLanesToSession();
+    if (body_ != nullptr)
+    {
+        body_->resizeForLanes();
+        body_->repaintLane (laneIdx);
+    }
+    return true;
+}
+
+void ArrangementView::promptLoadAudioFile()
+{
+    /* The DiskOp Request pattern navigates to the Disk Op page via
+     * setMainView, which DESTROYS the previous ContentView (i.e.
+     * THIS ArrangementView; see standard.cpp:181 primary.reset).
+     * So the onAccept callback fires AFTER this view is gone --
+     * we cannot capture `this` or even SafePointer<ArrangementView>
+     * and expect to do work on it.
+     *
+     * Capture Services* instead (lifetime-stable; lives in Element's
+     * Context) and route through the view-independent helper
+     * ArrangementTracksService::importAudioFileAsNewLane.  That
+     * helper writes the new Lane + Region directly into the
+     * session's tags::arrangement/lanes ValueTree; the next time
+     * ArrangementView opens (or didBecomeActive is called), its
+     * loadLanesFromSession picks the lane up. */
+    if (services_ == nullptr) return;
+    auto* gui = services_->find<GuiService>();
+    if (gui == nullptr) return;
+
+    Services* svc = services_;
+    const juce::String wildcard ("*.wav;*.aiff;*.aif;*.flac;*.ogg;*.mp3;*.w64;*.au");
+    const juce::File start = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
+
+    juce::Logger::writeToLog ("[ArrangementView::promptLoadAudioFile] arming Disk Op Request");
+
+    gui->requestFile (
+        "Load audio file into arrangement",
+        wildcard,
+        start,
+        juce::String() /*initialFilename*/,
+        false /*isSave*/,
+        [svc] (const juce::File& file)
+        {
+            juce::Logger::writeToLog (
+                juce::String ("[ArrangementView::promptLoadAudioFile] callback fired: ")
+                + file.getFullPathName());
+
+            if (svc == nullptr) return;
+            if (! file.existsAsFile())
+            {
+                juce::Logger::writeToLog (" -> chosen file does not exist; abort");
+                return;
+            }
+            ArrangementTracksService::importAudioFileAsNewLane (file, *svc);
+        },
+        nullptr /*onCancel*/);
+}
+
+int ArrangementView::laneIdxFromY (int yPx) const noexcept
+{
+    if (yPx < 0) return -1;
+    const int idx = yPx / kLaneH;
+    if (idx < 0 || idx >= lanes_.size()) return -1;
+    return idx;
 }
 
 void ArrangementView::updateTransportLabel()
@@ -570,12 +1184,10 @@ void ArrangementView::timerCallback()
     if (monitor_ == nullptr) return;
 
     const bool playing = monitor_->playing.get();
-    const double beat = computePlayheadBeats();
+    const double beat  = computePlayheadBeats();
 
-    /* Transport start edge: clear the per-lane "last dispatched"
-     * gate so the first region under the playhead fires when
-     * playback resumes (otherwise it would be considered already
-     * dispatched from before the stop). */
+    /* Transport start edge: clear per-lane "last dispatched" so the
+     * first region under the playhead fires when playback resumes. */
     if (! wasPlaying_ && playing)
         for (auto& rs : laneRuntime_)
         {
@@ -583,19 +1195,26 @@ void ArrangementView::timerCallback()
             rs.lastDispatchedSeqIdx = -1;
         }
 
+    /* Transport stop edge: silence audio lanes so playback halts on
+     * stop.  Tracker lanes don't get an explicit stop here -- their
+     * sequences carry "playing" state in vht state and stop on next
+     * launch start.  DAW convention is audio stops with transport. */
+    if (wasPlaying_ && ! playing)
+        stopAllAudioLanes();
+
     if (playing) dispatchAtBeat (beat);
 
-    /* Partial repaint of the playhead sweep — only the old + new vertical
-     * line columns, not the whole view. */
     if (body_ != nullptr && (playing || wasPlaying_ != playing))
     {
-        const int oldPxX = (lastBeat_ > -0.001) ? Body::kLabelW + (int) (lastBeat_ * Body::kPxPerBeat) : -1;
+        const int oldPxX = (lastBeat_ > -0.001)
+                              ? Body::kLabelW + (int) (lastBeat_ * Body::kPxPerBeat)
+                              : -1;
         const int newPxX = Body::kLabelW + (int) (beat * Body::kPxPerBeat);
         if (oldPxX != newPxX || wasPlaying_ != playing)
             body_->repaintPlayhead (oldPxX, newPxX);
     }
 
-    lastBeat_ = beat;
+    lastBeat_   = beat;
     wasPlaying_ = playing;
     updateTransportLabel();
 }
