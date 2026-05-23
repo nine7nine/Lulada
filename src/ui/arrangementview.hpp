@@ -12,6 +12,8 @@
 
 #include "ui/blocktoolbutton.hpp"
 
+#include "services/timeline/lane.hpp"
+
 #define EL_VIEW_ARRANGEMENT "ArrangementView"
 
 namespace element {
@@ -21,14 +23,23 @@ class TrackerNode;
 /** Main-window arrangement view.
  *
  *  Multi-lane timeline where each lane is bound to one TrackerNode in
- *  the active graph.  Per lane, a sequence of pattern blocks is laid
- *  out left-to-right; on playback the view drives each tracker via
- *  direct C++ calls (TrackerNode::advanceToPattern) — no MIDI
- *  program-change plumbing.
+ *  the active graph via targetNodeUuid.  Per lane, a Playlist of
+ *  Regions is laid out left-to-right; on playback the view drives
+ *  each tracker via the audio-thread SPSC FIFO (TrackerNode::
+ *  schedulePlaying).  Detection runs on the 30 Hz UI timer; the
+ *  actual sequence flip is sample-accurate within one render block.
+ *  Same path SessionView clip-launch uses (timeline-audio-design.md
+ *  Section 2.3).
  *
- *  v0 surface (this commit): lanes are auto-populated with one block
- *  per pattern present in the tracker, in order.  Block authoring
- *  (drag / add / remove) lands in v1.
+ *  Phase 1e (this commit): refactored onto the shared
+ *  element::Lane / element::Playlist / element::Region data model
+ *  in src/services/timeline/.  Lanes persist into the session's
+ *  tags::arrangement child; pre-Phase-1e sessions (no persisted
+ *  lanes) fall back to graph-walk auto-fill.
+ *
+ *  Authoring (drag / add / remove regions) remains TODO; the view
+ *  currently auto-fills one Region per tracker pattern for any
+ *  newly-discovered tracker that has no persisted lane yet.
  */
 class ArrangementView : public ContentView,
                         private juce::Timer,
@@ -54,19 +65,13 @@ private:
     void valueTreeParentChanged (juce::ValueTree&) override {}
 
 private:
-    struct Block {
-        int   patternIdx { 0 };
-        double startBeat { 0.0 };
-        double lengthBeats { 4.0 };
-    };
-
-    struct Lane {
-        TrackerNode* tracker = nullptr;
-        juce::String name;
-        int numPatterns = 0;
-        int currentPattern = -1;
-        juce::Array<Block> blocks;
-        int lastDispatchedBlockIdx = -1;
+    /** Per-lane transient runtime state.  Held parallel to lanes_;
+     *  rebuilt on every graph reconciliation.  NOT persisted -- only
+     *  the data parts of element::Lane survive a save/load cycle. */
+    struct LaneRuntimeState {
+        TrackerNode* trackerCache         = nullptr;   // resolved from lane.targetNodeUuid
+        juce::Uuid   lastDispatchedRegion;             // gates idempotent dispatch
+        int          lastDispatchedSeqIdx = -1;        // for paint highlighting
     };
 
     /* Body: single inline-paint component holding all lanes (no per-
@@ -74,16 +79,43 @@ private:
     class Body;
     friend class Body;
 
+    /** Reconcile lanes_ against the current active graph + session
+     *  arrangement state.  Steps:
+     *   1. Load persisted lanes from tags::arrangement (first call).
+     *   2. For every TrackerNode in the graph not already bound to a
+     *      lane, append a new auto-filled lane.
+     *   3. Rebuild laneRuntime_ pointers via graph walk by uuid.
+     *  Idempotent; safe to call on graph-topology change. */
     void rescanTrackers();
     void attachToActiveGraph();
     void detachFromActiveGraph();
     void updateTransportLabel();
     double computePlayheadBeats() const;
 
-    /* Dispatches advanceToPattern on any lane that crosses a block
-     * boundary at the given playhead beat.  Idempotent within a single
-     * block (gated by Lane::lastDispatchedBlockIdx). */
+    /** Dispatch advanceToPattern on any lane that crosses a region
+     *  boundary at the given playhead beat.  Idempotent within a
+     *  single region span (gated by LaneRuntimeState
+     *  ::lastDispatchedRegion). */
     void dispatchAtBeat (double beat);
+
+    /** Read lanes from the session's tags::arrangement child into
+     *  lanes_.  Empty-on-first-load is normal (pre-Phase-1e
+     *  sessions); rescanTrackers fills in defaults from the graph. */
+    void loadLanesFromSession();
+    /** Write lanes_ back into the session's tags::arrangement child.
+     *  Sparse-write via Lane::toValueTree (omits default fields). */
+    void writeLanesToSession();
+
+    /** Build a default Playlist for a newly-discovered tracker --
+     *  one Region per existing sequence, 4 beats each, end-to-end.
+     *  Mirrors the prior v0 auto-fill behaviour. */
+    void autoFillLaneForTracker (Lane& lane, TrackerNode* trk);
+
+    /** Resolve a target node uuid to a live TrackerNode* by walking
+     *  the active session graph (descending into subgraphs).  Returns
+     *  nullptr when the tracker isn't in the current graph (orphaned
+     *  lane -- the view paints these greyed). */
+    TrackerNode* resolveTrackerByUuid (juce::Uuid targetNodeUuid) const;
 
     void timerCallback() override;
 
@@ -94,7 +126,16 @@ private:
     juce::Viewport viewport_;
     std::unique_ptr<Body> body_;
 
-    juce::Array<Lane> lanes_;
+    /** Persisted lane data + parallel transient runtime state.
+     *  Same length; same indices.  Mutations always update both
+     *  arrays in lockstep. */
+    juce::Array<Lane>              lanes_;
+    juce::Array<LaneRuntimeState>  laneRuntime_;
+
+    /** True once we've loaded any persisted lanes from the session.
+     *  Gates auto-fill in rescanTrackers to "only for trackers
+     *  without an existing lane." */
+    bool lanesLoadedFromSession_ = false;
 
     /* Transport mirror — read from Transport::Monitor on the UI tick. */
     Transport::MonitorPtr monitor_;

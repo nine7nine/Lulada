@@ -8,6 +8,7 @@
 
 #include <element/context.hpp>
 #include "services/samplebankpool.hpp"
+#include "services/sources/sourceregistry.hpp"
 #include "tempo.hpp"
 
 using namespace juce;
@@ -108,6 +109,13 @@ bool Session::loadData (const ValueTree& data)
      * plugin (PluginProcessor::setStateInformation -> binary) -- come
      * through here, so this is the single place to restore. */
     restoreSampleBankPool();
+
+    /* SourceRegistry restores AFTER SampleBankPool but BEFORE any
+     * Region-bearing view (ArrangementView) reads its lanes -- regions
+     * reference audio sources by uuid, so the registry must hold them
+     * by the time the view stabilizes.  Empty-registry restore is a
+     * no-op (pre-Phase-3 sessions have no audio sources). */
+    restoreSourceRegistry();
     return true;
 }
 
@@ -126,6 +134,19 @@ std::unique_ptr<XmlElement> Session::createXml() const
         if (poolBlock.getSize() > 0)
             saveData.setProperty (tags::sampleBankPool,
                                   poolBlock.toBase64Encoding(),
+                                  nullptr);
+    }
+
+    /* SourceRegistry uses the same sparse-write convention -- the
+     * property only appears when at least one AudioFileSource is
+     * registered.  Pre-Phase-3 sessions never populate the registry
+     * so no property gets written; old saves remain bit-identical. */
+    {
+        juce::MemoryBlock regBlock;
+        SourceRegistry::get().getStateInformation (regBlock);
+        if (regBlock.getSize() > 0)
+            saveData.setProperty (tags::sourceRegistry,
+                                  regBlock.toBase64Encoding(),
                                   nullptr);
     }
 
@@ -160,6 +181,7 @@ void Session::setMissingProperties (bool resetExisting)
     objectData.getOrCreateChildWithName (tags::controllers, nullptr);
     objectData.getOrCreateChildWithName (tags::maps, nullptr);
     objectData.getOrCreateChildWithName (tags::sessionView, nullptr);
+    objectData.getOrCreateChildWithName (tags::arrangement, nullptr);
 }
 
 Node Session::findNodeById (const Uuid& uuid)
@@ -332,6 +354,18 @@ bool Session::writeToFile (const File& file) const
                                   nullptr);
     }
 
+    /* SourceRegistry mirrors the same sparse-write convention --
+     * empty registries (pre-Phase-3 sessions, sessions with no audio
+     * regions) skip the property entirely. */
+    {
+        juce::MemoryBlock regBlock;
+        SourceRegistry::get().getStateInformation (regBlock);
+        if (regBlock.getSize() > 0)
+            saveData.setProperty (tags::sourceRegistry,
+                                  regBlock.toBase64Encoding(),
+                                  nullptr);
+    }
+
     Node::sanitizeProperties (saveData, true);
     TemporaryFile tempFile (file);
 
@@ -365,6 +399,25 @@ void Session::restoreSampleBankPool() const
     if (block.getSize() == 0) return;
 
     SampleBankPool::get().setStateInformation (block.getData(), (int) block.getSize());
+}
+
+void Session::restoreSourceRegistry() const
+{
+    /* Parallel to restoreSampleBankPool.  Called from loadData; runs
+     * BEFORE any arrangement-view-aware code that resolves a Region's
+     * sourceId to a Source::Ptr.  Empty-on-load is the v1 norm
+     * (no Phase-3 audio sources yet); the property is absent in
+     * pre-Phase-3 sessions and the call is a clean no-op. */
+    SourceRegistry::get().clearAll();
+
+    const auto encoded = objectData.getProperty (tags::sourceRegistry, "").toString();
+    if (encoded.isEmpty()) return;
+
+    juce::MemoryBlock block;
+    if (! block.fromBase64Encoding (encoded)) return;
+    if (block.getSize() == 0) return;
+
+    SourceRegistry::get().setStateInformation (block.getData(), (int) block.getSize());
 }
 
 ValueTree Session::readFromFile (const File& file)
