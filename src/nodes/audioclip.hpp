@@ -8,77 +8,78 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <memory>
 
 namespace element {
 
 class Record_DS;
 
-/** Single-region audio playback / capture node for the arrangement
- *  timeline.  Drives a Playback_DS via a lock-free SPSC launch FIFO,
- *  mirroring the TrackerNode pattern (tracker.hpp:197-223 +
- *  tracker.cpp:600-666).  AudioLaneAdapter writes launch requests on
- *  the message thread; the audio thread drains the FIFO at block
- *  start, fires region launches whose beatTarget falls within the
- *  block, and mixes the active Playback_DS into the output.
+/** Audio playback + capture node for the arrangement timeline.
  *
- *  Two variants register as separate plugin descriptions to satisfy
- *  JUCE's static-IO-per-AudioProcessor contract:
- *   - EL_NODE_ID_AUDIO_CLIP      -> stereo bus
- *   - EL_NODE_ID_AUDIO_CLIP_MONO -> mono bus
- *  Same pattern Element already uses for CombFilter / AllPass / Volume.
+ *  ## Topology
  *
- *  ## Threading model
+ *  One bidirectional bus: input for capture, output for playback.
+ *  Two registered variants (per JUCE's static IO contract):
+ *   - EL_NODE_ID_AUDIO_CLIP       -> stereo (2 in / 2 out)
+ *   - EL_NODE_ID_AUDIO_CLIP_MONO  -> mono   (1 in / 1 out)
  *
- *  Three thread roles touch this class; their boundaries are
- *  enforced by the FIFO + the graveyard-FIFO + std::atomic state:
+ *  ## Playback
  *
- *  - **Message thread (caller, typically AudioLaneAdapter).**
- *    schedulePlay() / scheduleStop() open the Audio_File and spawn
- *    the Playback_DS IO thread synchronously, then write a single
- *    LaunchReq into launchFifo_.  Ownership of the new
- *    Playback_DS* transfers to the audio thread via the FIFO entry.
+ *  Lock-free SPSC launch FIFO drives a Playback_DS, mirroring the
+ *  TrackerNode pattern (tracker.hpp:197-223 + tracker.cpp:600-666).
+ *  Message thread opens the Audio_File + spawns the Playback_DS IO
+ *  thread in schedulePlay(), then writes a LaunchReq carrying
+ *  ownership.  Audio thread drains the FIFO at block start, fires
+ *  region launches whose beatTarget falls in the current block, and
+ *  mixes the active Playback_DS into the output bus.
  *
- *  - **Audio thread (processBlock).**  Drains launchFifo_ into
- *    pendingActions_; for each pending action whose beatTarget
- *    falls in the current block, retires the prior active stream
- *    (sends to graveyardFifo_) and installs the new one.  Then
- *    mixes the active Playback_DS into the output buffer.  NO
- *    locks on this path -- the message thread does not touch
- *    activeStream_ / activeStreamRegionId_ / pendingActions_ at all
- *    outside of construction and destruction.
+ *  ## Recording
  *
- *  - **Timer (message thread).**  Drains graveyardFifo_ every
- *    kGraveyardDrainMs and deletes the retired Playback_DS
- *    instances.  ~Playback_DS joins the IO thread (libsndfile sf_close
- *    + thread join, can take tens of ms); doing it here keeps that
- *    cost off both the audio thread and the message thread's
- *    launch-handling path.
+ *  Capture is triggered by (armed_ && transport.isRecording).  On
+ *  the edge from "not recording" to "recording in this block", the
+ *  audio thread lazily instantiates a Record_DS via the
+ *  pendingRecordStart_ flag (Record_DS construction must happen on
+ *  the message thread since it opens libsndfile + spawns a thread;
+ *  see startRecording() called via asyncUpdater).  Each block thereafter
+ *  feeds the input bus into Record_DS::process.
  *
- *  ## What's still v1
+ *  On the falling edge (transport stops, lane disarmed) the audio
+ *  thread requests Record_DS::stop().  The IO thread drains pending
+ *  audio + finalises the file.  A juce::Timer on the message thread
+ *  polls Record_DS::recording(); when it transitions to false, the
+ *  finalised file is delivered via onRecordingCommitted (caller --
+ *  ArrangementView -- registers it with SourceRegistry, appends a
+ *  Region to the lane's Playlist, refreshes UI).
  *
- *  - One active region at a time.  v1 enforces no-overlap in
- *    Playlist::addRegion; multi-active rendering is a Phase 6
- *    addition (extend pendingActions_ application to keep a
- *    juce::Array<ActiveRegion> instead of a single slot).
+ *  Capture file path: `recordingDirectory()` (Documents/Element
+ *  Recordings/ by default; configurable via setRecordingDirectory).
+ *  Filename = "audioclip-<timestamp>.wav".  Format = "Wav 24".
  *
- *  - Per-region gain / fades / loop ignored.  LaunchReq carries
- *    sampleOffset + beatTarget only; Region.fadeInBeats /
- *    fadeOutBeats / gainDb apply at the AudioLaneAdapter or post-mix
- *    layer later.
+ *  ## Threading invariants
  *
- *  - Recording.  setArmed / isArmed exist as stubs to keep the API
- *    surface stable; actual Record_DS instantiation + capture wiring
- *    lands in Phase 4.  The record_ member slot is reserved.
+ *  Three roles:
+ *   - Message thread (caller): schedulePlay / scheduleStop / setArmed
+ *     / setRecordingDirectory / dtor.  Spawns Playback_DS + Record_DS
+ *     IO threads.  Polls record_ via Timer for the finalise commit.
+ *   - Audio thread (processBlock): drains launchFifo_, applies
+ *     pending actions, feeds input into Record_DS, mixes Playback_DS
+ *     into output, retires dead streams to graveyardFifo_.  NO LOCKS.
+ *   - Timer (message thread): drains graveyardFifo_, deletes retired
+ *     Playback_DS instances; polls record_ for the recording->stopped
+ *     transition and fires onRecordingCommitted.
+ *
+ *  The juce::CriticalSection engineLock_ guards ONLY message-thread
+ *  bookkeeping (lastScheduledRegionId_, onRecordingCommitted callback
+ *  swap) that may be read by foreign threads (UI inspectors).  Audio
+ *  thread never takes it.
  */
 class AudioClipNode : public BaseProcessor,
-                      private juce::Timer
+                      private juce::Timer,
+                      private juce::AsyncUpdater
 {
 public:
-    /** Construct with the bus width baked in.  Stereo = one 2-channel
-     *  output bus; mono = one 1-channel output bus.  No MIDI in/out. */
     explicit AudioClipNode (bool stereo);
-
     ~AudioClipNode() override;
 
     //==============================================================================
@@ -114,36 +115,15 @@ public:
     bool                        hasEditor()    const override { return false; }
 
     //==============================================================================
-    // Launch API.  All called from the message thread (typically
-    // AudioLaneAdapter; for now also unit-test code).
+    // Playback API (message thread; typically AudioLaneAdapter).
 
-    /** Schedule a region for playback.  Synchronous:
-     *   1. Resolves sourceId via SourceRegistry::findAudioFile
-     *   2. Opens the Audio_File and spawns the Playback_DS IO thread
-     *      (Playback_DS::create)
-     *   3. Seeks to sampleOffset
-     *   4. Writes a LaunchReq into launchFifo_; ownership of the new
-     *      Playback_DS* transfers to the audio thread on FIFO read.
-     *
-     *  beatTarget < 0 = fire at next block boundary (immediate);
-     *  beatTarget >= 0 = fire at the audio block whose beat range
-     *  contains this target (sample-accurate to +/- one block).
-     *
-     *  No-op (no FIFO write, fresh stream cleaned up) if the source
-     *  isn't in the registry or the Audio_File fails to open. */
     void schedulePlay (juce::Uuid  regionId,
                        juce::Uuid  sourceId,
                        double      beatTarget,
                        juce::int64 sampleOffset);
 
-    /** Schedule a region stop.  beatTarget semantics match
-     *  schedulePlay.  Writes a LaunchReq with stream=null; the audio
-     *  thread retires the active stream when the request fires. */
     void scheduleStop (juce::Uuid regionId, double beatTarget) noexcept;
 
-    /** Last region UUID the *message thread* requested to play.
-     *  Best-effort snapshot for UI use; lags the audio-thread reality
-     *  by one FIFO drain. */
     juce::Uuid lastScheduledRegion() const noexcept
     {
         const juce::ScopedLock sl (engineLock_);
@@ -151,16 +131,36 @@ public:
     }
 
     //==============================================================================
-    // Record-arm API.  Phase 4 wires the Record_DS path; stubbed
-    // here so AudioLaneAdapter can call against a stable surface.
+    // Record-arm API (message thread).
+    //
+    // Capture starts on (armed_ && transport.isRecording).  The
+    // arm/disarm toggle alone never starts capture -- the user must
+    // also hit transport-record.
+
     void setArmed (bool armed) noexcept { armed_.store (armed, std::memory_order_release); }
     bool isArmed() const noexcept       { return armed_.load (std::memory_order_acquire); }
 
+    /** Directory where capture files land.  Defaults to
+     *  ~/Documents/Element Recordings/.  Pass an absolute path; the
+     *  directory is created on demand at recording start.  Caller-
+     *  owned; AudioClipNode just stores the path. */
+    void       setRecordingDirectory (const juce::File& dir);
+    juce::File recordingDirectory() const;
+
+    /** Called on the message thread when a capture finishes and the
+     *  Audio_File_SF has been closed.  Argument is the finalised
+     *  juce::File for the new recording -- the caller is expected to
+     *  register it with SourceRegistry::registerAudioFile, append a
+     *  Region to the lane's Playlist, and refresh UI.
+     *
+     *  The callback is invoked at most once per capture session.  If
+     *  recording is restarted without an interim commit (e.g. user
+     *  hits stop / record very quickly), the prior callback fires
+     *  first, then capture re-arms. */
+    void setRecordingCommittedHandler (std::function<void (const juce::File&)> handler);
+
     //==============================================================================
-    /** Editor / inspector lock -- audio thread does NOT take this on
-     *  the render path (FIFO design).  Used by future editors / state
-     *  inspectors that need to read message-thread bookkeeping (e.g.
-     *  lastScheduledRegionId_) coherently. */
+    /** Editor / inspector lock -- audio thread does NOT take this. */
     juce::CriticalSection& engineLock() noexcept { return engineLock_; }
 
 protected:
@@ -172,52 +172,77 @@ private:
     //==============================================================================
     // Audio-thread helpers.
 
-    /** Drain launchFifo_ into pendingActions_.  Called from
-     *  processBlock; runs only on the audio thread. */
     void drainLaunchFifo() noexcept;
-
-    /** For each pending action whose beatTarget falls in the block,
-     *  swap active stream + retire the prior one to graveyardFifo_.
-     *  Drops applied entries from pendingActions_; out-of-block
-     *  entries stay queued for a future block. */
     void applyPendingForBlock (double blockStartBeat, double blockEndBeat) noexcept;
-
-    /** Audio-thread helper to retire a stream pointer (push onto
-     *  graveyardFifo_ for the message thread to delete). */
     void retireStream (Playback_DS* dead) noexcept;
 
-    //==============================================================================
-    // Message-thread helper.
+    /** Audio-thread side of the record path.  Reads transport state
+     *  via getPlayHead; on the rising edge, sets pendingRecordStart_
+     *  and triggerAsyncUpdate() to ask the message thread to
+     *  instantiate Record_DS.  On the falling edge, calls
+     *  record_->stop() so the IO thread starts finalising. */
+    void handleRecordingFromTransport (const juce::AudioBuffer<float>& in,
+                                       int                              numFrames) noexcept;
 
-    /** juce::Timer callback -- drains graveyardFifo_, deletes the
-     *  retired Playback_DS instances (each dtor joins the IO thread). */
+    //==============================================================================
+    // Message-thread helpers.
+
+    /** Drains graveyardFifo_; polls record_ for recording-finished
+     *  edge and fires onRecordingCommitted. */
     void timerCallback() override;
+
+    /** Instantiates a fresh Record_DS for the upcoming capture.
+     *  Triggered by the audio thread setting pendingRecordStart_.
+     *  Runs on the message thread (AsyncUpdater). */
+    void handleAsyncUpdate() override;
+
+    /** Build the capture filename for a new recording.  Format:
+     *  recordingDirectory_/"audioclip-YYYYMMDD-HHMMSS-<n>".  The
+     *  ".wav" extension is appended by Audio_File_SF::create. */
+    juce::File composeRecordingBasename();
 
     //==============================================================================
     // Construction-time config.
     const bool stereo_;
     const int  numChannels_;
 
-    // Updated by prepareToPlay; read by message thread on
-    // schedulePlay to size the new Playback_DS.
     double sampleRate_ { 48000.0 };
     int    blockSize_  { 1024 };
 
     //==============================================================================
-    // Audio-thread-owned state.  Touched ONLY from processBlock and
-    // related audio-thread helpers (drainLaunchFifo,
-    // applyPendingForBlock, retireStream).  Message thread reads /
-    // mutates these only at construction / destruction when the audio
-    // thread is guaranteed quiescent.
+    // Audio-thread-owned state.
     std::unique_ptr<Playback_DS> activeStream_;
     juce::Uuid                   activeStreamRegionId_;
 
+    /* Audio thread reads + writes; message thread reads only between
+     * capture sessions (after timer observes recording()==false). */
+    std::unique_ptr<Record_DS>   record_;
+
+    /* Audio-thread edge-tracker for the (armed && transport.isRecording)
+     * signal.  Drives the lazy-instantiate path via AsyncUpdater. */
+    bool wasRecording_ { false };
+
+    /* Set by audio thread when transport starts recording while
+     * armed; cleared by message thread once handleAsyncUpdate has
+     * constructed the Record_DS.  Atomic for the cross-thread flag,
+     * but the actual construction happens single-threaded on message. */
+    std::atomic<bool> pendingRecordStart_ { false };
+
+    /* Set by message thread when a fresh Record_DS is ready; audio
+     * thread swaps it into record_ at the next block.  Hand-off
+     * pointer; SPSC. */
+    std::atomic<Record_DS*> pendingFreshRecord_ { nullptr };
+
     //==============================================================================
-    // Message-thread-owned state.  Accessed only from message thread
-    // entry points + the Timer callback; engineLock_ pins reads from
-    // foreign threads (e.g. UI inspectors).
+    // Message-thread-owned state.
     mutable juce::CriticalSection engineLock_;
     juce::Uuid                    lastScheduledRegionId_;
+
+    juce::File                     recordingDirectory_;
+    int                            recordingSequence_ { 0 };  // suffix counter within a session
+
+    std::function<void (const juce::File&)> onRecordingCommitted_;
+    bool                                    wasRecordingFinalising_ { false };
 
     std::atomic<bool> armed_ { false };
 
@@ -226,21 +251,16 @@ private:
     struct LaunchReq
     {
         juce::Uuid   regionId;
-        double       beatTarget;     // <0 = immediate
+        double       beatTarget;
         juce::int64  sampleOffset;
-        Playback_DS* stream;         // non-null on start, nullptr on stop
-        int          wantPlaying;    // 1 = start, 0 = stop
+        Playback_DS* stream;
+        int          wantPlaying;
     };
 
     static constexpr int kLaunchFifoSize = 64;
     std::array<LaunchReq, (std::size_t) kLaunchFifoSize> launchFifoStorage_ {};
     juce::AbstractFifo                                   launchFifo_ { kLaunchFifoSize };
 
-    //==============================================================================
-    // Audio-thread pending actions: launches that have been drained
-    // from launchFifo_ but whose beatTarget has not yet been reached.
-    // v1 enforces single-region playback in Playlist::addRegion, so
-    // this array usually holds 0 or 1 entries.
     struct PendingAction
     {
         juce::Uuid   regionId;
@@ -253,18 +273,12 @@ private:
     juce::Array<PendingAction> pendingActions_;
 
     //==============================================================================
-    // Audio -> message graveyard FIFO.  Audio thread pushes retired
-    // Playback_DS* here; Timer drains + deletes (the dtor joins the
-    // IO thread, which is not safe to do on the audio thread).
+    // Audio -> message graveyard FIFO.
     static constexpr int kGraveyardFifoSize = 32;
-    static constexpr int kGraveyardDrainMs  = 100;
+    static constexpr int kTimerIntervalMs   = 100;
 
     std::array<Playback_DS*, (std::size_t) kGraveyardFifoSize> graveyardStorage_ {};
     juce::AbstractFifo                                         graveyardFifo_ { kGraveyardFifoSize };
-
-    //==============================================================================
-    // Record_DS slot reserved for Phase 4.  nullptr until then.
-    std::unique_ptr<Record_DS> record_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioClipNode)
 };
