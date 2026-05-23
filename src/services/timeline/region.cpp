@@ -11,6 +11,7 @@ namespace {
  * shouldn't pay a percent overhead in attribute name bytes. */
 const juce::Identifier kIdAttr        ("id");
 const juce::Identifier kSourceIdAttr  ("src");
+const juce::Identifier kSeqIdxAttr    ("seq");
 const juce::Identifier kPosAttr       ("pos");
 const juce::Identifier kStartAttr     ("start");
 const juce::Identifier kLenAttr       ("len");
@@ -30,6 +31,7 @@ juce::ValueTree Region::toValueTree() const
     v.setProperty (kPosAttr,      positionBeats,         nullptr);
     /* Sparse-write the rest -- only when not at the default value.
      * Keeps tracker-only regions tiny. */
+    if (sequenceIdx  >= 0)            v.setProperty (kSeqIdxAttr,  sequenceIdx,          nullptr);
     if (startBeats   != 0.0)         v.setProperty (kStartAttr,   startBeats,           nullptr);
     if (lengthBeats  != 0.0)         v.setProperty (kLenAttr,     lengthBeats,          nullptr);
     if (gainDb       != 0.0)         v.setProperty (kGainAttr,    gainDb,               nullptr);
@@ -53,6 +55,7 @@ Region Region::fromValueTree (const juce::ValueTree& v)
 
     r.id            = juce::Uuid (v.getProperty (kIdAttr).toString());
     r.sourceId      = juce::Uuid (v.getProperty (kSourceIdAttr).toString());
+    r.sequenceIdx   = (int)    v.getProperty (kSeqIdxAttr, -1);
     r.positionBeats = (double) v.getProperty (kPosAttr,     0.0);
     r.startBeats    = (double) v.getProperty (kStartAttr,   0.0);
     r.lengthBeats   = (double) v.getProperty (kLenAttr,     0.0);

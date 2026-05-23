@@ -55,32 +55,35 @@ public:
     {
         const int laneIdx = e.y / kLaneH;
         if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
-        auto& lane = owner.lanes_.getReference (laneIdx);
-        if (e.x < kLabelW || lane.tracker == nullptr) return;
+        auto& lane    = owner.lanes_.getReference (laneIdx);
+        auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+        if (e.x < kLabelW || runtime.trackerCache == nullptr) return;
 
         const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
-        for (int i = 0; i < lane.blocks.size(); ++i)
+        const auto& regions = lane.playlist.regions();
+        for (const auto& r : regions)
         {
-            const auto& b = lane.blocks.getReference (i);
-            if (beat >= b.startBeat && beat < b.startBeat + b.lengthBeats)
+            if (r.containsBeat (beat))
             {
-                lane.tracker->advanceToPattern (b.patternIdx);
-                lane.lastDispatchedBlockIdx = i;
+                if (r.sequenceIdx >= 0)
+                    runtime.trackerCache->advanceToPattern (r.sequenceIdx);
+                runtime.lastDispatchedRegion  = r.id;
+                runtime.lastDispatchedSeqIdx  = r.sequenceIdx;
                 repaintLane (laneIdx);
                 return;
             }
         }
     }
 
-    /** Recompute size based on current lanes_ + longest block strip. */
+    /** Recompute size based on current lanes_ + longest region strip. */
     void resizeForLanes()
     {
         int maxBeats = 32;
         for (const auto& l : owner.lanes_)
         {
             double end = 0.0;
-            for (const auto& b : l.blocks)
-                end = juce::jmax (end, b.startBeat + b.lengthBeats);
+            for (const auto& r : l.playlist.regions())
+                end = juce::jmax (end, r.endBeats());
             const int needed = (int) end + 8;
             if (needed > maxBeats) maxBeats = needed;
         }
@@ -116,7 +119,8 @@ public:
 private:
     void paintLane (Graphics& g, int laneIdx)
     {
-        const auto& lane = owner.lanes_.getReference (laneIdx);
+        const auto& lane    = owner.lanes_.getReference (laneIdx);
+        const auto& runtime = owner.laneRuntime_.getReference (laneIdx);
         const int y = laneIdx * kLaneH;
         const Rectangle<int> bounds (0, y, getWidth(), kLaneH);
 
@@ -125,13 +129,17 @@ private:
                          : Colors::widgetBackgroundColor.darker (0.25f));
         g.fillRect (bounds);
 
-        /* Label column. */
+        /* Label column.  Orphaned lanes (target tracker missing) paint
+         * dimmed so the user can tell they don't dispatch. */
         const Rectangle<int> labelArea (0, y, kLabelW, kLaneH);
         g.setColour (Colors::widgetBackgroundColor.darker (0.6f));
         g.fillRect (labelArea);
-        g.setColour (Colors::textColor);
+        const bool orphaned = (runtime.trackerCache == nullptr);
+        g.setColour (orphaned ? Colors::textColor.withAlpha (0.45f)
+                              : Colors::textColor);
         g.setFont (juce::FontOptions (12.0f));
-        g.drawText (lane.name, labelArea.reduced (8, 0),
+        const juce::String label = orphaned ? (lane.name + " (orphan)") : lane.name;
+        g.drawText (label, labelArea.reduced (8, 0),
                     juce::Justification::centredLeft, true);
 
         /* Strip background + beat grid. */
@@ -145,29 +153,36 @@ private:
                                 (float) stripArea.getY(),
                                 (float) stripArea.getBottom());
 
-        /* Blocks. */
-        for (int i = 0; i < lane.blocks.size(); ++i)
+        /* Regions. */
+        for (const auto& r : lane.playlist.regions())
         {
-            const auto& b = lane.blocks.getReference (i);
-            const int xs = stripArea.getX() + (int) (b.startBeat * kPxPerBeat);
-            const int ws = juce::jmax (4, (int) (b.lengthBeats * kPxPerBeat));
-            Rectangle<int> r (xs, stripArea.getY() + 4, ws, stripArea.getHeight() - 8);
+            const int xs = stripArea.getX() + (int) (r.positionBeats * kPxPerBeat);
+            const int ws = juce::jmax (4, (int) (r.lengthBeats * kPxPerBeat));
+            Rectangle<int> rect (xs, stripArea.getY() + 4, ws, stripArea.getHeight() - 8);
 
-            const bool active = (i == lane.lastDispatchedBlockIdx);
+            const bool active = (r.id == runtime.lastDispatchedRegion);
             Colour fill = active ? Colour::fromRGB (220, 140, 60)
                                  : Colour::fromRGB (90, 130, 170);
+            if (orphaned) fill = fill.withMultipliedSaturation (0.3f)
+                                     .withMultipliedBrightness (0.6f);
             g.setColour (fill);
-            g.fillRect (r);
+            g.fillRect (rect);
             g.setColour (fill.brighter (0.4f));
-            g.drawRect (r, 1);
+            g.drawRect (rect, 1);
             g.setColour (Colours::white);
             g.setFont (juce::FontOptions (11.0f));
-            g.drawText ("P" + String (b.patternIdx),
-                        r.reduced (4, 0),
+            /* For tracker regions the meaningful display is the
+             * sequence index ("P0", "P1", ...).  Audio regions
+             * (Phase 3+) will use r.name. */
+            const juce::String tag = r.sequenceIdx >= 0
+                                        ? "P" + String (r.sequenceIdx)
+                                        : (r.name.isNotEmpty() ? r.name
+                                                               : String ("Audio"));
+            g.drawText (tag, rect.reduced (4, 0),
                         juce::Justification::centredLeft, true);
         }
 
-        /* Playhead overlay — single thin vertical line. */
+        /* Playhead overlay -- single thin vertical line. */
         const double phb = owner.lastBeat_;
         const int phx = stripArea.getX() + (int) (phb * kPxPerBeat);
         if (phx >= stripArea.getX() && phx < stripArea.getRight())
@@ -294,9 +309,13 @@ void ArrangementView::paint (Graphics& g)
 
 /* ===================================================================== */
 
-static void collectTrackersFromGraph (const Node& graph,
-                                      juce::Array<TrackerNode*>& out,
-                                      juce::Array<juce::String>& names)
+namespace {
+/** Recursive: append (Node, TrackerNode*) pairs for every TrackerNode
+ *  reachable from `graph` (including subgraphs).  Used to seed lanes
+ *  for trackers the user adds. */
+void collectTrackersFromGraph (const Node& graph,
+                                juce::Array<Node>&         outNodes,
+                                juce::Array<TrackerNode*>& outProcs)
 {
     const int n = graph.getNumNodes();
     for (int i = 0; i < n; ++i)
@@ -307,59 +326,168 @@ static void collectTrackersFromGraph (const Node& graph,
         {
             if (auto* t = dynamic_cast<TrackerNode*> (proc))
             {
-                out.add (t);
-                names.add (child.getName().isNotEmpty() ? child.getName() : String ("Tracker"));
+                outNodes.add (child);
+                outProcs.add (t);
                 continue;
             }
         }
         if (child.isGraph())
-            collectTrackersFromGraph (child, out, names);
+            collectTrackersFromGraph (child, outNodes, outProcs);
+    }
+}
+
+/** Recursive: find the first node with `targetUuid`.  Returns
+ *  default Node() on miss.  O(graph size); cheap. */
+Node findNodeByUuid (const Node& graph, juce::Uuid target)
+{
+    const int n = graph.getNumNodes();
+    for (int i = 0; i < n; ++i)
+    {
+        Node child = graph.getNode (i);
+        if (! child.isValid()) continue;
+        if (child.getUuid() == target) return child;
+        if (child.isGraph())
+        {
+            Node nested = findNodeByUuid (child, target);
+            if (nested.isValid()) return nested;
+        }
+    }
+    return Node();
+}
+} // namespace
+
+TrackerNode* ArrangementView::resolveTrackerByUuid (juce::Uuid targetNodeUuid) const
+{
+    if (services_ == nullptr) return nullptr;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return nullptr;
+    const Node active = sess->getActiveGraph();
+    if (! active.isValid()) return nullptr;
+
+    const Node target = findNodeByUuid (active, targetNodeUuid);
+    if (! target.isValid()) return nullptr;
+    return dynamic_cast<TrackerNode*> (target.getObject());
+}
+
+void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)
+{
+    /* One Region per existing sequence, 4 beats each, end-to-end.
+     * Same shape as the v0 auto-fill but expressed via the shared
+     * Region model.  sourceId = tracker's uuid (so resolvers can
+     * map back to the owning TrackerNode); sequenceIdx is the
+     * canonical "which pattern" pointer. */
+    if (trk == nullptr) return;
+    const int numPatterns = trk->numPatterns();
+    double cursor = 0.0;
+    for (int p = 0; p < numPatterns; ++p)
+    {
+        Region r;
+        r.id            = juce::Uuid();
+        r.sourceId      = lane.targetNodeUuid;
+        r.sequenceIdx   = p;
+        r.positionBeats = cursor;
+        r.lengthBeats   = 4.0;
+        r.colour        = juce::Colour::fromRGB (90, 130, 170);
+        lane.playlist.addRegion (std::move (r));
+        cursor += 4.0;
     }
 }
 
 void ArrangementView::rescanTrackers()
 {
-    lanes_.clearQuick();
+    /* First-ever activation: pull persisted lanes off the session.
+     * Empty result is the normal case for pre-Phase-1e sessions --
+     * graph-walk auto-fill below fills in defaults for any tracker
+     * that doesn't yet have a lane. */
+    if (! lanesLoadedFromSession_)
+    {
+        loadLanesFromSession();
+        lanesLoadedFromSession_ = true;
+    }
 
+    /* Collect current trackers + decide which need a new lane.
+     * Lanes already pointing at an existing tracker stay put. */
+    juce::Array<Node>           foundNodes;
+    juce::Array<TrackerNode*>   foundProcs;
     if (services_ != nullptr)
     {
-        if (auto session = services_->context().session())
+        if (auto sess = services_->context().session())
         {
-            auto active = session->getActiveGraph();
+            const Node active = sess->getActiveGraph();
             if (active.isValid())
-            {
-                juce::Array<TrackerNode*> ts;
-                juce::Array<String> names;
-                collectTrackersFromGraph (active, ts, names);
-
-                for (int i = 0; i < ts.size(); ++i)
-                {
-                    Lane lane;
-                    lane.tracker = ts[i];
-                    lane.name = names[i];
-                    lane.numPatterns = ts[i] != nullptr ? ts[i]->numPatterns() : 0;
-
-                    /* v0 auto-fill: one block per pattern, equal 4-beat
-                     * length, laid out end-to-end.  Real authoring lands
-                     * next. */
-                    double cursor = 0.0;
-                    for (int p = 0; p < lane.numPatterns; ++p)
-                    {
-                        Block b;
-                        b.patternIdx = p;
-                        b.startBeat = cursor;
-                        b.lengthBeats = 4.0;
-                        lane.blocks.add (b);
-                        cursor += b.lengthBeats;
-                    }
-
-                    lanes_.add (lane);
-                }
-            }
+                collectTrackersFromGraph (active, foundNodes, foundProcs);
         }
     }
 
+    bool mutated = false;
+    for (int i = 0; i < foundNodes.size(); ++i)
+    {
+        const juce::Uuid uuid = foundNodes.getReference (i).getUuid();
+        bool alreadyBound = false;
+        for (const auto& l : lanes_)
+            if (l.targetNodeUuid == uuid) { alreadyBound = true; break; }
+        if (alreadyBound) continue;
+
+        Lane lane;
+        lane.id             = juce::Uuid();
+        lane.targetNodeUuid = uuid;
+        lane.name           = foundNodes.getReference (i).getName().isNotEmpty()
+                                ? foundNodes.getReference (i).getName()
+                                : juce::String ("Tracker");
+        autoFillLaneForTracker (lane, foundProcs[i]);
+        lanes_.add (std::move (lane));
+        mutated = true;
+    }
+
+    /* Resync the parallel runtime-state array + resolve each lane's
+     * TrackerNode* cache via uuid lookup.  Cheap O(lanes * graph
+     * size); runs on graph topology change, not per render block. */
+    laneRuntime_.clearQuick();
+    for (const auto& l : lanes_)
+    {
+        LaneRuntimeState s;
+        s.trackerCache = resolveTrackerByUuid (l.targetNodeUuid);
+        laneRuntime_.add (s);
+    }
+
+    if (mutated) writeLanesToSession();
     if (body_ != nullptr) body_->resizeForLanes();
+}
+
+void ArrangementView::loadLanesFromSession()
+{
+    lanes_.clearQuick();
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+
+    auto tree = sess->data().getChildWithName (tags::arrangement);
+    if (! tree.isValid()) return;
+    auto lanesTree = tree.getChildWithName ("lanes");
+    if (! lanesTree.isValid()) return;
+
+    for (int i = 0; i < lanesTree.getNumChildren(); ++i)
+    {
+        const auto laneTree = lanesTree.getChild (i);
+        if (laneTree.getType() != juce::Identifier ("lane")) continue;
+        lanes_.add (Lane::fromValueTree (laneTree));
+    }
+}
+
+void ArrangementView::writeLanesToSession()
+{
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+
+    auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
+    auto lanesTree = tree.getOrCreateChildWithName ("lanes", nullptr);
+    /* Rebuild from scratch -- simpler than diff-edit + only runs on
+     * mutation, not per frame.  No undo support yet (Phase 1e ships
+     * read+auto-fill+persist; authoring + undo come later). */
+    lanesTree.removeAllChildren (nullptr);
+    for (const auto& l : lanes_)
+        lanesTree.appendChild (l.toValueTree(), nullptr);
 }
 
 double ArrangementView::computePlayheadBeats() const
@@ -370,26 +498,24 @@ double ArrangementView::computePlayheadBeats() const
 
 void ArrangementView::dispatchAtBeat (double beat)
 {
+    /* Idempotent per region: the same region won't dispatch twice on
+     * consecutive ticks (runtime.lastDispatchedRegion gates).
+     * Orphaned lanes (trackerCache == nullptr) skip silently. */
     for (int laneIdx = 0; laneIdx < lanes_.size(); ++laneIdx)
     {
-        auto& lane = lanes_.getReference (laneIdx);
-        if (lane.tracker == nullptr || lane.blocks.isEmpty()) continue;
-        int newIdx = -1;
-        for (int i = 0; i < lane.blocks.size(); ++i)
-        {
-            const auto& b = lane.blocks.getReference (i);
-            if (beat >= b.startBeat && beat < b.startBeat + b.lengthBeats)
-            {
-                newIdx = i;
-                break;
-            }
-        }
-        if (newIdx >= 0 && newIdx != lane.lastDispatchedBlockIdx)
-        {
-            lane.tracker->advanceToPattern (lane.blocks.getReference (newIdx).patternIdx);
-            lane.lastDispatchedBlockIdx = newIdx;
-            if (body_ != nullptr) body_->repaintLane (laneIdx);
-        }
+        const auto& lane    = lanes_.getReference (laneIdx);
+        auto&       runtime = laneRuntime_.getReference (laneIdx);
+        if (runtime.trackerCache == nullptr) continue;
+
+        const Region* active = lane.playlist.regionAt (beat);
+        if (active == nullptr) continue;
+        if (active->id == runtime.lastDispatchedRegion) continue;
+
+        if (active->sequenceIdx >= 0)
+            runtime.trackerCache->advanceToPattern (active->sequenceIdx);
+        runtime.lastDispatchedRegion = active->id;
+        runtime.lastDispatchedSeqIdx = active->sequenceIdx;
+        if (body_ != nullptr) body_->repaintLane (laneIdx);
     }
 }
 
@@ -417,8 +543,16 @@ void ArrangementView::timerCallback()
     const bool playing = monitor_->playing.get();
     const double beat = computePlayheadBeats();
 
+    /* Transport start edge: clear the per-lane "last dispatched"
+     * gate so the first region under the playhead fires when
+     * playback resumes (otherwise it would be considered already
+     * dispatched from before the stop). */
     if (! wasPlaying_ && playing)
-        for (auto& l : lanes_) l.lastDispatchedBlockIdx = -1;
+        for (auto& rs : laneRuntime_)
+        {
+            rs.lastDispatchedRegion = juce::Uuid::null();
+            rs.lastDispatchedSeqIdx = -1;
+        }
 
     if (playing) dispatchAtBeat (beat);
 

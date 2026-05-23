@@ -33,6 +33,14 @@ struct Region
 {
     juce::Uuid    id;
     juce::Uuid    sourceId;          // -> SourceRegistry lookup
+    /** For MIDI (vht) regions: index of the sequence WITHIN the owning
+     *  TrackerNode (sourceId = the TrackerNode's uuid).  For audio
+     *  regions: unused (-1).  Lets us express "this region plays
+     *  TrackerX's pattern N" without a Source-per-pattern entry in
+     *  the registry -- the data already lives inside the
+     *  TrackerNode's vht module.  Sparse-write: only persisted when
+     *  != -1. */
+    int           sequenceIdx   { -1 };
     double        positionBeats { 0.0 };
     double        startBeats    { 0.0 };
     double        lengthBeats   { 0.0 };
