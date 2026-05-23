@@ -10,6 +10,7 @@
 #include <element/session.hpp>
 #include <element/services.hpp>
 #include <element/tags.hpp>
+#include <element/ui.hpp>
 #include <element/ui/style.hpp>
 
 #include "nodes/audioclip.hpp"
@@ -1066,41 +1067,39 @@ bool ArrangementView::importAudioFileToLane (const juce::File& file,
 
 void ArrangementView::promptLoadAudioFile()
 {
-    /* JUCE-NSPA forces NonNative (in-process) file chooser under
-     * __WINE__ via the existing patches to
-     * juce_FileSearchPathListComponent.cpp.  juce::FileChooser
-     * itself honours that path; we pass useOSNativeBox=false
-     * explicitly to be safe across JUCE versions. */
+    /* juce::FileChooser is broken under winelib; route through the
+     * Disk Op Request pattern instead.  GuiService::requestFile arms
+     * a DiskOpService::Request + navigates to the Disk Op page.  The
+     * RequestPane handles Confirm/Cancel; our onAccept callback
+     * fires with the chosen file.  Same pattern session save/load +
+     * controller import use today.  See
+     * [[diskop-request-pattern-validated]]. */
+    if (services_ == nullptr) return;
+    auto* gui = services_->find<GuiService>();
+    if (gui == nullptr) return;
+
     const juce::String wildcard ("*.wav;*.aiff;*.aif;*.flac;*.ogg;*.mp3;*.w64;*.au");
     const juce::File start = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
 
-    audioChooser_ = std::make_unique<juce::FileChooser> (
-        "Load audio file into arrangement",
-        start,
-        wildcard,
-        false /*useOSNativeBox*/);
-
-    const int flags = juce::FileBrowserComponent::openMode
-                    | juce::FileBrowserComponent::canSelectFiles;
-
     juce::Component::SafePointer<ArrangementView> safe (this);
-    audioChooser_->launchAsync (flags,
-        [safe] (const juce::FileChooser& fc)
+    gui->requestFile (
+        "Load audio file into arrangement",
+        wildcard,
+        start,
+        juce::String() /*initialFilename*/,
+        false /*isSave*/,
+        [safe] (const juce::File& file)
         {
             auto* self = safe.getComponent();
             if (self == nullptr) return;
-
-            const juce::File file = fc.getResult();
-            self->audioChooser_.reset();
-
-            if (! file.existsAsFile())
-                return;
+            if (! file.existsAsFile()) return;
 
             const bool ok = self->importAudioFileToLane (file, -1 /*new lane*/, 0.0);
             juce::Logger::writeToLog (
-                juce::String ("[ArrangementView] promptLoadAudioFile -> importAudioFileToLane(")
+                juce::String ("[ArrangementView] requestFile accepted -> importAudioFileToLane(")
                 + file.getFileName() + ") = " + (ok ? "OK" : "FAIL"));
-        });
+        },
+        nullptr /*onCancel*/);
 }
 
 int ArrangementView::laneIdxFromY (int yPx) const noexcept
