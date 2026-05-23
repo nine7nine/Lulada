@@ -4,6 +4,7 @@
 #include "services/arrangementtracksservice.hpp"
 
 #include "nodes/audioclip.hpp"
+#include "services/sessionservice.hpp"
 #include "services/sources/sourceregistry.hpp"
 #include "services/timeline/lane.hpp"
 #include "services/timeline/playlist.hpp"
@@ -140,6 +141,34 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
         juce::Logger::writeToLog (
             "[ArrangementTracksService::addAudioClipNode] WARN: subgraph"
             " has no audio.output IO node; clip output not auto-wired");
+    }
+
+    /* Point the new clip's recording target at a session-adjacent
+     * "recordings/" directory if the session is saved, else fall
+     * back to ~/Documents/Element Recordings/ (matches AudioClipNode
+     * default).  Session-adjacent keeps captures with the project
+     * file so a session move/copy keeps recordings together. */
+    if (auto* sessSvc = engine.sibling<SessionService>())
+    {
+        const juce::File sessionFile = sessSvc->getSessionFile();
+        if (sessionFile.existsAsFile())
+        {
+            const juce::File recDir =
+                sessionFile.getParentDirectory().getChildFile ("recordings");
+
+            if (auto* wrapper = clip.getObject())
+            {
+                if (auto* audioClipProc =
+                        dynamic_cast<AudioClipNode*> (wrapper->getAudioProcessor()))
+                {
+                    audioClipProc->setRecordingDirectory (recDir);
+                    juce::Logger::writeToLog (
+                        juce::String ("[ArrangementTracksService::addAudioClipNode]"
+                                       " recording dir set to ")
+                        + recDir.getFullPathName());
+                }
+            }
+        }
     }
 
     return clip;
