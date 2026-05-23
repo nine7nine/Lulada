@@ -696,37 +696,44 @@ void ArrangementView::rescanLaneTargets()
              * node so re-opening a session restores arm state. */
             s.audioClipCache->setArmed (l.armed);
 
-            /* Capture the lane id by value so the callback survives
-             * lane index shifts (adds / removes elsewhere). */
+            /* Capture lane id by value (survives lane-index shifts)
+             * and the ArrangementView via Component::SafePointer so
+             * the lambda is safe to invoke after this view has been
+             * destroyed (graph-teardown race: AudioClipNode's Timer
+             * may fire after the view is already gone). */
             const juce::Uuid laneId = l.id;
+            juce::Component::SafePointer<ArrangementView> safe (this);
             s.audioClipCache->setRecordingCommittedHandler (
-                [this, laneId] (const juce::File& file)
+                [safe, laneId] (const juce::File& file)
                 {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr) return;
+
                     /* Resolve lane by id (linear scan).  If user
                      * deleted the lane mid-capture, drop the file
-                     * silently -- we leave the .wav on disk for
-                     * recovery but don't add a Region. */
+                     * silently -- the .wav stays on disk for
+                     * recovery but no Region is created. */
                     int idx = -1;
-                    for (int k = 0; k < lanes_.size(); ++k)
-                        if (lanes_.getReference (k).id == laneId) { idx = k; break; }
+                    for (int k = 0; k < self->lanes_.size(); ++k)
+                        if (self->lanes_.getReference (k).id == laneId) { idx = k; break; }
                     if (idx < 0) return;
 
                     auto src = SourceRegistry::get().importFromFile (file);
                     if (src == nullptr) return;
 
-                    auto& lane = lanes_.getReference (idx);
+                    auto& lane = self->lanes_.getReference (idx);
 
                     /* Append a Region at the end of the existing
                      * playlist.  positionBeats = max region endBeats,
                      * or 0 if empty.  lengthBeats derived from file
-                     * duration + session bpm; defaults to 8 if no
-                     * monitor is available. */
+                     * duration + session bpm; defaults to 120 bpm
+                     * when no monitor is available. */
                     double position = 0.0;
                     for (const auto& r : lane.playlist.regions())
                         position = juce::jmax (position, r.endBeats());
 
-                    const double bpm = monitor_ != nullptr
-                                          ? (double) monitor_->tempo.get()
+                    const double bpm = self->monitor_ != nullptr
+                                          ? (double) self->monitor_->tempo.get()
                                           : 120.0;
                     const double lengthSeconds = src->sourceSampleRate() > 0
                         ? (double) src->durationSamples() / (double) src->sourceSampleRate()
@@ -744,11 +751,11 @@ void ArrangementView::rescanLaneTargets()
                     r.colour        = juce::Colour::fromRGB (90, 170, 130);
                     lane.playlist.addRegion (std::move (r));
 
-                    writeLanesToSession();
-                    if (body_ != nullptr)
+                    self->writeLanesToSession();
+                    if (self->body_ != nullptr)
                     {
-                        body_->resizeForLanes();
-                        body_->repaintLane (idx);
+                        self->body_->resizeForLanes();
+                        self->body_->repaintLane (idx);
                     }
                 });
         }
