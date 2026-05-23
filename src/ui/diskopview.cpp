@@ -325,6 +325,27 @@ public:
             addAndMakeVisible (*l);
         }
 
+        /* Shared inline rename editor.  Hidden until showInlineRename
+         * positions it over a row.  Return commits via the captured
+         * callback; Escape + focus-loss revert (per
+         * feedback_inline_edit_cancel_on_click_away). */
+        inlineEditor_.setMultiLine (false);
+        inlineEditor_.setReturnKeyStartsNewLine (false);
+        inlineEditor_.setSelectAllWhenFocused (true);
+        inlineEditor_.setFont (FontOptions (kFontSize, Font::plain));
+        inlineEditor_.setColour (TextEditor::backgroundColourId,    Colour { 0xff'18'18'18 });
+        inlineEditor_.setColour (TextEditor::textColourId,          Colour { 0xff'ff'ff'ff });
+        inlineEditor_.setColour (TextEditor::outlineColourId,       Colour { 0xff'40'40'40 });
+        inlineEditor_.setColour (TextEditor::focusedOutlineColourId, Colour { 0xff'ff'a0'40 });
+        inlineEditor_.onReturnKey = [this] {
+            if (inlineEditCommit_)
+                inlineEditCommit_ (*this, inlineEditor_.getText());
+            hideInlineRename();
+        };
+        inlineEditor_.onEscapeKey = [this] { hideInlineRename(); };
+        inlineEditor_.onFocusLost = [this] { hideInlineRename(); };
+        addChildComponent (inlineEditor_);
+
         DiskOpService::get().activations.addChangeListener (this);
         startTimerHz (2);
     }
@@ -430,8 +451,10 @@ public:
                     6, 0, 36, h, Justification::centredLeft);
 
         g.setColour (used ? kAccentAmber : kEmptyText);
+        /* ASCII-only placeholder (em-dash mojibakes on some Wine /
+         * Linux WMs -- see feedback_no_non_ascii_characters memory). */
         const String name = (inst && inst->name.isNotEmpty()) ? inst->name
-                          : String (CharPointer_UTF8 ("\xe2\x80\x94"));
+                                                              : String ("--");
         g.drawText (name, 50, 0, w - 110, h, Justification::centredLeft);
 
         if (inst)
@@ -455,8 +478,7 @@ public:
         g.drawText (String::formatted ("%02d", row + 1),
                     6, 0, 30, h, Justification::centredLeft);
         g.setColour (slot ? kAccentAmber : kEmptyText);
-        g.drawText (slot ? slot->name
-                         : String (CharPointer_UTF8 ("\xe2\x80\x94")),
+        g.drawText (slot ? slot->name : String ("--"),
                     40, 0, w - 46, h, Justification::centredLeft);
     }
 
@@ -476,28 +498,52 @@ public:
         auto inst = sn->getInstrument (row);
         if (inst == nullptr) return;
 
-        auto* editor = new AlertWindow ("Rename instrument bank",
-            "Name for bank " + String (row + 1), AlertWindow::NoIcon);
-        editor->addTextEditor ("name", inst->name);
-        editor->addButton ("OK",     1, KeyPress (KeyPress::returnKey));
-        editor->addButton ("Cancel", 0, KeyPress (KeyPress::escapeKey));
-
-        /* SafePointer guards against the SampleBankPane (and its
-         * surrounding DiskOpContentView) being destroyed while the
-         * modal is still open — closing Disk Op or quitting the app
-         * before the rename is confirmed would otherwise leave the
-         * lambda's `this` capture dangling. */
-        Component::SafePointer<SampleBankPane> safeThis (this);
-        editor->enterModalState (true,
-            ModalCallbackFunction::create ([row, editor, safeThis] (int r) mutable {
-                std::unique_ptr<AlertWindow> ownEditor (editor);   /* always delete */
-                if (! safeThis) return;                              /* we died — bail */
-                if (r != 1)    return;
-                if (auto* sn2 = safeThis->getSamplerProcessor (safeThis->activeSampler_))
+        /* Position the shared inlineEditor_ over the name area of
+         * the bank row (NOT the full row -- the "NNN" prefix and the
+         * "loaded/16" suffix stay visible while the user types).
+         * Matches the SessionView's inline-edit convention -- Return
+         * commits, Escape + focus-loss revert.
+         *
+         * Row paint geometry (paintInstrumentRow):
+         *   bank number  x =  6, w = 36
+         *   name strip   x = 50, w = (rowW - 110)
+         *   loaded count anchored to the right edge, w = 46 + 6 pad. */
+        const auto rowLocal  = instrumentList_.list.getRowPosition (row, true);
+        auto editBounds = getLocalArea (&instrumentList_.list, rowLocal);
+        constexpr int kLeftInset  = 50;
+        constexpr int kRightInset = 58;
+        editBounds.removeFromLeft  (kLeftInset);
+        editBounds.removeFromRight (kRightInset);
+        showInlineRename (editBounds, inst->name,
+            [row] (SampleBankPane& self, const String& txt) {
+                if (auto* sn2 = self.getSamplerProcessor (self.activeSampler_))
                     if (auto inst2 = sn2->getInstrument (row))
-                        inst2->name = ownEditor->getTextEditorContents ("name");
-                safeThis->instrumentList_.list.repaint();
-            }), false);
+                        inst2->name = txt;
+                self.instrumentList_.list.repaint();
+            });
+    }
+
+    /** Position the shared inline TextEditor over the given local-
+     *  space bounds, populate it with the current name, focus it,
+     *  and select all so the user can start typing immediately.
+     *  Commit fires onCommit; Escape + focus-loss revert. */
+    void showInlineRename (juce::Rectangle<int> bounds,
+                           const String& initial,
+                           std::function<void (SampleBankPane&, const String&)> onCommit)
+    {
+        inlineEditCommit_ = std::move (onCommit);
+        inlineEditor_.setBounds (bounds);
+        inlineEditor_.setText (initial, dontSendNotification);
+        inlineEditor_.setVisible (true);
+        inlineEditor_.toFront (true);
+        inlineEditor_.selectAll();
+        inlineEditor_.grabKeyboardFocus();
+    }
+
+    void hideInlineRename()
+    {
+        inlineEditCommit_ = nullptr;
+        inlineEditor_.setVisible (false);
     }
 
 private:
@@ -769,6 +815,12 @@ private:
     Label title_, instrumentLabel_, slotsLabel_;
     ComboBox samplerCombo_;
     TextButton addSamplerBtn_, refreshBtn_, loadBtn_, loadBankBtn_;
+
+    /* Inline rename editor -- one shared TextEditor positioned over the
+     * row being renamed.  Replaces the prior AlertWindow popup so the
+     * user can rename without losing context. */
+    TextEditor inlineEditor_;
+    std::function<void (SampleBankPane&, const String&)> inlineEditCommit_;
 };
 
 
