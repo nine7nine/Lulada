@@ -326,10 +326,23 @@ public:
         const double mouseBeat = juce::jmax (0.0,
             (double) (e.x - kLabelW) / (double) kPxPerBeat);
 
+        /* Snap the cursor's beat-position to the configured grid
+         * before computing the new region pos/length.  Snap to the
+         * nearest division so the user can drag PAST a grid line a
+         * little and still land cleanly.  When snap is disabled
+         * (toggle off) we use the raw beat. */
+        auto snap = [this] (double beats) noexcept -> double
+        {
+            if (! owner.snapEnabled_ || owner.snapDivision_ <= 0.0)
+                return beats;
+            return std::round (beats / owner.snapDivision_) * owner.snapDivision_;
+        };
+
         if (gesture_.mode == Gesture::Move)
         {
-            const double delta = mouseBeat - gesture_.mouseDownXBeats;
-            const double target = juce::jmax (0.0, gesture_.originalPos + delta);
+            const double delta  = mouseBeat - gesture_.mouseDownXBeats;
+            const double target = juce::jmax (0.0,
+                snap (gesture_.originalPos + delta));
 
             /* moveRegion enforces no-overlap; if the target collides,
              * snap to the latest non-overlapping position before it.
@@ -339,8 +352,9 @@ public:
         }
         else /* Resize */
         {
-            const double newLength = juce::jmax (kMinRegionBeats,
-                mouseBeat - gesture_.originalPos);
+            const double snappedEnd = snap (mouseBeat);
+            const double newLength  = juce::jmax (kMinRegionBeats,
+                snappedEnd - gesture_.originalPos);
             lane.playlist.resizeRegion (gesture_.regionId, newLength);
         }
 
@@ -818,9 +832,42 @@ ArrangementView::ArrangementView()
     addAndMakeVisible (rescanBtn_);
     addAndMakeVisible (addAudioBtn_);
     addAndMakeVisible (loadAudioBtn_);
+    addAndMakeVisible (snapBtn_);
+    addAndMakeVisible (snapBox_);
     addAndMakeVisible (posLabel_);
     addAndMakeVisible (bpmLabel_);
     addAndMakeVisible (viewport_);
+
+    /* Snap controls.  snapBtn toggles snap on/off; snapBox picks
+     * the snap unit in beats.  Visual highlight = on. */
+    snapBtn_.setClickingTogglesState (true);
+    snapBtn_.setToggleState (snapEnabled_, juce::dontSendNotification);
+    snapBtn_.onClick = [this]()
+    {
+        snapEnabled_ = snapBtn_.getToggleState();
+        snapBox_.setEnabled (snapEnabled_);
+    };
+
+    snapBox_.addItem ("1/16",  1);
+    snapBox_.addItem ("1/8",   2);
+    snapBox_.addItem ("1/4",   3);
+    snapBox_.addItem ("Beat",  4);
+    snapBox_.addItem ("1/2",   5);
+    snapBox_.addItem ("Bar",   6);
+    snapBox_.setSelectedId (4, juce::dontSendNotification);   // Beat default
+    snapBox_.onChange = [this]()
+    {
+        switch (snapBox_.getSelectedId())
+        {
+            case 1: snapDivision_ = 0.25; break;
+            case 2: snapDivision_ = 0.5;  break;
+            case 3: snapDivision_ = 1.0;  break;
+            case 4: snapDivision_ = 1.0;  break;
+            case 5: snapDivision_ = 2.0;  break;
+            case 6: snapDivision_ = 4.0;  break;
+            default: break;
+        }
+    };
 
     body_ = std::make_unique<Body> (*this);
     viewport_.setViewedComponent (body_.get(), false);
@@ -918,6 +965,8 @@ void ArrangementView::resized()
     rescanBtn_    .setBounds (top.removeFromLeft (56)); top.removeFromLeft (6);
     addAudioBtn_  .setBounds (top.removeFromLeft (72)); top.removeFromLeft (6);
     loadAudioBtn_ .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
+    snapBtn_      .setBounds (top.removeFromLeft (50)); top.removeFromLeft (4);
+    snapBox_      .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
     bpmLabel_     .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
     posLabel_     .setBounds (top.removeFromLeft (96));
     viewport_.setBounds (r);
