@@ -144,6 +144,41 @@ public:
             addAndMakeVisible (pluginMenu);
 
         addAndMakeVisible (midiBlinker);
+
+        /* Bottom-row secondary widgets (Bitwig-style depth). */
+        addAndMakeVisible (timeElapsedLabel_);
+        timeElapsedLabel_.setText ("0:00.000", juce::dontSendNotification);
+        timeElapsedLabel_.setJustificationType (juce::Justification::centred);
+        timeElapsedLabel_.setColour (juce::Label::textColourId,
+                                       juce::Colour (0xff'c0'd5'e5));
+        timeElapsedLabel_.setFont (juce::FontOptions (
+            juce::Font::getDefaultMonospacedFontName(), 13.0f, juce::Font::bold));
+
+        const juce::Colour kActiveTint { 0xff'4a'a5'5a };
+        addAndMakeVisible (metroBtn_);
+        metroBtn_.setClickingTogglesState (true);
+        metroBtn_.setActiveTint (kActiveTint);
+        metroBtn_.setTooltip ("Metronome (placeholder; click track wiring pending)");
+
+        addAndMakeVisible (loopGlobalBtn_);
+        loopGlobalBtn_.setClickingTogglesState (true);
+        loopGlobalBtn_.setActiveTint (kActiveTint);
+        loopGlobalBtn_.setTooltip ("Transport loop (set range on the timeline first)");
+
+        addAndMakeVisible (syncBtn_);
+        syncBtn_.setClickingTogglesState (true);
+        syncBtn_.setActiveTint (juce::Colour (0xff'b5'8a'4a));   // amber when on (Ext)
+        syncBtn_.setTooltip ("Sync source: Int / Ext (mirrors tempo bar)");
+        syncBtn_.onClick = [this]() {
+            const bool ext = syncBtn_.getToggleState();
+            syncBtn_.setLabel (ext ? "Ext" : "Int");
+        };
+
+        /* Always-on timer ticks the time-elapsed readout (~80 ms).
+         * Existing buttonClicked timer for mapButton learning also
+         * uses this Timer; both call timerCallback so we have a
+         * single dispatch -- check what reasonably wants the tick. */
+        startTimerHz (12);
     }
 
     ~Toolbar()
@@ -188,17 +223,32 @@ public:
 
     void resized() override
     {
-        Rectangle<int> r (getLocalBounds());
+        Rectangle<int> bounds (getLocalBounds());
+        const int H = bounds.getHeight();
 
-        /* Tight padding — was 10px outer + 16px vertical, now 4px outer
-         * + 6px vertical.  Keeps the strip slim like the bottom
-         * statusbar and stops the top tempo/transport row from
-         * floating in dead space. */
-        const int tempoBarWidth = jmax (120, tempoBar.getWidth());
-        const int tempoBarHeight = getHeight() - 6;
+        /* Two-row Bitwig-style layout when we have the height for it
+         * (>= 50 px); otherwise collapse back to a single row so
+         * settings.toolBarSize=32 still works.  Primary row (top):
+         * tempo / transport / view-selector.  Secondary row (bottom):
+         * time elapsed, Metro / Loop / Int.Ext sync. */
+        const bool twoRows = H >= 50;
+        Rectangle<int> topRow, botRow;
+        if (twoRows)
+        {
+            topRow = bounds.removeFromTop (H / 2 + 2);
+            botRow = bounds;
+        }
+        else
+        {
+            topRow = bounds;
+        }
 
-        tempoBar.setBounds (4, 3, tempoBarWidth, tempoBarHeight);
+        /* ---- Top row (existing layout) ---- */
+        Rectangle<int> r = topRow;
+        const int tempoBarHeight = juce::jmax (20, r.getHeight() - 6);
+        const int tempoBarWidth  = jmax (120, tempoBar.getWidth());
 
+        tempoBar.setBounds (4, r.getY() + 3, tempoBarWidth, tempoBarHeight);
         r.removeFromRight (4);
 
         if (pluginMenu.isVisible())
@@ -217,8 +267,6 @@ public:
 
         if (viewSelector.isVisible())
         {
-            /* 4 colour-coded view buttons, each ~tempoBarHeight wide,
-             * total ~4× the old viewBtn footprint. */
             viewSelector.setBounds (r.removeFromRight (tempoBarHeight * 4)
                                        .withSizeKeepingCentre (tempoBarHeight * 4, tempoBarHeight));
         }
@@ -232,10 +280,42 @@ public:
 
         if (transport.isVisible())
         {
-            r = getLocalBounds().withX ((getWidth() / 2) - (transport.getWidth() / 2));
-            r.setWidth (transport.getWidth());
-            transport.setBounds (r.withSizeKeepingCentre (r.getWidth(), tempoBarHeight));
+            const int tW = transport.getWidth();
+            Rectangle<int> tr (topRow.getX() + (topRow.getWidth() / 2) - (tW / 2),
+                                topRow.getY(),
+                                tW, topRow.getHeight());
+            transport.setBounds (tr.withSizeKeepingCentre (tW, tempoBarHeight));
         }
+
+        if (! twoRows)
+        {
+            timeElapsedLabel_.setVisible (false);
+            metroBtn_      .setVisible (false);
+            loopGlobalBtn_ .setVisible (false);
+            syncBtn_       .setVisible (false);
+            return;
+        }
+        timeElapsedLabel_.setVisible (true);
+        metroBtn_      .setVisible (true);
+        loopGlobalBtn_ .setVisible (true);
+        syncBtn_       .setVisible (true);
+
+        /* ---- Bottom row (Bitwig-style secondaries) ----
+         *
+         * Left:  time elapsed (mm:ss.mmm), big monospace readout.
+         * Centre: Metro / Loop / Sync trio of toggles.
+         * Right: reserved for future widgets (key sig, master meter)
+         *        -- visible blank space communicates the affordance
+         *        until those widgets land. */
+        Rectangle<int> br = botRow.reduced (4, 3);
+        const int rowH = br.getHeight();
+
+        timeElapsedLabel_.setBounds (br.removeFromLeft (140));
+        br.removeFromLeft (12);
+
+        metroBtn_      .setBounds (br.removeFromLeft (rowH * 3));   br.removeFromLeft (3);
+        loopGlobalBtn_ .setBounds (br.removeFromLeft (rowH * 3));   br.removeFromLeft (3);
+        syncBtn_       .setBounds (br.removeFromLeft (rowH * 2));
     }
 
     void paint (Graphics& g) override
@@ -267,13 +347,43 @@ public:
 
     void timerCallback() override
     {
+        /* Resolve the transport monitor lazily; the audio engine isn't
+         * ready until the session loads. */
+        if (transportMonitor_ == nullptr)
+        {
+            if (auto* g = ViewHelpers::getGlobals (this))
+                if (auto eng = g->audio())
+                    transportMonitor_ = eng->getTransportMonitor();
+        }
+
+        if (transportMonitor_ != nullptr)
+        {
+            const double secs = transportMonitor_->getPositionSeconds();
+            if (std::abs (secs - lastShownTimeSecs_) > 0.01)
+            {
+                lastShownTimeSecs_ = secs;
+                const int totalMs = (int) std::lround (secs * 1000.0);
+                const int mins    = totalMs / 60000;
+                const int rest    = totalMs - mins * 60000;
+                const int seconds = rest / 1000;
+                const int millis  = rest - seconds * 1000;
+                juce::String s;
+                s << mins << ":";
+                if (seconds < 10) s << "0";
+                s << seconds << ".";
+                if (millis < 100) s << "0";
+                if (millis < 10)  s << "0";
+                s << millis;
+                timeElapsedLabel_.setText (s, juce::dontSendNotification);
+            }
+        }
+
+        /* Mapping-learn auto-clear (legacy behaviour; harmless when
+         * mapping isn't engaged). */
         if (auto* mapping = owner.services().find<MappingService>())
         {
-            if (! mapping->isLearning())
-            {
+            if (! mapping->isLearning() && mapButton.getToggleState())
                 mapButton.setToggleState (false, dontSendNotification);
-                stopTimer();
-            }
         }
     }
 
@@ -288,6 +398,17 @@ private:
     IconButton pluginMenu;
     MidiBlinker midiBlinker;
     Array<SignalConnection> connections;
+
+    /* Bottom-row Bitwig-style secondary widgets.  Visual-only stubs
+     * for v1 -- engine wiring (metronome click track, transport-
+     * loop, MIDI / link sync mode) is queued.  Time elapsed reads
+     * the monitor directly so it lights up immediately. */
+    juce::Label      timeElapsedLabel_;
+    BlockToolButton  metroBtn_  { "Metro" };
+    BlockToolButton  loopGlobalBtn_ { "Loop" };
+    BlockToolButton  syncBtn_   { "Int" };
+    Transport::MonitorPtr transportMonitor_;
+    double           lastShownTimeSecs_ { -1.0 };
 
     void runPluginMenu()
     {
@@ -456,7 +577,10 @@ Content::Content (Context& ctx)
     addAndMakeVisible (toolBar.get());
     toolBar->setSession (context().session());
     toolBarVisible = true;
-    toolBarSize = 32;
+    /* Thicker bar to fit the secondary Bitwig-style row beneath the
+     * primary tempo / transport row.  32 -> 60 = +28 px; the two-row
+     * layout in Content::Toolbar::resized() splits it ~50/50. */
+    toolBarSize = 60;
 
     const Node node (context().session()->getCurrentGraph());
     setCurrentNode (node);
