@@ -98,6 +98,54 @@ public:
                 kv.second->removeChangeListener (this);
     }
 
+    /** Active editing tool.  Toolbar above the ruler swaps between
+     *  these; mouseDown / mouseDrag branch on the value.
+     *   - Select   : drag = move, edge-drag = resize, click = launch,
+     *                right-click = context menu (existing behaviour)
+     *   - Range    : drag in strip = set time-range overlay
+     *                (loops between rangeStart/rangeEnd when loop
+     *                button is on; transport wraps in timerCallback)
+     *   - Split    : click on region = split at click beat
+     *   - Trim     : drag on region = resize only (no move)
+     *   - Audition : click on region = launch immediately, no drag */
+    enum class Tool { Select, Range, Split, Trim, Audition };
+
+    void setActiveTool (Tool t)
+    {
+        if (activeTool_ == t) return;
+        activeTool_ = t;
+        /* Cancel any in-flight gesture if it doesn't suit the new
+         * tool; harmless to wipe even when it does. */
+        gesture_ = Gesture {};
+        switch (t)
+        {
+            case Tool::Select:   setMouseCursor (juce::MouseCursor::NormalCursor);          break;
+            case Tool::Range:    setMouseCursor (juce::MouseCursor::CrosshairCursor);        break;
+            case Tool::Split:    setMouseCursor (juce::MouseCursor::IBeamCursor);             break;
+            case Tool::Trim:     setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);   break;
+            case Tool::Audition: setMouseCursor (juce::MouseCursor::PointingHandCursor);      break;
+        }
+        repaint();
+    }
+    Tool getActiveTool() const noexcept { return activeTool_; }
+
+    /** Loop-range state.  rangeActive_ is "user has drawn a range";
+     *  loopActive_ is "and the loop button is on".  Loop only takes
+     *  effect when both are true.  Range bounds are in beats and
+     *  always normalised so rangeStart_ <= rangeEnd_. */
+    bool   hasRange()       const noexcept { return rangeActive_; }
+    double rangeStart()     const noexcept { return rangeStart_; }
+    double rangeEnd()       const noexcept { return rangeEnd_;   }
+    bool   isLooping()      const noexcept { return loopActive_ && rangeActive_
+                                                     && rangeEnd_ > rangeStart_; }
+    void   setLoopActive (bool on) { loopActive_ = on; repaint(); }
+    void   clearRange()
+    {
+        rangeActive_ = false;
+        rangeDragging_ = false;
+        repaint();
+    }
+
 private:
     /** juce::AudioThumbnail emits a change notification each time the
      *  background reader updates its peak-data window.  Repaint the
@@ -130,6 +178,51 @@ public:
             g.drawText ("Drop an audio file here, or click + Audio to add a track.",
                         getLocalBounds().withTrimmedTop (kRulerH),
                         juce::Justification::centred);
+        }
+
+        /* Range overlay -- drawn over all lanes so it reads as a
+         * timeline-wide selection.  Loop-armed range gets a brighter
+         * outline + tinted fill; plain range gets a softer wash. */
+        if (rangeActive_ && rangeEnd_ > rangeStart_)
+        {
+            const int xs = kLabelW + (int) (rangeStart_ * kPxPerBeat);
+            const int xe = kLabelW + (int) (rangeEnd_   * kPxPerBeat);
+            const int w  = juce::jmax (1, xe - xs);
+            const int yTop  = 0;
+            const int yLanes = kRulerH + juce::jmax (1, laneCount) * kLaneH;
+
+            const juce::Colour fillCol = loopActive_
+                ? juce::Colour::fromRGBA (90, 180, 110, 50)
+                : juce::Colour::fromRGBA (140, 170, 210, 38);
+            const juce::Colour edgeCol = loopActive_
+                ? juce::Colour::fromRGB (110, 220, 130)
+                : juce::Colour::fromRGB (170, 200, 240);
+
+            /* Ruler-row band (brighter, marks the range as a loop
+             * marker when looping is on). */
+            g.setColour (loopActive_
+                            ? juce::Colour::fromRGBA (90, 200, 110, 130)
+                            : juce::Colour::fromRGBA (140, 170, 210, 100));
+            g.fillRect (xs, yTop, w, kRulerH);
+
+            /* Lane-area wash. */
+            g.setColour (fillCol);
+            g.fillRect (xs, kRulerH, w, juce::jmax (0, yLanes - kRulerH));
+
+            /* Edges -- 1 px vertical lines at start + end. */
+            g.setColour (edgeCol);
+            g.drawVerticalLine (xs,        (float) yTop, (float) yLanes);
+            g.drawVerticalLine (xe - 1,    (float) yTop, (float) yLanes);
+
+            /* Loop badge in the ruler row when loop is on. */
+            if (loopActive_)
+            {
+                g.setColour (juce::Colours::black);
+                g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                              9.0f, juce::Font::bold));
+                g.drawText ("LOOP", xs + 4, 2, juce::jmin (40, w - 8), kRulerH - 4,
+                            juce::Justification::centredLeft, false);
+            }
         }
 
         if (dropHover_)
@@ -266,19 +359,35 @@ public:
 
     void mouseDown (const MouseEvent& e) override
     {
-        if (e.y < kRulerH)   /* clicks in the ruler -- TODO seek transport */
+        /* Ruler clicks (the bars:beats strip at the top): seek
+         * transport to the clicked beat; if a drag follows, redefine
+         * the range from the click point.  Mirrors Ardour/Bitwig
+         * convention: ruler = locator + range surface. */
+        if (e.y < kRulerH && e.x >= kLabelW)
+        {
+            const double beat = juce::jmax (0.0,
+                (double) (e.x - kLabelW) / (double) kPxPerBeat);
+            owner.seekToBeat (beat);
+
+            rangeAnchor_   = beat;
+            rangeStart_    = beat;
+            rangeEnd_      = beat;
+            rangeActive_   = true;
+            rangeDragging_ = true;
+            grabKeyboardFocus();
+            repaint();
             return;
+        }
+        if (e.y < kRulerH) return;   /* ruler click in label gutter */
 
         const int laneIdx = (e.y - kRulerH) / kLaneH;
         if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
         auto& lane    = owner.lanes_.getReference (laneIdx);
         auto& runtime = owner.laneRuntime_.getReference (laneIdx);
 
+        /* Label area button hits (M/S/R) are tool-independent. */
         if (e.x < kLabelW)
         {
-            /* Mute / solo toggles work on both tracker AND audio
-             * lanes.  Arm is audio-only (no recording into a tracker
-             * lane). */
             if (muteToggleRect (laneIdx).contains (e.x, e.y))
             {
                 lane.muted = ! lane.muted;
@@ -292,7 +401,7 @@ public:
                 lane.soloed = ! lane.soloed;
                 owner.writeLanesToSession();
                 owner.propagateMuteSolo();
-                repaint();   // solo affects every other lane's effective mute
+                repaint();
                 return;
             }
             if (runtime.isAudioLane() && armToggleRect (laneIdx).contains (e.x, e.y))
@@ -308,14 +417,30 @@ public:
         if (runtime.isOrphan()) return;
 
         const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+
+        /* Range tool: any strip-area click begins a range drag.
+         * Doesn't matter whether a region was hit -- range overlays
+         * sit above all lanes. */
+        if (activeTool_ == Tool::Range)
+        {
+            rangeAnchor_   = beat;
+            rangeStart_    = beat;
+            rangeEnd_      = beat;
+            rangeActive_   = true;
+            rangeDragging_ = true;
+            selectedLane_   = -1;
+            selectedRegion_ = juce::Uuid::null();
+            grabKeyboardFocus();
+            repaint();
+            return;
+        }
+
         const auto& regions = lane.playlist.regions();
         for (const auto& r : regions)
         {
             if (! r.containsBeat (beat)) continue;
 
-            /* Right-click on a region: temporary context menu (loop
-             * toggle / split / delete) until the proper Ardour-style
-             * tool-mode toolbar lands.  No drag gesture started. */
+            /* Right-click context menu works in every tool. */
             if (e.mods.isPopupMenu())
             {
                 selectedLane_   = laneIdx;
@@ -325,9 +450,32 @@ public:
                 return;
             }
 
-            /* Begin a gesture; whether it ends in move/resize/click
-             * is decided by what happens between mouseDown and
-             * mouseUp. */
+            /* Split tool: cleave the region in two at the click beat. */
+            if (activeTool_ == Tool::Split)
+            {
+                const auto newId = lane.playlist.splitRegion (r.id, beat);
+                if (! newId.isNull())
+                {
+                    owner.writeLanesToSession();
+                    repaintLane (laneIdx);
+                }
+                return;
+            }
+
+            /* Audition tool: launch the region immediately (preview),
+             * skipping the move/resize gesture path entirely. */
+            if (activeTool_ == Tool::Audition)
+            {
+                launchRegionAudition (laneIdx, r);
+                selectedLane_   = laneIdx;
+                selectedRegion_ = r.id;
+                repaintLane (laneIdx);
+                return;
+            }
+
+            /* Select + Trim tools start a gesture; the mode differs:
+             * - Select: edge hit = Resize, body = Move
+             * - Trim:   anywhere on the region = Resize */
             gesture_.laneIdx         = laneIdx;
             gesture_.regionId        = r.id;
             gesture_.originalPos     = r.positionBeats;
@@ -335,12 +483,11 @@ public:
             gesture_.mouseDownXBeats = beat;
             gesture_.dragActive      = false;
 
-            /* Resize-vs-move hit test: cursor in the last kEdgeHandlePx
-             * pixels of the rendered region rect = Resize.  Otherwise
-             * Move. */
-            const int regionStartX = kLabelW + (int) (r.positionBeats * kPxPerBeat);
-            const int regionEndX   = kLabelW + (int) (r.endBeats()    * kPxPerBeat);
-            gesture_.mode = (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX)
+            const int regionEndX = kLabelW + (int) (r.endBeats() * kPxPerBeat);
+            const bool overRightEdge =
+                (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX);
+
+            gesture_.mode = (activeTool_ == Tool::Trim || overRightEdge)
                               ? Gesture::Resize
                               : Gesture::Move;
 
@@ -352,15 +499,61 @@ public:
             return;
         }
 
-        /* Empty area click -- clear selection. */
+        /* Empty strip area -- clear selection. */
         selectedLane_   = -1;
         selectedRegion_ = juce::Uuid::null();
         gesture_        = Gesture {};
         repaint();
     }
 
+    /** Audition helper -- routes a region launch through TrackerNode /
+     *  AudioClipNode the same way the mouseUp click-launch does, but
+     *  factored so the Audition tool can call it from mouseDown. */
+    void launchRegionAudition (int laneIdx, const Region& r)
+    {
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+        if (runtime.isTrackerLane() && r.sequenceIdx >= 0)
+        {
+            if (runtime.lastDispatchedSeqIdx >= 0
+                && runtime.lastDispatchedSeqIdx != r.sequenceIdx)
+                runtime.trackerCache->schedulePlaying (
+                    runtime.lastDispatchedSeqIdx, -1.0, false);
+            runtime.trackerCache->schedulePlaying (r.sequenceIdx, -1.0, true);
+        }
+        else if (runtime.isAudioLane())
+        {
+            const double bpm = owner.monitor_ != nullptr
+                ? (double) owner.monitor_->tempo.get() : 120.0;
+            const double sessionSR = owner.monitor_ != nullptr
+                ? (double) owner.monitor_->sampleRate.get() : 48000.0;
+            const double secsPerBeat = bpm > 0.0 ? 60.0 / bpm : 0.5;
+            runtime.audioClipCache->schedulePlay (
+                r.id, r.sourceId, -1.0, 0, r.looped,
+                r.gainDb,
+                (juce::int64) (r.fadeInBeats  * secsPerBeat * sessionSR),
+                (juce::int64) (r.fadeOutBeats * secsPerBeat * sessionSR),
+                (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR));
+        }
+        runtime.lastDispatchedRegion = r.id;
+        runtime.lastDispatchedSeqIdx = r.sequenceIdx;
+    }
+
     void mouseDrag (const MouseEvent& e) override
     {
+        /* Range drag (lane strip OR ruler) is independent of the
+         * region-gesture path -- it updates the range overlay and
+         * skips lane mutation. */
+        if (rangeDragging_)
+        {
+            const double mouseBeat = juce::jmax (0.0,
+                (double) (e.x - kLabelW) / (double) kPxPerBeat);
+            rangeStart_ = juce::jmin (rangeAnchor_, mouseBeat);
+            rangeEnd_   = juce::jmax (rangeAnchor_, mouseBeat);
+            repaint();
+            return;
+        }
+
         if (gesture_.laneIdx < 0) return;
         if (e.getDistanceFromDragStart() < kDragThresholdPx && ! gesture_.dragActive)
             return;
@@ -412,6 +605,20 @@ public:
 
     void mouseUp (const MouseEvent& e) override
     {
+        /* Finish range drag (lane strip OR ruler).  Empty range
+         * (start == end) collapses to no-range; non-empty range
+         * stays armed for loop / future delete-in-range. */
+        if (rangeDragging_)
+        {
+            rangeDragging_ = false;
+            if (rangeEnd_ <= rangeStart_ + 1e-6)
+            {
+                rangeActive_ = false;
+            }
+            repaint();
+            return;
+        }
+
         if (gesture_.laneIdx < 0) return;
 
         const int   laneIdx     = gesture_.laneIdx;
@@ -1145,6 +1352,27 @@ private:
                 g.reduceClipRegion (clipPath);
                 g.setColour (titleFill);
                 g.fillRect (titleRect);
+
+                /* Bitwig-style depth shading: subtle vertical gradient
+                 * over the top ~40% of the body, darkening at the
+                 * title-strip seam and fading to transparent toward
+                 * the centre.  Gives the clip a "lip" so the title
+                 * pops away from the waveform. */
+                if (bodyRect.getHeight() > 6)
+                {
+                    const int shadeH = juce::jmin (bodyRect.getHeight(),
+                                                    juce::jmax (8,
+                                                        (int) (bodyRect.getHeight() * 0.40f)));
+                    juce::ColourGradient grad (
+                        juce::Colours::black.withAlpha (0.45f),
+                        (float) bodyRect.getX(), (float) bodyRect.getY(),
+                        juce::Colours::black.withAlpha (0.0f),
+                        (float) bodyRect.getX(), (float) (bodyRect.getY() + shadeH),
+                        false);
+                    g.setGradientFill (grad);
+                    g.fillRect (bodyRect.getX(), bodyRect.getY(),
+                                bodyRect.getWidth(), shadeH);
+                }
             }
 
             /* Waveform overlay for audio regions (sequenceIdx < 0),
@@ -1348,6 +1576,16 @@ private:
     };
     Gesture gesture_;
 
+    /* Active tool + loop-range state.  See the comment block on the
+     * Tool enum declaration for the per-tool gesture mapping. */
+    Tool   activeTool_     = Tool::Select;
+    bool   rangeActive_    = false;
+    bool   rangeDragging_  = false;
+    double rangeStart_     = 0.0;
+    double rangeEnd_       = 0.0;
+    double rangeAnchor_    = 0.0;
+    bool   loopActive_     = false;
+
     /* Thumbnail infrastructure.  AudioFormatManager + AudioThumbnailCache
      * are per-Body; thumbnails_ is keyed by AudioFileSource uuid so
      * regions referencing the same source share the same waveform
@@ -1377,10 +1615,14 @@ ArrangementView::ArrangementView()
     addAndMakeVisible (rescanBtn_);
     addAndMakeVisible (addAudioBtn_);
     addAndMakeVisible (loadAudioBtn_);
+    addAndMakeVisible (toolSelectBtn_);
+    addAndMakeVisible (toolRangeBtn_);
+    addAndMakeVisible (toolSplitBtn_);
+    addAndMakeVisible (toolTrimBtn_);
+    addAndMakeVisible (toolAuditionBtn_);
+    addAndMakeVisible (loopBtn_);
     addAndMakeVisible (snapBtn_);
     addAndMakeVisible (snapBox_);
-    addAndMakeVisible (posLabel_);
-    addAndMakeVisible (bpmLabel_);
     addAndMakeVisible (viewport_);
 
     /* Snap controls.  snapBtn toggles snap on/off; snapBox picks
@@ -1418,14 +1660,184 @@ ArrangementView::ArrangementView()
     viewport_.setViewedComponent (body_.get(), false);
     viewport_.setScrollBarsShown (true, true);
 
-    posLabel_.setText ("Beat: 0.0", juce::dontSendNotification);
-    posLabel_.setColour (juce::Label::textColourId, Colors::textColor);
-    bpmLabel_.setText ("BPM: 120.0", juce::dontSendNotification);
-    bpmLabel_.setColour (juce::Label::textColourId, Colors::textColor);
-
     rescanBtn_.onClick    = [this]() { rescanLaneTargets(); };
     addAudioBtn_.onClick  = [this]() { createEmptyAudioLane (true /*stereo*/); };
     loadAudioBtn_.onClick = [this]() { promptLoadAudioFile(); };
+
+    /* Tool buttons: radio-group toggles; one tool active at a time.
+     * Select is default + sticky on start. */
+    toolSelectBtn_   .setClickingTogglesState (true);
+    toolRangeBtn_    .setClickingTogglesState (true);
+    toolSplitBtn_    .setClickingTogglesState (true);
+    toolTrimBtn_     .setClickingTogglesState (true);
+    toolAuditionBtn_ .setClickingTogglesState (true);
+    toolSelectBtn_.setToggleState (true, juce::dontSendNotification);
+
+    toolSelectBtn_  .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Select);   syncToolToggleStates(); };
+    toolRangeBtn_   .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Range);    syncToolToggleStates(); };
+    toolSplitBtn_   .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Split);    syncToolToggleStates(); };
+    toolTrimBtn_    .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Trim);     syncToolToggleStates(); };
+    toolAuditionBtn_.onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Audition); syncToolToggleStates(); };
+
+    loopBtn_.setClickingTogglesState (true);
+    loopBtn_.setToggleState (false, juce::dontSendNotification);
+    loopBtn_.onClick = [this]() { onLoopToggled(); };
+
+    /* Active-state green tint -- mirrors tracker FOLLOW button so a
+     * row of tool buttons reads as "this one is currently armed". */
+    const juce::Colour kActiveTint { 0xff'4a'a5'5a };
+    toolSelectBtn_  .setActiveTint (kActiveTint);
+    toolRangeBtn_   .setActiveTint (kActiveTint);
+    toolSplitBtn_   .setActiveTint (kActiveTint);
+    toolTrimBtn_    .setActiveTint (kActiveTint);
+    toolAuditionBtn_.setActiveTint (kActiveTint);
+    loopBtn_        .setActiveTint (kActiveTint);
+    snapBtn_        .setActiveTint (kActiveTint);
+
+    /* Tool icons (vector paths, foreground-coloured so they pop in
+     * both active + idle states).  Drawn in a square chunk on the
+     * left of the button; label sits beside. */
+    toolSelectBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Mouse-pointer arrow: thin filled triangle pointing
+             * upper-left to lower-right.  Standard cursor glyph. */
+            juce::Path p;
+            const float x0 = b.getX() + b.getWidth() * 0.20f;
+            const float y0 = b.getY() + b.getHeight() * 0.15f;
+            const float x1 = b.getX() + b.getWidth() * 0.55f;
+            const float y1 = b.getY() + b.getHeight() * 0.55f;
+            const float x2 = b.getX() + b.getWidth() * 0.35f;
+            const float y2 = b.getY() + b.getHeight() * 0.55f;
+            const float x3 = b.getX() + b.getWidth() * 0.55f;
+            const float y3 = b.getY() + b.getHeight() * 0.85f;
+            const float x4 = b.getX() + b.getWidth() * 0.35f;
+            const float y4 = b.getY() + b.getHeight() * 0.85f;
+            const float x5 = b.getX() + b.getWidth() * 0.20f;
+            const float y5 = b.getY() + b.getHeight() * 0.65f;
+            p.startNewSubPath (x0, y0);
+            p.lineTo (x1, y1);
+            p.lineTo (x2, y2);
+            p.lineTo (x3, y3);
+            p.lineTo (x4, y4);
+            p.lineTo (x5, y5);
+            p.closeSubPath();
+            g.setColour (fg);
+            g.fillPath (p);
+        });
+
+    toolRangeBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Two vertical bookends + horizontal line spanning between
+             * them: classic "range" / "loop bounds" glyph. */
+            const float pad = b.getHeight() * 0.20f;
+            const float top = b.getY() + pad;
+            const float bot = b.getBottom() - pad;
+            const float xL  = b.getX() + b.getWidth() * 0.20f;
+            const float xR  = b.getRight() - b.getWidth() * 0.20f;
+            const float yMid = b.getCentreY();
+            g.setColour (fg);
+            g.drawLine (xL, top, xL, bot, 1.5f);
+            g.drawLine (xR, top, xR, bot, 1.5f);
+            g.drawLine (xL, yMid, xR, yMid, 1.0f);
+        });
+
+    toolSplitBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Vertical blade with two outward arrowheads at the
+             * midline -- "cut here, two pieces". */
+            const float xMid = b.getCentreX();
+            const float yMid = b.getCentreY();
+            const float pad = b.getHeight() * 0.15f;
+            g.setColour (fg);
+            g.drawLine (xMid, b.getY() + pad, xMid, b.getBottom() - pad, 1.5f);
+            const float arrowLen = b.getWidth() * 0.22f;
+            const float arrowH   = b.getHeight() * 0.18f;
+            juce::Path leftArrow, rightArrow;
+            leftArrow.startNewSubPath (xMid - 1.5f, yMid);
+            leftArrow.lineTo (xMid - arrowLen, yMid - arrowH);
+            leftArrow.lineTo (xMid - arrowLen, yMid + arrowH);
+            leftArrow.closeSubPath();
+            rightArrow.startNewSubPath (xMid + 1.5f, yMid);
+            rightArrow.lineTo (xMid + arrowLen, yMid - arrowH);
+            rightArrow.lineTo (xMid + arrowLen, yMid + arrowH);
+            rightArrow.closeSubPath();
+            g.fillPath (leftArrow);
+            g.fillPath (rightArrow);
+        });
+
+    toolTrimBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Two brackets pointing inward -- ][ -- "trim from both
+             * sides into the middle". */
+            const float pad = b.getHeight() * 0.18f;
+            const float top = b.getY() + pad;
+            const float bot = b.getBottom() - pad;
+            const float xL  = b.getX() + b.getWidth() * 0.22f;
+            const float xR  = b.getRight() - b.getWidth() * 0.22f;
+            const float armLen = b.getWidth() * 0.18f;
+            g.setColour (fg);
+            g.drawLine (xL, top, xL, bot, 1.5f);
+            g.drawLine (xL, top, xL + armLen, top, 1.5f);
+            g.drawLine (xL, bot, xL + armLen, bot, 1.5f);
+            g.drawLine (xR, top, xR, bot, 1.5f);
+            g.drawLine (xR, top, xR - armLen, top, 1.5f);
+            g.drawLine (xR, bot, xR - armLen, bot, 1.5f);
+        });
+
+    toolAuditionBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Speaker glyph -- trapezoid body + two arc lines for
+             * sound waves.  Standard "preview" affordance. */
+            const float yMid = b.getCentreY();
+            const float bodyL = b.getX() + b.getWidth() * 0.18f;
+            const float bodyR = b.getX() + b.getWidth() * 0.42f;
+            const float coneR = b.getX() + b.getWidth() * 0.62f;
+            const float bodyTop = yMid - b.getHeight() * 0.15f;
+            const float bodyBot = yMid + b.getHeight() * 0.15f;
+            const float coneTop = yMid - b.getHeight() * 0.30f;
+            const float coneBot = yMid + b.getHeight() * 0.30f;
+            juce::Path sp;
+            sp.startNewSubPath (bodyL, bodyTop);
+            sp.lineTo (bodyR, bodyTop);
+            sp.lineTo (coneR, coneTop);
+            sp.lineTo (coneR, coneBot);
+            sp.lineTo (bodyR, bodyBot);
+            sp.lineTo (bodyL, bodyBot);
+            sp.closeSubPath();
+            g.setColour (fg);
+            g.fillPath (sp);
+            const float waveX = b.getX() + b.getWidth() * 0.72f;
+            g.drawLine (waveX, yMid - 3, waveX + b.getWidth() * 0.10f, yMid - 6, 1.2f);
+            g.drawLine (waveX, yMid + 3, waveX + b.getWidth() * 0.10f, yMid + 6, 1.2f);
+        });
+
+    loopBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Open circular arrow -- loop / wrap glyph. */
+            const float cx = b.getCentreX();
+            const float cy = b.getCentreY();
+            const float rad = juce::jmin (b.getWidth(), b.getHeight()) * 0.32f;
+            juce::Path arc;
+            arc.addCentredArc (cx, cy, rad, rad, 0.0f,
+                                0.25f, 6.0f, true);
+            g.setColour (fg);
+            g.strokePath (arc, juce::PathStrokeType (1.4f));
+            /* Tiny arrowhead at the end of the arc. */
+            const float ax = cx + rad * 0.7f;
+            const float ay = cy - rad * 0.7f;
+            juce::Path tip;
+            tip.startNewSubPath (ax, ay);
+            tip.lineTo (ax - rad * 0.45f, ay - rad * 0.15f);
+            tip.lineTo (ax - rad * 0.10f, ay - rad * 0.55f);
+            tip.closeSubPath();
+            g.fillPath (tip);
+        });
 }
 
 ArrangementView::~ArrangementView()
@@ -1507,13 +1919,21 @@ void ArrangementView::resized()
 {
     auto r = getLocalBounds();
     auto top = r.removeFromTop (kHeaderH).reduced (4, 4);
-    rescanBtn_    .setBounds (top.removeFromLeft (56)); top.removeFromLeft (6);
-    addAudioBtn_  .setBounds (top.removeFromLeft (72)); top.removeFromLeft (6);
-    loadAudioBtn_ .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
-    snapBtn_      .setBounds (top.removeFromLeft (50)); top.removeFromLeft (4);
-    snapBox_      .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
-    bpmLabel_     .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
-    posLabel_     .setBounds (top.removeFromLeft (96));
+    rescanBtn_      .setBounds (top.removeFromLeft (60)); top.removeFromLeft (4);
+    addAudioBtn_    .setBounds (top.removeFromLeft (70)); top.removeFromLeft (4);
+    loadAudioBtn_   .setBounds (top.removeFromLeft (60)); top.removeFromLeft (12);
+
+    toolSelectBtn_  .setBounds (top.removeFromLeft (76)); top.removeFromLeft (2);
+    toolRangeBtn_   .setBounds (top.removeFromLeft (72)); top.removeFromLeft (2);
+    toolSplitBtn_   .setBounds (top.removeFromLeft (64)); top.removeFromLeft (2);
+    toolTrimBtn_    .setBounds (top.removeFromLeft (64)); top.removeFromLeft (2);
+    toolAuditionBtn_.setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
+
+    loopBtn_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (12);
+
+    snapBtn_        .setBounds (top.removeFromLeft (52)); top.removeFromLeft (4);
+    snapBox_        .setBounds (top.removeFromLeft (64));
+
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
 }
@@ -2296,19 +2716,52 @@ int ArrangementView::laneIdxFromY (int yPx) const noexcept
 
 void ArrangementView::updateTransportLabel()
 {
-    if (monitor_ == nullptr) return;
-    const float bpm = monitor_->tempo.get();
-    if (std::abs (bpm - lastBpmShown_) > 0.05f)
-    {
-        bpmLabel_.setText ("BPM: " + String (bpm, 1), juce::dontSendNotification);
-        lastBpmShown_ = bpm;
-    }
-    const double beat = lastBeat_;
-    if (std::abs (beat - lastBeatShown_) > 0.01)
-    {
-        posLabel_.setText ("Beat: " + String (beat, 2), juce::dontSendNotification);
-        lastBeatShown_ = beat;
-    }
+    /* BPM + Beat read-outs moved to the global transport bar (above
+     * the content view), so this is a no-op now.  Kept as a stub so
+     * timerCallback's call site stays valid without conditional
+     * checks; remove once a follow-up audits timerCallback. */
+}
+
+void ArrangementView::syncToolToggleStates()
+{
+    if (body_ == nullptr) return;
+    const auto tool = body_->getActiveTool();
+    toolSelectBtn_  .setToggleState (tool == Body::Tool::Select,   juce::dontSendNotification);
+    toolRangeBtn_   .setToggleState (tool == Body::Tool::Range,    juce::dontSendNotification);
+    toolSplitBtn_   .setToggleState (tool == Body::Tool::Split,    juce::dontSendNotification);
+    toolTrimBtn_    .setToggleState (tool == Body::Tool::Trim,     juce::dontSendNotification);
+    toolAuditionBtn_.setToggleState (tool == Body::Tool::Audition, juce::dontSendNotification);
+}
+
+void ArrangementView::onLoopToggled()
+{
+    if (body_ == nullptr) return;
+    body_->setLoopActive (loopBtn_.getToggleState());
+}
+
+int64_t ArrangementView::beatsToFrames (double beats) const noexcept
+{
+    if (monitor_ == nullptr) return 0;
+    const double bpm = juce::jmax (1.0, (double) monitor_->tempo.get());
+    const double sr  = juce::jmax (1.0, (double) monitor_->sampleRate.get());
+    const double secs = beats * 60.0 / bpm;
+    return (int64_t) std::llround (secs * sr);
+}
+
+double ArrangementView::framesToBeats (int64_t frames) const noexcept
+{
+    if (monitor_ == nullptr) return 0.0;
+    const double bpm = juce::jmax (1.0, (double) monitor_->tempo.get());
+    const double sr  = juce::jmax (1.0, (double) monitor_->sampleRate.get());
+    const double secs = (double) frames / sr;
+    return secs * bpm / 60.0;
+}
+
+void ArrangementView::seekToBeat (double beats)
+{
+    if (services_ == nullptr) return;
+    if (auto* eng = services_->context().audio().get())
+        eng->seekToAudioFrame (beatsToFrames (juce::jmax (0.0, beats)));
 }
 
 void ArrangementView::timerCallback()
@@ -2361,6 +2814,26 @@ void ArrangementView::timerCallback()
         }
     }
     wasRecording_ = recording;
+
+    /* Loop wrap: if loop is armed and the playhead has crossed the
+     * range-end boundary, seek the transport back to range-start.
+     * Driven from the 30 Hz UI timer -- one tick of jitter at the
+     * wrap is acceptable for v1; future move to engine-side seek
+     * for sample-accurate loop. */
+    if (playing && body_ != nullptr && body_->isLooping())
+    {
+        const double loopStart = body_->rangeStart();
+        const double loopEnd   = body_->rangeEnd();
+        if (beat >= loopEnd - 1e-6 && loopEnd > loopStart)
+        {
+            seekToBeat (loopStart);
+            for (auto& rs : laneRuntime_)
+            {
+                rs.lastDispatchedRegion = juce::Uuid::null();
+                rs.lastDispatchedSeqIdx = -1;
+            }
+        }
+    }
 
     if (playing) dispatchAtBeat (beat);
 
