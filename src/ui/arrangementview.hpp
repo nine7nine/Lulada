@@ -213,7 +213,8 @@ private:
     bool lanesLoadedFromSession_ = false;
 
     Transport::MonitorPtr monitor_;
-    bool wasPlaying_ = false;
+    bool wasPlaying_   = false;
+    bool wasRecording_ = false;
     double lastBeat_ = 0.0;
 
     float lastBpmShown_ = -1.0f;

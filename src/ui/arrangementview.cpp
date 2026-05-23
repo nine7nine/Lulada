@@ -549,16 +549,39 @@ private:
         g.drawText (label, labelArea.reduced (8, 0),
                     juce::Justification::centredLeft, true);
 
-        /* Arm toggle (audio lanes only). */
+        /* Arm toggle (audio lanes only).  While the transport is
+         * actively recording AND this lane is armed, grow + brighten
+         * the dot and overlay a "REC" badge so the user knows capture
+         * is in flight. */
+        const bool transportRecording = owner.monitor_ != nullptr
+                                      && owner.monitor_->recording.get();
+        const bool capturing = isAudio && lane.armed && transportRecording;
+
         if (isAudio)
         {
-            const auto rect = armToggleRect (laneIdx);
-            g.setColour (lane.armed ? Colour::fromRGB (220, 70, 70)
-                                    : Colour::fromRGB (60, 60, 60));
+            const auto baseRect = armToggleRect (laneIdx);
+            const auto rect = capturing ? baseRect.expanded (2)
+                                        : baseRect;
+
+            const Colour fillCol = lane.armed
+                ? (capturing ? Colour::fromRGB (255, 60, 60)
+                             : Colour::fromRGB (220, 70, 70))
+                : Colour::fromRGB (60, 60, 60);
+            g.setColour (fillCol);
             g.fillRect (rect);
-            g.setColour (lane.armed ? Colour::fromRGB (255, 120, 120)
+            g.setColour (lane.armed ? Colour::fromRGB (255, 160, 160)
                                     : Colour::fromRGB (90, 90, 90));
-            g.drawRect (rect, 1);
+            g.drawRect (rect, capturing ? 2 : 1);
+
+            if (capturing)
+            {
+                g.setColour (Colour::fromRGB (255, 80, 80));
+                g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+                const Rectangle<int> badge (
+                    rect.getX() - 32, rect.getY(), 28, rect.getHeight());
+                g.drawText ("REC", badge,
+                            juce::Justification::centredRight, false);
+            }
         }
 
         /* Strip background + beat grid. */
@@ -1580,8 +1603,9 @@ void ArrangementView::timerCallback()
 {
     if (monitor_ == nullptr) return;
 
-    const bool playing = monitor_->playing.get();
-    const double beat  = computePlayheadBeats();
+    const bool playing   = monitor_->playing.get();
+    const bool recording = monitor_->recording.get();
+    const double beat    = computePlayheadBeats();
 
     /* Transport start edge: clear per-lane "last dispatched" so the
      * first region under the playhead fires when playback resumes. */
@@ -1598,6 +1622,26 @@ void ArrangementView::timerCallback()
      * launch start.  DAW convention is audio stops with transport. */
     if (wasPlaying_ && ! playing)
         stopAllAudioLanes();
+
+    /* Repaint armed lanes while transport-recording so the REC
+     * indicator appears.  The dispatchAtBeat path only repaints
+     * lanes that change region state -- which doesn't happen during
+     * capture (no region exists until finalise). */
+    const bool recordingStateChanged = (recording != wasRecording_);
+    if (recording || recordingStateChanged)
+    {
+        if (body_ != nullptr)
+        {
+            for (int i = 0; i < lanes_.size(); ++i)
+            {
+                const auto& l = lanes_.getReference (i);
+                const auto& rs = laneRuntime_.getReference (i);
+                if (rs.isAudioLane() && l.armed)
+                    body_->repaintLane (i);
+            }
+        }
+    }
+    wasRecording_ = recording;
 
     if (playing) dispatchAtBeat (beat);
 
