@@ -37,7 +37,11 @@ private:
     AudioEnginePtr engine;
     Transport::MonitorPtr monitor;
 
-    std::unique_ptr<SettingButton> play, stop, record, toZero;
+    /* Transport buttons use the BlockToolButton family so the
+     * Play/Stop/Record/SeekZero icons render in the same vector-glyph
+     * style as the view-selector buttons (consistent silhouette,
+     * padding, gradient). */
+    std::unique_ptr<juce::Button> play, stop, record, toZero;
     std::unique_ptr<DragableIntLabel> barLabel, beatLabel, subLabel;
     bool showPositionLabels_ { true };
 

@@ -417,10 +417,9 @@ public:
         transport.setShowPositionLabels (false);
         transport.updateWidth();
 
-        /* Undo / Redo migrate from the Edit menu to the toolbar.
-         * File menu + plugin-windows buttons were pulled per user
-         * feedback (file ops live in Disk Op, plugin windows are
-         * reachable via the system Window menu when needed). */
+        /* Leftmost cluster: file menu, virtual keyboard toggle, then
+         * Edit-menu Undo / Redo.  Bitwig puts the FILE button as the
+         * first thing on the bar -- mirror that. */
         using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
         auto wireBtn = [&] (BlockToolButton& b, const juce::String& tip,
                               IconFn icon, std::function<void()> action)
@@ -431,10 +430,17 @@ public:
             b.onClick = std::move (action);
             addAndMakeVisible (b);
         };
+        wireBtn (fileMenuBtn_, "File / Session menu", &ui::iconMenu,
+                  [this]() { runFileMenu(); });
+        wireBtn (vKbdBtn_,     "Virtual keyboard",     &ui::iconKeyboard,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::toggleVirtualKeyboard, true); });
         wireBtn (undoBtn_, "Undo", &ui::iconUndo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::undo, true); });
         wireBtn (redoBtn_, "Redo", &ui::iconRedo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
+
+        vKbdBtn_.setClickingTogglesState (true);
+        vKbdBtn_.setActiveTint (juce::Colour (0xff'4a'a5'5a));
     }
 
     ~Toolbar()
@@ -492,18 +498,23 @@ public:
         const int innerPad = juce::jmax (3, (H - 50) / 2);
         const int rowH = H - innerPad * 2;
 
-        constexpr int kSidePad = 6;
-        constexpr int kGap     = 10;
-        constexpr int kIconBtnW = 30;
-        constexpr int kDisplayW = 380;
+        constexpr int kSidePad   = 8;
+        constexpr int kGap       = 14;
+        constexpr int kIconBtnW  = 32;
+        constexpr int kIconGap   = 4;
+        constexpr int kDisplayW  = 380;
 
         r.reduce (kSidePad, 0);
         const int top = r.getY() + innerPad;
 
-        /* ---- LEFT: undo / redo pair ---- */
-        undoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (2);
-        redoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        /* ---- LEFT: file menu + virtual keyboard + undo + redo ---- */
+        fileMenuBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (kIconGap);
+        vKbdBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (kGap);
+        undoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (kIconGap);
+        redoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (kGap);
 
         /* ---- Transport (Play / Stop / Record / SeekZero) ---- */
@@ -617,10 +628,25 @@ private:
      * transport monitor + session. */
     MainDisplayPanel display_ { &owner.services() };
 
-    /* Edit Undo / Redo migrated onto the toolbar.  File-menu +
-     * plugin-windows buttons removed per user feedback. */
-    BlockToolButton undoBtn_ { "" };
-    BlockToolButton redoBtn_ { "" };
+    /* Leftmost cluster: file menu, virtual keyboard toggle, undo, redo. */
+    BlockToolButton fileMenuBtn_ { "" };
+    BlockToolButton vKbdBtn_     { "" };
+    BlockToolButton undoBtn_     { "" };
+    BlockToolButton redoBtn_     { "" };
+
+    void runFileMenu()
+    {
+        auto* ui = owner.services().find<UI>();
+        if (ui == nullptr) return;
+        auto& cm = ui->commands();
+        juce::PopupMenu menu;
+        MainMenu::buildSessionMenu (cm, menu);
+        menu.addSeparator();
+        menu.addCommandItem (&cm, Commands::showPreferences, "Preferences...");
+        menu.addSeparator();
+        menu.addCommandItem (&cm, juce::StandardApplicationCommandIDs::quit);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&fileMenuBtn_));
+    }
 
     void runPluginMenu()
     {

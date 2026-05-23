@@ -302,5 +302,53 @@ inline void iconMetronome (juce::Graphics& g, juce::Rectangle<float> b, juce::Co
                  1.4f);
 }
 
+inline void iconKeyboard (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+{
+    /* Mini piano: 6 white-key rectangles + 4 black-key cap rectangles. */
+    const auto box = b.reduced (b.getWidth() * 0.12f, b.getHeight() * 0.25f);
+    g.setColour (fg);
+    g.drawRect (box, 1.2f);
+    const float w = box.getWidth() / 6.0f;
+    for (int i = 1; i < 6; ++i)
+        g.drawLine (box.getX() + w * i, box.getY(),
+                     box.getX() + w * i, box.getBottom(), 1.0f);
+    const float bw = w * 0.55f;
+    const float bh = box.getHeight() * 0.55f;
+    g.fillRect (box.getX() + w * 1 - bw * 0.5f, box.getY(), bw, bh);
+    g.fillRect (box.getX() + w * 2 - bw * 0.5f, box.getY(), bw, bh);
+    g.fillRect (box.getX() + w * 4 - bw * 0.5f, box.getY(), bw, bh);
+    g.fillRect (box.getX() + w * 5 - bw * 0.5f, box.getY(), bw, bh);
+}
+
+inline void iconMeterBars (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+{
+    /* Vertical meter bars at descending heights. */
+    const auto box = b.reduced (b.getWidth() * 0.18f, b.getHeight() * 0.18f);
+    const float w = (box.getWidth() - 6.0f) / 4.0f;
+    const float hs[4] = { 0.95f, 0.55f, 0.75f, 0.40f };
+    g.setColour (fg);
+    for (int i = 0; i < 4; ++i)
+    {
+        const float h = box.getHeight() * hs[i];
+        g.fillRect (box.getX() + (w + 2.0f) * i,
+                     box.getBottom() - h, w, h);
+    }
+}
+
+inline void iconChannelStrip (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+{
+    /* Vertical fader track + cap. */
+    const auto box = b.reduced (b.getWidth() * 0.30f, b.getHeight() * 0.10f);
+    const float trackW = 2.0f;
+    const float trackX = box.getCentreX() - trackW * 0.5f;
+    g.setColour (fg);
+    g.fillRect (trackX, box.getY(), trackW, box.getHeight());
+    const float capH = box.getHeight() * 0.16f;
+    const float capW = box.getWidth() * 1.6f;
+    g.fillRoundedRectangle (box.getCentreX() - capW * 0.5f,
+                              box.getCentreY() - capH * 0.5f,
+                              capW, capH, 1.5f);
+}
+
 } // namespace ui
 } // namespace element

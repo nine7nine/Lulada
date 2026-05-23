@@ -3,7 +3,9 @@
 
 #include <element/session.hpp>
 
+#include "ui/blocktoolbutton.hpp"
 #include "ui/guicommon.hpp"
+#include "ui/toolbaricons.hpp"
 #include "ui/transportbar.hpp"
 
 namespace element {
@@ -45,45 +47,44 @@ public:
 
 TransportBar::TransportBar()
 {
-    /* Modernised transport cluster -- icons sized at ~55 % of the
-     * button via pathReduction = 10 px so they sit inset like the
-     * tracker EDIT pill rather than crowding the borders.  Bitwig
-     * palette: bright orange Play, warm-white Stop, bright red
-     * Record, soft-white SeekZero.  Toggle-on body wash highlights
-     * Play when running + Record when armed. */
-    constexpr float kIconPad = 10.0f;
-    play = std::make_unique<PlayButton>();
+    /* Transport cluster rebuilt on BlockToolButton so the icons
+     * render in the same vector-glyph family as the view selector +
+     * undo/redo (consistent inset, gradient, hover behaviour).
+     * Bright orange Play, warm-white Stop, bright red Record,
+     * soft-white SeekZero.  Active tints push the body wash so the
+     * armed/playing state stays clearly visible. */
+    auto setIcon = [] (BlockToolButton& b,
+                        void (*fn)(juce::Graphics&, juce::Rectangle<float>, juce::Colour))
+    {
+        b.setIcon ([fn] (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour fg)
+                   { fn (g, r, fg); });
+    };
+
+    auto playB = std::make_unique<BlockToolButton> ("", Colour (0xff'ff'8a'30));
+    setIcon (*playB, &ui::iconPlay);
+    playB->setActiveTint (Colour (0xff'5a'2d'10));
+    playB->addListener (this);
+    play = std::move (playB);
     addAndMakeVisible (play.get());
-    play->setPath (getIcons().fasPlay, kIconPad);
-    play->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    play->addListener (this);
-    play->setIconColour (Colour (0xff'ff'8a'30));               // Bitwig orange
-    play->setColour (TextButton::buttonOnColourId, Colour (0xff'ff'8a'30));
-    play->setColour (SettingButton::backgroundOnColourId, Colour (0xff'4a'2a'10));
 
-    stop = std::make_unique<StopButton>();
+    auto stopB = std::make_unique<BlockToolButton> ("", Colour (0xff'b0'b0'b0));
+    setIcon (*stopB, &ui::iconStop);
+    stopB->addListener (this);
+    stop = std::move (stopB);
     addAndMakeVisible (stop.get());
-    stop->setPath (getIcons().fasStop, kIconPad);
-    stop->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    stop->addListener (this);
-    stop->setIconColour (Colour (0xff'e8'e8'e8));               // bright white
 
-    record = std::make_unique<RecordButton>();
+    auto recB = std::make_unique<BlockToolButton> ("", Colour (0xff'ff'4d'4d));
+    setIcon (*recB, &ui::iconRecord);
+    recB->setActiveTint (Colour (0xff'7a'1a'1a));
+    recB->addListener (this);
+    record = std::move (recB);
     addAndMakeVisible (record.get());
-    record->setPath (getIcons().fasCircle, kIconPad);
-    record->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    record->addListener (this);
-    record->setIconColour (Colour (0xff'ff'4d'4d));             // bright red
-    record->setColour (SettingButton::backgroundOnColourId, Colour (0xff'5a'1a'1a));
 
-    toZero = std::make_unique<SeekZeroButton>();
+    auto seekB = std::make_unique<BlockToolButton> ("", Colour (0xff'9a'9a'9a));
+    setIcon (*seekB, &ui::iconSeekZero);
+    seekB->addListener (this);
+    toZero = std::move (seekB);
     addAndMakeVisible (toZero.get());
-    auto toZeroPath = getIcons().fasChevronRight;
-    toZeroPath.applyTransform (AffineTransform().rotated (juce::MathConstants<float>::pi));
-    toZero->setPath (toZeroPath, kIconPad);
-    toZero->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    toZero->addListener (this);
-    toZero->setIconColour (Colour (0xff'd0'd0'd0));
 
     barLabel = std::make_unique<BarLabel> (*this);
     addAndMakeVisible (barLabel.get());
@@ -151,23 +152,22 @@ void TransportBar::paint (Graphics& g)
 
 void TransportBar::resized()
 {
-    /* Height-driven layout.  In the new MainDisplayPanel-led toolbar
-     * the bar/beat/sub labels are hidden (showPositionLabels_=false)
-     * so this lays out as a tight Play / Stop / Record / SeekZero
-     * cluster on the left.  When labels are shown (e.g. legacy
-     * standalone use) they precede the buttons with a small group
-     * gap, matching the original layout. */
+    /* Height-driven layout.  Each transport button is a square that
+     * matches the row height + a 4-px gap between siblings so the
+     * cluster breathes (Bitwig has visible spacing between Play,
+     * Stop, Record).  When labels are shown they precede the
+     * buttons with a wider gap for visual grouping. */
     const int h = getHeight();
     const int labelW = juce::jmax (24, juce::roundToInt (h * 1.6f));
-    const int btnW   = juce::jmax (22, juce::roundToInt (h * 1.25f));
-    constexpr int gap = 2;
-    constexpr int groupGap = 6;
+    const int btnW   = h;
+    constexpr int gap = 4;
+    constexpr int groupGap = 10;
 
     int x = 0;
     if (showPositionLabels_)
     {
-        barLabel->setBounds  (x, 0, labelW, h); x += labelW + gap;
-        beatLabel->setBounds (x, 0, labelW, h); x += labelW + gap;
+        barLabel->setBounds  (x, 0, labelW, h); x += labelW + 2;
+        beatLabel->setBounds (x, 0, labelW, h); x += labelW + 2;
         subLabel->setBounds  (x, 0, labelW, h); x += labelW + groupGap;
     }
 
