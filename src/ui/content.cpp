@@ -452,6 +452,18 @@ public:
         wireBtn (redoBtn_,      "Redo",             &ui::iconRedo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
 
+        /* Per-button border + icon-halo tints.  Disk Op + Plugin
+         * Manager carry the same colours they had inside the view
+         * selector (gold + magenta) so muscle memory survives.
+         * Preferences cog gets a soft blue.  Post-transport trio
+         * picks colours from the same Bitwig-ish family. */
+        diskOpBtn_   .setTint (juce::Colour::fromRGB (200, 180,  80));
+        pluginMgrBtn_.setTint (juce::Colour::fromRGB (190, 110, 170));
+        prefsBtn_    .setTint (juce::Colour::fromRGB ( 90, 150, 210));
+        vKbdBtn_     .setTint (juce::Colour::fromRGB ( 80, 200, 170));
+        undoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
+        redoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
+
         vKbdBtn_.setClickingTogglesState (true);
         vKbdBtn_.setActiveTint (juce::Colour (0xff'4a'a5'5a));
     }
@@ -518,19 +530,23 @@ public:
 
         constexpr int kSidePad   = 8;
         constexpr int kGap       = 14;
-        constexpr int kIconBtnW  = 32;
         constexpr int kIconGap   = 4;
         constexpr int kDisplayW  = 380;
+        /* Icon buttons share the per-row height so the leftmost
+         * trio reads as a 3-square cluster -- same shape, same
+         * inter-button gap as the view selector on the right. */
+        const int kIconBtnW = rowH;
 
         r.reduce (kSidePad, 0);
         const int top = r.getY() + innerPad;
 
-        /* ---- LEFT: Disk Op + Plugin Manager (file + plugin view
-                shortcuts), Preferences cog ---- */
+        /* ---- LEFT cluster: Disk Op + Plugin Manager + Preferences.
+                Treated as a 3-square group; matches the right view
+                selector's shape + gap so the bar reads symmetric. */
         diskOpBtn_   .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (kIconGap);
         pluginMgrBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kGap);
+        r.removeFromLeft (kIconGap);
         prefsBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (kGap);
 

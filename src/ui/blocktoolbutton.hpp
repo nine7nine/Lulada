@@ -52,6 +52,12 @@ public:
      *  grey-brightening default. */
     void setActiveTint (juce::Colour c) { activeTint_ = c; repaint(); }
 
+    /** Border + icon-halo tint.  Same colour drives the outer stroke
+     *  AND the 1-px outline around the icon glyph.  Pass a
+     *  transparent colour to drop back to the neutral grey border
+     *  + no halo. */
+    void setTint (juce::Colour c) { tint_ = c; repaint(); }
+
     void paintButton (juce::Graphics& g, bool isOver, bool isDown) override
     {
         const float cornerSize = 3.0f;
