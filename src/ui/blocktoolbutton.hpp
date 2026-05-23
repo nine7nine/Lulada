@@ -109,6 +109,27 @@ public:
         auto inner = box.reduced (4, 0);
         const bool hasLabel = label_.isNotEmpty();
 
+        /* Icons get a 1-px coloured halo when the button carries a
+         * tint -- stamp the drawer in the tint colour at the 4
+         * cardinal offsets and overpaint in fg.  The 4 stamps render
+         * a 1-px outline that exactly traces whatever silhouette the
+         * icon draws (works for both filled paths + stroked paths). */
+        auto drawIconWithHalo = [&] (juce::Rectangle<float> iconBox)
+        {
+            if (tinted)
+            {
+                const float dx[] = { -1.0f, 1.0f,  0.0f, 0.0f };
+                const float dy[] = {  0.0f, 0.0f, -1.0f, 1.0f };
+                for (int i = 0; i < 4; ++i)
+                {
+                    juce::Graphics::ScopedSaveState ss (g);
+                    g.addTransform (juce::AffineTransform::translation (dx[i], dy[i]));
+                    iconDrawer_ (g, iconBox, tint_);
+                }
+            }
+            iconDrawer_ (g, iconBox, fg);
+        };
+
         if (iconDrawer_)
         {
             if (hasLabel)
@@ -121,7 +142,7 @@ public:
                     inner.getX(),
                     inner.getY() + (inner.getHeight() - iconSide) / 2,
                     iconSide, iconSide).toFloat();
-                iconDrawer_ (g, iconBox, fg);
+                drawIconWithHalo (iconBox);
 
                 const auto textBox = inner.withTrimmedLeft (iconSide + 3);
                 g.setColour (fg);
@@ -131,10 +152,6 @@ public:
             }
             else
             {
-                /* Icon-only: square, centred horizontally + vertically
-                 * with comfortable padding so the glyph never crowds
-                 * the border.  Pad = 22 % of the smaller dimension --
-                 * matches the look of the tracker editor's EDIT pill. */
                 const int side = juce::jmin (inner.getWidth(), inner.getHeight());
                 const int pad  = juce::jmax (3, side / 5);
                 const int iconSide = juce::jmax (8, side - pad * 2);
@@ -142,7 +159,7 @@ public:
                     inner.getX() + (inner.getWidth()  - iconSide) / 2,
                     inner.getY() + (inner.getHeight() - iconSide) / 2,
                     iconSide, iconSide).toFloat();
-                iconDrawer_ (g, iconBox, fg);
+                drawIconWithHalo (iconBox);
             }
         }
         else
