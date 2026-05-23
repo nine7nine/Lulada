@@ -425,8 +425,17 @@ public:
             }
             else if (runtime.isAudioLane())
             {
+                const double bpm = owner.monitor_ != nullptr
+                    ? (double) owner.monitor_->tempo.get() : 120.0;
+                const double sessionSR = owner.monitor_ != nullptr
+                    ? (double) owner.monitor_->sampleRate.get() : 48000.0;
+                const double secsPerBeat = bpm > 0.0 ? 60.0 / bpm : 0.5;
                 runtime.audioClipCache->schedulePlay (
-                    r->id, r->sourceId, -1.0, 0, r->looped);
+                    r->id, r->sourceId, -1.0, 0, r->looped,
+                    r->gainDb,
+                    (juce::int64) (r->fadeInBeats  * secsPerBeat * sessionSR),
+                    (juce::int64) (r->fadeOutBeats * secsPerBeat * sessionSR),
+                    (juce::int64) (r->lengthBeats  * secsPerBeat * sessionSR));
             }
             runtime.lastDispatchedRegion = r->id;
             runtime.lastDispatchedSeqIdx = r->sequenceIdx;
@@ -1615,6 +1624,19 @@ void ArrangementView::dispatchAtBeat (double beat)
                 }
             }
 
+            /* Convert region beat-domain envelope params to source
+             * samples for the audio-thread envelope code. */
+            const double sessionSampleRate = monitor_ != nullptr
+                ? (double) monitor_->sampleRate.get()
+                : 48000.0;
+            const double secsPerBeat = bpm > 0.0 ? 60.0 / bpm : 0.5;
+            const juce::int64 fadeInSamples
+                = (juce::int64) (active->fadeInBeats  * secsPerBeat * sessionSampleRate);
+            const juce::int64 fadeOutSamples
+                = (juce::int64) (active->fadeOutBeats * secsPerBeat * sessionSampleRate);
+            const juce::int64 regionLenSamples
+                = (juce::int64) (active->lengthBeats  * secsPerBeat * sessionSampleRate);
+
             /* beatTarget = the region's positionBeats so AudioClipNode's
              * audio-thread applyPendingForBlock fires at the block
              * whose range contains it (or catches up if we already
@@ -1624,7 +1646,9 @@ void ArrangementView::dispatchAtBeat (double beat)
                 active->id, active->sourceId,
                 active->positionBeats,
                 sampleOffset,
-                active->looped);
+                active->looped,
+                active->gainDb,
+                fadeInSamples, fadeOutSamples, regionLenSamples);
         }
 
         runtime.lastDispatchedRegion = active->id;
@@ -1792,8 +1816,16 @@ bool ArrangementView::importAudioFileToLane (const juce::File& file,
      * boundary. */
     auto& runtime = laneRuntime_.getReference (laneIdx);
     if (runtime.isAudioLane())
+    {
+        const double sessionSR = monitor_ != nullptr
+            ? (double) monitor_->sampleRate.get() : 48000.0;
+        const double secsPerBeat = bpm > 0.0 ? 60.0 / bpm : 0.5;
         runtime.audioClipCache->schedulePlay (
-            r.id, r.sourceId, -1.0, 0);
+            r.id, r.sourceId, -1.0, 0, r.looped, r.gainDb,
+            (juce::int64) (r.fadeInBeats  * secsPerBeat * sessionSR),
+            (juce::int64) (r.fadeOutBeats * secsPerBeat * sessionSR),
+            (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR));
+    }
 
     writeLanesToSession();
     if (body_ != nullptr)
