@@ -180,13 +180,36 @@ AudioClipNode::processBlock (juce::AudioBuffer<float>& buffer,
 
     outputBus.clear();
 
-    /* TODO Phase 2 (full): blockStartBeat / blockEndBeat from
-     * AudioPlayHead.  v1: -1.0 = immediate fire only. */
-    constexpr double kBlockStartBeat = -1.0;
-    constexpr double kBlockEndBeat   = -1.0;
+    /* Pull transport beat range from the host AudioPlayHead so
+     * applyPendingForBlock can fire beatTarget-quantised launches
+     * at the block whose range contains the target.  Sample-
+     * accurate to +/- one block (same as TrackerNode's launch
+     * scheduler).  When no playhead info is available (transport
+     * stopped / unhosted), fall back to immediate-only semantics
+     * (-1, -1). */
+    double blockStartBeat = -1.0;
+    double blockEndBeat   = -1.0;
+    if (auto* ph = getPlayHead())
+    {
+        if (auto pos = ph->getPosition())
+        {
+            if (auto ppq = pos->getPpqPosition())
+            {
+                blockStartBeat = *ppq;
+                /* Block span in beats = numFrames / sampleRate * bpm/60. */
+                const auto bpmOpt = pos->getBpm();
+                const double bpm = (bpmOpt.hasValue() ? *bpmOpt : 120.0);
+                if (sampleRate_ > 0.0 && bpm > 0.0)
+                    blockEndBeat = blockStartBeat
+                        + ((double) numFrames / sampleRate_) * (bpm / 60.0);
+                else
+                    blockEndBeat = blockStartBeat;
+            }
+        }
+    }
 
     drainLaunchFifo();
-    applyPendingForBlock (kBlockStartBeat, kBlockEndBeat);
+    applyPendingForBlock (blockStartBeat, blockEndBeat);
 
     if (activeStream_ != nullptr)
         activeStream_->process (outputBus, 0, (nframes_t) numFrames);
@@ -392,10 +415,19 @@ AudioClipNode::applyPendingForBlock (double blockStartBeat, double blockEndBeat)
     {
         auto& p = pendingActions_.getReference (i);
 
+        /* Fire in three cases:
+         *   1. beatTarget < 0 -- caller asked for immediate.
+         *   2. We have transport info AND beatTarget falls inside
+         *      this block's beat range -- sample-accurate launch.
+         *   3. We have transport info AND beatTarget is BEFORE this
+         *      block's start -- caller queued the target before our
+         *      drain caught up; fire now (catch-up).  Without this
+         *      branch, a launch scheduled at beat 4 by a UI tick at
+         *      beat 4.05 would never fire because beatTarget never
+         *      lands inside a future block range. */
         const bool fireNow =
             (p.beatTarget < 0.0)
             || (blockStartBeat >= 0.0
-                && p.beatTarget >= blockStartBeat
                 && p.beatTarget <  blockEndBeat);
 
         if (! fireNow)

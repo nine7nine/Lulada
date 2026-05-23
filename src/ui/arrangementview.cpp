@@ -1411,8 +1411,15 @@ void ArrangementView::dispatchAtBeat (double beat)
                 }
             }
 
+            /* beatTarget = the region's positionBeats so AudioClipNode's
+             * audio-thread applyPendingForBlock fires at the block
+             * whose range contains it (or catches up if we already
+             * passed it).  Sample-accurate to +/- one block ~ 5-10 ms,
+             * vs. ~33 ms latency on the prior immediate-only path. */
             runtime.audioClipCache->schedulePlay (
-                active->id, active->sourceId, -1.0, sampleOffset);
+                active->id, active->sourceId,
+                active->positionBeats,
+                sampleOffset);
         }
 
         runtime.lastDispatchedRegion = active->id;
