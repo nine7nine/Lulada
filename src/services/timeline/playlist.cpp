@@ -70,6 +70,41 @@ bool Playlist::resizeRegion (juce::Uuid regionId, double newLengthBeats)
     return true;
 }
 
+juce::Uuid Playlist::splitRegion (juce::Uuid regionId, double atBeat)
+{
+    static constexpr double kMinFragmentBeats = 0.0625;   /* 1/16 of a beat */
+
+    auto* head = findRegion (regionId);
+    if (head == nullptr) return juce::Uuid();
+
+    const double splitOffset = atBeat - head->positionBeats;
+    if (splitOffset < kMinFragmentBeats) return juce::Uuid();
+
+    const double tailLength = head->lengthBeats - splitOffset;
+    if (tailLength < kMinFragmentBeats) return juce::Uuid();
+
+    /* Build the tail by copy + adjust.  Source-offset is preserved
+     * across the cut so audio playback flows through the seam: the
+     * tail's startBeats picks up where the head left off in the
+     * source file. */
+    Region tail = *head;
+    tail.id            = juce::Uuid();
+    tail.positionBeats = atBeat;
+    tail.lengthBeats   = tailLength;
+    tail.startBeats    = head->startBeats + splitOffset;
+
+    /* Shrink the head in place.  head pointer stays valid since we
+     * don't mutate the vector here. */
+    head->lengthBeats = splitOffset;
+
+    /* Append + re-sort.  push_back may invalidate `head` but we're
+     * done with it by now. */
+    const juce::Uuid newId = tail.id;
+    regions_.push_back (std::move (tail));
+    rebuildOrder();
+    return newId;
+}
+
 const Region* Playlist::regionAt (double beat) const noexcept
 {
     /* Sorted by positionBeats; first region whose span contains

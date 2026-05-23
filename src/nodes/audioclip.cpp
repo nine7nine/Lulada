@@ -212,7 +212,41 @@ AudioClipNode::processBlock (juce::AudioBuffer<float>& buffer,
     applyPendingForBlock (blockStartBeat, blockEndBeat);
 
     if (activeStream_ != nullptr)
+    {
         activeStream_->process (outputBus, 0, (nframes_t) numFrames);
+
+        /* Per-block envelope: gain * fade-in * fade-out, applied to
+         * the full block.  v1 uses block-rate (not sample-rate)
+         * resolution -- a 5 ms block within a 50 ms fade gets 10
+         * envelope steps, inaudibly coarse for the typical fade
+         * length.  Sample-accurate ramping (juce::AudioBuffer::
+         * applyGainRamp) is a polish item. */
+        float blockGain = activeGainLinear_;
+
+        if (activeFadeInSamples_ > 0 && activeSamplesPlayed_ < activeFadeInSamples_)
+        {
+            const float t = (float) activeSamplesPlayed_
+                          / (float) activeFadeInSamples_;
+            blockGain *= juce::jlimit (0.0f, 1.0f, t);
+        }
+
+        if (activeFadeOutSamples_ > 0 && activeLengthSamples_ > 0)
+        {
+            const juce::int64 fadeOutStart =
+                activeLengthSamples_ - activeFadeOutSamples_;
+            if (activeSamplesPlayed_ >= fadeOutStart)
+            {
+                const juce::int64 into = activeSamplesPlayed_ - fadeOutStart;
+                const float t = 1.0f - (float) into / (float) activeFadeOutSamples_;
+                blockGain *= juce::jlimit (0.0f, 1.0f, t);
+            }
+        }
+
+        if (std::abs (blockGain - 1.0f) > 1.0e-4f)
+            outputBus.applyGain (blockGain);
+
+        activeSamplesPlayed_ += numFrames;
+    }
 }
 
 void
@@ -220,14 +254,25 @@ AudioClipNode::handleRecordingFromTransport (const juce::AudioBuffer<float>& in,
                                              int                              numFrames) noexcept
 {
     bool transportRecording = false;
+    bool transportPlaying   = false;
     if (auto* ph = getPlayHead())
     {
         if (auto pos = ph->getPosition())
+        {
             transportRecording = pos->getIsRecording();
+            transportPlaying   = pos->getIsPlaying();
+        }
     }
 
-    const bool armed     = armed_.load (std::memory_order_acquire);
-    const bool wantingCapture = armed && transportRecording;
+    /* Capture requires armed lane AND transport in record mode AND
+     * transport actually playing.  The third condition matches
+     * Ardour / Ableton / Bitwig behaviour: hitting Stop finalises
+     * the recording (transport.isPlaying drops to false even if
+     * .isRecording stays true).  Otherwise the user would have to
+     * click the record toggle separately to commit -- non-standard
+     * DAW UX. */
+    const bool armed          = armed_.load (std::memory_order_acquire);
+    const bool wantingCapture = armed && transportRecording && transportPlaying;
 
     /* Rising edge: ask message thread to instantiate Record_DS. */
     if (wantingCapture && ! wasRecording_)
@@ -258,7 +303,12 @@ void
 AudioClipNode::schedulePlay (juce::Uuid  regionId,
                              juce::Uuid  sourceId,
                              double      beatTarget,
-                             juce::int64 sampleOffset)
+                             juce::int64 sampleOffset,
+                             bool        looped,
+                             double      gainDb,
+                             juce::int64 fadeInSamples,
+                             juce::int64 fadeOutSamples,
+                             juce::int64 regionLengthSamples)
 {
     auto source = SourceRegistry::get().findAudioFile (sourceId);
     if (source == nullptr)
@@ -269,10 +319,15 @@ AudioClipNode::schedulePlay (juce::Uuid  regionId,
         return;
     }
 
+    /* Loop start = sampleOffset (so a region launched mid-source
+     * loops back to that same start, not the absolute file start).
+     * Bitwig-style "start" follows the region's content offset. */
     auto fresh = Playback_DS::create (source,
                                       (float) sampleRate_,
                                       (nframes_t) blockSize_,
-                                      numChannels_);
+                                      numChannels_,
+                                      looped,
+                                      (nframes_t) sampleOffset /*loopStartFrame*/);
     if (fresh == nullptr)
         return;
 
@@ -289,8 +344,11 @@ AudioClipNode::schedulePlay (juce::Uuid  regionId,
 
     Playback_DS* freshRaw = fresh.release();
 
+    const float gainLinear = (float) juce::Decibels::decibelsToGain (gainDb);
+
     const LaunchReq req {
-        regionId, beatTarget, sampleOffset, freshRaw, 1 /*wantPlaying*/
+        regionId, beatTarget, sampleOffset, freshRaw, 1 /*wantPlaying*/, looped,
+        gainLinear, fadeInSamples, fadeOutSamples, regionLengthSamples
     };
 
     if (sz1 > 0)
@@ -314,7 +372,8 @@ AudioClipNode::scheduleStop (juce::Uuid regionId, double beatTarget) noexcept
         return;
 
     const LaunchReq req {
-        regionId, beatTarget, 0, nullptr, 0 /*wantPlaying*/
+        regionId, beatTarget, 0, nullptr, 0 /*wantPlaying*/, false,
+        1.0f /*unused*/, 0, 0, 0
     };
 
     if (sz1 > 0)
@@ -396,7 +455,9 @@ AudioClipNode::drainLaunchFifo() noexcept
         }
         pendingActions_.add (PendingAction {
             r.regionId, r.beatTarget, r.sampleOffset, r.stream,
-            r.wantPlaying != 0
+            r.wantPlaying != 0,
+            r.gainLinear, r.fadeInSamples, r.fadeOutSamples,
+            r.regionLengthSamples
         });
     };
 
@@ -439,12 +500,24 @@ AudioClipNode::applyPendingForBlock (double blockStartBeat, double blockEndBeat)
                 retireStream (activeStream_.release());
             activeStream_.reset (p.stream);
             activeStreamRegionId_ = p.regionId;
+
+            /* Latch envelope state for the new region. */
+            activeGainLinear_     = p.gainLinear;
+            activeFadeInSamples_  = p.fadeInSamples;
+            activeFadeOutSamples_ = p.fadeOutSamples;
+            activeLengthSamples_  = p.regionLengthSamples;
+            activeSamplesPlayed_  = 0;
         }
         else
         {
             if (activeStream_ != nullptr)
                 retireStream (activeStream_.release());
             activeStreamRegionId_ = juce::Uuid::null();
+            activeGainLinear_     = 1.0f;
+            activeFadeInSamples_  = 0;
+            activeFadeOutSamples_ = 0;
+            activeLengthSamples_  = 0;
+            activeSamplesPlayed_  = 0;
         }
         pendingActions_.remove (i);
     }

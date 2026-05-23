@@ -152,6 +152,14 @@ private:
      *  doesn't continue past transport stop. */
     void stopAllAudioLanes();
 
+    /** Walk lanes_; compute effective mute (lane.muted OR (any
+     *  soloed AND ! lane.soloed)); call Processor::setMuted on each
+     *  lane's target node accordingly.  Tracker lanes also propagate
+     *  via TrackerNode::setUserMuted/setSoloed so the SessionView /
+     *  TrackerEditor see the same state.  Called on M/S toggle and
+     *  on every rescan + post-mutation. */
+    void propagateMuteSolo();
+
     void loadLanesFromSession();
     void writeLanesToSession();
 
@@ -202,10 +210,20 @@ private:
     BlockToolButton rescanBtn_     { "Rescan" };
     BlockToolButton addAudioBtn_   { "+ Audio" };
     BlockToolButton loadAudioBtn_  { "Load..." };
+    BlockToolButton snapBtn_       { "Snap" };
+    juce::ComboBox snapBox_;
     juce::Label posLabel_;
     juce::Label bpmLabel_;
     juce::Viewport viewport_;
     std::unique_ptr<Body> body_;
+
+    /** Snap configuration.  snapEnabled_ toggles whether drag/resize
+     *  snap the target beat to the nearest snapDivision_ multiple.
+     *  snapDivision_ is in beats (1.0 = whole beat, 0.25 = 16th,
+     *  0.5 = 8th, 4.0 = bar at 4/4).  Set via snapBox_; persisted
+     *  in the session arrangement tree on change. */
+    bool   snapEnabled_  = true;
+    double snapDivision_ = 1.0;
 
     juce::Array<Lane>              lanes_;
     juce::Array<LaneRuntimeState>  laneRuntime_;

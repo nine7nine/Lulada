@@ -17,7 +17,9 @@ std::unique_ptr<Playback_DS>
 Playback_DS::create (AudioFileSource::Ptr source,
                      float                frame_rate,
                      nframes_t            block_size,
-                     int                  channels)
+                     int                  channels,
+                     bool                 looped,
+                     nframes_t            loopStartFrame)
 {
     if (source == nullptr)
         return nullptr;
@@ -36,17 +38,23 @@ Playback_DS::create (AudioFileSource::Ptr source,
 
     /* std::make_unique can't see the private ctor; use new directly. */
     return std::unique_ptr<Playback_DS> (
-        new Playback_DS (std::move (source), handle, frame_rate, block_size, channels));
+        new Playback_DS (std::move (source), handle, frame_rate, block_size, channels,
+                         looped, loopStartFrame));
 }
 
 Playback_DS::Playback_DS (AudioFileSource::Ptr source,
                           Audio_File*          handle,
                           float                frame_rate,
                           nframes_t            block_size,
-                          int                  channels)
+                          int                  channels,
+                          bool                 looped,
+                          nframes_t            loopStartFrame)
     : Disk_Stream ("ElementPlaybackDS", frame_rate, block_size, channels),
       source_ (std::move (source)),
-      file_   (handle)
+      file_   (handle),
+      loop_   (looped),
+      loopStart_ (loopStartFrame),
+      sourceLen_ (handle != nullptr ? handle->length() : 0)
 {
     run_io();
 }
@@ -86,9 +94,22 @@ Playback_DS::read_block (sample_t* interleaved_buf,
                          sample_t* deinterleave_buf,
                          nframes_t total_frames) noexcept
 {
-    const int   ch    = channels();
-    const auto  frame = _frame.load (std::memory_order_relaxed)
-                      + _undelay.load (std::memory_order_relaxed);
+    const int ch = channels();
+    auto      frame = _frame.load (std::memory_order_relaxed)
+                    + _undelay.load (std::memory_order_relaxed);
+
+    /* Loop wrap-around (entry side): if we already passed EOF AND
+     * looping is on, snap back to the loop start before reading.
+     * Keeps multiple consecutive loops working without a special-case
+     * seek path. */
+    if (loop_ && sourceLen_ > 0 && frame >= sourceLen_)
+    {
+        const nframes_t past = frame - loopStart_;
+        const nframes_t cycle = sourceLen_ > loopStart_ ? sourceLen_ - loopStart_ : 1;
+        frame = loopStart_ + (past % cycle);
+        _frame.store (frame - _undelay.load (std::memory_order_relaxed),
+                      std::memory_order_relaxed);
+    }
 
     /* Zero-fill in case of short read (EOF). */
     std::memset (interleaved_buf, 0,
@@ -103,7 +124,26 @@ Playback_DS::read_block (sample_t* interleaved_buf,
      * Audio_File::lock_).  Threading: this runs only on our IO thread;
      * any other access to the same Audio_File* would be a programming
      * error (each Playback_DS owns its own handle). */
-    const nframes_t got = file_->read (interleaved_buf, -1, frame, total_frames);
+    nframes_t got = file_->read (interleaved_buf, -1, frame, total_frames);
+
+    /* Loop wrap-around (split read): if the requested span straddles
+     * EOF, fill the tail by seeking to loopStart_ and reading the
+     * remainder.  Single-pass straddle handles per-block crossings;
+     * if the loop body is shorter than total_frames the user gets
+     * acceptable v1 behaviour (partial silence past one wrap) -- a
+     * cleaner multi-pass fill is a follow-up. */
+    if (loop_ && sourceLen_ > 0 && got < total_frames && got > 0)
+    {
+        const nframes_t remaining = total_frames - got;
+        sample_t* tail = interleaved_buf
+            + (std::size_t) got * (std::size_t) ch;
+        const nframes_t wrapped = file_->read (tail, -1, loopStart_, remaining);
+        got += wrapped;
+        /* _frame after this block ends up at loopStart_ + wrapped,
+         * computed by the loop-entry branch on the next iteration. */
+        _frame.store (loopStart_ + wrapped - _undelay.load (std::memory_order_relaxed),
+                      std::memory_order_relaxed);
+    }
 
     /* Deinterleave into the per-channel rings, one block (= _nframes
      * frames) at a time.  Splitting on block boundaries matches the

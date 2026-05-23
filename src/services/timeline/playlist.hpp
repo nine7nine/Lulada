@@ -52,6 +52,18 @@ public:
     /** Resize the region.  Same overlap policy as add/move. */
     bool resizeRegion (juce::Uuid regionId, double newLengthBeats);
 
+    /** Split the region with `regionId` at the absolute timeline
+     *  beat `atBeat`.  The original region keeps the head (its
+     *  positionBeats unchanged, lengthBeats = atBeat - position),
+     *  and a new region is appended for the tail (positionBeats =
+     *  atBeat, lengthBeats = original_end - atBeat).  Source-offset
+     *  is preserved across both halves so audio playback continues
+     *  through the cut seam without re-reading the file from start.
+     *  Returns the new tail region's uuid on success, juce::Uuid()
+     *  on failure (atBeat outside the region, region not found,
+     *  resulting head/tail too short). */
+    juce::Uuid splitRegion (juce::Uuid regionId, double atBeat);
+
     /** Returns the region whose span contains the given beat, or
      *  nullptr.  V1 always returns 0 or 1; v2 may layer. */
     const Region* regionAt (double beat) const noexcept;

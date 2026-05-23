@@ -120,7 +120,12 @@ public:
     void schedulePlay (juce::Uuid  regionId,
                        juce::Uuid  sourceId,
                        double      beatTarget,
-                       juce::int64 sampleOffset);
+                       juce::int64 sampleOffset,
+                       bool        looped = false,
+                       double      gainDb = 0.0,
+                       juce::int64 fadeInSamples  = 0,
+                       juce::int64 fadeOutSamples = 0,
+                       juce::int64 regionLengthSamples = 0);
 
     void scheduleStop (juce::Uuid regionId, double beatTarget) noexcept;
 
@@ -214,6 +219,17 @@ private:
     std::unique_ptr<Playback_DS> activeStream_;
     juce::Uuid                   activeStreamRegionId_;
 
+    /* Per-active-region envelope state.  Reset on each new launch
+     * via applyPendingForBlock.  Envelope is computed once per
+     * block (not per-sample) for v1 -- fades typically span >> one
+     * audio block so coarseness is inaudible.  Sample-accurate
+     * envelope ramping is a polish later. */
+    float       activeGainLinear_       { 1.0f };
+    juce::int64 activeFadeInSamples_    { 0 };
+    juce::int64 activeFadeOutSamples_   { 0 };
+    juce::int64 activeLengthSamples_    { 0 };
+    juce::int64 activeSamplesPlayed_    { 0 };
+
     /* Audio thread reads + writes; message thread reads only between
      * capture sessions (after timer observes recording()==false). */
     std::unique_ptr<Record_DS>   record_;
@@ -255,6 +271,11 @@ private:
         juce::int64  sampleOffset;
         Playback_DS* stream;
         int          wantPlaying;
+        bool         looped;
+        float        gainLinear;            /* dB-converted at queue time */
+        juce::int64  fadeInSamples;
+        juce::int64  fadeOutSamples;
+        juce::int64  regionLengthSamples;
     };
 
     static constexpr int kLaunchFifoSize = 64;
@@ -268,6 +289,10 @@ private:
         juce::int64  sampleOffset;
         Playback_DS* stream;
         bool         wantPlaying;
+        float        gainLinear;
+        juce::int64  fadeInSamples;
+        juce::int64  fadeOutSamples;
+        juce::int64  regionLengthSamples;
     };
 
     juce::Array<PendingAction> pendingActions_;
