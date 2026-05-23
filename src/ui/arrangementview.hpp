@@ -211,11 +211,34 @@ private:
     BlockToolButton addAudioBtn_   { "+ Audio" };
     BlockToolButton loadAudioBtn_  { "Load..." };
     BlockToolButton snapBtn_       { "Snap" };
+    BlockToolButton toolSelectBtn_   { "Select" };
+    BlockToolButton toolRangeBtn_    { "Range" };
+    BlockToolButton toolSplitBtn_    { "Split" };
+    BlockToolButton toolTrimBtn_     { "Trim" };
+    BlockToolButton toolAuditionBtn_ { "Audit" };
+    BlockToolButton loopBtn_         { "Loop" };
     juce::ComboBox snapBox_;
-    juce::Label posLabel_;
-    juce::Label bpmLabel_;
     juce::Viewport viewport_;
     std::unique_ptr<Body> body_;
+
+    /** Synchronise tool-button toggle states so only one tool reads
+     *  as active at a time (manual radio-group). */
+    void syncToolToggleStates();
+
+    /** Read current loop-on state out of loopBtn_, plus the body's
+     *  current range, and route to the Body so paint + transport
+     *  wrap can react. */
+    void onLoopToggled();
+
+    /** Convert beats <-> audio frames using monitor_'s tempo + sample
+     *  rate.  Used for transport seek on loop wrap. */
+    int64_t beatsToFrames (double beats) const noexcept;
+    double  framesToBeats (int64_t frames) const noexcept;
+
+    /** Seek the running AudioEngine's transport to a beat position.
+     *  Routes through AudioEngine::seekToAudioFrame; no-op if no
+     *  audio engine context. */
+    void seekToBeat (double beats);
 
     /** Snap configuration.  snapEnabled_ toggles whether drag/resize
      *  snap the target beat to the nearest snapDivision_ multiple.
@@ -242,15 +265,15 @@ private:
      * the captured file finalises into a real Region. */
     double recordStartBeat_ = 0.0;
 
-    float lastBpmShown_ = -1.0f;
-    double lastBeatShown_ = -999.0;
-
     juce::ValueTree attachedGraphTree_;
 
     static constexpr int kHeaderH = 36;
-    static constexpr int kLaneH   = 64;
-    static constexpr int kLabelW  = 160;
-    static constexpr int kPxPerBeat = 24;
+    /* kLaneH + kPxPerBeat are instance-zoomable on Body; outer
+     * methods read them via body_->kLaneH / body_->kPxPerBeat.  Only
+     * kLabelW stays a static constant (it never zooms).  Shrunk from
+     * 160 -> 130 once buttons were stacked vertically instead of in
+     * a horizontal row; saves 30 px of timeline real estate. */
+    static constexpr int kLabelW  = 130;
 };
 
 } // namespace element

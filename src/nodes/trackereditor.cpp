@@ -4,6 +4,8 @@
 #include "nodes/trackereditor.hpp"
 #include "nodes/tracker.hpp"
 
+#include "ui/lanepalette.hpp"
+
 namespace element {
 
 namespace {
@@ -83,19 +85,11 @@ const juce::Colour kEmptyTextColour   { 0xff'7a'7a'7a };   // "---" / "--" in em
 const juce::Colour kVelTextColour     { 0xff'd0'80'40 };
 const juce::Colour kEditModeColour    { 0xff'e0'40'40 };
 
-const juce::Colour kTrackTints[] = {
-    juce::Colour { 0xff'c5'5a'5a }, // red
-    juce::Colour { 0xff'c5'8a'4a }, // orange
-    juce::Colour { 0xff'b5'b5'4a }, // yellow
-    juce::Colour { 0xff'6a'b5'5a }, // green
-    juce::Colour { 0xff'4a'a5'b5 }, // cyan
-    juce::Colour { 0xff'5a'7a'c5 }, // blue
-    juce::Colour { 0xff'9a'5a'c5 }, // purple
-    juce::Colour { 0xff'c5'5a'9a }, // pink
-};
-inline juce::Colour trackTint (int idx) {
-    return kTrackTints[((unsigned) idx) % (sizeof (kTrackTints) / sizeof (kTrackTints[0]))];
-}
+/* Track tint palette moved to ui/lanepalette.hpp so the same hue
+ * cycle drives tracker / arrangement / (future) session-view clips.
+ * Local alias kept so existing call sites (`trackTint (idx)`)
+ * compile unchanged. */
+inline juce::Colour trackTint (int idx) { return element::ui::laneTint (idx); }
 
 juce::String formatNote (int note)
 {

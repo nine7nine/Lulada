@@ -129,6 +129,20 @@ public:
 
     void scheduleStop (juce::Uuid regionId, double beatTarget) noexcept;
 
+    /** Live gain override (linear, not dB).  Set to NaN to clear (then
+     *  the per-launch static gainLinear takes over again).  Message
+     *  thread writes -- audio thread reads atomically once per block.
+     *
+     *  Designed for clip volume envelopes: ArrangementView's 30 Hz
+     *  timer evaluates the active region's envelope at the playhead
+     *  position and pushes the result here.  Sample-accurate envelope
+     *  is a polish; v1 ships with 30 Hz coarseness (matches Bitwig's
+     *  display rate). */
+    void setLiveGain (float linear) noexcept
+    {
+        liveGainOverride_.store (linear, std::memory_order_relaxed);
+    }
+
     juce::Uuid lastScheduledRegion() const noexcept
     {
         const juce::ScopedLock sl (engineLock_);
@@ -229,6 +243,11 @@ private:
     juce::int64 activeFadeOutSamples_   { 0 };
     juce::int64 activeLengthSamples_    { 0 };
     juce::int64 activeSamplesPlayed_    { 0 };
+
+    /* Live gain override -- see setLiveGain.  NaN sentinel means
+     * "no override; use activeGainLinear_".  std::atomic<float> on
+     * x86-64 is lock-free (no atomic mutex). */
+    std::atomic<float> liveGainOverride_ { std::numeric_limits<float>::quiet_NaN() };
 
     /* Audio thread reads + writes; message thread reads only between
      * capture sessions (after timer observes recording()==false). */

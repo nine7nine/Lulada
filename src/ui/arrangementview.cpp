@@ -18,6 +18,7 @@
 #include "services/arrangementtracksservice.hpp"
 #include "services/sources/sourceregistry.hpp"
 #include "services/timeline/audiolaneadapter.hpp"
+#include "ui/lanepalette.hpp"
 
 #include <unordered_map>
 
@@ -37,6 +38,14 @@ namespace {
 const char* const kAudioDropExtensions[] = {
     ".wav", ".aiff", ".aif", ".flac", ".ogg", ".mp3", ".w64", ".au"
 };
+
+/* Lane tint palette lives in ui/lanepalette.hpp (shared with the
+ * tracker editor + future session-view clip cells).  Local helper
+ * kept so call sites read naturally. */
+inline juce::Colour laneTintForIndex (int idx) noexcept
+{
+    return element::ui::laneTint (idx);
+}
 
 bool isAcceptableAudioFile (const juce::String& path) noexcept
 {
@@ -89,6 +98,54 @@ public:
                 kv.second->removeChangeListener (this);
     }
 
+    /** Active editing tool.  Toolbar above the ruler swaps between
+     *  these; mouseDown / mouseDrag branch on the value.
+     *   - Select   : drag = move, edge-drag = resize, click = launch,
+     *                right-click = context menu (existing behaviour)
+     *   - Range    : drag in strip = set time-range overlay
+     *                (loops between rangeStart/rangeEnd when loop
+     *                button is on; transport wraps in timerCallback)
+     *   - Split    : click on region = split at click beat
+     *   - Trim     : drag on region = resize only (no move)
+     *   - Audition : click on region = launch immediately, no drag */
+    enum class Tool { Select, Range, Split, Trim, Audition };
+
+    void setActiveTool (Tool t)
+    {
+        if (activeTool_ == t) return;
+        activeTool_ = t;
+        /* Cancel any in-flight gesture if it doesn't suit the new
+         * tool; harmless to wipe even when it does. */
+        gesture_ = Gesture {};
+        switch (t)
+        {
+            case Tool::Select:   setMouseCursor (juce::MouseCursor::NormalCursor);          break;
+            case Tool::Range:    setMouseCursor (juce::MouseCursor::CrosshairCursor);        break;
+            case Tool::Split:    setMouseCursor (juce::MouseCursor::IBeamCursor);             break;
+            case Tool::Trim:     setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);   break;
+            case Tool::Audition: setMouseCursor (juce::MouseCursor::PointingHandCursor);      break;
+        }
+        repaint();
+    }
+    Tool getActiveTool() const noexcept { return activeTool_; }
+
+    /** Loop-range state.  rangeActive_ is "user has drawn a range";
+     *  loopActive_ is "and the loop button is on".  Loop only takes
+     *  effect when both are true.  Range bounds are in beats and
+     *  always normalised so rangeStart_ <= rangeEnd_. */
+    bool   hasRange()       const noexcept { return rangeActive_; }
+    double rangeStart()     const noexcept { return rangeStart_; }
+    double rangeEnd()       const noexcept { return rangeEnd_;   }
+    bool   isLooping()      const noexcept { return loopActive_ && rangeActive_
+                                                     && rangeEnd_ > rangeStart_; }
+    void   setLoopActive (bool on) { loopActive_ = on; repaint(); }
+    void   clearRange()
+    {
+        rangeActive_ = false;
+        rangeDragging_ = false;
+        repaint();
+    }
+
 private:
     /** juce::AudioThumbnail emits a change notification each time the
      *  background reader updates its peak-data window.  Repaint the
@@ -121,6 +178,51 @@ public:
             g.drawText ("Drop an audio file here, or click + Audio to add a track.",
                         getLocalBounds().withTrimmedTop (kRulerH),
                         juce::Justification::centred);
+        }
+
+        /* Range overlay -- drawn over all lanes so it reads as a
+         * timeline-wide selection.  Loop-armed range gets a brighter
+         * outline + tinted fill; plain range gets a softer wash. */
+        if (rangeActive_ && rangeEnd_ > rangeStart_)
+        {
+            const int xs = kLabelW + (int) (rangeStart_ * kPxPerBeat);
+            const int xe = kLabelW + (int) (rangeEnd_   * kPxPerBeat);
+            const int w  = juce::jmax (1, xe - xs);
+            const int yTop  = 0;
+            const int yLanes = kRulerH + juce::jmax (1, laneCount) * kLaneH;
+
+            const juce::Colour fillCol = loopActive_
+                ? juce::Colour::fromRGBA (90, 180, 110, 50)
+                : juce::Colour::fromRGBA (140, 170, 210, 38);
+            const juce::Colour edgeCol = loopActive_
+                ? juce::Colour::fromRGB (110, 220, 130)
+                : juce::Colour::fromRGB (170, 200, 240);
+
+            /* Ruler-row band (brighter, marks the range as a loop
+             * marker when looping is on). */
+            g.setColour (loopActive_
+                            ? juce::Colour::fromRGBA (90, 200, 110, 130)
+                            : juce::Colour::fromRGBA (140, 170, 210, 100));
+            g.fillRect (xs, yTop, w, kRulerH);
+
+            /* Lane-area wash. */
+            g.setColour (fillCol);
+            g.fillRect (xs, kRulerH, w, juce::jmax (0, yLanes - kRulerH));
+
+            /* Edges -- 1 px vertical lines at start + end. */
+            g.setColour (edgeCol);
+            g.drawVerticalLine (xs,        (float) yTop, (float) yLanes);
+            g.drawVerticalLine (xe - 1,    (float) yTop, (float) yLanes);
+
+            /* Loop badge in the ruler row when loop is on. */
+            if (loopActive_)
+            {
+                g.setColour (juce::Colours::black);
+                g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                              9.0f, juce::Font::bold));
+                g.drawText ("LOOP", xs + 4, 2, juce::jmin (40, w - 8), kRulerH - 4,
+                            juce::Justification::centredLeft, false);
+            }
         }
 
         if (dropHover_)
@@ -257,19 +359,35 @@ public:
 
     void mouseDown (const MouseEvent& e) override
     {
-        if (e.y < kRulerH)   /* clicks in the ruler -- TODO seek transport */
+        /* Ruler clicks (the bars:beats strip at the top): seek
+         * transport to the clicked beat; if a drag follows, redefine
+         * the range from the click point.  Mirrors Ardour/Bitwig
+         * convention: ruler = locator + range surface. */
+        if (e.y < kRulerH && e.x >= kLabelW)
+        {
+            const double beat = juce::jmax (0.0,
+                (double) (e.x - kLabelW) / (double) kPxPerBeat);
+            owner.seekToBeat (beat);
+
+            rangeAnchor_   = beat;
+            rangeStart_    = beat;
+            rangeEnd_      = beat;
+            rangeActive_   = true;
+            rangeDragging_ = true;
+            grabKeyboardFocus();
+            repaint();
             return;
+        }
+        if (e.y < kRulerH) return;   /* ruler click in label gutter */
 
         const int laneIdx = (e.y - kRulerH) / kLaneH;
         if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
         auto& lane    = owner.lanes_.getReference (laneIdx);
         auto& runtime = owner.laneRuntime_.getReference (laneIdx);
 
+        /* Label area button hits (M/S/R) are tool-independent. */
         if (e.x < kLabelW)
         {
-            /* Mute / solo toggles work on both tracker AND audio
-             * lanes.  Arm is audio-only (no recording into a tracker
-             * lane). */
             if (muteToggleRect (laneIdx).contains (e.x, e.y))
             {
                 lane.muted = ! lane.muted;
@@ -283,7 +401,7 @@ public:
                 lane.soloed = ! lane.soloed;
                 owner.writeLanesToSession();
                 owner.propagateMuteSolo();
-                repaint();   // solo affects every other lane's effective mute
+                repaint();
                 return;
             }
             if (runtime.isAudioLane() && armToggleRect (laneIdx).contains (e.x, e.y))
@@ -299,14 +417,61 @@ public:
         if (runtime.isOrphan()) return;
 
         const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+
+        /* Range tool: any strip-area click begins a range drag.
+         * Doesn't matter whether a region was hit -- range overlays
+         * sit above all lanes. */
+        if (activeTool_ == Tool::Range)
+        {
+            rangeAnchor_   = beat;
+            rangeStart_    = beat;
+            rangeEnd_      = beat;
+            rangeActive_   = true;
+            rangeDragging_ = true;
+            selectedLane_   = -1;
+            selectedRegion_ = juce::Uuid::null();
+            grabKeyboardFocus();
+            repaint();
+            return;
+        }
+
         const auto& regions = lane.playlist.regions();
         for (const auto& r : regions)
         {
             if (! r.containsBeat (beat)) continue;
 
-            /* Right-click on a region: temporary context menu (loop
-             * toggle / split / delete) until the proper Ardour-style
-             * tool-mode toolbar lands.  No drag gesture started. */
+            /* Envelope-point hit test (Select tool, audio regions
+             * only).  Takes priority over region-body click so
+             * clicking on a breakpoint dot starts a point drag
+             * instead of moving the region.  Right-click on a point
+             * opens the curve-type / delete menu. */
+            if (activeTool_ == Tool::Select
+                && runtime.isAudioLane()
+                && r.sequenceIdx < 0
+                && ! r.volumeEnvelope.empty())
+            {
+                const int ptIdx = envPointHitAt (laneIdx, r, e.x, e.y);
+                if (ptIdx >= 0)
+                {
+                    const auto pointId = r.volumeEnvelope[(size_t) ptIdx].id;
+                    if (e.mods.isPopupMenu())
+                    {
+                        showEnvPointContextMenu (laneIdx, r.id, pointId);
+                        return;
+                    }
+                    envGesture_.laneIdx    = laneIdx;
+                    envGesture_.regionId   = r.id;
+                    envGesture_.pointId    = pointId;
+                    envGesture_.dragActive = false;
+                    selectedLane_   = laneIdx;
+                    selectedRegion_ = r.id;
+                    grabKeyboardFocus();
+                    repaintLane (laneIdx);
+                    return;
+                }
+            }
+
+            /* Right-click context menu works in every tool. */
             if (e.mods.isPopupMenu())
             {
                 selectedLane_   = laneIdx;
@@ -316,9 +481,32 @@ public:
                 return;
             }
 
-            /* Begin a gesture; whether it ends in move/resize/click
-             * is decided by what happens between mouseDown and
-             * mouseUp. */
+            /* Split tool: cleave the region in two at the click beat. */
+            if (activeTool_ == Tool::Split)
+            {
+                const auto newId = lane.playlist.splitRegion (r.id, beat);
+                if (! newId.isNull())
+                {
+                    owner.writeLanesToSession();
+                    repaintLane (laneIdx);
+                }
+                return;
+            }
+
+            /* Audition tool: launch the region immediately (preview),
+             * skipping the move/resize gesture path entirely. */
+            if (activeTool_ == Tool::Audition)
+            {
+                launchRegionAudition (laneIdx, r);
+                selectedLane_   = laneIdx;
+                selectedRegion_ = r.id;
+                repaintLane (laneIdx);
+                return;
+            }
+
+            /* Select + Trim tools start a gesture; the mode differs:
+             * - Select: edge hit = Resize, body = Move
+             * - Trim:   anywhere on the region = Resize */
             gesture_.laneIdx         = laneIdx;
             gesture_.regionId        = r.id;
             gesture_.originalPos     = r.positionBeats;
@@ -326,12 +514,11 @@ public:
             gesture_.mouseDownXBeats = beat;
             gesture_.dragActive      = false;
 
-            /* Resize-vs-move hit test: cursor in the last kEdgeHandlePx
-             * pixels of the rendered region rect = Resize.  Otherwise
-             * Move. */
-            const int regionStartX = kLabelW + (int) (r.positionBeats * kPxPerBeat);
-            const int regionEndX   = kLabelW + (int) (r.endBeats()    * kPxPerBeat);
-            gesture_.mode = (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX)
+            const int regionEndX = kLabelW + (int) (r.endBeats() * kPxPerBeat);
+            const bool overRightEdge =
+                (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX);
+
+            gesture_.mode = (activeTool_ == Tool::Trim || overRightEdge)
                               ? Gesture::Resize
                               : Gesture::Move;
 
@@ -343,15 +530,269 @@ public:
             return;
         }
 
-        /* Empty area click -- clear selection. */
+        /* Empty strip area -- clear selection. */
         selectedLane_   = -1;
         selectedRegion_ = juce::Uuid::null();
         gesture_        = Gesture {};
         repaint();
     }
 
+    /** Compute the body rect of a region (the area BELOW its title
+     *  strip).  Mirrors the paintLane layout maths so hit-tests +
+     *  envelope edits sit precisely on the painted curve. */
+    Rectangle<int> regionBodyRect (int laneIdx, const Region& r) const noexcept
+    {
+        constexpr int kTitleH = 13;
+        const int laneTopY = kRulerH + laneIdx * kLaneH;
+        const int xs = kLabelW + (int) (r.positionBeats * kPxPerBeat);
+        const int ws = juce::jmax (4, (int) (r.lengthBeats * kPxPerBeat));
+        const int innerTopY = laneTopY + 4 + kTitleH;
+        const int innerH    = juce::jmax (1, kLaneH - 8 - kTitleH);
+        return Rectangle<int> (xs, innerTopY, ws, innerH).reduced (3, 2);
+    }
+
+    /** Inverse of paintVolumeEnvelope's gainToY -- map a Y inside
+     *  a body rect back to a gain in dB over the [+6, -24] window. */
+    float envYToGainDb (int y, const Rectangle<int>& body) const noexcept
+    {
+        constexpr float kTopDb = 6.0f;
+        constexpr float kBotDb = -24.0f;
+        const int yPad = 3;
+        const int H = juce::jmax (1, body.getHeight() - yPad * 2);
+        const float t = juce::jlimit (0.0f, 1.0f,
+            (float) (y - body.getY() - yPad) / (float) H);
+        return kTopDb - t * (kTopDb - kBotDb);
+    }
+
+    /** Inverse of beatToX -- map an X to a beat offset within the
+     *  region's local timeline.  Clamped to [0, lengthBeats]. */
+    double envXToBeatOffset (int x, const Rectangle<int>& body,
+                              const Region& r) const noexcept
+    {
+        if (r.lengthBeats <= 1e-6) return 0.0;
+        const double t = juce::jlimit (0.0, 1.0,
+            (double) (x - body.getX()) / juce::jmax (1.0, (double) body.getWidth()));
+        return t * r.lengthBeats;
+    }
+
+    /** Hit-test for envelope breakpoint dots.  5 px radius -- matches
+     *  the visual dot size when selected, with a small slop for
+     *  finger / trackpad use.  Returns the matching point's index in
+     *  the region's envelope, or -1 if none. */
+    int envPointHitAt (int laneIdx, const Region& r, int x, int y) const noexcept
+    {
+        if (r.volumeEnvelope.empty()) return -1;
+        const auto body = regionBodyRect (laneIdx, r);
+        constexpr float kTopDb = 6.0f, kBotDb = -24.0f;
+        const int yPad = 3;
+        const int H = juce::jmax (1, body.getHeight() - yPad * 2);
+        for (size_t i = 0; i < r.volumeEnvelope.size(); ++i)
+        {
+            const auto& pt = r.volumeEnvelope[i];
+            const float px = body.getX()
+                + (float) (pt.beatOffset / juce::jmax (1e-9, r.lengthBeats))
+                  * (float) body.getWidth();
+            const float t  = juce::jlimit (0.0f, 1.0f,
+                (kTopDb - pt.gainDb) / (kTopDb - kBotDb));
+            const float py = body.getY() + yPad + t * (float) H;
+            const float dx = (float) x - px;
+            const float dy = (float) y - py;
+            if (dx * dx + dy * dy <= 25.0f) return (int) i;
+        }
+        return -1;
+    }
+
+    /** Insert a breakpoint at the clicked beat + gain.  When the
+     *  envelope was empty, ALSO seed start + end anchors at the
+     *  region's static gainDb so the user gets a visible curve out
+     *  of one double-click instead of an invisible single point. */
+    void insertEnvelopePoint (int laneIdx, juce::Uuid regionId,
+                                double beatOffset, float gainDb)
+    {
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& lane = owner.lanes_.getReference (laneIdx);
+        auto* r = lane.playlist.findRegion (regionId);
+        if (r == nullptr) return;
+
+        if (r->volumeEnvelope.empty())
+        {
+            /* Seed at 0 dB (unity gain) so the envelope defaults to
+             * "no attenuation", not whatever the static gainDb was.
+             * The user drags individual points down from there. */
+            EnvelopePoint anchor0; anchor0.id = juce::Uuid();
+            anchor0.beatOffset = 0.0; anchor0.gainDb = 0.0f;
+            EnvelopePoint anchorN; anchorN.id = juce::Uuid();
+            anchorN.beatOffset = r->lengthBeats; anchorN.gainDb = 0.0f;
+            r->volumeEnvelope.push_back (anchor0);
+            r->volumeEnvelope.push_back (anchorN);
+        }
+        EnvelopePoint pt;
+        pt.id         = juce::Uuid();
+        pt.beatOffset = juce::jlimit (0.0, r->lengthBeats, beatOffset);
+        pt.gainDb     = juce::jlimit (-60.0f, 12.0f, gainDb);
+        pt.curve      = EnvelopeCurve::Linear;
+        r->volumeEnvelope.push_back (pt);
+        r->sortEnvelope();
+        owner.writeLanesToSession();
+        repaintLane (laneIdx);
+    }
+
+    /** Right-click context menu on an envelope point.  Curve type
+     *  + delete.  Async so the menu can outlive its trigger event
+     *  without keeping mouse state alive. */
+    void showEnvPointContextMenu (int laneIdx, juce::Uuid regionId,
+                                    juce::Uuid pointId)
+    {
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& lane = owner.lanes_.getReference (laneIdx);
+        auto* r = lane.playlist.findRegion (regionId);
+        if (r == nullptr) return;
+
+        EnvelopePoint* match = nullptr;
+        for (auto& pt : r->volumeEnvelope)
+            if (pt.id == pointId) { match = &pt; break; }
+        if (match == nullptr) return;
+
+        enum { ItemLinear = 1, ItemExp, ItemSmooth, ItemHold, ItemDelete = 10 };
+
+        juce::PopupMenu menu;
+        menu.addSectionHeader ("Curve to next point");
+        menu.addItem (ItemLinear, "Linear", true, match->curve == EnvelopeCurve::Linear);
+        menu.addItem (ItemExp,    "Exponential", true, match->curve == EnvelopeCurve::Exponential);
+        menu.addItem (ItemSmooth, "Smooth",       true, match->curve == EnvelopeCurve::Smooth);
+        menu.addItem (ItemHold,   "Hold (step)",  true, match->curve == EnvelopeCurve::Hold);
+        menu.addSeparator();
+        menu.addItem (ItemDelete, "Delete point");
+
+        juce::Component::SafePointer<Body> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options(),
+            [safe, laneIdx, regionId, pointId] (int result)
+            {
+                auto* self = safe.getComponent();
+                if (self == nullptr || result == 0) return;
+                if (laneIdx < 0 || laneIdx >= self->owner.lanes_.size()) return;
+                auto& l = self->owner.lanes_.getReference (laneIdx);
+                auto* rr = l.playlist.findRegion (regionId);
+                if (rr == nullptr) return;
+
+                if (result == ItemDelete)
+                {
+                    rr->volumeEnvelope.erase (
+                        std::remove_if (rr->volumeEnvelope.begin(),
+                                         rr->volumeEnvelope.end(),
+                                         [pointId] (const EnvelopePoint& p)
+                                         { return p.id == pointId; }),
+                        rr->volumeEnvelope.end());
+                }
+                else
+                {
+                    EnvelopeCurve nc = EnvelopeCurve::Linear;
+                    if (result == ItemExp)    nc = EnvelopeCurve::Exponential;
+                    if (result == ItemSmooth) nc = EnvelopeCurve::Smooth;
+                    if (result == ItemHold)   nc = EnvelopeCurve::Hold;
+                    for (auto& pt : rr->volumeEnvelope)
+                        if (pt.id == pointId) { pt.curve = nc; break; }
+                }
+                self->owner.writeLanesToSession();
+                self->repaintLane (laneIdx);
+            });
+    }
+
+    void mouseDoubleClick (const MouseEvent& e) override
+    {
+        if (e.y < kRulerH) return;
+        const int laneIdx = (e.y - kRulerH) / kLaneH;
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        const auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+        if (! runtime.isAudioLane()) return;
+
+        const auto& lane = owner.lanes_.getReference (laneIdx);
+        const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+        for (const auto& r : lane.playlist.regions())
+        {
+            if (! r.containsBeat (beat) || r.sequenceIdx >= 0) continue;
+            const auto body = regionBodyRect (laneIdx, r);
+            if (! body.contains (e.x, e.y)) continue;
+            const double off = envXToBeatOffset (e.x, body, r);
+            const float  db  = envYToGainDb     (e.y, body);
+            insertEnvelopePoint (laneIdx, r.id, off, db);
+            return;
+        }
+    }
+
+    /** Audition helper -- routes a region launch through TrackerNode /
+     *  AudioClipNode the same way the mouseUp click-launch does, but
+     *  factored so the Audition tool can call it from mouseDown. */
+    void launchRegionAudition (int laneIdx, const Region& r)
+    {
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+        if (runtime.isTrackerLane() && r.sequenceIdx >= 0)
+        {
+            if (runtime.lastDispatchedSeqIdx >= 0
+                && runtime.lastDispatchedSeqIdx != r.sequenceIdx)
+                runtime.trackerCache->schedulePlaying (
+                    runtime.lastDispatchedSeqIdx, -1.0, false);
+            runtime.trackerCache->schedulePlaying (r.sequenceIdx, -1.0, true);
+        }
+        else if (runtime.isAudioLane())
+        {
+            const double bpm = owner.monitor_ != nullptr
+                ? (double) owner.monitor_->tempo.get() : 120.0;
+            const double sessionSR = owner.monitor_ != nullptr
+                ? (double) owner.monitor_->sampleRate.get() : 48000.0;
+            const double secsPerBeat = bpm > 0.0 ? 60.0 / bpm : 0.5;
+            runtime.audioClipCache->schedulePlay (
+                r.id, r.sourceId, -1.0, 0, r.looped,
+                r.gainDb,
+                (juce::int64) (r.fadeInBeats  * secsPerBeat * sessionSR),
+                (juce::int64) (r.fadeOutBeats * secsPerBeat * sessionSR),
+                (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR));
+        }
+        runtime.lastDispatchedRegion = r.id;
+        runtime.lastDispatchedSeqIdx = r.sequenceIdx;
+    }
+
     void mouseDrag (const MouseEvent& e) override
     {
+        /* Envelope point drag -- updates the point's beat + gain.
+         * Sort happens at mouseUp so neighbours don't reshuffle
+         * mid-drag (would break the pointer to the in-flight
+         * pt for subsequent drag events). */
+        if (envGesture_.laneIdx >= 0)
+        {
+            envGesture_.dragActive = true;
+            if (envGesture_.laneIdx >= owner.lanes_.size()) return;
+            auto& lane = owner.lanes_.getReference (envGesture_.laneIdx);
+            auto* r = lane.playlist.findRegion (envGesture_.regionId);
+            if (r == nullptr) return;
+            EnvelopePoint* pt = nullptr;
+            for (auto& p : r->volumeEnvelope)
+                if (p.id == envGesture_.pointId) { pt = &p; break; }
+            if (pt == nullptr) return;
+
+            const auto body = regionBodyRect (envGesture_.laneIdx, *r);
+            pt->beatOffset = juce::jlimit (0.0, r->lengthBeats,
+                                            envXToBeatOffset (e.x, body, *r));
+            pt->gainDb     = juce::jlimit (-60.0f, 12.0f,
+                                            envYToGainDb (e.y, body));
+            repaintLane (envGesture_.laneIdx);
+            return;
+        }
+
+        /* Range drag (lane strip OR ruler) is independent of the
+         * region-gesture path -- it updates the range overlay and
+         * skips lane mutation. */
+        if (rangeDragging_)
+        {
+            const double mouseBeat = juce::jmax (0.0,
+                (double) (e.x - kLabelW) / (double) kPxPerBeat);
+            rangeStart_ = juce::jmin (rangeAnchor_, mouseBeat);
+            rangeEnd_   = juce::jmax (rangeAnchor_, mouseBeat);
+            repaint();
+            return;
+        }
+
         if (gesture_.laneIdx < 0) return;
         if (e.getDistanceFromDragStart() < kDragThresholdPx && ! gesture_.dragActive)
             return;
@@ -403,6 +844,39 @@ public:
 
     void mouseUp (const MouseEvent& e) override
     {
+        /* Finish envelope point drag -- sort the envelope (in case
+         * the point passed neighbours) + persist.  Clicks without
+         * drag still consumed by the env path, no fallthrough to
+         * region-launch. */
+        if (envGesture_.laneIdx >= 0)
+        {
+            if (envGesture_.dragActive
+                && envGesture_.laneIdx < owner.lanes_.size())
+            {
+                auto& lane = owner.lanes_.getReference (envGesture_.laneIdx);
+                if (auto* r = lane.playlist.findRegion (envGesture_.regionId))
+                    r->sortEnvelope();
+                owner.writeLanesToSession();
+                repaintLane (envGesture_.laneIdx);
+            }
+            envGesture_ = EnvGesture {};
+            return;
+        }
+
+        /* Finish range drag (lane strip OR ruler).  Empty range
+         * (start == end) collapses to no-range; non-empty range
+         * stays armed for loop / future delete-in-range. */
+        if (rangeDragging_)
+        {
+            rangeDragging_ = false;
+            if (rangeEnd_ <= rangeStart_ + 1e-6)
+            {
+                rangeActive_ = false;
+            }
+            repaint();
+            return;
+        }
+
         if (gesture_.laneIdx < 0) return;
 
         const int   laneIdx     = gesture_.laneIdx;
@@ -499,6 +973,75 @@ public:
             }
         }
         setMouseCursor (juce::MouseCursor::NormalCursor);
+    }
+
+    /** Sampler-style zoom on mouse wheel.
+     *
+     *  - Plain wheel: horizontal zoom (px-per-beat).  Beat under the
+     *    cursor stays under the cursor after zoom.
+     *  - Ctrl/Cmd + wheel: vertical zoom (lane height).  Lane row
+     *    under the cursor stays under the cursor after zoom.
+     *  - Trackpad horizontal swipes (deltaX dominant) pass through
+     *    to the viewport's default scroll handling. */
+    void mouseWheelMove (const MouseEvent& e,
+                          const juce::MouseWheelDetails& w) override
+    {
+        if (std::abs (w.deltaX) > std::abs (w.deltaY))
+        {
+            juce::Component::mouseWheelMove (e, w);
+            return;
+        }
+        if (std::abs (w.deltaY) < 0.001f) return;
+
+        const double factor = (w.deltaY > 0) ? 1.20 : (1.0 / 1.20);
+
+        /* Ctrl/Cmd modifier -> vertical (lane height) zoom.  Anchor:
+         * keep the lane row directly under the cursor pinned to its
+         * current screen Y. */
+        if (e.mods.isCtrlDown() || e.mods.isCommandDown())
+        {
+            const int anchorBodyY = e.y;
+            const int oldScrollY  = owner.viewport_.getViewPositionY();
+            const int anchorScreenY = anchorBodyY - oldScrollY;
+
+            const int relY = juce::jmax (0, anchorBodyY - kRulerH);
+            const int oldLaneIdx   = relY / kLaneH;
+            const double yRelInLane = (double) (relY - oldLaneIdx * kLaneH)
+                                     / (double) kLaneH;
+
+            const int newH = juce::jlimit (kLaneHMin, kLaneHMax,
+                                            (int) std::lround (kLaneH * factor));
+            if (newH == kLaneH) return;
+            kLaneH = newH;
+            resizeForLanes();
+
+            const int newAnchorBodyY = kRulerH + oldLaneIdx * kLaneH
+                                     + (int) (yRelInLane * kLaneH);
+            const int newScrollY = juce::jmax (0, newAnchorBodyY - anchorScreenY);
+            const auto viewArea = owner.viewport_.getViewArea();
+            owner.viewport_.setViewPosition (viewArea.getX(), newScrollY);
+            return;
+        }
+
+        /* Plain wheel -> horizontal (px-per-beat) zoom.  Anchor: keep
+         * the beat directly under the cursor pinned to its current
+         * screen X. */
+        const int anchorPxX  = e.x;
+        const int stripPxX   = anchorPxX - kLabelW;
+        const double anchorBeat = (stripPxX <= 0)
+            ? 0.0
+            : (double) stripPxX / (double) kPxPerBeat;
+
+        const int newPxPerBeat = juce::jlimit (kPxPerBeatMin, kPxPerBeatMax,
+                                                (int) std::lround (kPxPerBeat * factor));
+        if (newPxPerBeat == kPxPerBeat) return;
+        kPxPerBeat = newPxPerBeat;
+        resizeForLanes();
+
+        const int newAnchorBodyX = kLabelW + (int) (anchorBeat * kPxPerBeat);
+        const int newScrollX     = juce::jmax (0, newAnchorBodyX - anchorPxX);
+        const auto viewArea = owner.viewport_.getViewArea();
+        owner.viewport_.setViewPosition (newScrollX, viewArea.getY());
     }
 
     /** Build + show the region right-click popup.  Stop-gap UI until
@@ -627,9 +1170,21 @@ public:
             repaint (juce::jlimit (0, W, newPxX - 1), 0, 3, H);
     }
 
-    static constexpr int kLabelW         = 160;
-    static constexpr int kLaneH          = 64;
-    static constexpr int kPxPerBeat      = 24;
+    static constexpr int kLabelW         = 130;
+    /* Vertical zoom: per-instance lane height.  Ctrl+wheel scales
+     * within [kLaneHMin, kLaneHMax].  Default bumped from 64 -> 88
+     * so the title strip + waveform + R/S/M cluster breathe. */
+    int kLaneH = 88;
+    static constexpr int kLaneHMin = 40;
+    static constexpr int kLaneHMax = 240;
+    /* Horizontal zoom: per-instance px-per-beat.  Sampler-style
+     * mouse-wheel zoom (mouseWheelMove) scales this in [kPxPerBeatMin,
+     * kPxPerBeatMax].  All paint + hit-test math uses the instance
+     * value; the outer ArrangementView dereferences it via
+     * body_->kPxPerBeat for playhead scrolling. */
+    int kPxPerBeat = 24;
+    static constexpr int kPxPerBeatMin = 4;
+    static constexpr int kPxPerBeatMax = 256;
     static constexpr int kRulerH         = 24;   /* bars:beats ruler row */
     static constexpr int kEdgeHandlePx   = 6;    /* width of right-edge resize handle */
     static constexpr int kDragThresholdPx = 4;   /* pixels before mouseDown -> drag */
@@ -716,40 +1271,288 @@ private:
         }
     }
 
-    /** Bounding box of the arm-toggle dot within a lane's label area.
-     *  Small square in the top-right corner; used by mouseDown to
-     *  detect clicks. */
-    Rectangle<int> armToggleRect (int laneIdx) const noexcept
+    /** ARM / MUTE / SOLO button stack lives on the right side of
+     *  the lane label area, three buttons tall.  Visual style mirrors
+     *  SessionView column-header buttons: flat fillRect + drawRect
+     *  with full-word labels and tint-derived idle colour.  Tracker
+     *  lanes paint only MUTE + SOLO (ARM slot is left blank so M+S
+     *  stay at the same Y positions across lane kinds).
+     *
+     *  Cluster X is right-anchored to the label area so shrinking
+     *  kLabelW just shrinks the lane-name column to its left.  Vertical
+     *  stacking trades horizontal label width for height -- buttons
+     *  read big because they span the full width of the right column. */
+    static constexpr int kBtnW       = 46;
+    static constexpr int kBtnH       = 14;
+    static constexpr int kBtnGap     = 2;
+    static constexpr int kBtnRightPad = 4;
+    static constexpr int kBtnTopPad  = 4;
+
+    int laneButtonX() const noexcept
     {
-        constexpr int sz   = 12;
-        constexpr int pad  = 6;
-        const int y = kRulerH + laneIdx * kLaneH + pad;
-        const int x = kLabelW - sz - pad;
-        return Rectangle<int> (x, y, sz, sz);
+        return kLabelW - kBtnW - kBtnRightPad;
     }
 
-    /** M (mute) and S (solo) toggle rectangles in the lane label
-     *  area.  Stacked vertically below the lane name; reach the
-     *  arm dot from the right edge and these are inset 6 px to the
-     *  left in label X.  Audio AND tracker lanes get the M/S
-     *  affordance (TrackerNode honors mute/solo via the existing
-     *  SessionView path). */
+    Rectangle<int> armToggleRect (int laneIdx) const noexcept
+    {
+        const int y = kRulerH + laneIdx * kLaneH + kBtnTopPad;
+        return Rectangle<int> (laneButtonX(), y, kBtnW, kBtnH);
+    }
+
     Rectangle<int> muteToggleRect (int laneIdx) const noexcept
     {
-        constexpr int sz  = 14;
-        constexpr int pad = 4;
-        const int y = kRulerH + laneIdx * kLaneH + kLaneH / 2 - sz - 1;
-        const int x = kLabelW - sz - pad - 36;   // left of solo
-        return Rectangle<int> (x, y, sz, sz);
+        const int y = kRulerH + laneIdx * kLaneH + kBtnTopPad
+                    + (kBtnH + kBtnGap);
+        return Rectangle<int> (laneButtonX(), y, kBtnW, kBtnH);
     }
 
     Rectangle<int> soloToggleRect (int laneIdx) const noexcept
     {
-        constexpr int sz  = 14;
-        constexpr int pad = 4;
-        const int y = kRulerH + laneIdx * kLaneH + kLaneH / 2 - sz - 1;
-        const int x = kLabelW - sz - pad - 18;   // between mute + arm
-        return Rectangle<int> (x, y, sz, sz);
+        const int y = kRulerH + laneIdx * kLaneH + kBtnTopPad
+                    + (kBtnH + kBtnGap) * 2;
+        return Rectangle<int> (laneButtonX(), y, kBtnW, kBtnH);
+    }
+
+    /** Paint a volume envelope curve over the audio region body
+     *  plus an attenuation-shading polygon above the curve.
+     *
+     *  Visual: the area BETWEEN the top of the body and the envelope
+     *  curve is dimmed by a translucent black overlay, so the
+     *  shaded portion of the clip reads as "this much gain is being
+     *  cut here".  Below the curve stays at full waveform intensity.
+     *
+     *  Empty envelope -> single horizontal line at 0 dB (the curve
+     *  defaults to unity gain on first paint); the area above that
+     *  line is also shaded so the surface always has something to
+     *  read against. */
+    void paintVolumeEnvelope (Graphics& g,
+                                const Rectangle<int>& body,
+                                const Region& r,
+                                juce::Colour tint,
+                                bool selected) const
+    {
+        if (body.getWidth() < 4 || body.getHeight() < 6) return;
+        if (r.lengthBeats <= 1e-6) return;
+
+        /* Map gainDb to Y over a [+6, -24] dB window.  0 dB sits at
+         * 80 % up the body so the user can pull above unity gain too. */
+        constexpr float kTopDb = 6.0f;
+        constexpr float kBotDb = -24.0f;
+        const int yPad = 3;
+        auto gainToY = [&] (float dB) noexcept
+        {
+            const float t = juce::jlimit (0.0f, 1.0f,
+                (kTopDb - dB) / (kTopDb - kBotDb));
+            return (float) body.getY() + yPad
+                 + t * (float) juce::jmax (1, body.getHeight() - yPad * 2);
+        };
+        auto beatToX = [&] (double localBeat) noexcept
+        {
+            const double t = juce::jlimit (0.0, 1.0, localBeat / r.lengthBeats);
+            return (float) body.getX() + (float) (t * body.getWidth());
+        };
+
+        const juce::Colour lineCol = selected
+            ? juce::Colours::white
+            : tint.brighter (0.45f).withAlpha (0.85f);
+
+        /* Build a stroke path for the envelope curve AND an aligned
+         * polygon path for the attenuation shading above the curve.
+         * Both share the same per-segment subdivision so the shaded
+         * polygon's bottom edge sits perfectly on the line. */
+        juce::Path stroke;
+        juce::Path shadePoly;
+
+        constexpr int kSubdiv = 12;
+
+        auto pushSegment = [&] (double beatA, float dbA,
+                                 double beatB, float dbB,
+                                 EnvelopeCurve curve, bool first)
+        {
+            const float xA = beatToX (beatA);
+            const float yA = gainToY (dbA);
+            if (first)
+            {
+                stroke.startNewSubPath (xA, yA);
+                shadePoly.startNewSubPath ((float) body.getX(), (float) body.getY());
+                shadePoly.lineTo (xA, (float) body.getY());
+                shadePoly.lineTo (xA, yA);
+            }
+            if (curve == EnvelopeCurve::Hold)
+            {
+                const float xB = beatToX (beatB);
+                stroke.lineTo (xB, yA);
+                stroke.lineTo (xB, gainToY (dbB));
+                shadePoly.lineTo (xB, yA);
+                shadePoly.lineTo (xB, gainToY (dbB));
+                return;
+            }
+            if (curve == EnvelopeCurve::Linear)
+            {
+                const float xB = beatToX (beatB);
+                const float yB = gainToY (dbB);
+                stroke.lineTo (xB, yB);
+                shadePoly.lineTo (xB, yB);
+                return;
+            }
+            for (int k = 1; k <= kSubdiv; ++k)
+            {
+                const double t = (double) k / (double) kSubdiv;
+                double shaped = t;
+                if (curve == EnvelopeCurve::Exponential) shaped = t * t;
+                if (curve == EnvelopeCurve::Smooth)
+                    shaped = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * t);
+                const double beat = beatA + t * (beatB - beatA);
+                const double db   = dbA + shaped * (dbB - dbA);
+                const float xK = beatToX (beat);
+                const float yK = gainToY ((float) db);
+                stroke.lineTo (xK, yK);
+                shadePoly.lineTo (xK, yK);
+            }
+        };
+
+        if (r.volumeEnvelope.empty())
+        {
+            /* No breakpoints -> render an implicit "constant at 0 dB"
+             * line spanning the full region.  Shading above is still
+             * meaningful (zero, since 0 dB is at the top window edge,
+             * but the surface IS there to double-click). */
+            const float y = gainToY (0.0f);
+            stroke.startNewSubPath ((float) body.getX(),     y);
+            stroke.lineTo            ((float) body.getRight(), y);
+            shadePoly.startNewSubPath ((float) body.getX(),     (float) body.getY());
+            shadePoly.lineTo            ((float) body.getRight(), (float) body.getY());
+            shadePoly.lineTo            ((float) body.getRight(), y);
+            shadePoly.lineTo            ((float) body.getX(),     y);
+            shadePoly.closeSubPath();
+        }
+        else
+        {
+            for (size_t i = 0; i + 1 < r.volumeEnvelope.size(); ++i)
+            {
+                const auto& a = r.volumeEnvelope[i];
+                const auto& b = r.volumeEnvelope[i + 1];
+                pushSegment (a.beatOffset, a.gainDb,
+                              b.beatOffset, b.gainDb,
+                              a.curve, i == 0);
+            }
+            /* Close the shading polygon: traverse along the top edge
+             * back to the starting X. */
+            const auto& last = r.volumeEnvelope.back();
+            const float xEnd = beatToX (last.beatOffset);
+            shadePoly.lineTo (xEnd, (float) body.getY());
+            shadePoly.closeSubPath();
+        }
+
+        /* Attenuation shading -- translucent black above the curve.
+         * Sits below the envelope line so it never hides the curve
+         * itself; sits above the waveform so the dimming is visible. */
+        g.setColour (juce::Colours::black.withAlpha (0.45f));
+        g.fillPath (shadePoly);
+
+        /* Envelope line on top of everything. */
+        g.setColour (lineCol);
+        g.strokePath (stroke, juce::PathStrokeType (selected ? 1.5f : 1.0f));
+
+        /* Breakpoint dots -- larger + ringed when selected. */
+        const float dotR = selected ? 3.0f : 2.5f;
+        for (const auto& pt : r.volumeEnvelope)
+        {
+            const float x = beatToX (pt.beatOffset);
+            const float y = gainToY (pt.gainDb);
+            g.setColour (lineCol);
+            g.fillEllipse (x - dotR, y - dotR, dotR * 2, dotR * 2);
+            if (selected)
+            {
+                g.setColour (juce::Colours::black);
+                g.drawEllipse (x - dotR, y - dotR, dotR * 2, dotR * 2, 1.0f);
+            }
+        }
+    }
+
+    /** Paint a piano-roll style overview of a tracker sequence into
+     *  the region body.  Walks every note_on row across every track
+     *  of the sequence; maps row index -> X, MIDI pitch -> inverted
+     *  Y over the sequence's used pitch range.  Thread-safe: takes
+     *  the TrackerNode engine lock for the duration of the iteration
+     *  so vht doesn't free the sequence/track arrays underneath. */
+    void paintTrackerThumb (Graphics& g,
+                              const Rectangle<int>& body,
+                              TrackerNode* trk,
+                              int sequenceIdx,
+                              juce::Colour tint) const
+    {
+        if (trk == nullptr || sequenceIdx < 0) return;
+        if (body.getWidth() < 4 || body.getHeight() < 4) return;
+
+        juce::ScopedLock sl (trk->engineLock());
+        auto* mod = trk->modulePtr();
+        if (mod == nullptr || sequenceIdx >= mod->nseq) return;
+        auto* seq = mod->seq[sequenceIdx];
+        if (seq == nullptr || seq->ntrk <= 0) return;
+
+        /* First pass: discover the in-use MIDI pitch range across
+         * all tracks/cols/rows.  If no notes, bail. */
+        int minNote = 127, maxNote = 0;
+        int totalRows = 0;
+        for (int t = 0; t < seq->ntrk; ++t)
+        {
+            auto* trkP = seq->trk[t];
+            if (trkP == nullptr) continue;
+            if (trkP->nrows > totalRows) totalRows = trkP->nrows;
+            for (int c = 0; c < trkP->ncols; ++c)
+                for (int r = 0; r < trkP->nrows; ++r)
+                {
+                    const auto& row = trkP->rows[c][r];
+                    if (row.type == note_on && row.note > 0)
+                    {
+                        if (row.note < minNote) minNote = row.note;
+                        if (row.note > maxNote) maxNote = row.note;
+                    }
+                }
+        }
+        if (totalRows <= 0 || minNote > maxNote) return;
+
+        /* Give a one-octave minimum range so a single-pitch loop
+         * doesn't paint as one flat line at the top of the body. */
+        const int pitchPad = juce::jmax (0, 12 - (maxNote - minNote));
+        const int loNote = juce::jmax (0, minNote - pitchPad / 2);
+        const int hiNote = juce::jmin (127, maxNote + (pitchPad - pitchPad / 2));
+        const double pitchRange = (double) juce::jmax (1, hiNote - loNote);
+
+        const int pad = 2;
+        const int innerW = juce::jmax (1, body.getWidth() - pad * 2);
+        const int innerH = juce::jmax (1, body.getHeight() - pad * 2);
+        const int innerX = body.getX() + pad;
+        const int innerY = body.getY() + pad;
+
+        g.setColour (tint.withMultipliedBrightness (1.35f)
+                          .withMultipliedSaturation (0.85f));
+
+        /* Second pass: paint each note_on row as a small horizontal
+         * tick.  Width derives from sequence-row-density so notes
+         * read as ticks at low zoom and as bars when zoomed in. */
+        for (int t = 0; t < seq->ntrk; ++t)
+        {
+            auto* trkP = seq->trk[t];
+            if (trkP == nullptr || trkP->nrows <= 0) continue;
+            const float rowStepPx = (float) innerW / (float) trkP->nrows;
+            const int tickW = juce::jmax (1, (int) std::ceil (rowStepPx));
+
+            for (int c = 0; c < trkP->ncols; ++c)
+                for (int r = 0; r < trkP->nrows; ++r)
+                {
+                    const auto& row = trkP->rows[c][r];
+                    if (row.type != note_on || row.note <= 0) continue;
+
+                    const float xRel = (float) r / (float) trkP->nrows;
+                    const float yRel = (float) (row.note - loNote) / (float) pitchRange;
+                    const int dotX = innerX + (int) (xRel * innerW);
+                    const int dotY = innerY + innerH - 1
+                                     - (int) (yRel * (innerH - 1));
+                    g.fillRect (dotX, dotY, tickW, 2);
+                }
+        }
     }
 
     void paintLane (Graphics& g, int laneIdx)
@@ -759,10 +1562,10 @@ private:
         const int y = kRulerH + laneIdx * kLaneH;
         const Rectangle<int> bounds (0, y, getWidth(), kLaneH);
 
-        /* Tracker-editor visual language: dark gutter background +
-         * tint band at the top of the label area + low-alpha tint
-         * wash for the body, monospace font for the lane name. */
-        constexpr int kTintBandH = 6;
+        /* Bitwig-style vertical tint strip on the LEFT edge of the
+         * label area, low-alpha wash for the rest, monospace font
+         * for the lane name. */
+        constexpr int kTintStripW = 6;
         const juce::Colour kGutterColour { 0xff'14'14'14 };
         const juce::Colour kRowDividerColour { 0xff'22'22'22 };
         const juce::Colour kRowTextColour { 0xff'a8'a8'a8 };
@@ -784,15 +1587,21 @@ private:
         g.setColour (kGutterColour);
         g.fillRect (labelArea);
 
-        /* Tint band + body wash (tracker pattern). */
+        /* Vertical tint strip on the LEFT edge + low-alpha wash
+         * across the rest of the label area. */
         g.setColour (tint);
         g.fillRect (labelArea.getX(), labelArea.getY(),
-                    labelArea.getWidth() - 1, kTintBandH);
+                    kTintStripW, labelArea.getHeight() - 1);
         g.setColour (tint.withAlpha (0.12f));
-        g.fillRect (labelArea.getX(), labelArea.getY() + kTintBandH,
-                    labelArea.getWidth() - 1, labelArea.getHeight() - kTintBandH);
+        g.fillRect (labelArea.getX() + kTintStripW, labelArea.getY(),
+                    labelArea.getWidth() - kTintStripW - 1,
+                    labelArea.getHeight() - 1);
 
-        /* Lane name in tint colour, monospaced bold (tracker style). */
+        /* Lane name + kind pill sit in the left column of the label
+         * area, between the tint strip and the right-anchored button
+         * stack.  Name on top, pill below, both left-aligned. */
+        const int labelInset = kTintStripW + 4;
+        const int leftColW   = laneButtonX() - labelInset - 2;
         g.setColour (orphan ? tint.withAlpha (0.55f) : tint);
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       12.0f, juce::Font::bold));
@@ -801,12 +1610,11 @@ private:
                                 : (isAudio ? juce::String ("Audio") : juce::String ("Tracker"));
         if (orphan) label += " (orphan)";
         g.drawText (label,
-                    labelArea.reduced (6, 0).withTrimmedTop (kTintBandH + 1)
-                                            .withHeight (14),
+                    Rectangle<int> (labelArea.getX() + labelInset,
+                                     labelArea.getY() + 3,
+                                     leftColW, 14),
                     juce::Justification::centredLeft, true);
 
-        /* Lane kind pill in the upper right, matches tracker channel
-         * pill style ("ch01"). */
         g.setColour (juce::Colours::white.withAlpha (0.55f));
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       10.0f, juce::Font::plain));
@@ -814,80 +1622,88 @@ private:
                                 : runtime.isTrackerLane() ? "trk"
                                 : "?";
         g.drawText (pill,
-                    labelArea.getRight() - 40, labelArea.getY() + kTintBandH + 1,
-                    36, 12,
-                    juce::Justification::centredRight);
+                    Rectangle<int> (labelArea.getX() + labelInset,
+                                     labelArea.getY() + 19,
+                                     leftColW, 12),
+                    juce::Justification::centredLeft);
 
-        /* MUTE | SOLO buttons -- tracker palette (mute = dark
-         * red-brown when active, solo = yellow when active),
-         * monospace caps text.  Matches paintHeader at
-         * trackereditor.cpp:816-838. */
-        const juce::Colour btnTint = tint.withMultipliedBrightness (0.55f)
-                                         .withSaturation (0.3f);
+        /* MUTE / SOLO / ARM cluster at the bottom of the label area.
+         * Flat-panel style mirroring SessionView column buttons:
+         * fillRect + drawRect, full-word labels, tint-derived idle
+         * background so the row reads as a horizontal cousin of a
+         * session column. */
+        const juce::Colour btnTint = tint.withMultipliedSaturation (0.6f)
+                                         .withMultipliedBrightness (0.55f);
+        auto drawFlatButton = [&] (const Rectangle<int>& rect,
+                                    bool active,
+                                    juce::Colour activeFill,
+                                    juce::Colour activeText,
+                                    const juce::String& label)
         {
-            const auto mRect = muteToggleRect (laneIdx);
-            g.setColour (lane.muted ? juce::Colour { 0xff'40'30'30 } : btnTint);
-            g.fillRect (mRect);
+            g.setColour (active ? activeFill : btnTint);
+            g.fillRect (rect);
             g.setColour (kRowDividerColour);
-            g.drawRect (mRect, 1);
-            g.setColour (lane.muted ? juce::Colours::white
-                                    : juce::Colours::white.withAlpha (0.70f));
+            g.drawRect (rect, 1);
+            g.setColour (active ? activeText
+                                : juce::Colours::white.withAlpha (0.70f));
             g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                          10.0f, juce::Font::bold));
-            g.drawText ("M", mRect, juce::Justification::centred);
-        }
-        {
-            const auto sRect = soloToggleRect (laneIdx);
-            g.setColour (lane.soloed ? juce::Colour { 0xff'd5'b0'30 } : btnTint);
-            g.fillRect (sRect);
-            g.setColour (kRowDividerColour);
-            g.drawRect (sRect, 1);
-            g.setColour (lane.soloed ? juce::Colours::black
-                                     : juce::Colours::white.withAlpha (0.70f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                          10.0f, juce::Font::bold));
-            g.drawText ("S", sRect, juce::Justification::centred);
-        }
+                                          9.0f, juce::Font::bold));
+            g.drawText (label, rect, juce::Justification::centred);
+        };
 
-        /* Arm toggle (audio lanes only).  While the transport is
-         * actively recording AND this lane is armed, grow + brighten
-         * the dot and overlay a "REC" badge so the user knows capture
-         * is in flight. */
+        drawFlatButton (muteToggleRect (laneIdx), lane.muted,
+                         juce::Colour { 0xff'c0'30'30 },
+                         juce::Colours::white, "MUTE");
+        drawFlatButton (soloToggleRect (laneIdx), lane.soloed,
+                         juce::Colour { 0xff'd5'b0'30 },
+                         juce::Colours::black, "SOLO");
+
+        /* Arm toggle (audio lanes only).  Same pill idiom, with a
+         * recording-mode growth + red-200 letter overlay so the user
+         * sees capture is in flight without losing the round button
+         * style. */
         const bool transportRecording = owner.monitor_ != nullptr
                                       && owner.monitor_->recording.get();
         const bool capturing = isAudio && lane.armed && transportRecording;
 
         if (isAudio)
         {
-            const auto baseRect = armToggleRect (laneIdx);
-            const auto rect = capturing ? baseRect.expanded (2)
-                                        : baseRect;
+            const auto rect = armToggleRect (laneIdx);
 
             const Colour fillCol = lane.armed
                 ? (capturing ? Colour::fromRGB (255, 60, 60)
                              : Colour::fromRGB (220, 70, 70))
-                : Colour::fromRGB (60, 60, 60);
+                : btnTint;
             g.setColour (fillCol);
             g.fillRect (rect);
-            g.setColour (lane.armed ? Colour::fromRGB (255, 160, 160)
-                                    : Colour::fromRGB (90, 90, 90));
+            g.setColour (capturing ? Colour::fromRGB (255, 160, 160)
+                                    : kRowDividerColour);
             g.drawRect (rect, capturing ? 2 : 1);
-
-            if (capturing)
-            {
-                g.setColour (Colour::fromRGB (255, 80, 80));
-                g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
-                const Rectangle<int> badge (
-                    rect.getX() - 32, rect.getY(), 28, rect.getHeight());
-                g.drawText ("REC", badge,
-                            juce::Justification::centredRight, false);
-            }
+            g.setColour (lane.armed ? juce::Colours::white
+                                    : juce::Colours::white.withAlpha (0.70f));
+            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                          9.0f, juce::Font::bold));
+            /* "REC" both at-rest and while capturing -- the fill
+             * colour conveys state (dim/bright red when armed-but-
+             * idle vs capturing) so the label can stay one word. */
+            g.drawText ("REC", rect, juce::Justification::centred);
         }
 
         /* Strip background + beat grid. */
         const Rectangle<int> stripArea (kLabelW, y, getWidth() - kLabelW, kLaneH);
         g.setColour (Colors::widgetBackgroundColor.darker (0.4f));
         g.fillRect (stripArea);
+
+        /* Bitwig-style whole-lane tint wash: low-alpha lane colour over
+         * the full strip so a row is colour-coded between regions, not
+         * just inside them.  Skipped for orphans (their tint is already
+         * desaturated and they shouldn't compete with live lanes for
+         * visual weight). */
+        if (! orphan)
+        {
+            g.setColour (tint.withAlpha (0.08f));
+            g.fillRect (stripArea);
+        }
 
         g.setColour (Colors::widgetBackgroundColor.brighter (0.05f));
         for (int x = 0; x < stripArea.getWidth(); x += kPxPerBeat * 4)
@@ -922,13 +1738,47 @@ private:
             const juce::Colour fill = borderTint.withMultipliedSaturation (0.55f)
                                                 .withMultipliedBrightness (0.45f);
 
+            /* Region body fill (rounded). */
             g.setColour (fill);
             g.fillRoundedRectangle (rect.toFloat(), kCornerSize);
 
+            /* Bitwig-style region title strip: thin band across the
+             * top of the region in a more saturated/darker shade of
+             * the lane tint.  Holds the region label so the waveform
+             * area below stays uncluttered.  Squared-off bottom via
+             * an inner overdraw with the body fill below the band. */
+            constexpr int kTitleH = 13;
+            const Rectangle<int> titleRect (rect.getX(), rect.getY(),
+                                             rect.getWidth(),
+                                             juce::jmin (kTitleH, rect.getHeight()));
+            const Rectangle<int> bodyRect (rect.getX(),
+                                            rect.getY() + titleRect.getHeight(),
+                                            rect.getWidth(),
+                                            juce::jmax (0, rect.getHeight() - titleRect.getHeight()));
+            const juce::Colour titleFill = borderTint.withMultipliedBrightness (0.70f)
+                                                      .withMultipliedSaturation (1.10f);
+            {
+                /* Clip to the rounded outer rect so the title band's
+                 * top corners follow the region's rounding while its
+                 * bottom edge stays straight against the body fill. */
+                juce::Graphics::ScopedSaveState save (g);
+                juce::Path clipPath;
+                clipPath.addRoundedRectangle (rect.toFloat(), kCornerSize);
+                g.reduceClipRegion (clipPath);
+                g.setColour (titleFill);
+                g.fillRect (titleRect);
+
+                /* (Envelope-driven attenuation shading is drawn by
+                 * paintVolumeEnvelope below -- it shades only the area
+                 * ABOVE the envelope curve, so the visible "dimmed"
+                 * region maps directly to how much gain is being cut.
+                 * No global gradient here.) */
+            }
+
             /* Waveform overlay for audio regions (sequenceIdx < 0),
-             * clipped to the rounded rect so the wave doesn't bleed
-             * past the corner radius. */
-            if (isAudio && r.sequenceIdx < 0)
+             * clipped to the *body* rect only so it never overlaps the
+             * title band. */
+            if (isAudio && r.sequenceIdx < 0 && bodyRect.getHeight() > 2)
             {
                 if (auto* thumb = const_cast<Body*> (this)->getThumbnail (r.sourceId))
                 {
@@ -952,10 +1802,41 @@ private:
 
                         g.setColour (borderTint.withMultipliedBrightness (1.2f)
                                                .withMultipliedSaturation (0.8f));
-                        thumb->drawChannels (g, rect.reduced (3, 5),
+                        thumb->drawChannels (g,
+                                              bodyRect.reduced (3, 2),
                                               srcStartSec, srcEndSec, 0.85f);
                     }
                 }
+            }
+            else if (! isAudio && r.sequenceIdx >= 0 && bodyRect.getHeight() > 2)
+            {
+                /* Tracker pattern thumbnail: piano-roll-style dots so
+                 * each region carries a glanceable shape of its
+                 * sequence, paralleling the audio waveform overlay. */
+                juce::Graphics::ScopedSaveState save (g);
+                juce::Path clipPath;
+                clipPath.addRoundedRectangle (
+                    rect.toFloat().reduced (2.0f, 2.0f),
+                    juce::jmax (0.5f, kCornerSize - 1.0f));
+                g.reduceClipRegion (clipPath);
+                paintTrackerThumb (g, bodyRect.reduced (3, 2),
+                                    runtime.trackerCache,
+                                    r.sequenceIdx, borderTint);
+            }
+
+            /* Volume envelope -- audio regions only.  Empty envelope
+             * still draws a flat line at the static gainDb so the
+             * surface is always there to double-click on. */
+            if (isAudio && r.sequenceIdx < 0 && bodyRect.getHeight() > 6)
+            {
+                juce::Graphics::ScopedSaveState save (g);
+                juce::Path clipPath;
+                clipPath.addRoundedRectangle (
+                    rect.toFloat().reduced (2.0f, 2.0f),
+                    juce::jmax (0.5f, kCornerSize - 1.0f));
+                g.reduceClipRegion (clipPath);
+                paintVolumeEnvelope (g, bodyRect.reduced (3, 2),
+                                       r, borderTint, selected);
             }
 
             /* Graph-block borders: tinted outer stroke + black inner
@@ -975,14 +1856,28 @@ private:
                 juce::jmax (0.5f, kCornerSize - outerWidth),
                 1.0f);
 
-            g.setColour (juce::Colours::white.withAlpha (0.95f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                          11.0f, juce::Font::bold));
+            /* Region label in the title strip.  Bar-position prefix
+             * (e.g. "5 Drums") matches Bitwig + Cubase phrasing -- the
+             * region is anchored to that bar so the bar number reads
+             * as the region's primary identifier.  Pattern regions
+             * fall back to their "P<idx>" tag with no bar prefix. */
+            const int beatsPerBar = owner.monitor_ != nullptr
+                ? juce::jmax (1, (int) owner.monitor_->beatsPerBar.get())
+                : 4;
+            const int barAt = (int) (r.positionBeats / beatsPerBar) + 1;
 
-            const juce::String tag = r.sequenceIdx >= 0
-                                        ? "P" + String (r.sequenceIdx)
-                                        : (r.name.isNotEmpty() ? r.name : String ("Audio"));
-            g.drawText (tag, rect.reduced (6, 0),
+            juce::String labelText;
+            if (r.sequenceIdx >= 0)
+                labelText = "P" + String (r.sequenceIdx);
+            else
+                labelText = String (barAt) + " " +
+                             (r.name.isNotEmpty() ? r.name : String ("Audio"));
+
+            g.setColour (juce::Colours::white.withAlpha (0.92f));
+            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                          10.0f, juce::Font::bold));
+            g.drawText (labelText,
+                        titleRect.reduced (5, 0),
                         juce::Justification::centredLeft, true);
         }
 
@@ -1096,6 +1991,28 @@ private:
     };
     Gesture gesture_;
 
+    /** Live drag of an envelope breakpoint.  Set in mouseDown when
+     *  the cursor lands on a breakpoint dot; updated in mouseDrag;
+     *  cleared in mouseUp.  Decoupled from the region-Gesture so a
+     *  Select-tool click on a dot doesn't also start a move/resize. */
+    struct EnvGesture {
+        int        laneIdx    = -1;
+        juce::Uuid regionId;
+        juce::Uuid pointId;
+        bool       dragActive = false;
+    };
+    EnvGesture envGesture_;
+
+    /* Active tool + loop-range state.  See the comment block on the
+     * Tool enum declaration for the per-tool gesture mapping. */
+    Tool   activeTool_     = Tool::Select;
+    bool   rangeActive_    = false;
+    bool   rangeDragging_  = false;
+    double rangeStart_     = 0.0;
+    double rangeEnd_       = 0.0;
+    double rangeAnchor_    = 0.0;
+    bool   loopActive_     = false;
+
     /* Thumbnail infrastructure.  AudioFormatManager + AudioThumbnailCache
      * are per-Body; thumbnails_ is keyed by AudioFileSource uuid so
      * regions referencing the same source share the same waveform
@@ -1125,10 +2042,14 @@ ArrangementView::ArrangementView()
     addAndMakeVisible (rescanBtn_);
     addAndMakeVisible (addAudioBtn_);
     addAndMakeVisible (loadAudioBtn_);
+    addAndMakeVisible (toolSelectBtn_);
+    addAndMakeVisible (toolRangeBtn_);
+    addAndMakeVisible (toolSplitBtn_);
+    addAndMakeVisible (toolTrimBtn_);
+    addAndMakeVisible (toolAuditionBtn_);
+    addAndMakeVisible (loopBtn_);
     addAndMakeVisible (snapBtn_);
     addAndMakeVisible (snapBox_);
-    addAndMakeVisible (posLabel_);
-    addAndMakeVisible (bpmLabel_);
     addAndMakeVisible (viewport_);
 
     /* Snap controls.  snapBtn toggles snap on/off; snapBox picks
@@ -1166,14 +2087,184 @@ ArrangementView::ArrangementView()
     viewport_.setViewedComponent (body_.get(), false);
     viewport_.setScrollBarsShown (true, true);
 
-    posLabel_.setText ("Beat: 0.0", juce::dontSendNotification);
-    posLabel_.setColour (juce::Label::textColourId, Colors::textColor);
-    bpmLabel_.setText ("BPM: 120.0", juce::dontSendNotification);
-    bpmLabel_.setColour (juce::Label::textColourId, Colors::textColor);
-
     rescanBtn_.onClick    = [this]() { rescanLaneTargets(); };
     addAudioBtn_.onClick  = [this]() { createEmptyAudioLane (true /*stereo*/); };
     loadAudioBtn_.onClick = [this]() { promptLoadAudioFile(); };
+
+    /* Tool buttons: radio-group toggles; one tool active at a time.
+     * Select is default + sticky on start. */
+    toolSelectBtn_   .setClickingTogglesState (true);
+    toolRangeBtn_    .setClickingTogglesState (true);
+    toolSplitBtn_    .setClickingTogglesState (true);
+    toolTrimBtn_     .setClickingTogglesState (true);
+    toolAuditionBtn_ .setClickingTogglesState (true);
+    toolSelectBtn_.setToggleState (true, juce::dontSendNotification);
+
+    toolSelectBtn_  .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Select);   syncToolToggleStates(); };
+    toolRangeBtn_   .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Range);    syncToolToggleStates(); };
+    toolSplitBtn_   .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Split);    syncToolToggleStates(); };
+    toolTrimBtn_    .onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Trim);     syncToolToggleStates(); };
+    toolAuditionBtn_.onClick = [this]() { if (body_) body_->setActiveTool (Body::Tool::Audition); syncToolToggleStates(); };
+
+    loopBtn_.setClickingTogglesState (true);
+    loopBtn_.setToggleState (false, juce::dontSendNotification);
+    loopBtn_.onClick = [this]() { onLoopToggled(); };
+
+    /* Active-state green tint -- mirrors tracker FOLLOW button so a
+     * row of tool buttons reads as "this one is currently armed". */
+    const juce::Colour kActiveTint { 0xff'4a'a5'5a };
+    toolSelectBtn_  .setActiveTint (kActiveTint);
+    toolRangeBtn_   .setActiveTint (kActiveTint);
+    toolSplitBtn_   .setActiveTint (kActiveTint);
+    toolTrimBtn_    .setActiveTint (kActiveTint);
+    toolAuditionBtn_.setActiveTint (kActiveTint);
+    loopBtn_        .setActiveTint (kActiveTint);
+    snapBtn_        .setActiveTint (kActiveTint);
+
+    /* Tool icons (vector paths, foreground-coloured so they pop in
+     * both active + idle states).  Drawn in a square chunk on the
+     * left of the button; label sits beside. */
+    toolSelectBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Mouse-pointer arrow: thin filled triangle pointing
+             * upper-left to lower-right.  Standard cursor glyph. */
+            juce::Path p;
+            const float x0 = b.getX() + b.getWidth() * 0.20f;
+            const float y0 = b.getY() + b.getHeight() * 0.15f;
+            const float x1 = b.getX() + b.getWidth() * 0.55f;
+            const float y1 = b.getY() + b.getHeight() * 0.55f;
+            const float x2 = b.getX() + b.getWidth() * 0.35f;
+            const float y2 = b.getY() + b.getHeight() * 0.55f;
+            const float x3 = b.getX() + b.getWidth() * 0.55f;
+            const float y3 = b.getY() + b.getHeight() * 0.85f;
+            const float x4 = b.getX() + b.getWidth() * 0.35f;
+            const float y4 = b.getY() + b.getHeight() * 0.85f;
+            const float x5 = b.getX() + b.getWidth() * 0.20f;
+            const float y5 = b.getY() + b.getHeight() * 0.65f;
+            p.startNewSubPath (x0, y0);
+            p.lineTo (x1, y1);
+            p.lineTo (x2, y2);
+            p.lineTo (x3, y3);
+            p.lineTo (x4, y4);
+            p.lineTo (x5, y5);
+            p.closeSubPath();
+            g.setColour (fg);
+            g.fillPath (p);
+        });
+
+    toolRangeBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Two vertical bookends + horizontal line spanning between
+             * them: classic "range" / "loop bounds" glyph. */
+            const float pad = b.getHeight() * 0.20f;
+            const float top = b.getY() + pad;
+            const float bot = b.getBottom() - pad;
+            const float xL  = b.getX() + b.getWidth() * 0.20f;
+            const float xR  = b.getRight() - b.getWidth() * 0.20f;
+            const float yMid = b.getCentreY();
+            g.setColour (fg);
+            g.drawLine (xL, top, xL, bot, 1.5f);
+            g.drawLine (xR, top, xR, bot, 1.5f);
+            g.drawLine (xL, yMid, xR, yMid, 1.0f);
+        });
+
+    toolSplitBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Vertical blade with two outward arrowheads at the
+             * midline -- "cut here, two pieces". */
+            const float xMid = b.getCentreX();
+            const float yMid = b.getCentreY();
+            const float pad = b.getHeight() * 0.15f;
+            g.setColour (fg);
+            g.drawLine (xMid, b.getY() + pad, xMid, b.getBottom() - pad, 1.5f);
+            const float arrowLen = b.getWidth() * 0.22f;
+            const float arrowH   = b.getHeight() * 0.18f;
+            juce::Path leftArrow, rightArrow;
+            leftArrow.startNewSubPath (xMid - 1.5f, yMid);
+            leftArrow.lineTo (xMid - arrowLen, yMid - arrowH);
+            leftArrow.lineTo (xMid - arrowLen, yMid + arrowH);
+            leftArrow.closeSubPath();
+            rightArrow.startNewSubPath (xMid + 1.5f, yMid);
+            rightArrow.lineTo (xMid + arrowLen, yMid - arrowH);
+            rightArrow.lineTo (xMid + arrowLen, yMid + arrowH);
+            rightArrow.closeSubPath();
+            g.fillPath (leftArrow);
+            g.fillPath (rightArrow);
+        });
+
+    toolTrimBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Two brackets pointing inward -- ][ -- "trim from both
+             * sides into the middle". */
+            const float pad = b.getHeight() * 0.18f;
+            const float top = b.getY() + pad;
+            const float bot = b.getBottom() - pad;
+            const float xL  = b.getX() + b.getWidth() * 0.22f;
+            const float xR  = b.getRight() - b.getWidth() * 0.22f;
+            const float armLen = b.getWidth() * 0.18f;
+            g.setColour (fg);
+            g.drawLine (xL, top, xL, bot, 1.5f);
+            g.drawLine (xL, top, xL + armLen, top, 1.5f);
+            g.drawLine (xL, bot, xL + armLen, bot, 1.5f);
+            g.drawLine (xR, top, xR, bot, 1.5f);
+            g.drawLine (xR, top, xR - armLen, top, 1.5f);
+            g.drawLine (xR, bot, xR - armLen, bot, 1.5f);
+        });
+
+    toolAuditionBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Speaker glyph -- trapezoid body + two arc lines for
+             * sound waves.  Standard "preview" affordance. */
+            const float yMid = b.getCentreY();
+            const float bodyL = b.getX() + b.getWidth() * 0.18f;
+            const float bodyR = b.getX() + b.getWidth() * 0.42f;
+            const float coneR = b.getX() + b.getWidth() * 0.62f;
+            const float bodyTop = yMid - b.getHeight() * 0.15f;
+            const float bodyBot = yMid + b.getHeight() * 0.15f;
+            const float coneTop = yMid - b.getHeight() * 0.30f;
+            const float coneBot = yMid + b.getHeight() * 0.30f;
+            juce::Path sp;
+            sp.startNewSubPath (bodyL, bodyTop);
+            sp.lineTo (bodyR, bodyTop);
+            sp.lineTo (coneR, coneTop);
+            sp.lineTo (coneR, coneBot);
+            sp.lineTo (bodyR, bodyBot);
+            sp.lineTo (bodyL, bodyBot);
+            sp.closeSubPath();
+            g.setColour (fg);
+            g.fillPath (sp);
+            const float waveX = b.getX() + b.getWidth() * 0.72f;
+            g.drawLine (waveX, yMid - 3, waveX + b.getWidth() * 0.10f, yMid - 6, 1.2f);
+            g.drawLine (waveX, yMid + 3, waveX + b.getWidth() * 0.10f, yMid + 6, 1.2f);
+        });
+
+    loopBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Open circular arrow -- loop / wrap glyph. */
+            const float cx = b.getCentreX();
+            const float cy = b.getCentreY();
+            const float rad = juce::jmin (b.getWidth(), b.getHeight()) * 0.32f;
+            juce::Path arc;
+            arc.addCentredArc (cx, cy, rad, rad, 0.0f,
+                                0.25f, 6.0f, true);
+            g.setColour (fg);
+            g.strokePath (arc, juce::PathStrokeType (1.4f));
+            /* Tiny arrowhead at the end of the arc. */
+            const float ax = cx + rad * 0.7f;
+            const float ay = cy - rad * 0.7f;
+            juce::Path tip;
+            tip.startNewSubPath (ax, ay);
+            tip.lineTo (ax - rad * 0.45f, ay - rad * 0.15f);
+            tip.lineTo (ax - rad * 0.10f, ay - rad * 0.55f);
+            tip.closeSubPath();
+            g.fillPath (tip);
+        });
 }
 
 ArrangementView::~ArrangementView()
@@ -1255,13 +2346,21 @@ void ArrangementView::resized()
 {
     auto r = getLocalBounds();
     auto top = r.removeFromTop (kHeaderH).reduced (4, 4);
-    rescanBtn_    .setBounds (top.removeFromLeft (56)); top.removeFromLeft (6);
-    addAudioBtn_  .setBounds (top.removeFromLeft (72)); top.removeFromLeft (6);
-    loadAudioBtn_ .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
-    snapBtn_      .setBounds (top.removeFromLeft (50)); top.removeFromLeft (4);
-    snapBox_      .setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
-    bpmLabel_     .setBounds (top.removeFromLeft (96)); top.removeFromLeft (4);
-    posLabel_     .setBounds (top.removeFromLeft (96));
+    rescanBtn_      .setBounds (top.removeFromLeft (60)); top.removeFromLeft (4);
+    addAudioBtn_    .setBounds (top.removeFromLeft (70)); top.removeFromLeft (4);
+    loadAudioBtn_   .setBounds (top.removeFromLeft (60)); top.removeFromLeft (12);
+
+    toolSelectBtn_  .setBounds (top.removeFromLeft (76)); top.removeFromLeft (2);
+    toolRangeBtn_   .setBounds (top.removeFromLeft (72)); top.removeFromLeft (2);
+    toolSplitBtn_   .setBounds (top.removeFromLeft (64)); top.removeFromLeft (2);
+    toolTrimBtn_    .setBounds (top.removeFromLeft (64)); top.removeFromLeft (2);
+    toolAuditionBtn_.setBounds (top.removeFromLeft (72)); top.removeFromLeft (12);
+
+    loopBtn_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (12);
+
+    snapBtn_        .setBounds (top.removeFromLeft (52)); top.removeFromLeft (4);
+    snapBox_        .setBounds (top.removeFromLeft (64));
+
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
 }
@@ -1313,7 +2412,7 @@ void ArrangementView::filesDropped (const juce::StringArray& files, int x, int y
 
     const int laneIdx = laneIdxFromY (bodyY);
     const double dropBeats =
-        juce::jmax (0.0, (double) (bodyX - kLabelW) / (double) kPxPerBeat);
+        juce::jmax (0.0, (double) (bodyX - kLabelW) / (double) body_->kPxPerBeat);
 
     int targetLane = laneIdx;
     if (targetLane >= 0 && targetLane < lanes_.size())
@@ -1523,6 +2622,14 @@ void ArrangementView::rescanLaneTargets()
         lanes_.add (std::move (lane));
         mutated = true;
     }
+
+    /* Assign palette tint to every lane by its index.  Lanes
+     * created before the palette landed default to dark-gray; this
+     * line replaces those with the shared tracker palette.  Future
+     * "lane colour picker" UI will introduce a separate override
+     * flag so user-customised colours aren't reset on rescan. */
+    for (int i = 0; i < lanes_.size(); ++i)
+        lanes_.getReference (i).colour = laneTintForIndex (i);
 
     /* Rebuild runtime state in lockstep.  For each persisted lane,
      * resolve which kind of node it binds to + wire up the
@@ -1881,7 +2988,7 @@ int ArrangementView::createEmptyAudioLane (bool stereo)
     lane.id             = juce::Uuid();
     lane.targetNodeUuid = clip.getUuid();
     lane.name           = juce::String ("Audio ") + juce::String (lanes_.size() + 1);
-    lane.colour         = juce::Colour::fromRGB (90, 170, 130);
+    lane.colour         = laneTintForIndex (lanes_.size());
     lanes_.add (std::move (lane));
 
     rescanLaneTargets();   // resolves the new lane's audioClipCache
@@ -2025,28 +3132,63 @@ void ArrangementView::promptLoadAudioFile()
 int ArrangementView::laneIdxFromY (int yPx) const noexcept
 {
     /* Body coordinate; account for the top ruler row.  Negative or
-     * inside-ruler y returns -1 (no lane at that y). */
+     * inside-ruler y returns -1 (no lane at that y).  Lane height
+     * is the Body's zoomable kLaneH. */
     if (yPx < Body::kRulerH) return -1;
-    const int idx = (yPx - Body::kRulerH) / kLaneH;
+    if (body_ == nullptr) return -1;
+    const int idx = (yPx - Body::kRulerH) / body_->kLaneH;
     if (idx < 0 || idx >= lanes_.size()) return -1;
     return idx;
 }
 
 void ArrangementView::updateTransportLabel()
 {
-    if (monitor_ == nullptr) return;
-    const float bpm = monitor_->tempo.get();
-    if (std::abs (bpm - lastBpmShown_) > 0.05f)
-    {
-        bpmLabel_.setText ("BPM: " + String (bpm, 1), juce::dontSendNotification);
-        lastBpmShown_ = bpm;
-    }
-    const double beat = lastBeat_;
-    if (std::abs (beat - lastBeatShown_) > 0.01)
-    {
-        posLabel_.setText ("Beat: " + String (beat, 2), juce::dontSendNotification);
-        lastBeatShown_ = beat;
-    }
+    /* BPM + Beat read-outs moved to the global transport bar (above
+     * the content view), so this is a no-op now.  Kept as a stub so
+     * timerCallback's call site stays valid without conditional
+     * checks; remove once a follow-up audits timerCallback. */
+}
+
+void ArrangementView::syncToolToggleStates()
+{
+    if (body_ == nullptr) return;
+    const auto tool = body_->getActiveTool();
+    toolSelectBtn_  .setToggleState (tool == Body::Tool::Select,   juce::dontSendNotification);
+    toolRangeBtn_   .setToggleState (tool == Body::Tool::Range,    juce::dontSendNotification);
+    toolSplitBtn_   .setToggleState (tool == Body::Tool::Split,    juce::dontSendNotification);
+    toolTrimBtn_    .setToggleState (tool == Body::Tool::Trim,     juce::dontSendNotification);
+    toolAuditionBtn_.setToggleState (tool == Body::Tool::Audition, juce::dontSendNotification);
+}
+
+void ArrangementView::onLoopToggled()
+{
+    if (body_ == nullptr) return;
+    body_->setLoopActive (loopBtn_.getToggleState());
+}
+
+int64_t ArrangementView::beatsToFrames (double beats) const noexcept
+{
+    if (monitor_ == nullptr) return 0;
+    const double bpm = juce::jmax (1.0, (double) monitor_->tempo.get());
+    const double sr  = juce::jmax (1.0, (double) monitor_->sampleRate.get());
+    const double secs = beats * 60.0 / bpm;
+    return (int64_t) std::llround (secs * sr);
+}
+
+double ArrangementView::framesToBeats (int64_t frames) const noexcept
+{
+    if (monitor_ == nullptr) return 0.0;
+    const double bpm = juce::jmax (1.0, (double) monitor_->tempo.get());
+    const double sr  = juce::jmax (1.0, (double) monitor_->sampleRate.get());
+    const double secs = (double) frames / sr;
+    return secs * bpm / 60.0;
+}
+
+void ArrangementView::seekToBeat (double beats)
+{
+    if (services_ == nullptr) return;
+    if (auto* eng = services_->context().audio().get())
+        eng->seekToAudioFrame (beatsToFrames (juce::jmax (0.0, beats)));
 }
 
 void ArrangementView::timerCallback()
@@ -2100,14 +3242,65 @@ void ArrangementView::timerCallback()
     }
     wasRecording_ = recording;
 
+    /* Loop wrap: if loop is armed and the playhead has crossed the
+     * range-end boundary, seek the transport back to range-start.
+     * Driven from the 30 Hz UI timer -- one tick of jitter at the
+     * wrap is acceptable for v1; future move to engine-side seek
+     * for sample-accurate loop. */
+    if (playing && body_ != nullptr && body_->isLooping())
+    {
+        const double loopStart = body_->rangeStart();
+        const double loopEnd   = body_->rangeEnd();
+        if (beat >= loopEnd - 1e-6 && loopEnd > loopStart)
+        {
+            seekToBeat (loopStart);
+            for (auto& rs : laneRuntime_)
+            {
+                rs.lastDispatchedRegion = juce::Uuid::null();
+                rs.lastDispatchedSeqIdx = -1;
+            }
+        }
+    }
+
+    /* Clip volume envelope -- push the evaluated live gain to each
+     * audio lane whose last-dispatched region carries an envelope.
+     * 30 Hz update rate; coarser than per-sample but matches Bitwig's
+     * display refresh + is plenty for most musical envelopes.  Lanes
+     * without an envelope clear the override (NaN) so the per-launch
+     * static gain takes back over. */
+    if (playing)
+    {
+        for (int i = 0; i < lanes_.size(); ++i)
+        {
+            auto& rs = laneRuntime_.getReference (i);
+            if (! rs.isAudioLane()) continue;
+            if (rs.lastDispatchedRegion.isNull())
+            {
+                rs.audioClipCache->setLiveGain (std::numeric_limits<float>::quiet_NaN());
+                continue;
+            }
+            const auto& lane = lanes_.getReference (i);
+            const auto* r = lane.playlist.findRegion (rs.lastDispatchedRegion);
+            if (r == nullptr || r->volumeEnvelope.size() < 2)
+            {
+                rs.audioClipCache->setLiveGain (std::numeric_limits<float>::quiet_NaN());
+                continue;
+            }
+            const double localBeat = beat - r->positionBeats;
+            const float  envDb = r->gainAtBeatOffset (localBeat);
+            const float  linear = juce::Decibels::decibelsToGain (envDb);
+            rs.audioClipCache->setLiveGain (linear);
+        }
+    }
+
     if (playing) dispatchAtBeat (beat);
 
     if (body_ != nullptr && (playing || wasPlaying_ != playing))
     {
         const int oldPxX = (lastBeat_ > -0.001)
-                              ? Body::kLabelW + (int) (lastBeat_ * Body::kPxPerBeat)
+                              ? Body::kLabelW + (int) (lastBeat_ * body_->kPxPerBeat)
                               : -1;
-        const int newPxX = Body::kLabelW + (int) (beat * Body::kPxPerBeat);
+        const int newPxX = Body::kLabelW + (int) (beat * body_->kPxPerBeat);
         if (oldPxX != newPxX || wasPlaying_ != playing)
             body_->repaintPlayhead (oldPxX, newPxX);
     }
