@@ -100,11 +100,20 @@ public:
 
     bool isInterestedInFileDrag (const juce::StringArray& files) override
     {
-        return anyAudioFileIn (files);
+        const bool interested = anyAudioFileIn (files);
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::Body] isInterestedInFileDrag count=")
+            + juce::String (files.size())
+            + (interested ? " ACCEPT" : " REJECT"));
+        return interested;
     }
 
     void fileDragEnter (const juce::StringArray& files, int x, int y) override
     {
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::Body] fileDragEnter x=")
+            + juce::String (x) + " y=" + juce::String (y)
+            + " count=" + juce::String (files.size()));
         if (! anyAudioFileIn (files)) return;
         dropHover_         = true;
         dropHoverLaneIdx_  = owner.laneIdxFromY (y);
@@ -129,6 +138,11 @@ public:
 
     void filesDropped (const juce::StringArray& files, int x, int y) override
     {
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView::Body] filesDropped x=")
+            + juce::String (x) + " y=" + juce::String (y)
+            + " count=" + juce::String (files.size()));
+
         dropHover_        = false;
         dropHoverLaneIdx_ = -1;
         repaint();
@@ -514,6 +528,97 @@ void ArrangementView::resized()
     posLabel_   .setBounds (top.removeFromLeft (96));
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
+}
+
+/* =====================================================================
+ * Outer FileDragAndDropTarget on the ContentView itself.  Belt-and-
+ * suspenders alongside Body's same interface (Body lives inside a
+ * Viewport which can rarely swallow X11 XDND routing in some peer
+ * configurations).
+ * ===================================================================== */
+
+bool ArrangementView::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    const bool interested = anyAudioFileIn (files);
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView] isInterestedInFileDrag count=")
+        + juce::String (files.size())
+        + (interested ? " ACCEPT" : " REJECT"));
+    return interested;
+}
+
+void ArrangementView::fileDragEnter (const juce::StringArray& files, int x, int y)
+{
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView] fileDragEnter x=") + juce::String (x)
+        + " y=" + juce::String (y)
+        + " count=" + juce::String (files.size()));
+}
+
+void ArrangementView::fileDragExit (const juce::StringArray&)
+{
+    juce::Logger::writeToLog ("[ArrangementView] fileDragExit");
+}
+
+void ArrangementView::filesDropped (const juce::StringArray& files, int x, int y)
+{
+    juce::Logger::writeToLog (
+        juce::String ("[ArrangementView] filesDropped x=") + juce::String (x)
+        + " y=" + juce::String (y)
+        + " count=" + juce::String (files.size()));
+
+    /* Translate ArrangementView-local coords to Body-local coords:
+     * subtract header height + add viewport scroll offset.  body_'s
+     * (0,0) is at the top of the lanes area. */
+    if (body_ == nullptr) return;
+
+    const int bodyY = (y - kHeaderH) + viewport_.getViewPositionY();
+    const int bodyX =  x              + viewport_.getViewPositionX();
+
+    const int laneIdx = laneIdxFromY (bodyY);
+    const double dropBeats =
+        juce::jmax (0.0, (double) (bodyX - kLabelW) / (double) kPxPerBeat);
+
+    int targetLane = laneIdx;
+    if (targetLane >= 0 && targetLane < lanes_.size())
+    {
+        const auto& runtime = laneRuntime_.getReference (targetLane);
+        if (! runtime.isAudioLane())
+            targetLane = -1;   // tracker lane -> create new audio
+    }
+    else
+    {
+        targetLane = -1;       // empty area -> create new audio
+    }
+
+    double cursor = dropBeats;
+    for (const auto& path : files)
+    {
+        const juce::File f (path);
+        if (! f.existsAsFile())
+        {
+            juce::Logger::writeToLog (
+                juce::String ("[ArrangementView] skipping non-existent file: ") + path);
+            continue;
+        }
+
+        const bool ok = importAudioFileToLane (f, targetLane, cursor);
+        juce::Logger::writeToLog (
+            juce::String ("[ArrangementView] importAudioFileToLane(")
+            + f.getFileName() + ", " + juce::String (targetLane) + ", "
+            + juce::String (cursor, 2) + ") = " + (ok ? "OK" : "FAIL"));
+        if (! ok) continue;
+
+        if (targetLane < 0)
+            targetLane = lanes_.size() - 1;
+
+        if (targetLane >= 0 && targetLane < lanes_.size())
+        {
+            const auto& regs = lanes_.getReference (targetLane).playlist.regions();
+            if (! regs.empty())
+                cursor = regs.back().endBeats();
+        }
+    }
 }
 
 void ArrangementView::paint (Graphics& g)

@@ -53,6 +53,7 @@ class TrackerNode;
  *  SessionView clip-launch uses (timeline-audio-design.md §2.3).
  */
 class ArrangementView : public ContentView,
+                        public juce::FileDragAndDropTarget,
                         private juce::Timer,
                         private juce::ValueTree::Listener
 {
@@ -67,6 +68,19 @@ public:
 
     void resized() override;
     void paint (juce::Graphics&) override;
+
+    /* FileDragAndDropTarget at the outer ContentView level -- belt
+     * and suspenders alongside the inner Body's same interface.  X11
+     * XDND routing under winelib (juce_DragAndDrop_linux.cpp via
+     * winelib_compat.h undefining _WIN32) walks the component tree
+     * from peer->getComponent() down to the deepest component at
+     * the drop point that implements FileDragAndDropTarget.  Body
+     * lives inside a juce::Viewport; covering both the outer view
+     * and the inner Body guarantees something always hits. */
+    bool isInterestedInFileDrag (const juce::StringArray&) override;
+    void filesDropped (const juce::StringArray&, int x, int y) override;
+    void fileDragEnter (const juce::StringArray&, int x, int y) override;
+    void fileDragExit (const juce::StringArray&) override;
 
 private:
     void valueTreeChildAdded   (juce::ValueTree&, juce::ValueTree&) override;
