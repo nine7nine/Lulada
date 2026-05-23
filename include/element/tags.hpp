@@ -95,6 +95,11 @@ static const juce::Identifier active = "active";
  *  SampleBankPool::getStateInformation output.  See
  *  project_sample_bank_pool_architecture memory note. */
 static const juce::Identifier sampleBankPool = "sampleBankPool";
+/** Property on a Session ValueTree: base64-encoded MemoryBlock holding
+ *  SourceRegistry::getStateInformation output (the session-global
+ *  AudioFileSource pool, mirrored after sampleBankPool's shape).
+ *  See timeline-audio-design.md Section 1.2. */
+static const juce::Identifier sourceRegistry = "sourceRegistry";
 static const juce::Identifier arc = "arc";
 static const juce::Identifier arcs = "arcs";
 static const juce::Identifier bypass = "bypass";
@@ -140,6 +145,12 @@ static const juce::Identifier output = "output";
 
 static const juce::Identifier session = "session";
 static const juce::Identifier sessionView = "sessionView";
+/* tags::arrangement is already defined at the top of this file via
+ * EL_TAG (arrangement) -- it's used elsewhere in the codebase too.
+ * Phase 1d of timeline-audio-design.md reuses that same identifier
+ * as the child of a Session ValueTree holding the arrangement
+ * view's persistent state (lanes + playlists + regions).  See
+ * timeline-audio-design.md Sections 1.3-1.4. */
 static const juce::Identifier state = "state";
 static const juce::Identifier programState = "programState";
 static const juce::Identifier beatsPerBar = "beatsPerBar";

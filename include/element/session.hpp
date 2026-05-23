@@ -74,6 +74,13 @@ public:
      *  clears the pool at the start. */
     void restoreSampleBankPool() const;
 
+    /** Pull the session-global SourceRegistry out of the persisted
+     *  session ValueTree.  Parallel to restoreSampleBankPool; runs
+     *  BEFORE any arrangement-view code that resolves a Region's
+     *  sourceId.  Idempotent: clears the registry at the start.
+     *  See timeline-audio-design.md Section 1.2. */
+    void restoreSourceRegistry() const;
+
     inline int getNumControllers() const { return getControllersValueTree().getNumChildren(); }
 
     inline juce::ValueTree getControllerValueTree (const int i) const
