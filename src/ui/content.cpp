@@ -334,16 +334,27 @@ public:
 
     void resized() override
     {
+        /* 4-px gap between buttons (matches the transport cluster
+         * spacing) so the bar reads as a row of distinct chips, not
+         * a single dark strip. */
+        constexpr int kGap = 4;
+        const int n = 7;
         auto r = getLocalBounds();
-        const int n  = 7;
-        const int w  = r.getWidth() / n;
-        patchBtn  .setBounds (r.removeFromLeft (w));
-        graphBtn  .setBounds (r.removeFromLeft (w));
-        arrBtn    .setBounds (r.removeFromLeft (w));
-        trkBtn    .setBounds (r.removeFromLeft (w));
-        sessionBtn.setBounds (r.removeFromLeft (w));
-        diskBtn   .setBounds (r.removeFromLeft (w));
-        plugBtn   .setBounds (r);
+        const int total = r.getWidth();
+        const int w = (total - kGap * (n - 1)) / n;
+
+        auto place = [&] (BlockToolButton& b)
+        {
+            b.setBounds (r.removeFromLeft (w));
+            if (! r.isEmpty()) r.removeFromLeft (kGap);
+        };
+        place (patchBtn);
+        place (graphBtn);
+        place (arrBtn);
+        place (trkBtn);
+        place (sessionBtn);
+        place (diskBtn);
+        plugBtn.setBounds (r);
     }
 
 private:
@@ -495,8 +506,13 @@ public:
          * menu + midi blinker right-aligned. */
         Rectangle<int> r = getLocalBounds();
         const int H = r.getHeight();
-        const int innerPad = juce::jmax (3, (H - 50) / 2);
-        const int rowH = H - innerPad * 2;
+        /* 7-px top/bottom padding so every button (transport, view
+         * selector, undo/redo, display, all of it) sits inside a
+         * clear breathing margin against the bar's top + bottom
+         * edges.  Previous 3-5 px ate the gap entirely. */
+        constexpr int kInnerPadY = 7;
+        const int innerPad = kInnerPadY;
+        const int rowH = juce::jmax (20, H - innerPad * 2);
 
         constexpr int kSidePad   = 8;
         constexpr int kGap       = 14;

@@ -335,6 +335,39 @@ inline void iconMeterBars (juce::Graphics& g, juce::Rectangle<float> b, juce::Co
     }
 }
 
+inline void iconCog (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+{
+    /* Settings cog: 8-tooth gear + inner hole. */
+    const auto box = b.reduced (b.getWidth() * 0.14f, b.getHeight() * 0.14f);
+    const float cx = box.getCentreX();
+    const float cy = box.getCentreY();
+    const float rOuter = juce::jmin (box.getWidth(), box.getHeight()) * 0.50f;
+    const float rInner = rOuter * 0.62f;
+    const float rHole  = rOuter * 0.30f;
+
+    juce::Path gear;
+    constexpr int teeth = 8;
+    constexpr float twoPi = juce::MathConstants<float>::twoPi;
+    for (int i = 0; i < teeth * 2; ++i)
+    {
+        const float a = (twoPi * i) / (teeth * 2.0f);
+        const float r = (i % 2 == 0) ? rOuter : rInner;
+        const float x = cx + std::cos (a) * r;
+        const float y = cy + std::sin (a) * r;
+        if (i == 0) gear.startNewSubPath (x, y);
+        else        gear.lineTo (x, y);
+    }
+    gear.closeSubPath();
+    g.setColour (fg);
+    g.fillPath (gear);
+
+    /* Centre hole (knock out a smaller filled circle in background
+     * colour -- approximate by drawing a black disc.  Body sits on
+     * dark button, so a hard black hole reads correctly). */
+    g.setColour (juce::Colour (0xff'1c'1c'1c));
+    g.fillEllipse (cx - rHole, cy - rHole, rHole * 2.0f, rHole * 2.0f);
+}
+
 inline void iconChannelStrip (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
 {
     /* Vertical fader track + cap. */
