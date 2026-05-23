@@ -4532,7 +4532,20 @@ public:
          * way Disk Op's instrument list does.  Lazy-allocate when
          * advancing past the current count so the user can populate
          * any of the 128 banks. */
-        auto navigate = [this] (int delta) {
+        /* Navigating the editor's bank focus also rebinds MIDI channel
+         * 1 to the new active bank.  Without this, switching banks in
+         * the GUI only changes what the editor SHOWS -- the playing
+         * bank stays whatever channelBinding[ch1] points at (default
+         * ch1 -> bank 1).  Tying ch1 to the active bank makes the
+         * single-sampler "navigate = switch what plays" UX work; other
+         * channels keep their bindings (or fall through to the default
+         * "ch N -> bank N" mapping) so multi-instrument routing via
+         * MIDI program-change still works as before. */
+        auto bindActiveToCh1 = [this] {
+            node.bindChannelToInstrument (1, activeInstrument);
+        };
+
+        auto navigate = [this, bindActiveToCh1] (int delta) {
             const int target = juce::jlimit (0, SamplerNode::kMaxInstruments - 1,
                                              activeInstrument + delta);
             if (target == activeInstrument) return;
@@ -4540,6 +4553,7 @@ public:
                 if (node.addInstrument() == nullptr) break;
             if (target >= node.getNumInstruments()) return;
             activeInstrument = target;
+            bindActiveToCh1();
             rebuildEnvelopeViews();
             refresh();
         };
@@ -4552,20 +4566,22 @@ public:
         addAndMakeVisible (instNextBtn);
 
         instAddBtn.setButtonText ("+");
-        instAddBtn.onClick = [this] {
+        instAddBtn.onClick = [this, bindActiveToCh1] {
             node.addInstrument();
             activeInstrument = node.getNumInstruments() - 1;
+            bindActiveToCh1();
             rebuildEnvelopeViews();
             refresh();
         };
         addAndMakeVisible (instAddBtn);
 
         instDelBtn.setButtonText ("-");
-        instDelBtn.onClick = [this] {
+        instDelBtn.onClick = [this, bindActiveToCh1] {
             if (node.getNumInstruments() <= 1) return;
             node.removeInstrument (activeInstrument);
             if (activeInstrument >= node.getNumInstruments())
                 activeInstrument = node.getNumInstruments() - 1;
+            bindActiveToCh1();
             rebuildEnvelopeViews();
             refresh();
         };

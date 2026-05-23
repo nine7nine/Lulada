@@ -245,18 +245,19 @@ void TrackerNode::drainEngineToMidi (RenderContext& rc, int numSamples)
 
 void TrackerNode::installDefaultPattern()
 {
-    /* Empty 16-row × 2-track default pattern, created on first
-     * prepareToPlay when no saved state exists.  Both tracks emit on
-     * the single MIDI output port and separate downstream by MIDI
-     * channel (1 vs 2); a MidiChannelSplitter / MidiRouter fans them
-     * out.  Pattern is rowless — the user fills it in. */
+    /* Empty 16-row x 2-track default pattern, created on first
+     * prepareToPlay when no saved state exists.  Both tracks default
+     * to MIDI ch 1 so notes play through whatever a downstream
+     * Sampler / synth has bound to ch 1 -- single-instrument users
+     * get sound out of the box.  Multi-channel routing is opt-in:
+     * click the channel pill on a track header to cycle 1..16. */
     constexpr int kLen = 16;
     sequence* seq = sequence_new (kLen);
 
-    track* trk0 = track_new (0, 0, kLen, kLen, TRACK_DEF_CTRLPR);  /* ch 1 */
+    track* trk0 = track_new (0, 0 /*ch1*/, kLen, kLen, TRACK_DEF_CTRLPR);
     sequence_add_track (seq, trk0);
 
-    track* trk1 = track_new (0, 1, kLen, kLen, TRACK_DEF_CTRLPR);  /* ch 2 */
+    track* trk1 = track_new (0, 0 /*ch1*/, kLen, kLen, TRACK_DEF_CTRLPR);
     sequence_add_track (seq, trk1);
 
     module_add_sequence (mod_, seq);

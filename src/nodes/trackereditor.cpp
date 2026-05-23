@@ -1521,8 +1521,13 @@ public:
         if (mod == nullptr || mod->curr_seq == nullptr) return;
         auto* seq = mod->curr_seq;
         if (seq->ntrk >= 16) return;
-        const int newCh = seq->ntrk;
-        track* trk = track_new (0 /*port*/, newCh, seq->length, seq->length, TRACK_DEF_CTRLPR);
+        /* Default new tracks to MIDI ch 1 (engine ch index 0) so they
+         * play through whatever the downstream sampler / synth has
+         * bound to ch 1 -- single-instrument users get notes out of
+         * the box.  Multi-channel routing is opt-in via the channel
+         * pill (click to cycle 1..16). */
+        track* trk = track_new (0 /*port*/, 0 /*ch1*/,
+                                seq->length, seq->length, TRACK_DEF_CTRLPR);
         sequence_add_track (seq, trk);
         cursorTrack = seq->ntrk - 1;
         repaint();
