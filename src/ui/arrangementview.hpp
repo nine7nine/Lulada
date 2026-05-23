@@ -12,34 +12,45 @@
 
 #include "ui/blocktoolbutton.hpp"
 
+#include "services/timeline/audiolaneadapter.hpp"
 #include "services/timeline/lane.hpp"
 
 #define EL_VIEW_ARRANGEMENT "ArrangementView"
 
 namespace element {
 
+class AudioClipNode;
 class TrackerNode;
 
 /** Main-window arrangement view.
  *
- *  Multi-lane timeline where each lane is bound to one TrackerNode in
- *  the active graph via targetNodeUuid.  Per lane, a Playlist of
- *  Regions is laid out left-to-right; on playback the view drives
- *  each tracker via the audio-thread SPSC FIFO (TrackerNode::
- *  schedulePlaying).  Detection runs on the 30 Hz UI timer; the
- *  actual sequence flip is sample-accurate within one render block.
- *  Same path SessionView clip-launch uses (timeline-audio-design.md
- *  Section 2.3).
+ *  Multi-lane timeline.  Each Lane binds to one target graph node
+ *  (TrackerNode or AudioClipNode) via Lane.targetNodeUuid.  Per-lane
+ *  paint + dispatch branch on the resolved target type:
  *
- *  Phase 1e (this commit): refactored onto the shared
- *  element::Lane / element::Playlist / element::Region data model
- *  in src/services/timeline/.  Lanes persist into the session's
- *  tags::arrangement child; pre-Phase-1e sessions (no persisted
- *  lanes) fall back to graph-walk auto-fill.
+ *   - TrackerNode lanes: regions reference vht sequences; click /
+ *     dispatch routes through TrackerNode::schedulePlaying (the same
+ *     audio-thread SPSC FIFO SessionView clip-launch uses).
+ *   - AudioClipNode lanes: regions reference AudioFileSources via
+ *     SourceRegistry; click / dispatch routes through AudioClipNode::
+ *     schedulePlay (its own SPSC launch FIFO).
  *
- *  Authoring (drag / add / remove regions) remains TODO; the view
- *  currently auto-fills one Region per tracker pattern for any
- *  newly-discovered tracker that has no persisted lane yet.
+ *  External file drop (juce::FileDragAndDropTarget):
+ *   - Drop on an existing audio lane row -> append Region at drop X
+ *   - Drop on a tracker lane or empty area -> create a new audio lane
+ *     in the ArrangementTracks subgraph, append Region.
+ *
+ *  Record path:
+ *   - Per-lane record-arm toggle (Lane.armed) propagates to the
+ *     bound AudioClipNode::setArmed.  Transport-record + armed
+ *     triggers capture inside AudioClipNode.  On capture finish,
+ *     AudioClipNode invokes onRecordingCommitted with the new file;
+ *     ArrangementView registers the file as an AudioFileSource and
+ *     appends a Region to the lane's Playlist.
+ *
+ *  Detection still runs on the 30 Hz UI timer; the actual sequence
+ *  flip is sample-accurate within one render block.  Same path
+ *  SessionView clip-launch uses (timeline-audio-design.md §2.3).
  */
 class ArrangementView : public ContentView,
                         private juce::Timer,
@@ -66,12 +77,22 @@ private:
 
 private:
     /** Per-lane transient runtime state.  Held parallel to lanes_;
-     *  rebuilt on every graph reconciliation.  NOT persisted -- only
-     *  the data parts of element::Lane survive a save/load cycle. */
-    struct LaneRuntimeState {
-        TrackerNode* trackerCache         = nullptr;   // resolved from lane.targetNodeUuid
-        juce::Uuid   lastDispatchedRegion;             // gates idempotent dispatch
-        int          lastDispatchedSeqIdx = -1;        // for paint highlighting
+     *  rebuilt on every graph reconciliation.  NOT persisted.
+     *
+     *  Resolved kind is implicit: exactly one of trackerCache /
+     *  audioClipCache is non-null for live lanes; both null for
+     *  orphan lanes whose target node was deleted from the graph. */
+    struct LaneRuntimeState
+    {
+        TrackerNode*     trackerCache    = nullptr;
+        AudioClipNode*   audioClipCache  = nullptr;
+        AudioLaneAdapter audioAdapter    { nullptr };   // target rebound on each rescan
+        juce::Uuid       lastDispatchedRegion;
+        int              lastDispatchedSeqIdx = -1;
+
+        bool isTrackerLane() const noexcept { return trackerCache   != nullptr; }
+        bool isAudioLane()   const noexcept { return audioClipCache != nullptr; }
+        bool isOrphan()      const noexcept { return ! isTrackerLane() && ! isAudioLane(); }
     };
 
     /* Body: single inline-paint component holding all lanes (no per-
@@ -83,72 +104,93 @@ private:
      *  arrangement state.  Steps:
      *   1. Load persisted lanes from tags::arrangement (first call).
      *   2. For every TrackerNode in the graph not already bound to a
-     *      lane, append a new auto-filled lane.
-     *   3. Rebuild laneRuntime_ pointers via graph walk by uuid.
+     *      lane, append a new auto-filled tracker lane.
+     *   3. Rebuild laneRuntime_ caches via graph walk by uuid.  Each
+     *      lane gets its trackerCache or audioClipCache populated
+     *      from the resolved target node.
+     *   4. For audio-clip lanes, rebind the embedded AudioLaneAdapter
+     *      to the resolved node + wire its recording-committed handler.
      *  Idempotent; safe to call on graph-topology change. */
-    void rescanTrackers();
+    void rescanLaneTargets();
+
     void attachToActiveGraph();
     void detachFromActiveGraph();
     void updateTransportLabel();
     double computePlayheadBeats() const;
 
-    /** Dispatch advanceToPattern on any lane that crosses a region
-     *  boundary at the given playhead beat.  Idempotent within a
-     *  single region span (gated by LaneRuntimeState
-     *  ::lastDispatchedRegion). */
+    /** Dispatch region launches for the lane(s) whose playhead just
+     *  crossed a region boundary.  Branches per-lane kind:
+     *   - Tracker: schedulePlaying(seqIdx, -1.0, true/false)
+     *   - Audio:   schedulePlay(regionId, sourceId, -1.0, 0)
+     *  Idempotent via LaneRuntimeState::lastDispatchedRegion. */
     void dispatchAtBeat (double beat);
 
-    /** Read lanes from the session's tags::arrangement child into
-     *  lanes_.  Empty-on-first-load is normal (pre-Phase-1e
-     *  sessions); rescanTrackers fills in defaults from the graph. */
+    /** On transport stop, send scheduleStop to all audio lanes so
+     *  their AudioClipNodes silence cleanly.  No effect on tracker
+     *  lanes (their last sequence stays "playing" in vht state until
+     *  the next start triggers a launch).  Per-DAW convention; audio
+     *  doesn't continue past transport stop. */
+    void stopAllAudioLanes();
+
     void loadLanesFromSession();
-    /** Write lanes_ back into the session's tags::arrangement child.
-     *  Sparse-write via Lane::toValueTree (omits default fields). */
     void writeLanesToSession();
 
-    /** Build a default Playlist for a newly-discovered tracker --
-     *  one Region per existing sequence, 4 beats each, end-to-end.
-     *  Mirrors the prior v0 auto-fill behaviour. */
     void autoFillLaneForTracker (Lane& lane, TrackerNode* trk);
 
-    /** Resolve a target node uuid to a live TrackerNode* by walking
-     *  the active session graph (descending into subgraphs).  Returns
-     *  nullptr when the tracker isn't in the current graph (orphaned
-     *  lane -- the view paints these greyed). */
-    TrackerNode* resolveTrackerByUuid (juce::Uuid targetNodeUuid) const;
+    /** Resolve a target node uuid to a TrackerNode* via graph walk.
+     *  Returns nullptr if absent or not a tracker. */
+    TrackerNode*   resolveTrackerByUuid    (juce::Uuid targetNodeUuid) const;
+    /** Same, for AudioClipNode. */
+    AudioClipNode* resolveAudioClipByUuid  (juce::Uuid targetNodeUuid) const;
+
+    /** Header action: create an empty audio lane bound to a fresh
+     *  AudioClipNode in the ArrangementTracks subgraph.  Returns the
+     *  index of the new lane in lanes_, or -1 on failure (no
+     *  Services / no Session / subgraph creation failed). */
+    int createEmptyAudioLane (bool stereo = true);
+
+    /** Common path for file-drop and create-from-disk:
+     *   - Opens `file` via libsndfile (metadata: sr, channels, length)
+     *   - Registers as AudioFileSource via SourceRegistry
+     *   - If `laneIdx == -1`: creates a new audio lane via
+     *     createEmptyAudioLane, otherwise targets the given lane
+     *     (must already be an audio lane).
+     *   - Appends a Region of natural length at positionBeats.
+     *   - Auto-fires AudioLaneAdapter::launchNow so the user hears
+     *     it immediately.  (Subsequent transport-driven dispatch
+     *     keeps it firing on loop wraps.)
+     *  Returns false on any failure.  Side effects: writeLanesToSession,
+     *  repaint body. */
+    bool importAudioFileToLane (const juce::File& file,
+                                int               laneIdx,
+                                double            positionBeats);
+
+    /** Lane index whose strip area contains the given pixel y, or
+     *  -1 if y is below all lanes / above the strip. */
+    int laneIdxFromY (int yPx) const noexcept;
 
     void timerCallback() override;
 
     Services* services_ = nullptr;
-    BlockToolButton rescanBtn_ { "Rescan" };
+    BlockToolButton rescanBtn_   { "Rescan" };
+    BlockToolButton addAudioBtn_ { "+ Audio" };
     juce::Label posLabel_;
     juce::Label bpmLabel_;
     juce::Viewport viewport_;
     std::unique_ptr<Body> body_;
 
-    /** Persisted lane data + parallel transient runtime state.
-     *  Same length; same indices.  Mutations always update both
-     *  arrays in lockstep. */
     juce::Array<Lane>              lanes_;
     juce::Array<LaneRuntimeState>  laneRuntime_;
 
-    /** True once we've loaded any persisted lanes from the session.
-     *  Gates auto-fill in rescanTrackers to "only for trackers
-     *  without an existing lane." */
     bool lanesLoadedFromSession_ = false;
 
-    /* Transport mirror — read from Transport::Monitor on the UI tick. */
     Transport::MonitorPtr monitor_;
     bool wasPlaying_ = false;
     double lastBeat_ = 0.0;
 
-    /* Label diff state — gates juce::Label::setText so we don't keep
-     * burning string allocations on idle ticks. */
     float lastBpmShown_ = -1.0f;
     double lastBeatShown_ = -999.0;
 
-    /* Active graph we're attached to as a ValueTree listener — pulled
-     * from session->getActiveGraph().data() when the view is opened. */
     juce::ValueTree attachedGraphTree_;
 
     static constexpr int kHeaderH = 36;
