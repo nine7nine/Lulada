@@ -10,6 +10,7 @@
 #include "engine/midiengine.hpp"
 
 #include "nodes/allpassfilter.hpp"
+#include "nodes/audioclip.hpp"
 #include "nodes/audiofileplayer.hpp"
 #include "nodes/audiomixer.hpp"
 #include "nodes/channelize.hpp"
@@ -151,6 +152,16 @@ void ElementAudioPluginFormat::findAllTypesForFile (OwnedArray<PluginDescription
         auto* const desc = ds.add (new PluginDescription());
         AudioFilePlayerNode().fillInPluginDescription (*desc);
     }
+    else if (fileOrId == EL_NODE_ID_AUDIO_CLIP)
+    {
+        auto* const desc = ds.add (new PluginDescription());
+        AudioClipNode (true /*stereo*/).fillInPluginDescription (*desc);
+    }
+    else if (fileOrId == EL_NODE_ID_AUDIO_CLIP_MONO)
+    {
+        auto* const desc = ds.add (new PluginDescription());
+        AudioClipNode (false /*mono*/).fillInPluginDescription (*desc);
+    }
     else if (fileOrId == EL_NODE_ID_SAMPLER)
     {
         auto* const desc = ds.add (new PluginDescription());
@@ -217,6 +228,8 @@ StringArray ElementAudioPluginFormat::searchPathsForPlugins (const FileSearchPat
     results.add (EL_NODE_ID_MEDIA_PLAYER);
     results.add (EL_NODE_ID_MIDI_CHANNEL_MAP);
     results.add (EL_NODE_ID_AUDIO_FILE_PLAYER);
+    results.add (EL_NODE_ID_AUDIO_CLIP);
+    results.add (EL_NODE_ID_AUDIO_CLIP_MONO);
     results.add (EL_NODE_ID_SAMPLER);
     results.add (EL_NODE_ID_PLACEHOLDER);
 #if ! ELEMENT_USE_JACK
@@ -270,6 +283,10 @@ AudioPluginInstance* ElementAudioPluginFormat::instantiatePlugin (const PluginDe
         base = std::make_unique<MidiChannelMapProcessor>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_AUDIO_FILE_PLAYER)
         base = std::make_unique<AudioFilePlayerNode>();
+    else if (desc.fileOrIdentifier == EL_NODE_ID_AUDIO_CLIP)
+        base = std::make_unique<AudioClipNode> (true /*stereo*/);
+    else if (desc.fileOrIdentifier == EL_NODE_ID_AUDIO_CLIP_MONO)
+        base = std::make_unique<AudioClipNode> (false /*mono*/);
     else if (desc.fileOrIdentifier == EL_NODE_ID_SAMPLER)
         base = std::make_unique<SamplerNode>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_MEDIA_PLAYER)

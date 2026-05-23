@@ -24,8 +24,11 @@ target_include_directories(element
         "${Boost_INCLUDE_DIRS}"       
 )
 
-file(GLOB_RECURSE ELEMENT_SOURCES 
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp" 
+# Re-glob marker: bump this file's mtime to force CMake to re-scan
+# after adding new sources under src/.  Updated 2026-05-23 for the
+# AudioClipNode addition.
+file(GLOB_RECURSE ELEMENT_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
 
 target_sources(element PRIVATE ${ELEMENT_SOURCES})
@@ -46,6 +49,17 @@ if(JACK_FOUND)
     message(STATUS "JACK audio driver enabled")
     target_compile_definitions(element PUBLIC ELEMENT_USE_JACK=1)
     target_include_directories(element PUBLIC ${JACK_INCLUDE_DIRS})
+endif()
+
+# libsndfile -- backs services/audiostreaming/audio_file_sf.{hpp,cpp},
+# the NON-ported disk streaming path that AudioClipNode consumes for
+# timeline audio playback / recording.  POSIX-native (no juce::File,
+# no wineserver round-trips) per timeline-audio-design.md Section 0a.
+if(PkgConfig_FOUND)
+    pkg_check_modules(SNDFILE REQUIRED sndfile)
+    target_include_directories(element PUBLIC ${SNDFILE_INCLUDE_DIRS})
+    target_link_libraries(element PUBLIC ${SNDFILE_LIBRARIES})
+    target_link_directories(element PUBLIC ${SNDFILE_LIBRARY_DIRS})
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
