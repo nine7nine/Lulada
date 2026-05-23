@@ -19,9 +19,10 @@ Playlist::Playlist()
 bool Playlist::addRegion (Region r)
 {
     if (r.lengthBeats < 0.0)  return false;
-    if (overlapsExisting (r.positionBeats, r.lengthBeats, r.id))
-        return false;
-
+    /* Overlap-allowed: regions may share or contain beat spans.
+     * regionAt returns the first hit in position order, which gives
+     * "earliest-start wins" playback resolution.  v2 may introduce
+     * an explicit z-order property for top-wins. */
     regions_.push_back (std::move (r));
     rebuildOrder();
     return true;
@@ -42,13 +43,9 @@ bool Playlist::moveRegion (juce::Uuid regionId, double newPositionBeats)
     auto* r = findRegion (regionId);
     if (r == nullptr) return false;
 
-    const double oldPos = r->positionBeats;
+    /* Overlap-allowed (see addRegion).  Move freely; rebuildOrder
+     * keeps positionBeats-sort intact. */
     r->positionBeats = newPositionBeats;
-    if (overlapsExisting (r->positionBeats, r->lengthBeats, regionId))
-    {
-        r->positionBeats = oldPos;     // restore
-        return false;
-    }
     rebuildOrder();
     return true;
 }
@@ -60,13 +57,9 @@ bool Playlist::resizeRegion (juce::Uuid regionId, double newLengthBeats)
     auto* r = findRegion (regionId);
     if (r == nullptr) return false;
 
-    const double oldLen = r->lengthBeats;
+    /* Overlap-allowed; downstream paint + playback resolve via
+     * earliest-start-wins regionAt(). */
     r->lengthBeats = newLengthBeats;
-    if (overlapsExisting (r->positionBeats, r->lengthBeats, regionId))
-    {
-        r->lengthBeats = oldLen;       // restore
-        return false;
-    }
     return true;
 }
 

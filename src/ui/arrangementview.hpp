@@ -248,9 +248,12 @@ private:
     juce::ValueTree attachedGraphTree_;
 
     static constexpr int kHeaderH = 36;
-    static constexpr int kLaneH   = 64;
-    static constexpr int kLabelW  = 160;
-    static constexpr int kPxPerBeat = 24;
+    /* kLaneH + kPxPerBeat are instance-zoomable on Body; outer
+     * methods read them via body_->kLaneH / body_->kPxPerBeat.  Only
+     * kLabelW stays a static constant (it never zooms).  Shrunk from
+     * 160 -> 130 once buttons were stacked vertically instead of in
+     * a horizontal row; saves 30 px of timeline real estate. */
+    static constexpr int kLabelW  = 130;
 };
 
 } // namespace element
