@@ -179,8 +179,17 @@ ArrangementTracksService::importAudioFileAsNewLane (const juce::File& file,
 
     /* 6. Fire schedulePlay so the user hears the new region
      * immediately (subject to the subgraph being wired to the
-     * session sink; manual today). */
-    if (auto* clipProc = dynamic_cast<AudioClipNode*> (clip.getObject()))
+     * session sink; manual today).
+     *
+     * Two-step unwrap: clip.getObject() returns the
+     * AudioProcessorNode wrapper (element::Processor); the actual
+     * AudioClipNode lives inside as the wrapped juce::AudioProcessor.
+     * Reach it via getAudioProcessor(). */
+    AudioClipNode* clipProc = nullptr;
+    if (auto* wrapper = clip.getObject())
+        clipProc = dynamic_cast<AudioClipNode*> (wrapper->getAudioProcessor());
+
+    if (clipProc != nullptr)
     {
         clipProc->schedulePlay (regionIdCopy, sourceIdCopy,
                                 -1.0 /*immediate*/,
@@ -192,8 +201,8 @@ ArrangementTracksService::importAudioFileAsNewLane (const juce::File& file,
     else
     {
         juce::Logger::writeToLog (
-            " -> WARN: clip Node is not a live AudioClipNode at import time;"
-            " audible feedback skipped (graph rebind hadn't happened yet)");
+            " -> WARN: could not resolve clip.getObject()->getAudioProcessor()"
+            " to AudioClipNode*; immediate playback skipped");
     }
 
     juce::Logger::writeToLog (" -> SUCCESS");

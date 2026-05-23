@@ -713,7 +713,16 @@ AudioClipNode* ArrangementView::resolveAudioClipByUuid (juce::Uuid targetNodeUui
 
     const Node target = findNodeByUuid (active, targetNodeUuid);
     if (! target.isValid()) return nullptr;
-    return dynamic_cast<AudioClipNode*> (target.getObject());
+
+    /* Two-step unwrap: AudioClipNode is a juce::AudioPluginInstance,
+     * so Element wraps it in an AudioProcessorNode (element::Processor).
+     * Node::getObject() returns the wrapper -- we have to go through
+     * its getAudioProcessor() to reach the underlying AudioClipNode.
+     * (TrackerNode IS an element::Processor directly, so the
+     * resolveTrackerByUuid path doesn't need this dance.) */
+    auto* proc = target.getObject();
+    if (proc == nullptr) return nullptr;
+    return dynamic_cast<AudioClipNode*> (proc->getAudioProcessor());
 }
 
 void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)
