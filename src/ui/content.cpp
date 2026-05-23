@@ -20,6 +20,7 @@
 #include <element/ui/mainwindow.hpp>
 #include "ui/mainmenu.hpp"
 #include "ui/tempoandmeterbar.hpp"
+#include "ui/toolbaricons.hpp"
 #include "ui/transportbar.hpp"
 #include "ui/viewhelpers.hpp"
 
@@ -298,23 +299,35 @@ class ViewSelectorBar : public juce::Component,
 {
 public:
     ViewSelectorBar()
-        : patchBtn ("P", juce::Colour::fromRGB ( 80, 160, 200)),
-          graphBtn ("G", juce::Colour::fromRGB (110, 170, 110)),
-          arrBtn   ("A", juce::Colour::fromRGB (220, 140,  60)),
-          trkBtn   ("T", juce::Colour::fromRGB (160, 100, 180))
+        : patchBtn   ("", juce::Colour::fromRGB ( 80, 160, 200)),
+          graphBtn   ("", juce::Colour::fromRGB (110, 170, 110)),
+          arrBtn     ("", juce::Colour::fromRGB (220, 140,  60)),
+          trkBtn     ("", juce::Colour::fromRGB (160, 100, 180)),
+          sessionBtn ("", juce::Colour::fromRGB ( 80, 200, 170)),
+          diskBtn    ("", juce::Colour::fromRGB (200, 180,  80)),
+          plugBtn    ("", juce::Colour::fromRGB (190, 110, 170))
     {
-        auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID)
+        using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
+        auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID,
+                              IconFn icon)
         {
             b.setTooltip (tip);
+            b.setIcon ([icon] (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour fg)
+            {
+                icon (g, r, fg);
+            });
             b.onClick = [this, commandID]() {
                 ViewHelpers::invokeDirectly (this, commandID, true);
             };
             addAndMakeVisible (b);
         };
-        wire (patchBtn, "Patch Bay",    Commands::showPatchBay);
-        wire (graphBtn, "Graph Editor", Commands::showGraphEditor);
-        wire (arrBtn,   "Arrangement",  Commands::showArrangement);
-        wire (trkBtn,   "Trackers",     Commands::showTrackerHost);
+        wire (patchBtn,   "Patch Bay",      Commands::showPatchBay,      &ui::iconPatchBay);
+        wire (graphBtn,   "Graph Editor",   Commands::showGraphEditor,   &ui::iconGraph);
+        wire (arrBtn,     "Arrangement",    Commands::showArrangement,   &ui::iconArrangement);
+        wire (trkBtn,     "Trackers",       Commands::showTrackerHost,   &ui::iconTracker);
+        wire (sessionBtn, "Session",        Commands::showSessionView,   &ui::iconSession);
+        wire (diskBtn,    "Disk Op",        Commands::showDiskOp,        &ui::iconDisk);
+        wire (plugBtn,    "Plugin Manager", Commands::showPluginManager, &ui::iconPluginManager);
 
         startTimer (150); // tick-state refresh; cheap, no repaint when nothing changed
     }
@@ -322,12 +335,15 @@ public:
     void resized() override
     {
         auto r = getLocalBounds();
-        const int n  = 4;
+        const int n  = 7;
         const int w  = r.getWidth() / n;
-        patchBtn.setBounds (r.removeFromLeft (w));
-        graphBtn.setBounds (r.removeFromLeft (w));
-        arrBtn  .setBounds (r.removeFromLeft (w));
-        trkBtn  .setBounds (r);
+        patchBtn  .setBounds (r.removeFromLeft (w));
+        graphBtn  .setBounds (r.removeFromLeft (w));
+        arrBtn    .setBounds (r.removeFromLeft (w));
+        trkBtn    .setBounds (r.removeFromLeft (w));
+        sessionBtn.setBounds (r.removeFromLeft (w));
+        diskBtn   .setBounds (r.removeFromLeft (w));
+        plugBtn   .setBounds (r);
     }
 
 private:
@@ -347,13 +363,17 @@ private:
                 b.repaint();
             }
         };
-        refresh (patchBtn, Commands::showPatchBay);
-        refresh (graphBtn, Commands::showGraphEditor);
-        refresh (arrBtn,   Commands::showArrangement);
-        refresh (trkBtn,   Commands::showTrackerHost);
+        refresh (patchBtn,   Commands::showPatchBay);
+        refresh (graphBtn,   Commands::showGraphEditor);
+        refresh (arrBtn,     Commands::showArrangement);
+        refresh (trkBtn,     Commands::showTrackerHost);
+        refresh (sessionBtn, Commands::showSessionView);
+        refresh (diskBtn,    Commands::showDiskOp);
+        refresh (plugBtn,    Commands::showPluginManager);
     }
 
-    BlockToolButton patchBtn, graphBtn, arrBtn, trkBtn;
+    BlockToolButton patchBtn, graphBtn, arrBtn, trkBtn,
+                    sessionBtn, diskBtn, plugBtn;
 };
 
 class Content::Toolbar : public Component,
@@ -396,6 +416,29 @@ public:
         tempoBar.setVisible (false);
         transport.setShowPositionLabels (false);
         transport.updateWidth();
+
+        /* Migrated-from-menus icon buttons.  Each is a BlockToolButton
+         * with an icon drawer + tooltip.  The legacy MenuBarModel can
+         * stay for keyboard discovery, but the toolbar makes the same
+         * commands reachable without ever opening a menu. */
+        using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
+        auto wireBtn = [&] (BlockToolButton& b, const juce::String& tip,
+                              IconFn icon, std::function<void()> action)
+        {
+            b.setTooltip (tip);
+            b.setIcon ([icon] (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour fg)
+                       { icon (g, r, fg); });
+            b.onClick = std::move (action);
+            addAndMakeVisible (b);
+        };
+        wireBtn (fileMenuBtn_, "File / Session menu", &ui::iconMenu,
+                  [this]() { runFileMenu(); });
+        wireBtn (undoBtn_,     "Undo",                 &ui::iconUndo,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::undo, true); });
+        wireBtn (redoBtn_,     "Redo",                 &ui::iconRedo,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
+        wireBtn (pluginWinBtn_,"Show / hide plugin windows", &ui::iconWindows,
+                  [this]() { runPluginWindowsMenu(); });
     }
 
     ~Toolbar()
@@ -442,42 +485,52 @@ public:
     {
         /* Single-row Bitwig-style layout:
          *
-         *   [transport cluster ] [== central display ==] [view selector + extras]
+         *   [menu | undo | redo] [transport] [== display ==] [pluginwin] [view selector ...]
          *
-         * Transport buttons sit hard-left at full bar height (~44 px
-         * tall when toolBarSize=60).  Central display is a fixed-
-         * width inset panel taking ~380 px in the middle.  Right
-         * cluster (view selector + plugin menu + midi blinker) is
-         * right-aligned.  Map button + tempoBar are hidden in this
-         * layout. */
+         * Migrated-from-menus icon buttons hard-left, transport just
+         * to their right, central display floats with the leftover
+         * mid-width, view selector + plugin window toggle + plugin
+         * menu + midi blinker right-aligned. */
         Rectangle<int> r = getLocalBounds();
         const int H = r.getHeight();
-        const int innerPad = juce::jmax (3, (H - 50) / 2);   // vertical centre
+        const int innerPad = juce::jmax (3, (H - 50) / 2);
         const int rowH = H - innerPad * 2;
 
         constexpr int kSidePad = 6;
         constexpr int kGap     = 10;
+        constexpr int kIconBtnW = 30;
         constexpr int kDisplayW = 380;
 
         r.reduce (kSidePad, 0);
+        const int top = r.getY() + innerPad;
 
-        /* ---- LEFT: transport (Play / Stop / Record / SeekZero) ---- */
+        /* ---- LEFT: file menu / undo / redo trio ---- */
+        fileMenuBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (2);
+        undoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (2);
+        redoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (kGap);
+
+        /* ---- Transport (Play / Stop / Record / SeekZero) ---- */
         if (transport.isVisible())
         {
             transport.setShowPositionLabels (false);
             transport.setSize (transport.getWidth(), rowH);
             transport.updateWidth();
             const int tW = juce::jmax (160, transport.getWidth());
-            const Rectangle<int> tr (r.getX(), innerPad, tW, rowH);
-            transport.setBounds (tr);
+            transport.setBounds (r.getX(), top, tW, rowH);
             r.removeFromLeft (tW + kGap);
         }
 
-        /* ---- RIGHT: viewSelector + pluginMenu + midiBlinker ---- */
+        /* ---- RIGHT (right-aligned chain): viewSelector | pluginWin |
+                pluginMenu | midiBlinker.  Walk r.removeFromRight in
+                the visible order. ---- */
         if (pluginMenu.isVisible())
         {
             const int pms = rowH + 3;
-            pluginMenu.setBounds (r.removeFromRight (rowH).withSizeKeepingCentre (pms, pms));
+            pluginMenu.setBounds (r.removeFromRight (rowH)
+                                       .withSizeKeepingCentre (pms, pms));
             r.removeFromRight (kGap / 2);
         }
         if (midiBlinker.isVisible())
@@ -489,21 +542,26 @@ public:
         }
         if (viewSelector.isVisible())
         {
-            viewSelector.setBounds (r.removeFromRight (rowH * 4)
-                                       .withSizeKeepingCentre (rowH * 4, rowH));
+            /* 7 view buttons now: P G A T S D M.  Same per-button
+             * size as before (rowH wide each). */
+            viewSelector.setBounds (r.removeFromRight (rowH * 7)
+                                       .withSizeKeepingCentre (rowH * 7, rowH));
         }
+        r.removeFromRight (kGap / 2);
+        pluginWinBtn_.setBounds (r.removeFromRight (kIconBtnW).withY (top).withHeight (rowH));
         if (mapButton.isVisible())
         {
-            r.removeFromRight (2);
+            r.removeFromRight (4);
             mapButton.setBounds (r.removeFromRight (rowH * 2)
                                      .withSizeKeepingCentre (rowH * 2, rowH));
         }
+        r.removeFromRight (kGap);
 
-        /* ---- CENTRE: digital display ---- */
+        /* ---- CENTRE: digital display fills the remaining mid-band ---- */
         {
             const int dispW = juce::jmin (kDisplayW, juce::jmax (240, r.getWidth() - 8));
             const int dispX = r.getX() + (r.getWidth() - dispW) / 2;
-            display_.setBounds (dispX, innerPad, dispW, rowH);
+            display_.setBounds (dispX, top, dispW, rowH);
         }
     }
 
@@ -566,6 +624,39 @@ private:
      * toggles.  Self-timed at 15 Hz; pulls state directly from the
      * transport monitor + session. */
     MainDisplayPanel display_ { &owner.services() };
+
+    /* Icon buttons that absorb the legacy menu-bar's most-used items
+     * so the main toolbar reads as the primary affordance surface
+     * and the system MenuBar can eventually be hidden. */
+    BlockToolButton fileMenuBtn_  { "" };
+    BlockToolButton undoBtn_      { "" };
+    BlockToolButton redoBtn_      { "" };
+    BlockToolButton pluginWinBtn_ { "" };
+
+    void runFileMenu()
+    {
+        auto* ui = owner.services().find<UI>();
+        if (ui == nullptr) return;
+        auto& cm = ui->commands();
+        juce::PopupMenu menu;
+        MainMenu::buildSessionMenu (cm, menu);
+        menu.addSeparator();
+        menu.addCommandItem (&cm, Commands::showPreferences, "Preferences...");
+        menu.addSeparator();
+        menu.addCommandItem (&cm, juce::StandardApplicationCommandIDs::quit);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&fileMenuBtn_));
+    }
+
+    void runPluginWindowsMenu()
+    {
+        juce::PopupMenu menu;
+        auto* ui = owner.services().find<UI>();
+        if (ui == nullptr) return;
+        auto& cm = ui->commands();
+        menu.addCommandItem (&cm, Commands::showAllPluginWindows,  "Show plugin windows");
+        menu.addCommandItem (&cm, Commands::hideAllPluginWindows,  "Hide plugin windows");
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pluginWinBtn_));
+    }
 
     void runPluginMenu()
     {

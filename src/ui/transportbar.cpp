@@ -45,42 +45,44 @@ public:
 
 TransportBar::TransportBar()
 {
-    /* Transport icons are colour-coded so they read against the bold
-     * neutral border + dark body: play=green, stop=blue, record=red,
-     * rewind=white.  These tint the icon glyph itself, independent of
-     * any toggle-on body wash from backgroundOnColourId. */
+    /* Modernised transport cluster -- chunkier glyphs (pathReduction
+     * dropped from 4.4 -> 2.0 so the icon fills ~75 % of the
+     * button) + Bitwig-inspired colour palette: bright orange Play,
+     * white Stop, red Record, white rewind chevron.  Toggle-on body
+     * wash highlights Play when running + Record when armed. */
+    constexpr float kIconPad = 2.0f;
     play = std::make_unique<PlayButton>();
     addAndMakeVisible (play.get());
-    play->setPath (getIcons().fasPlay, 4.4f);
+    play->setPath (getIcons().fasPlay, kIconPad);
     play->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     play->addListener (this);
-    play->setIconColour (Colour (0xff5cd65c));
-    play->setColour (TextButton::buttonOnColourId, Colours::chartreuse);
-    play->setColour (SettingButton::backgroundOnColourId, Colors::toggleGreen);
+    play->setIconColour (Colour (0xff'ff'8a'30));               // Bitwig orange
+    play->setColour (TextButton::buttonOnColourId, Colour (0xff'ff'8a'30));
+    play->setColour (SettingButton::backgroundOnColourId, Colour (0xff'4a'2a'10));
 
     stop = std::make_unique<StopButton>();
     addAndMakeVisible (stop.get());
-    stop->setPath (getIcons().fasStop, 4.4f);
+    stop->setPath (getIcons().fasStop, kIconPad);
     stop->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     stop->addListener (this);
-    stop->setIconColour (Colour (0xff4ea1ff));
+    stop->setIconColour (Colour (0xff'e8'e8'e8));               // bright white
 
     record = std::make_unique<RecordButton>();
     addAndMakeVisible (record.get());
-    record->setPath (getIcons().fasCircle, 4.4f);
+    record->setPath (getIcons().fasCircle, kIconPad);
     record->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     record->addListener (this);
-    record->setIconColour (Colour (0xffff4d4d));
-    record->setColour (SettingButton::backgroundOnColourId, Colours::red);
+    record->setIconColour (Colour (0xff'ff'4d'4d));             // bright red
+    record->setColour (SettingButton::backgroundOnColourId, Colour (0xff'5a'1a'1a));
 
     toZero = std::make_unique<SeekZeroButton>();
     addAndMakeVisible (toZero.get());
     auto toZeroPath = getIcons().fasChevronRight;
     toZeroPath.applyTransform (AffineTransform().rotated (juce::MathConstants<float>::pi));
-    toZero->setPath (toZeroPath, 4.4f);
+    toZero->setPath (toZeroPath, kIconPad);
     toZero->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
     toZero->addListener (this);
-    toZero->setIconColour (Colours::white);
+    toZero->setIconColour (Colour (0xff'd0'd0'd0));
 
     barLabel = std::make_unique<BarLabel> (*this);
     addAndMakeVisible (barLabel.get());
