@@ -679,6 +679,35 @@ private:
                         juce::Justification::centredLeft, true);
         }
 
+        /* Live-recording placeholder: while transport is capturing
+         * + this lane is armed, paint a red translucent rect from
+         * recordStartBeat to the current playhead, with a
+         * "Recording..." label.  On stop, the AudioClipNode commit
+         * handler appends a real Region to the playlist and the
+         * placeholder vanishes (its source data lives in the
+         * playlist now). */
+        if (capturing)
+        {
+            const double startBeat = owner.recordStartBeat_;
+            const double endBeat   = owner.lastBeat_;
+            if (endBeat > startBeat)
+            {
+                const int rx = stripArea.getX() + (int) (startBeat * kPxPerBeat);
+                const int rw = juce::jmax (4, (int) ((endBeat - startBeat) * kPxPerBeat));
+                const Rectangle<int> recRect (rx, stripArea.getY() + 4,
+                                              rw, stripArea.getHeight() - 8);
+
+                g.setColour (Colour::fromRGB (220, 60, 60).withAlpha (0.55f));
+                g.fillRect (recRect);
+                g.setColour (Colour::fromRGB (255, 120, 120));
+                g.drawRect (recRect, 1);
+                g.setColour (Colours::white);
+                g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+                g.drawText ("Recording...", recRect.reduced (6, 0),
+                            juce::Justification::centredLeft, true);
+            }
+        }
+
         /* Playhead overlay. */
         const double phb = owner.lastBeat_;
         const int phx = stripArea.getX() + (int) (phb * kPxPerBeat);
@@ -1623,10 +1652,17 @@ void ArrangementView::timerCallback()
     if (wasPlaying_ && ! playing)
         stopAllAudioLanes();
 
+    /* Transport-recording rising edge: snapshot playhead position
+     * so Body can paint a placeholder growing rect from here to
+     * the current playhead on each armed lane. */
+    if (recording && ! wasRecording_)
+        recordStartBeat_ = beat;
+
     /* Repaint armed lanes while transport-recording so the REC
-     * indicator appears.  The dispatchAtBeat path only repaints
-     * lanes that change region state -- which doesn't happen during
-     * capture (no region exists until finalise). */
+     * indicator + growing-placeholder rect refresh.  The
+     * dispatchAtBeat path only repaints lanes that change region
+     * state -- which doesn't happen during capture (no region
+     * exists until finalise). */
     const bool recordingStateChanged = (recording != wasRecording_);
     if (recording || recordingStateChanged)
     {
