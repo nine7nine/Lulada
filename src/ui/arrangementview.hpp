@@ -152,6 +152,14 @@ private:
      *  doesn't continue past transport stop. */
     void stopAllAudioLanes();
 
+    /** Walk lanes_; compute effective mute (lane.muted OR (any
+     *  soloed AND ! lane.soloed)); call Processor::setMuted on each
+     *  lane's target node accordingly.  Tracker lanes also propagate
+     *  via TrackerNode::setUserMuted/setSoloed so the SessionView /
+     *  TrackerEditor see the same state.  Called on M/S toggle and
+     *  on every rescan + post-mutation. */
+    void propagateMuteSolo();
+
     void loadLanesFromSession();
     void writeLanesToSession();
 

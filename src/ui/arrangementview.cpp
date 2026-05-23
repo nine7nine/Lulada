@@ -259,6 +259,25 @@ public:
 
         if (e.x < kLabelW)
         {
+            /* Mute / solo toggles work on both tracker AND audio
+             * lanes.  Arm is audio-only (no recording into a tracker
+             * lane). */
+            if (muteToggleRect (laneIdx).contains (e.x, e.y))
+            {
+                lane.muted = ! lane.muted;
+                owner.writeLanesToSession();
+                owner.propagateMuteSolo();
+                repaintLane (laneIdx);
+                return;
+            }
+            if (soloToggleRect (laneIdx).contains (e.x, e.y))
+            {
+                lane.soloed = ! lane.soloed;
+                owner.writeLanesToSession();
+                owner.propagateMuteSolo();
+                repaint();   // solo affects every other lane's effective mute
+                return;
+            }
             if (runtime.isAudioLane() && armToggleRect (laneIdx).contains (e.x, e.y))
             {
                 lane.armed = ! lane.armed;
@@ -613,6 +632,30 @@ private:
         return Rectangle<int> (x, y, sz, sz);
     }
 
+    /** M (mute) and S (solo) toggle rectangles in the lane label
+     *  area.  Stacked vertically below the lane name; reach the
+     *  arm dot from the right edge and these are inset 6 px to the
+     *  left in label X.  Audio AND tracker lanes get the M/S
+     *  affordance (TrackerNode honors mute/solo via the existing
+     *  SessionView path). */
+    Rectangle<int> muteToggleRect (int laneIdx) const noexcept
+    {
+        constexpr int sz  = 14;
+        constexpr int pad = 4;
+        const int y = laneIdx * kLaneH + kLaneH / 2 - sz - 1;
+        const int x = kLabelW - sz - pad - 36;   // left of solo
+        return Rectangle<int> (x, y, sz, sz);
+    }
+
+    Rectangle<int> soloToggleRect (int laneIdx) const noexcept
+    {
+        constexpr int sz  = 14;
+        constexpr int pad = 4;
+        const int y = laneIdx * kLaneH + kLaneH / 2 - sz - 1;
+        const int x = kLabelW - sz - pad - 18;   // between mute + arm
+        return Rectangle<int> (x, y, sz, sz);
+    }
+
     void paintLane (Graphics& g, int laneIdx)
     {
         const auto& lane    = owner.lanes_.getReference (laneIdx);
@@ -642,6 +685,33 @@ private:
         if (orphan) label += " (orphan)";
         g.drawText (label, labelArea.reduced (8, 0),
                     juce::Justification::centredLeft, true);
+
+        /* Mute / Solo toggles.  Compact 14-px M and S buttons in the
+         * label area; visible on every lane (audio + tracker).  Solo
+         * yellow / cyan to distinguish from mute red.  Filled when
+         * active, outlined when inactive. */
+        {
+            const auto mRect = muteToggleRect (laneIdx);
+            g.setColour (lane.muted ? Colour::fromRGB (200,  90,  60)
+                                    : Colour::fromRGB ( 50,  50,  50));
+            g.fillRect (mRect);
+            g.setColour (Colour::fromRGB (200, 200, 200));
+            g.drawRect (mRect, 1);
+            g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+            g.setColour (lane.muted ? Colours::white : Colour::fromRGB (160, 160, 160));
+            g.drawText ("M", mRect, juce::Justification::centred, false);
+        }
+        {
+            const auto sRect = soloToggleRect (laneIdx);
+            g.setColour (lane.soloed ? Colour::fromRGB (200, 180,  60)
+                                     : Colour::fromRGB ( 50,  50,  50));
+            g.fillRect (sRect);
+            g.setColour (Colour::fromRGB (200, 200, 200));
+            g.drawRect (sRect, 1);
+            g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+            g.setColour (lane.soloed ? Colours::white : Colour::fromRGB (160, 160, 160));
+            g.drawText ("S", sRect, juce::Justification::centred, false);
+        }
 
         /* Arm toggle (audio lanes only).  While the transport is
          * actively recording AND this lane is armed, grow + brighten
@@ -1415,6 +1485,11 @@ void ArrangementView::rescanLaneTargets()
 
     if (mutated) writeLanesToSession();
     if (body_ != nullptr) body_->resizeForLanes();
+
+    /* After any rescan, re-apply persisted mute / solo state to the
+     * freshly-bound target processors (a graph rebind clears the
+     * underlying setMuted state). */
+    propagateMuteSolo();
 }
 
 void ArrangementView::loadLanesFromSession()
@@ -1563,6 +1638,44 @@ void ArrangementView::stopAllAudioLanes()
     for (auto& rs : laneRuntime_)
         if (rs.isAudioLane())
             rs.audioClipCache->scheduleStop (juce::Uuid::null(), -1.0);
+}
+
+void ArrangementView::propagateMuteSolo()
+{
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    const Node active = sess->getActiveGraph();
+    if (! active.isValid()) return;
+
+    /* Any-soloed gate: in Bitwig / Ableton / Ardour, the moment one
+     * lane is soloed, every non-soloed lane is effectively muted. */
+    bool anySoloed = false;
+    for (const auto& l : lanes_)
+        if (l.soloed) { anySoloed = true; break; }
+
+    for (int i = 0; i < lanes_.size(); ++i)
+    {
+        const auto& l = lanes_.getReference (i);
+        const bool effMuted = l.muted || (anySoloed && ! l.soloed);
+
+        const Node target = findNodeByUuid (active, l.targetNodeUuid);
+        if (! target.isValid()) continue;
+        if (auto* proc = target.getObject())
+            proc->setMuted (effMuted);
+
+        /* TrackerNode also has its own session-view mute / solo state
+         * so the SessionView grid + TrackerEditor stay in sync.
+         * Audio lanes go through Processor::setMuted only -- the
+         * AudioProcessorNode wrapper's setMuted gates the audio
+         * graph layer, which is enough. */
+        const auto& rs = laneRuntime_.getReference (i);
+        if (rs.isTrackerLane())
+        {
+            rs.trackerCache->setUserMuted (l.muted);
+            rs.trackerCache->setSoloed (l.soloed);
+        }
+    }
 }
 
 int ArrangementView::createEmptyAudioLane (bool stereo)
