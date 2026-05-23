@@ -7,11 +7,13 @@
 //     juce::AbstractFifo + std::vector<sample_t> storage (lock-free
 //     SPSC; same shape TrackerNode's launch FIFO already uses, no
 //     JACK runtime dep).
-//   - Replaced POSIX sem_t IO-thread wakeup with juce::WaitableEvent;
-//     under winelib (__WINE__) this is librtpi-backed (PiMutex +
-//     PiCond via FUTEX_WAIT_REQUEUE_PI), so the audio-thread signal()
-//     path inherits RT priority across the disk thread with no
-//     wineserver round-trip.
+//   - Replaced POSIX sem_t IO-thread wakeup with juce::WaitableEvent.
+//     JUCE-NSPA swaps its underlying primitive to librtpi PiMutex +
+//     PiCond (FUTEX_WAIT_REQUEUE_PI) when compiled with __WINE__
+//     defined -- Element-NSPA's canonical wineg++ build hits this.
+//     The signal path is a direct Linux kernel futex syscall, so the
+//     audio-thread signal() boosts the IO-thread waiter via PI with
+//     no wineserver involvement.
 //   - Replaced NON's pthread Thread wrapper with juce::Thread.
 //   - Dropped the `Track* _track` + `Audio_Sequence*` indirection
 //     entirely.  Playback_DS / Record_DS receive the audio buffer
@@ -94,9 +96,10 @@ protected:
     void base_flush (bool is_output);
 
     /** Audio-thread side: tell the IO thread we just produced (record)
-     *  or consumed (playback) a block.  juce::WaitableEvent::signal is
-     *  PI-safe under winelib (PiCond + brief PiMutex lock); under
-     *  native Linux it's std::condition_variable. */
+     *  or consumed (playback) a block.  juce::WaitableEvent::signal
+     *  is librtpi-backed (PiCond + brief PiMutex lock) when the JUCE
+     *  module is compiled with __WINE__ -- Element-NSPA's canonical
+     *  wineg++ build.  Direct Linux kernel futex; no wineserver. */
     void block_processed() noexcept { _blocks.signal(); }
 
     /** IO-thread side: block until the audio thread signals (or
@@ -151,8 +154,10 @@ private:
     std::vector<std::unique_ptr<juce::AbstractFifo>> _rb;
     std::vector<std::vector<sample_t>>               _rb_storage;
 
-    // PI-backed wakeup primitive (librtpi PiCond + PiMutex under
-    // __WINE__; std::condition_variable otherwise).
+    // Wakeup primitive.  Under JUCE-NSPA + __WINE__ this is a librtpi
+    // PiMutex + PiCond (FUTEX_WAIT_REQUEUE_PI -- direct Linux kernel
+    // futex, PI-aware, no wineserver).  Otherwise plain std::mutex +
+    // std::condition_variable.
     juce::WaitableEvent _blocks { false /*not manual-reset*/ };
 
     JUCE_DECLARE_NON_COPYABLE (Disk_Stream)

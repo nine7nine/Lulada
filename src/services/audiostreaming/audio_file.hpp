@@ -6,11 +6,15 @@
 // changes:
 //   - Wrapped in `namespace element`.
 //   - Replaced NON's Mutex base class with juce::CriticalSection
-//     composition.  Under winelib (__WINE__) juce::CriticalSection is
-//     backed by librtpi's pi_mutex_t (FUTEX_LOCK_PI with NSPA
-//     recursive extension) -- inherits RT priority across audio /
-//     disk-IO thread boundaries.  See JUCE-NSPA
-//     modules/juce_core/threads/juce_CriticalSection.h:125-132 and
+//     composition.  JUCE-NSPA swaps the underlying primitive to
+//     librtpi's pi_mutex_t (FUTEX_LOCK_PI with NSPA recursive
+//     extension) whenever the JUCE module is compiled with __WINE__
+//     defined -- Element-NSPA's canonical wineg++ build hits this.
+//     The PI path is a direct Linux kernel futex syscall (no
+//     wineserver, no Wine ntdll); it inherits RT priority across
+//     audio / disk-IO boundaries the same way native librtpi users
+//     do.  See JUCE-NSPA modules/juce_core/threads/
+//     juce_CriticalSection.h:125-132 and the inline librtpi impl at
 //     modules/juce_core/native/juce_winelib_rtpi.h.
 //   - Stripped Peaks member + read_peaks() (JUCE AudioThumbnail
 //     handles waveform caching in the Element UI layer).
@@ -105,10 +109,11 @@ protected:
     nframes_t           _samplerate;
     int                 _channels;
 
-    /* librtpi-backed under winelib (juce::CriticalSection ->
-     * pi_mutex_t with FUTEX_LOCK_PI).  Used by Audio_File_SF to
-     * serialise libsndfile calls between disk-IO and (rare) UI-thread
-     * metadata reads. */
+    /* librtpi-backed pi_mutex_t in Element-NSPA's canonical
+     * wineg++ build (juce::CriticalSection gates on __WINE__ at JUCE
+     * module compile time).  Used by Audio_File_SF to serialise
+     * libsndfile calls between disk-IO and (rare) UI-thread metadata
+     * reads.  PI: direct Linux kernel FUTEX_LOCK_PI, no wineserver. */
     mutable juce::CriticalSection lock_;
 
 private:

@@ -24,6 +24,9 @@ target_include_directories(element
         "${Boost_INCLUDE_DIRS}"       
 )
 
+# Re-glob marker: bump this file's mtime to force CMake to re-scan
+# after adding new sources under src/.  Updated 2026-05-23 for the
+# AudioClipNode addition.
 file(GLOB_RECURSE ELEMENT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")

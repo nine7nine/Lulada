@@ -15,6 +15,8 @@ extern "C" {
 
 // Nodes backed by juce::AudioProcessor
 #define EL_NODE_ID_ALLPASS_FILTER     "element.allPass"
+#define EL_NODE_ID_AUDIO_CLIP         "element.audioClip"          /* stereo */
+#define EL_NODE_ID_AUDIO_CLIP_MONO    "element.audioClip.mono"
 #define EL_NODE_ID_AUDIO_FILE_PLAYER  "element.audioFilePlayer"
 #define EL_NODE_ID_AUDIO_MIXER        "element.audioMixer"
 #define EL_NODE_ID_CHANNELIZE         "element.channelize"
@@ -96,6 +98,8 @@ extern "C" {
 #define EL_NODE_UID_JACK_MIDI_OUTPUT      1030
 #define EL_NODE_UID_JACK_MIDI_INPUT_ALL   1031
 #define EL_NODE_UID_JACK_MIDI_OUTPUT_ALL  1032
+#define EL_NODE_UID_AUDIO_CLIP            1033
+#define EL_NODE_UID_AUDIO_CLIP_MONO       1034
 
 #ifdef __cplusplus
 }
