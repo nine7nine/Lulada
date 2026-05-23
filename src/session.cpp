@@ -100,12 +100,35 @@ bool Session::loadData (const ValueTree& data)
     objectData = data;
     setMissingProperties();
     objectData.addListener (this);
+
+    /* Push the session-global SampleBankPool BEFORE any SamplerNode's
+     * setStateInformation runs against the new tree: nodes reference
+     * banks by index, so the pool must already hold them.  Both load
+     * paths -- standalone (SessionDocument::loadDocument -> XML) and
+     * plugin (PluginProcessor::setStateInformation -> binary) -- come
+     * through here, so this is the single place to restore. */
+    restoreSampleBankPool();
     return true;
 }
 
 std::unique_ptr<XmlElement> Session::createXml() const
 {
     ValueTree saveData = objectData.createCopy();
+
+    /* Mirror writeToFile: serialise the session-global SampleBankPool
+     * into the session ValueTree so banks + slots round-trip with the
+     * XML save path (SessionDocument::saveDocument).  Previously only
+     * writeToFile (binary path) wrote the pool, which meant saving via
+     * "File > Save Session" left every sample bank empty on reload. */
+    {
+        juce::MemoryBlock poolBlock;
+        SampleBankPool::get().getStateInformation (poolBlock);
+        if (poolBlock.getSize() > 0)
+            saveData.setProperty (tags::sampleBankPool,
+                                  poolBlock.toBase64Encoding(),
+                                  nullptr);
+    }
+
     Node::sanitizeProperties (saveData, true);
     return saveData.createXml();
 }
