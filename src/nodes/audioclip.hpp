@@ -120,7 +120,8 @@ public:
     void schedulePlay (juce::Uuid  regionId,
                        juce::Uuid  sourceId,
                        double      beatTarget,
-                       juce::int64 sampleOffset);
+                       juce::int64 sampleOffset,
+                       bool        looped = false);
 
     void scheduleStop (juce::Uuid regionId, double beatTarget) noexcept;
 
@@ -255,6 +256,7 @@ private:
         juce::int64  sampleOffset;
         Playback_DS* stream;
         int          wantPlaying;
+        bool         looped;
     };
 
     static constexpr int kLaunchFifoSize = 64;

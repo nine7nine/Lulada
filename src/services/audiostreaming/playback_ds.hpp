@@ -33,11 +33,18 @@ public:
     /** Construct + spawn the IO thread.  `source` must be a registered
      *  AudioFileSource; we open our own Audio_File against
      *  source.file() so the playback head is independent.  Returns
-     *  nullptr if the file fails to open. */
+     *  nullptr if the file fails to open.
+     *
+     *  When `looped` is true, the IO thread wraps back to
+     *  `loopStartFrame` once it reaches end-of-source instead of
+     *  stalling at EOF.  The default (false) plays straight through
+     *  source-end and then silence. */
     static std::unique_ptr<Playback_DS> create (AudioFileSource::Ptr source,
                                                 float                frame_rate,
                                                 nframes_t            block_size,
-                                                int                  channels);
+                                                int                  channels,
+                                                bool                 looped         = false,
+                                                nframes_t            loopStartFrame = 0);
 
     ~Playback_DS() override;
 
@@ -79,7 +86,9 @@ private:
                  Audio_File*          handle,
                  float                frame_rate,
                  nframes_t            block_size,
-                 int                  channels);
+                 int                  channels,
+                 bool                 looped,
+                 nframes_t            loopStartFrame);
 
     void disk_thread() override;
     void flush() override { base_flush (true); }
@@ -93,6 +102,13 @@ private:
     AudioFileSource::Ptr   source_;
     Audio_File*            file_     { nullptr };   // owned -- ::release() in dtor
     std::atomic<nframes_t> _undelay  { 0 };
+
+    /* Loop config -- set at create() time, immutable for the life of
+     * the streamer.  When loop_ is true, read_block wraps the
+     * source-frame counter to loopStart_ on EOF instead of stalling. */
+    bool       loop_       { false };
+    nframes_t  loopStart_  { 0 };
+    nframes_t  sourceLen_  { 0 };   /* cached source length in frames */
 
     JUCE_DECLARE_NON_COPYABLE (Playback_DS)
 };

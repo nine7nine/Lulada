@@ -258,7 +258,8 @@ void
 AudioClipNode::schedulePlay (juce::Uuid  regionId,
                              juce::Uuid  sourceId,
                              double      beatTarget,
-                             juce::int64 sampleOffset)
+                             juce::int64 sampleOffset,
+                             bool        looped)
 {
     auto source = SourceRegistry::get().findAudioFile (sourceId);
     if (source == nullptr)
@@ -269,10 +270,15 @@ AudioClipNode::schedulePlay (juce::Uuid  regionId,
         return;
     }
 
+    /* Loop start = sampleOffset (so a region launched mid-source
+     * loops back to that same start, not the absolute file start).
+     * Bitwig-style "start" follows the region's content offset. */
     auto fresh = Playback_DS::create (source,
                                       (float) sampleRate_,
                                       (nframes_t) blockSize_,
-                                      numChannels_);
+                                      numChannels_,
+                                      looped,
+                                      (nframes_t) sampleOffset /*loopStartFrame*/);
     if (fresh == nullptr)
         return;
 
@@ -290,7 +296,7 @@ AudioClipNode::schedulePlay (juce::Uuid  regionId,
     Playback_DS* freshRaw = fresh.release();
 
     const LaunchReq req {
-        regionId, beatTarget, sampleOffset, freshRaw, 1 /*wantPlaying*/
+        regionId, beatTarget, sampleOffset, freshRaw, 1 /*wantPlaying*/, looped
     };
 
     if (sz1 > 0)
@@ -314,7 +320,7 @@ AudioClipNode::scheduleStop (juce::Uuid regionId, double beatTarget) noexcept
         return;
 
     const LaunchReq req {
-        regionId, beatTarget, 0, nullptr, 0 /*wantPlaying*/
+        regionId, beatTarget, 0, nullptr, 0 /*wantPlaying*/, false
     };
 
     if (sz1 > 0)

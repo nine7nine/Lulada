@@ -395,7 +395,7 @@ public:
             else if (runtime.isAudioLane())
             {
                 runtime.audioClipCache->schedulePlay (
-                    r->id, r->sourceId, -1.0, 0);
+                    r->id, r->sourceId, -1.0, 0, r->looped);
             }
             runtime.lastDispatchedRegion = r->id;
             runtime.lastDispatchedSeqIdx = r->sequenceIdx;
@@ -1468,7 +1468,8 @@ void ArrangementView::dispatchAtBeat (double beat)
             runtime.audioClipCache->schedulePlay (
                 active->id, active->sourceId,
                 active->positionBeats,
-                sampleOffset);
+                sampleOffset,
+                active->looped);
         }
 
         runtime.lastDispatchedRegion = active->id;
