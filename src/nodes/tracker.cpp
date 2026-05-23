@@ -324,6 +324,11 @@ void TrackerNode::getState (juce::MemoryBlock& block)
                     tt.setProperty ("channel", trk->channel, nullptr);
                     tt.setProperty ("ncols",   trk->ncols,   nullptr);
                     tt.setProperty ("muted",   trk->playing == 0, nullptr);
+                    /* loop defaults to 1 (always-loop); sparse-write
+                     * only when the user disabled it.  Old saves
+                     * without the attribute restore as loop = 1. */
+                    if (trk->loop == 0)
+                        tt.setProperty ("lp", 0, nullptr);
 
                     for (int c = 0; c < trk->ncols; ++c)
                     {
@@ -338,6 +343,16 @@ void TrackerNode::getState (juce::MemoryBlock& block)
                             rowNode.setProperty ("t", row.type,      nullptr);
                             rowNode.setProperty ("n", row.note,      nullptr);
                             rowNode.setProperty ("v", row.velocity,  nullptr);
+                            /* Sparse-write the modifiers.  Old saves
+                             * without these attributes restore as 0. */
+                            if (row.delay != 0)
+                                rowNode.setProperty ("d",  row.delay,          nullptr);
+                            if (row.prob != 0)
+                                rowNode.setProperty ("pb", row.prob,           nullptr);
+                            if (row.velocity_range != 0)
+                                rowNode.setProperty ("vr", row.velocity_range, nullptr);
+                            if (row.delay_range != 0)
+                                rowNode.setProperty ("dr", row.delay_range,    nullptr);
                             if (row.fx[0] != 0)
                                 { rowNode.setProperty ("f0", row.fx[0],      nullptr);
                                   rowNode.setProperty ("p0", row.fxParam[0], nullptr); }
@@ -727,8 +742,10 @@ void TrackerNode::setState (const void* data, int size)
             const int port    = (int) tt.getProperty ("port",    0);
             const int channel = (int) tt.getProperty ("channel", 0);
             const bool muted  = (bool) tt.getProperty ("muted", false);
+            const int loop    = (int)  tt.getProperty ("lp",    1);
 
             track* trk = track_new (port, channel, length, length, TRACK_DEF_CTRLPR);
+            trk->loop = loop;
 
             for (int j = 0; j < tt.getNumChildren(); ++j)
             {
@@ -740,14 +757,26 @@ void TrackerNode::setState (const void* data, int size)
                 const int rtype = (int) rowNode.getProperty ("t", 0);
                 const int note  = (int) rowNode.getProperty ("n", 0);
                 const int vel   = (int) rowNode.getProperty ("v", 100);
+                const int delay = (int) rowNode.getProperty ("d", 0);
 
                 if (r >= 0 && r < length)
                 {
-                    track_set_row (trk, c, r, rtype, note, vel, 0);
-                    trk->rows[c][r].fx[0]      = (int) rowNode.getProperty ("f0", 0);
-                    trk->rows[c][r].fxParam[0] = (int) rowNode.getProperty ("p0", 0);
-                    trk->rows[c][r].fx[1]      = (int) rowNode.getProperty ("f1", 0);
-                    trk->rows[c][r].fxParam[1] = (int) rowNode.getProperty ("p1", 0);
+                    /* track_set_row writes type/note/vel/delay and
+                     * zeros prob/velocity_range/delay_range/*_next +
+                     * leaves fx untouched.  Restore the modifiers +
+                     * fx from the XML after the call (sparse: missing
+                     * attrs land as 0 which matches the zeroed start). */
+                    track_set_row (trk, c, r, rtype, note, vel, delay);
+                    auto& dst = trk->rows[c][r];
+                    dst.prob           = (int) rowNode.getProperty ("pb", 0);
+                    dst.velocity_range = (int) rowNode.getProperty ("vr", 0);
+                    dst.delay_range    = (int) rowNode.getProperty ("dr", 0);
+                    dst.velocity_next  = vel;
+                    dst.delay_next     = delay;
+                    dst.fx[0]          = (int) rowNode.getProperty ("f0", 0);
+                    dst.fxParam[0]     = (int) rowNode.getProperty ("p0", 0);
+                    dst.fx[1]          = (int) rowNode.getProperty ("f1", 0);
+                    dst.fxParam[1]     = (int) rowNode.getProperty ("p1", 0);
                 }
             }
             if (muted) trk->playing = 0;

@@ -39,6 +39,8 @@ public:
     void  changeEditStep (int delta);
     int   getPatternLength() const;
     void  changePatternLength (int delta);
+    int   getRpb() const;
+    void  changeRpb (int delta);
     int   getTrackCount() const;
     void  addTrack();
     void  deleteCurrentTrack();
@@ -78,6 +80,7 @@ private:
     int   lastToolbarOctave_       = -1;
     int   lastToolbarEditStep_     = -1;
     int   lastToolbarPatternLength_= -1;
+    int   lastToolbarRpb_          = -1;
     int   lastToolbarTrackCount_   = -1;
     bool  lastToolbarFollow_       = false;
     bool  lastToolbarCanUndo_      = false;

@@ -8,33 +8,66 @@ namespace element {
 
 namespace {
 
-/* Layout constants — Renoise-ish. Tunable later. */
+/* Layout constants. */
 constexpr int kRowHeight        = 18;
 constexpr int kRowGutterWidth   = 40;
-constexpr int kTrackWidth       = 168;
-constexpr int kTrackHeaderH     = 30;
+constexpr int kTrackHeaderH     = 56;   /* tint + name/ch + inst + legend + MUTE/SOLO */
 constexpr int kColumnSubWidth   = 32;
 constexpr float kCellFontSize   = 13.0f;
 constexpr float kHeaderFontSize = 12.0f;
 
 /* Sub-column X positions (relative to the track's left edge) and widths.
- * Each FX column takes 36 px (12 per char × 3 chars). */
+ * Each column uses 12 px per character.  Aux columns (delay / prob /
+ * vel-range / delay-range) sit between Vel and FX1, ordered to read as
+ * "the modifiers that shape this note's trigger" before the per-row
+ * engine effects in FX1 / FX2. */
 constexpr int kNoteX      = 4;
 constexpr int kNoteW      = 36;     // "C-5", incl trailing pad
 constexpr int kVelX       = 44;     // velocity column
 constexpr int kVelHalfW   = 12;     // each nybble character
 constexpr int kVelW       = 24;     // hi+lo
-constexpr int kFx1X       = 76;     // FX1 column start
+constexpr int kAuxCharW   = 12;     // per digit / nybble in aux cells
+constexpr int kAuxCellW   = 24;     // 2 chars
+constexpr int kDelayX     = 72;     // Dl: delay (00..99 decimal = delay/100 row)
+constexpr int kProbX      = 100;    // Pr: skip probability (00..99)
+constexpr int kVrX        = 128;    // VR: velocity_range (00..FF hex, mirrors Vel)
+constexpr int kDrX        = 156;    // DR: delay_range   (00..99 decimal)
+constexpr int kFx1X       = 184;    // FX1 column start
 constexpr int kFxCharW    = 12;     // letter / hi / lo each 12 px wide
 constexpr int kFxColW     = 36;     // FX column total (letter + hi + lo)
-constexpr int kFx2X       = 120;    // FX2 column start
+constexpr int kFx2X       = 224;    // FX2 column start
+constexpr int kTrackWidth = 264;    // full track including right padding
 
 /* Total sub-columns the cursor walks through (per track):
- *   0  note
- *   1  vel-hi    2  vel-lo
- *   3  fx1-let   4  fx1-hi  5  fx1-lo
- *   6  fx2-let   7  fx2-hi  8  fx2-lo */
-constexpr int kNumSubCols = 9;
+ *   0   note
+ *   1   vel-hi      2   vel-lo
+ *   3   delay-hi    4   delay-lo       (decimal, 0-9 each)
+ *   5   prob-hi     6   prob-lo        (decimal, 0-9 each)
+ *   7   vr-hi       8   vr-lo          (hex 0-F)
+ *   9   dr-hi      10   dr-lo          (decimal 0-9)
+ *  11   fx1-let    12   fx1-hi   13   fx1-lo
+ *  14   fx2-let    15   fx2-hi   16   fx2-lo */
+constexpr int kNumSubCols = 17;
+
+/* Sub-col index helpers -- kept as constexpr so the cursor logic
+ * reads at call site rather than as bare integers. */
+constexpr int kColNote      = 0;
+constexpr int kColVelHi     = 1;
+constexpr int kColVelLo     = 2;
+constexpr int kColDelayHi   = 3;
+constexpr int kColDelayLo   = 4;
+constexpr int kColProbHi    = 5;
+constexpr int kColProbLo    = 6;
+constexpr int kColVrHi      = 7;
+constexpr int kColVrLo      = 8;
+constexpr int kColDrHi      = 9;
+constexpr int kColDrLo      = 10;
+constexpr int kColFx1Let    = 11;
+constexpr int kColFx1Hi     = 12;
+constexpr int kColFx1Lo     = 13;
+constexpr int kColFx2Let    = 14;
+constexpr int kColFx2Hi     = 15;
+constexpr int kColFx2Lo     = 16;
 
 /* Dark palette. */
 const juce::Colour kBgColour          { 0xff'18'18'18 };
@@ -389,16 +422,26 @@ public:
         // Delete / backspace — context-aware clear.
         if (kc == juce::KeyPress::deleteKey || kc == juce::KeyPress::backspaceKey)
         {
-            if (selActive)                                   clearSelectionCells();
-            else if (cursorSubCol == 0)                      writeCell (-1);
-            else if (cursorSubCol == 1 || cursorSubCol == 2) writeVelocityNybble (0);
-            else if (cursorSubCol == 3 || cursorSubCol == 6) writeFxLetter (0);
+            if (selActive)                                    clearSelectionCells();
+            else if (cursorSubCol == kColNote)                writeCell (-1);
+            else if (cursorSubCol == kColVelHi
+                  || cursorSubCol == kColVelLo)               writeVelocityNybble (0);
+            else if (cursorSubCol == kColDelayHi
+                  || cursorSubCol == kColDelayLo)             writeDelayDigit (0);
+            else if (cursorSubCol == kColProbHi
+                  || cursorSubCol == kColProbLo)              writeProbDigit (0);
+            else if (cursorSubCol == kColVrHi
+                  || cursorSubCol == kColVrLo)                writeVrNybble (0);
+            else if (cursorSubCol == kColDrHi
+                  || cursorSubCol == kColDrLo)                writeDrDigit (0);
+            else if (cursorSubCol == kColFx1Let
+                  || cursorSubCol == kColFx2Let)              writeFxLetter (0);
             else                                              writeFxNybble (0);
             return true;
         }
 
         /* Velocity sub-columns: hex digits write nybbles. */
-        if (cursorSubCol == 1 || cursorSubCol == 2)
+        if (cursorSubCol == kColVelHi || cursorSubCol == kColVelLo)
         {
             int nybble = -1;
             if      (kc >= '0' && kc <= '9') nybble = kc - '0';
@@ -408,8 +451,40 @@ public:
             return false;
         }
 
-        /* FX letter sub-columns: accept A-Z and 0-9 (FT2 effect codes). */
-        if (cursorSubCol == 3 || cursorSubCol == 6)
+        /* Delay sub-columns: decimal digits 0-9 (delay/100 row offset). */
+        if (cursorSubCol == kColDelayHi || cursorSubCol == kColDelayLo)
+        {
+            if (kc >= '0' && kc <= '9') { writeDelayDigit (kc - '0'); return true; }
+            return false;
+        }
+
+        /* Probability sub-columns: decimal 0-9 (skip-probability percent). */
+        if (cursorSubCol == kColProbHi || cursorSubCol == kColProbLo)
+        {
+            if (kc >= '0' && kc <= '9') { writeProbDigit (kc - '0'); return true; }
+            return false;
+        }
+
+        /* Velocity-range sub-columns: hex digits (mirrors Vel column). */
+        if (cursorSubCol == kColVrHi || cursorSubCol == kColVrLo)
+        {
+            int nybble = -1;
+            if      (kc >= '0' && kc <= '9') nybble = kc - '0';
+            else if (kc >= 'A' && kc <= 'F') nybble = 10 + (kc - 'A');
+            else if (kc >= 'a' && kc <= 'f') nybble = 10 + (kc - 'a');
+            if (nybble >= 0) { writeVrNybble (nybble); return true; }
+            return false;
+        }
+
+        /* Delay-range sub-columns: decimal 0-9. */
+        if (cursorSubCol == kColDrHi || cursorSubCol == kColDrLo)
+        {
+            if (kc >= '0' && kc <= '9') { writeDrDigit (kc - '0'); return true; }
+            return false;
+        }
+
+        /* FX letter sub-columns: accept A-Z and 0-9. */
+        if (cursorSubCol == kColFx1Let || cursorSubCol == kColFx2Let)
         {
             const int up = (kc >= 'a' && kc <= 'z') ? (kc - 32) : kc;
             if ((up >= 'A' && up <= 'Z') || (up >= '0' && up <= '9'))
@@ -418,8 +493,8 @@ public:
         }
 
         /* FX param hex sub-columns: hex digits. */
-        if (cursorSubCol == 4 || cursorSubCol == 5
-            || cursorSubCol == 7 || cursorSubCol == 8)
+        if (cursorSubCol == kColFx1Hi || cursorSubCol == kColFx1Lo
+            || cursorSubCol == kColFx2Hi || cursorSubCol == kColFx2Lo)
         {
             int nybble = -1;
             if      (kc >= '0' && kc <= '9') nybble = kc - '0';
@@ -456,12 +531,10 @@ public:
         const int y = e.y;
         if (x < kRowGutterWidth) return;
 
-        /* Click in track header (top band):
-         *   plain                  → toggle mute
-         *   Shift+click            → solo (mute others; re-solo cancels)
-         *   click in channel pill  → cycle channel (right-click reverses)
-         *   click in inst chip     → cycle program 0..127 (right reverses)
-         *   right-click on header  → popup (program picker + actions) */
+        /* Click in track header.  Explicit MUTE / SOLO buttons take
+         * priority over generic header clicks now that they're visible
+         * and match the SessionView's pattern.  Channel pill / inst
+         * chip stay clickable; right-click still opens the popup. */
         if (y >= 0 && y < kTrackHeaderH)
         {
             const int trk = (x - kRowGutterWidth) / kTrackWidth;
@@ -470,13 +543,25 @@ public:
                 const int trkXBase = kRowGutterWidth + trk * kTrackWidth;
                 const int pillRight = trkXBase + kTrackWidth - 8;
                 const int pillLeft  = trkXBase + kTrackWidth - 36;
-                const bool inChanPill = (x >= pillLeft && x <= pillRight && y <= 22);
+                const juce::Point<int> p { x, y };
+                const bool inMuteBtn  = muteButtonBounds (trk).contains (p);
+                const bool inSoloBtn  = soloButtonBounds (trk).contains (p);
+                const bool inChanPill = (x >= pillLeft && x <= pillRight
+                                          && y >= 6 && y <= 20);
                 const bool inInstChip = (x >= pillLeft && x <= pillRight
                                           && y >= 20 && y <= 32);
 
                 if (e.mods.isRightButtonDown())
                 {
                     showHeaderPopup (trk, e);
+                }
+                else if (inMuteBtn)
+                {
+                    toggleTrackMute (trk);
+                }
+                else if (inSoloBtn)
+                {
+                    soloTrack (trk);
                 }
                 else if (inInstChip)
                 {
@@ -490,12 +575,13 @@ public:
                 }
                 else if (e.mods.isShiftDown())
                 {
+                    /* Shift-click on the name strip still solos for
+                     * keyboard-driven users used to the prior gesture. */
                     soloTrack (trk);
                 }
-                else
-                {
-                    toggleTrackMute (trk);
-                }
+                /* Plain click on the name strip is now a no-op -- the
+                 * explicit MUTE button replaces the old "click anywhere"
+                 * shortcut.  Keeps drag-style accidents from muting. */
             }
             return;
         }
@@ -539,6 +625,10 @@ public:
 private:
     struct Cell {
         int type = 0; int note = 0; int velocity = 0;
+        int delay          = 0;    // 0..99 = delay/100 row offset
+        int prob           = 0;    // 0..99 = chance to skip
+        int velocity_range = 0;    // 0..127 = negative jitter range on velocity
+        int delay_range    = 0;    // 0..99  = symmetric jitter range on delay
         int fx[2] {0, 0};
         int fxParam[2] {0, 0};
     };
@@ -595,22 +685,70 @@ private:
             {
                 auto& cell = s.tracks[(size_t) t].cells[(size_t) r];
                 const auto& row = trk->rows[0][r]; // col 0
-                cell.type     = row.type;
-                cell.note     = row.note;
-                cell.velocity = row.velocity;
-                cell.fx[0]      = row.fx[0];
-                cell.fx[1]      = row.fx[1];
-                cell.fxParam[0] = row.fxParam[0];
-                cell.fxParam[1] = row.fxParam[1];
+                cell.type           = row.type;
+                cell.note           = row.note;
+                cell.velocity       = row.velocity;
+                cell.delay          = row.delay;
+                cell.prob           = row.prob;
+                cell.velocity_range = row.velocity_range;
+                cell.delay_range    = row.delay_range;
+                cell.fx[0]          = row.fx[0];
+                cell.fx[1]          = row.fx[1];
+                cell.fxParam[0]     = row.fxParam[0];
+                cell.fxParam[1]     = row.fxParam[1];
             }
         }
     }
 
+    /* Track header zones (per-track, x relative to track left edge).
+     *   0..6        tint band
+     *   6..20       Track name (left), channel pill + inst chip (right)
+     *   20..32      Inst chip (when bound; otherwise reserved space)
+     *   32..46      MUTE | SOLO buttons (14 px tall, 2 px outer + center gap)
+     *   46..56      Column legend, each label centred under its sub-col
+     *
+     * The button row mirrors the session-view's per-column MUTE/SOLO
+     * affordance so the two views feel the same.  Mute draws with a
+     * red-ish fill when active; solo with yellow.  Legend sits just
+     * above the cells so each label lines up with the column it
+     * names; cells read top-down "label -> data". */
+    static constexpr int kHdrButtonRowY = 32;
+    static constexpr int kHdrButtonRowH = 14;
+    static constexpr int kHdrLegendY    = 46;
+    static constexpr int kHdrLegendH    = 10;
+
+    juce::Rectangle<int> muteButtonBounds (int t) const noexcept
+    {
+        const int x = kRowGutterWidth + t * kTrackWidth;
+        const int innerW = kTrackWidth - 4;
+        const int w = (innerW - 2) / 2;
+        return juce::Rectangle<int> (x + 2, kHdrButtonRowY, w, kHdrButtonRowH);
+    }
+
+    juce::Rectangle<int> soloButtonBounds (int t) const noexcept
+    {
+        const int x = kRowGutterWidth + t * kTrackWidth;
+        const int innerW = kTrackWidth - 4;
+        const int w = (innerW - 2) / 2;
+        return juce::Rectangle<int> (x + 2 + w + 2, kHdrButtonRowY, w, kHdrButtonRowH);
+    }
+
+    /* Derived: is track t currently the lone un-muted track?  Matches
+     * the toggle semantics in soloTrack(): "this one un-muted, others
+     * all muted" reads as solo, otherwise not.  Single-track patterns
+     * never show solo (the toggle is a no-op there). */
+    static bool isTrackSoloed (const Snapshot& s, int t) noexcept
+    {
+        if (s.ntrk < 2 || t < 0 || (size_t) t >= s.tracks.size()) return false;
+        if (s.tracks[(size_t) t].muted) return false;
+        for (int i = 0; i < s.ntrk; ++i)
+            if (i != t && (size_t) i < s.tracks.size() && ! s.tracks[(size_t) i].muted)
+                return false;
+        return true;
+    }
+
     void paintHeader (juce::Graphics& g, const Snapshot& s)
     {
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                      kHeaderFontSize, juce::Font::bold));
-
         g.setColour (kGutterColour);
         g.fillRect (0, 0, kRowGutterWidth, kTrackHeaderH);
 
@@ -620,36 +758,38 @@ private:
             g.setColour (kEditModeColour);
             g.fillEllipse (4.0f, 4.0f, 8.0f, 8.0f);
         }
-        // Octave indicator (top-left of gutter, below the dot).
+        // Octave indicator (top-left of gutter, lower band).
         g.setColour (kRowTextColour);
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       kHeaderFontSize - 2.0f, juce::Font::plain));
         g.drawText (juce::String ("o") + juce::String (octave),
                     2, kTrackHeaderH - 14, kRowGutterWidth - 4, 12,
                     juce::Justification::centred);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                      kHeaderFontSize, juce::Font::bold));
 
         for (int t = 0; t < s.ntrk; ++t)
         {
             const int x = kRowGutterWidth + t * kTrackWidth;
             const auto fullTint = trackTint (t);
-            const bool muted = (size_t) t < s.tracks.size() && s.tracks[(size_t) t].muted;
+            const bool muted  = (size_t) t < s.tracks.size() && s.tracks[(size_t) t].muted;
+            const bool soloed = isTrackSoloed (s, t);
             const auto tint = muted ? fullTint.withSaturation (0.2f).withBrightness (0.4f)
                                     : fullTint;
 
+            /* Tint band + body wash. */
             g.setColour (tint);
             g.fillRect (x, 0, kTrackWidth - 1, 6);
-
             g.setColour (tint.withAlpha (0.18f));
             g.fillRect (x, 6, kTrackWidth - 1, kTrackHeaderH - 6);
 
+            /* Track name in the upper strip. */
+            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                          kHeaderFontSize, juce::Font::bold));
             g.setColour (tint);
             g.drawText (juce::String::formatted ("Track%02d", t),
-                        x + 6, 6, kTrackWidth - 28, 14,
+                        x + 6, 6, kTrackWidth - 36, 14,
                         juce::Justification::centredLeft);
 
-            /* Channel pill (top-right of track header). */
+            /* Channel pill (top-right) -- click to cycle channel. */
             const int chan = (size_t) t < s.tracks.size()
                                 ? s.tracks[(size_t) t].channel + 1
                                 : t + 1;
@@ -660,9 +800,9 @@ private:
                         x + kTrackWidth - 36, 6, 28, 14,
                         juce::Justification::centredRight);
 
-            /* Instrument / program chip — visible only when a program is
-             * bound (vht trk->prog ≥ 0).  Right-click the header opens a
-             * picker; engine emits MIDI PC at row 0 / on prog change. */
+            /* Instrument / program chip -- visible only when bound.
+             * Sits in the 20..32 band so the legend strip below has its
+             * own line. */
             const int prog = (size_t) t < s.tracks.size()
                                 ? s.tracks[(size_t) t].program : -1;
             if (prog >= 0)
@@ -673,23 +813,49 @@ private:
                             juce::Justification::centredRight);
             }
 
-            /* Bottom sub-label: M indicator when muted, else "Note  Vel". */
-            if (muted)
-            {
-                g.setColour (juce::Colours::red.withAlpha (0.85f));
-                g.drawText ("MUTE",
-                            x + 6, kTrackHeaderH - 14, kTrackWidth - 12, 12,
-                            juce::Justification::centredLeft);
-            }
-            else
-            {
-                g.setColour (juce::Colours::white.withAlpha (0.45f));
-                g.drawText ("Note  Vel",
-                            x + 6, kTrackHeaderH - 14, kTrackWidth - 12, 12,
-                            juce::Justification::centredLeft);
-            }
+            /* MUTE | SOLO buttons -- match the SessionView pattern. */
+            const auto muteR = muteButtonBounds (t);
+            const auto soloR = soloButtonBounds (t);
+            const juce::Colour btnTint = tint.withMultipliedBrightness (0.55f)
+                                             .withSaturation (0.3f);
+
+            g.setColour (muted ? juce::Colour { 0xff'40'30'30 } : btnTint);
+            g.fillRect (muteR);
+            g.setColour (kRowDividerColour);
+            g.drawRect (muteR, 1);
+            g.setColour (muted ? juce::Colours::white
+                               : juce::Colours::white.withAlpha (0.70f));
             g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
-                                          kHeaderFontSize, juce::Font::bold));
+                                          kHeaderFontSize - 2.0f, juce::Font::bold));
+            g.drawText ("MUTE", muteR, juce::Justification::centred);
+
+            g.setColour (soloed ? juce::Colour { 0xff'd5'b0'30 } : btnTint);
+            g.fillRect (soloR);
+            g.setColour (kRowDividerColour);
+            g.drawRect (soloR, 1);
+            g.setColour (soloed ? juce::Colours::black
+                                : juce::Colours::white.withAlpha (0.70f));
+            g.drawText ("SOLO", soloR, juce::Justification::centred);
+
+            /* Column legend -- one label per sub-col, positioned at the
+             * sub-col's actual X so it reads as a header for the data
+             * directly below.  Brighter than the previous "0.45 white"
+             * to stand out from the cell text. */
+            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                          kHeaderFontSize - 3.0f, juce::Font::bold));
+            g.setColour (juce::Colour { 0xff'd0'd0'd0 });
+            auto drawLabel = [&] (const char* txt, int colX, int w) {
+                g.drawText (txt, x + colX, kHdrLegendY, w, kHdrLegendH,
+                            juce::Justification::centredLeft);
+            };
+            drawLabel ("Nt",  kNoteX,  kNoteW);
+            drawLabel ("Vel", kVelX,   kVelW);
+            drawLabel ("Dl",  kDelayX, kAuxCellW);
+            drawLabel ("Pr",  kProbX,  kAuxCellW);
+            drawLabel ("VR",  kVrX,    kAuxCellW);
+            drawLabel ("DR",  kDrX,    kAuxCellW);
+            drawLabel ("Fx1", kFx1X,   kFxColW);
+            drawLabel ("Fx2", kFx2X,   kFxColW);
         }
     }
 
@@ -769,15 +935,23 @@ private:
                     int sx = 0, sw = 0;
                     switch (cursorSubCol)
                     {
-                        case 0: sx = tx + kNoteX;                 sw = kNoteW;     break;
-                        case 1: sx = tx + kVelX;                  sw = kVelHalfW;  break;
-                        case 2: sx = tx + kVelX + kVelHalfW;      sw = kVelHalfW;  break;
-                        case 3: sx = tx + kFx1X;                  sw = kFxCharW;   break;
-                        case 4: sx = tx + kFx1X + kFxCharW;       sw = kFxCharW;   break;
-                        case 5: sx = tx + kFx1X + 2 * kFxCharW;   sw = kFxCharW;   break;
-                        case 6: sx = tx + kFx2X;                  sw = kFxCharW;   break;
-                        case 7: sx = tx + kFx2X + kFxCharW;       sw = kFxCharW;   break;
-                        case 8: sx = tx + kFx2X + 2 * kFxCharW;   sw = kFxCharW;   break;
+                        case kColNote:    sx = tx + kNoteX;                 sw = kNoteW;     break;
+                        case kColVelHi:   sx = tx + kVelX;                  sw = kVelHalfW;  break;
+                        case kColVelLo:   sx = tx + kVelX + kVelHalfW;      sw = kVelHalfW;  break;
+                        case kColDelayHi: sx = tx + kDelayX;                sw = kAuxCharW;  break;
+                        case kColDelayLo: sx = tx + kDelayX + kAuxCharW;    sw = kAuxCharW;  break;
+                        case kColProbHi:  sx = tx + kProbX;                 sw = kAuxCharW;  break;
+                        case kColProbLo:  sx = tx + kProbX  + kAuxCharW;    sw = kAuxCharW;  break;
+                        case kColVrHi:    sx = tx + kVrX;                   sw = kAuxCharW;  break;
+                        case kColVrLo:    sx = tx + kVrX    + kAuxCharW;    sw = kAuxCharW;  break;
+                        case kColDrHi:    sx = tx + kDrX;                   sw = kAuxCharW;  break;
+                        case kColDrLo:    sx = tx + kDrX    + kAuxCharW;    sw = kAuxCharW;  break;
+                        case kColFx1Let:  sx = tx + kFx1X;                  sw = kFxCharW;   break;
+                        case kColFx1Hi:   sx = tx + kFx1X + kFxCharW;       sw = kFxCharW;   break;
+                        case kColFx1Lo:   sx = tx + kFx1X + 2 * kFxCharW;   sw = kFxCharW;   break;
+                        case kColFx2Let:  sx = tx + kFx2X;                  sw = kFxCharW;   break;
+                        case kColFx2Hi:   sx = tx + kFx2X + kFxCharW;       sw = kFxCharW;   break;
+                        case kColFx2Lo:   sx = tx + kFx2X + 2 * kFxCharW;   sw = kFxCharW;   break;
                     }
                     g.fillRect (sx, y, sw, kRowHeight);
                 }
@@ -797,8 +971,9 @@ private:
         }
     }
 
-    /* x is the track-left edge (tx).  We draw three column groups:
-     *   note (kNoteX), velocity (kVelX), FX1 (kFx1X), FX2 (kFx2X). */
+    /* x is the track-left edge (tx).  Column groups drawn left to right:
+     *   note (kNoteX) | vel (kVelX) | delay (kDelayX) | prob (kProbX)
+     *   | vr (kVrX) | dr (kDrX) | FX1 (kFx1X) | FX2 (kFx2X). */
     void drawCell (juce::Graphics& g, const Cell& cell, int x, int y, int h)
     {
         /* Note + velocity */
@@ -832,9 +1007,46 @@ private:
                         juce::Justification::centredLeft);
         }
 
+        /* Aux columns -- dim "--" when zero so the eye picks out only
+         * cells that actually carry a modifier.  delay / prob / dr are
+         * two-decimal-digit; vr is two-hex matching the velocity column
+         * (since it operates on velocity bytes). */
+        drawDecCell (g, cell.delay,          x + kDelayX, y, h, kAuxCellW);
+        drawDecCell (g, cell.prob,           x + kProbX,  y, h, kAuxCellW);
+        drawHexCell (g, cell.velocity_range, x + kVrX,    y, h, kAuxCellW);
+        drawDecCell (g, cell.delay_range,    x + kDrX,    y, h, kAuxCellW);
+
         /* FX columns */
         drawFxCell (g, cell.fx[0], cell.fxParam[0], x + kFx1X, y, h);
         drawFxCell (g, cell.fx[1], cell.fxParam[1], x + kFx2X, y, h);
+    }
+
+    void drawDecCell (juce::Graphics& g, int value, int x, int y, int h, int w)
+    {
+        if (value == 0)
+        {
+            g.setColour (kEmptyTextColour);
+            g.drawText ("--", x, y, w, h, juce::Justification::centredLeft);
+            return;
+        }
+        const int v = juce::jlimit (0, 99, value);
+        g.setColour (kRowTextColour);
+        g.drawText (juce::String (v).paddedLeft ('0', 2),
+                    x, y, w, h, juce::Justification::centredLeft);
+    }
+
+    void drawHexCell (juce::Graphics& g, int value, int x, int y, int h, int w)
+    {
+        if (value == 0)
+        {
+            g.setColour (kEmptyTextColour);
+            g.drawText ("--", x, y, w, h, juce::Justification::centredLeft);
+            return;
+        }
+        const int v = juce::jlimit (0, 255, value);
+        g.setColour (kRowTextColour);
+        g.drawText (juce::String::toHexString (v).toUpperCase().paddedLeft ('0', 2),
+                    x, y, w, h, juce::Justification::centredLeft);
     }
 
     void drawFxCell (juce::Graphics& g, int fxType, int fxParam,
@@ -871,8 +1083,12 @@ private:
     void drawEmptyCell (juce::Graphics& g, int x, int y, int h)
     {
         g.setColour (kEmptyTextColour);
-        g.drawText ("---", x + kNoteX, y, kNoteW, h, juce::Justification::centredLeft);
-        g.drawText ("--",  x + kVelX,  y, kVelW,  h, juce::Justification::centredLeft);
+        g.drawText ("---", x + kNoteX,  y, kNoteW,    h, juce::Justification::centredLeft);
+        g.drawText ("--",  x + kVelX,   y, kVelW,     h, juce::Justification::centredLeft);
+        g.drawText ("--",  x + kDelayX, y, kAuxCellW, h, juce::Justification::centredLeft);
+        g.drawText ("--",  x + kProbX,  y, kAuxCellW, h, juce::Justification::centredLeft);
+        g.drawText ("--",  x + kVrX,    y, kAuxCellW, h, juce::Justification::centredLeft);
+        g.drawText ("--",  x + kDrX,    y, kAuxCellW, h, juce::Justification::centredLeft);
         drawFxCell (g, 0, 0, x + kFx1X, y, h);
         drawFxCell (g, 0, 0, x + kFx2X, y, h);
     }
@@ -967,6 +1183,11 @@ private:
 
     /** Write a note (>= 0) or clear (< 0) at the cursor. Advances cursor
      *  by one row after a successful write — Renoise-style auto-step. */
+    /* track_set_row zeros delay / prob / velocity_range / delay_range
+     * (its contract for the recording path); we want note / velocity
+     * edits in the editor to preserve those modifiers.  Capture before,
+     * restore after.  Fx fields are untouched by track_set_row, so
+     * they survive without help. */
     void writeCell (int midiNote)
     {
         if (trackerNode == nullptr) return;
@@ -980,13 +1201,29 @@ private:
         auto* trk = seq->trk[cursorTrack];
         if (! trk || cursorRow < 0 || cursorRow >= seq->length) return;
 
+        auto& dst = trk->rows[0][cursorRow];
+        const int prevDelay = dst.delay;
+        const int prevProb  = dst.prob;
+        const int prevVR    = dst.velocity_range;
+        const int prevDR    = dst.delay_range;
+
         if (midiNote < 0)
         {
-            track_set_row (trk, 0, cursorRow, 0, 0, 0, 0); // clear
+            /* Clear: wipe note / vel / delay AND the modifiers + fx --
+             * Delete on the note column is the "clear this whole cell"
+             * shortcut, distinct from the per-sub-col clears below. */
+            track_set_row (trk, 0, cursorRow, 0, 0, 0, 0);
+            dst.fx[0] = dst.fx[1] = 0;
+            dst.fxParam[0] = dst.fxParam[1] = 0;
         }
         else
         {
-            track_set_row (trk, 0, cursorRow, 1, midiNote, 100, 0);
+            track_set_row (trk, 0, cursorRow, 1, midiNote, 100, prevDelay);
+            dst.prob           = prevProb;
+            dst.velocity_range = prevVR;
+            dst.delay_range    = prevDR;
+            dst.velocity_next  = 100;
+            dst.delay_next     = prevDelay;
         }
 
         if (editStep > 0)
@@ -998,14 +1235,14 @@ private:
         repaint();
     }
 
-    /** Write a letter into the FX-letter sub-column (cursorSubCol 3 or
-     *  6).  Sets fx[slot] = ASCII letter; clears via 0. After write,
-     *  advance cursor to the FX-hi sub-column of the same FX slot. */
+    /** Write a letter into the FX-letter sub-column (kColFx1Let /
+     *  kColFx2Let).  Sets fx[slot] = ASCII letter; clears via 0. After
+     *  write, advance cursor to the FX-hi sub-column of the same slot. */
     void writeFxLetter (int letter)
     {
         if (trackerNode == nullptr) return;
-        const int slot = (cursorSubCol == 3) ? 0 : 1;
-        if (cursorSubCol != 3 && cursorSubCol != 6) return;
+        if (cursorSubCol != kColFx1Let && cursorSubCol != kColFx2Let) return;
+        const int slot = (cursorSubCol == kColFx1Let) ? 0 : 1;
         trackerNode->pushUndo();
 
         juce::ScopedLock sl (trackerNode->engineLock());
@@ -1024,14 +1261,16 @@ private:
     }
 
     /** Set one hex nybble of an FX param.
-     *  cursorSubCol 4/7 = high nybble of FX1/FX2; 5/8 = low nybble.
-     *  After low-nybble write, optionally advance to next row. */
+     *  cursorSubCol kColFx1Hi/kColFx2Hi = high nybble; +Lo variants = low.
+     *  After low-nybble write, advance to next row. */
     void writeFxNybble (int nybble)
     {
         if (trackerNode == nullptr) return;
-        if (cursorSubCol < 4 || cursorSubCol > 8 || cursorSubCol == 6) return;
-        const int slot = (cursorSubCol <= 5) ? 0 : 1;
-        const bool isHi = (cursorSubCol == 4 || cursorSubCol == 7);
+        const bool inFx1 = (cursorSubCol == kColFx1Hi || cursorSubCol == kColFx1Lo);
+        const bool inFx2 = (cursorSubCol == kColFx2Hi || cursorSubCol == kColFx2Lo);
+        if (! inFx1 && ! inFx2) return;
+        const int slot = inFx1 ? 0 : 1;
+        const bool isHi = (cursorSubCol == kColFx1Hi || cursorSubCol == kColFx2Hi);
         trackerNode->pushUndo();
 
         juce::ScopedLock sl (trackerNode->engineLock());
@@ -1049,7 +1288,7 @@ private:
 
         if (isHi)
         {
-            ++cursorSubCol; // hi → lo
+            ++cursorSubCol; // hi -> lo
         }
         else
         {
@@ -1070,7 +1309,7 @@ private:
     void writeVelocityNybble (int nybble)
     {
         if (trackerNode == nullptr) return;
-        if (cursorSubCol < 1 || cursorSubCol > 2) return;
+        if (cursorSubCol != kColVelHi && cursorSubCol != kColVelLo) return;
         trackerNode->pushUndo();
 
         juce::ScopedLock sl (trackerNode->engineLock());
@@ -1082,25 +1321,35 @@ private:
         if (! trk || cursorRow < 0 || cursorRow >= seq->length) return;
 
         /* Velocity edit only applies if there's a note here. */
-        const auto& current = trk->rows[0][cursorRow];
-        if (current.type != 1) return; // not a note_on; ignore
+        auto& cur = trk->rows[0][cursorRow];
+        if (cur.type != 1) return; // not a note_on; ignore
 
-        int vel = current.velocity;
-        if (cursorSubCol == 1)
+        int vel = cur.velocity;
+        if (cursorSubCol == kColVelHi)
             vel = ((nybble & 0x0f) << 4) | (vel & 0x0f);
         else
             vel = (vel & 0xf0) | (nybble & 0x0f);
         vel = juce::jlimit (0, 127, vel);
 
-        track_set_row (trk, 0, cursorRow, current.type, current.note, vel, 0);
+        /* Preserve delay / prob / vr / dr around the track_set_row call. */
+        const int prevDelay = cur.delay;
+        const int prevProb  = cur.prob;
+        const int prevVR    = cur.velocity_range;
+        const int prevDR    = cur.delay_range;
+        track_set_row (trk, 0, cursorRow, cur.type, cur.note, vel, prevDelay);
+        cur.prob           = prevProb;
+        cur.velocity_range = prevVR;
+        cur.delay_range    = prevDR;
+        cur.velocity_next  = vel;
+        cur.delay_next     = prevDelay;
 
-        if (cursorSubCol == 1)
+        if (cursorSubCol == kColVelHi)
         {
-            cursorSubCol = 2;
+            cursorSubCol = kColVelLo;
         }
         else
         {
-            cursorSubCol = 0;
+            cursorSubCol = kColNote;
             if (editStep > 0)
             {
                 const int next = cursorRow + editStep;
@@ -1109,6 +1358,117 @@ private:
             ensureCursorVisible();
         }
         repaint();
+    }
+
+    /* === Aux column writers (delay / prob / velocity_range / delay_range)
+     *
+     * Each writer:
+     *   - locates the row + field under engineLock_ (no pointer reads
+     *     outside the lock; the lookup is atomic with the write);
+     *   - mutates the engine field directly (no track_set_row -- we
+     *     don't want its zeroing of the OTHER aux fields);
+     *   - keeps velocity_next / delay_next in sync so the randomiser
+     *     reads a consistent starting point (row_randomise on next
+     *     trigger will re-roll them within the new range);
+     *   - bumps dirty so the thumbnail picks up the change;
+     *   - advances cursor on low-digit input the same way the other
+     *     columns do. */
+    enum class AuxField { Delay, Prob, VelRange, DelayRange };
+
+    void writeAuxDigit (AuxField which, int nybble, bool isHi)
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        if (cursorTrack < 0 || cursorTrack >= seq->ntrk) return;
+        auto* trk = seq->trk[cursorTrack];
+        if (! trk || cursorRow < 0 || cursorRow >= seq->length) return;
+
+        auto& cur = trk->rows[0][cursorRow];
+
+        int* field        = nullptr;
+        int maxValue      = 0;
+        bool decimal      = true;
+        int hiSubCol = 0, loSubCol = 0;
+        switch (which)
+        {
+            case AuxField::Delay:
+                field = &cur.delay;          maxValue = 99;
+                hiSubCol = kColDelayHi;      loSubCol = kColDelayLo;
+                decimal = true;
+                break;
+            case AuxField::Prob:
+                field = &cur.prob;           maxValue = 99;
+                hiSubCol = kColProbHi;       loSubCol = kColProbLo;
+                decimal = true;
+                break;
+            case AuxField::VelRange:
+                field = &cur.velocity_range; maxValue = 127;
+                hiSubCol = kColVrHi;         loSubCol = kColVrLo;
+                decimal = false;
+                break;
+            case AuxField::DelayRange:
+                field = &cur.delay_range;    maxValue = 99;
+                hiSubCol = kColDrHi;         loSubCol = kColDrLo;
+                decimal = true;
+                break;
+        }
+        if (field == nullptr) return;
+
+        const int base = decimal ? 10 : 16;
+        int v  = juce::jlimit (0, maxValue, *field);
+        const int hi = decimal ? (v / 10) : ((v >> 4) & 0x0f);
+        const int lo = decimal ? (v % 10) : (v & 0x0f);
+        if (isHi)
+            v = nybble * base + lo;
+        else
+            v = hi * base + nybble;
+        *field = juce::jlimit (0, maxValue, v);
+
+        cur.velocity_next = cur.velocity;
+        cur.delay_next    = cur.delay;
+        trk->dirty = 1;
+
+        if (isHi)
+        {
+            cursorSubCol = loSubCol;
+        }
+        else
+        {
+            cursorSubCol = hiSubCol;
+            if (editStep > 0)
+            {
+                const int next = cursorRow + editStep;
+                cursorRow = (next < seq->length) ? next : (next % seq->length);
+            }
+            ensureCursorVisible();
+        }
+        repaint();
+    }
+
+    void writeDelayDigit (int nybble)
+    {
+        if (cursorSubCol != kColDelayHi && cursorSubCol != kColDelayLo) return;
+        writeAuxDigit (AuxField::Delay, nybble, cursorSubCol == kColDelayHi);
+    }
+    void writeProbDigit (int nybble)
+    {
+        if (cursorSubCol != kColProbHi && cursorSubCol != kColProbLo) return;
+        writeAuxDigit (AuxField::Prob, nybble, cursorSubCol == kColProbHi);
+    }
+    void writeVrNybble (int nybble)
+    {
+        if (cursorSubCol != kColVrHi && cursorSubCol != kColVrLo) return;
+        writeAuxDigit (AuxField::VelRange, nybble, cursorSubCol == kColVrHi);
+    }
+    void writeDrDigit (int nybble)
+    {
+        if (cursorSubCol != kColDrHi && cursorSubCol != kColDrLo) return;
+        writeAuxDigit (AuxField::DelayRange, nybble, cursorSubCol == kColDrHi);
     }
 
 public:
@@ -1126,6 +1486,29 @@ public:
         if (newLen == seq->length) return;
         sequence_set_length (seq, newLen);
         if (cursorRow >= newLen) cursorRow = newLen - 1;
+        repaint();
+    }
+
+    int getRpb() const
+    {
+        if (trackerNode == nullptr) return 4;
+        juce::ScopedLock sl (const_cast<juce::CriticalSection&> (trackerNode->engineLock()));
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return 4;
+        return mod->curr_seq->rpb;
+    }
+
+    void changeRpb (int delta)
+    {
+        if (trackerNode == nullptr || delta == 0) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        auto* seq = mod->curr_seq;
+        const int newRpb = juce::jlimit (1, 32, seq->rpb + delta);
+        if (newRpb == seq->rpb) return;
+        seq->rpb = newRpb;
         repaint();
     }
 
@@ -1434,14 +1817,17 @@ public:
                 if (! trk) continue;
                 const auto& src = trk->rows[0][r];
                 auto& dst = clipboard[(size_t)(r - r0)][(size_t)(t - t0)];
-                dst.type     = src.type;
-                dst.note     = src.note;
-                dst.velocity = src.velocity;
-                dst.delay    = src.delay;
-                dst.fx[0]      = src.fx[0];
-                dst.fx[1]      = src.fx[1];
-                dst.fxParam[0] = src.fxParam[0];
-                dst.fxParam[1] = src.fxParam[1];
+                dst.type           = src.type;
+                dst.note           = src.note;
+                dst.velocity       = src.velocity;
+                dst.delay          = src.delay;
+                dst.prob           = src.prob;
+                dst.velocity_range = src.velocity_range;
+                dst.delay_range    = src.delay_range;
+                dst.fx[0]          = src.fx[0];
+                dst.fx[1]          = src.fx[1];
+                dst.fxParam[0]     = src.fxParam[0];
+                dst.fxParam[1]     = src.fxParam[1];
             }
         }
     }
@@ -1466,7 +1852,12 @@ public:
                 if (t < 0 || t >= seq->ntrk) continue;
                 auto* trk = seq->trk[t];
                 if (! trk) continue;
+                /* track_set_row zeros type/note/vel/delay + the aux
+                 * fields; FX fields it leaves alone, so we have to
+                 * wipe them here for a full cell clear. */
                 track_set_row (trk, 0, r, 0, 0, 0, 0);
+                trk->rows[0][r].fx[0] = trk->rows[0][r].fx[1] = 0;
+                trk->rows[0][r].fxParam[0] = trk->rows[0][r].fxParam[1] = 0;
             }
         }
         repaint();
@@ -1493,6 +1884,8 @@ public:
                 auto* trk = seq->trk[t];
                 if (! trk) continue;
                 track_set_row (trk, 0, r, 0, 0, 0, 0);
+                trk->rows[0][r].fx[0] = trk->rows[0][r].fx[1] = 0;
+                trk->rows[0][r].fxParam[0] = trk->rows[0][r].fxParam[1] = 0;
             }
         }
         repaint();
@@ -1522,10 +1915,16 @@ public:
                 if (! trk) continue;
                 const auto& src = clipboard[(size_t) dr][(size_t) dt];
                 track_set_row (trk, 0, targetRow, src.type, src.note, src.velocity, src.delay);
-                trk->rows[0][targetRow].fx[0]      = src.fx[0];
-                trk->rows[0][targetRow].fx[1]      = src.fx[1];
-                trk->rows[0][targetRow].fxParam[0] = src.fxParam[0];
-                trk->rows[0][targetRow].fxParam[1] = src.fxParam[1];
+                auto& dst = trk->rows[0][targetRow];
+                dst.prob           = src.prob;
+                dst.velocity_range = src.velocity_range;
+                dst.delay_range    = src.delay_range;
+                dst.velocity_next  = src.velocity;
+                dst.delay_next     = src.delay;
+                dst.fx[0]          = src.fx[0];
+                dst.fx[1]          = src.fx[1];
+                dst.fxParam[0]     = src.fxParam[0];
+                dst.fxParam[1]     = src.fxParam[1];
             }
         }
         repaint();
@@ -1630,10 +2029,28 @@ public:
 
         cursorTrack = trk;
 
+        /* Snapshot the track's loop state for the menu checkmark.
+         * Lookup under engineLock so a concurrent pattern switch can't
+         * leave us holding a stale pointer. */
+        bool trackLoops = true;
+        {
+            juce::ScopedLock sl (trackerNode->engineLock());
+            auto* mod = trackerNode->modulePtr();
+            if (mod != nullptr && mod->curr_seq != nullptr
+                && trk >= 0 && trk < mod->curr_seq->ntrk)
+            {
+                if (auto* t = mod->curr_seq->trk[trk])
+                    trackLoops = (t->loop != 0);
+            }
+        }
+
         juce::PopupMenu m;
         m.addSectionHeader ("Track " + juce::String (trk + 1));
         m.addItem (1, "Mute / unmute");
         m.addItem (2, "Solo");
+        m.addSeparator();
+        m.addItem (8, "Loop (one-shot when off)", /*enabled*/ true,
+                   /*checked*/ trackLoops);
         m.addSeparator();
         m.addItem (3, "Inst +1");
         m.addItem (4, "Inst -1");
@@ -1647,7 +2064,14 @@ public:
         m.addItem (6, "Channel +1");
         m.addItem (7, "Channel -1");
 
-        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
+        /* Anchor the popup at the actual click position (screen coords)
+         * rather than at the component edge.  withTargetComponent on
+         * its own picks a default placement (bottom-left of component)
+         * which surfaced the menu way below the tracker grid. */
+        const juce::Rectangle<int> targetArea (e.getScreenX(), e.getScreenY(), 1, 1);
+        m.showMenuAsync (juce::PopupMenu::Options()
+                            .withTargetComponent (this)
+                            .withTargetScreenArea (targetArea),
             [this, trk] (int sel) {
                 switch (sel)
                 {
@@ -1659,13 +2083,27 @@ public:
                     case 5:  setTrackProgram (trk, -1); break;
                     case 6:  cursorTrack = trk; cycleCursorTrackChannel ( 1); break;
                     case 7:  cursorTrack = trk; cycleCursorTrackChannel (-1); break;
+                    case 8:  toggleTrackLoop (trk); break;
                     default:
                         if (sel >= 101 && sel <= 116)
                             setTrackProgram (trk, sel - 101);
                         break;
                 }
             });
-        juce::ignoreUnused (e);
+    }
+
+    void toggleTrackLoop (int t)
+    {
+        if (trackerNode == nullptr) return;
+        trackerNode->pushUndo();
+        juce::ScopedLock sl (trackerNode->engineLock());
+        auto* mod = trackerNode->modulePtr();
+        if (mod == nullptr || mod->curr_seq == nullptr) return;
+        if (t < 0 || t >= mod->curr_seq->ntrk) return;
+        auto* trk = mod->curr_seq->trk[t];
+        if (! trk) return;
+        trk->loop = trk->loop ? 0 : 1;
+        repaint();
     }
 
     void setTrackProgram (int t, int prog)
@@ -1768,23 +2206,28 @@ private:
                 "  Q 2 W 3 E R 5 T 6 Y 7 U I    notes (high row, C+12 up)",
                 "  [ / ]        octave -/+",
                 "  Shift+1..8   set octave 1..8",
-                "  Delete       clear note (or zero velocity nybble)",
-                "  0-9 A-F      set velocity hex digit (in vel sub-cols)",
+                "  STEP         rows the cursor jumps after entering a note",
+                "               (only applies while EDIT mode is on)",
+                "  Delete       clear cell (note col) / zero digit (other cols)",
+                "  0-9 A-F      hex digit (Vel / VR / FX param sub-cols)",
+                "  0-9          decimal digit (Delay / Prob / DR sub-cols)",
+                "  A-Z / 0-9    FX letter (FX1-let / FX2-let sub-cols)",
                 "  Insert       insert row at cursor (current track)",
                 "  Shift+Insert delete row at cursor",
                 "",
                 "NAVIGATION",
                 "  Up / Down    move cursor row",
-                "  Left / Right step sub-column (note / vel-hi / vel-lo,",
-                "                  crosses tracks at boundaries)",
+                "  Left / Right step sub-column (Note / Vel / Dl / Pr",
+                "                  / VR / DR / FX1 / FX2; crosses",
+                "                  tracks at boundaries)",
                 "  Tab / S-Tab  jump to next / previous track",
                 "  PgUp / PgDn  jump 16 rows",
                 "  Home / End   first / last row",
                 "  Click        jump cursor to cell",
-                "  Click header        toggle track mute",
-                "  Shift+Click header  solo track (others muted)",
+                "  Click MUTE / SOLO   toggle on the track header",
                 "  Click channel pill  cycle MIDI channel 1..16",
                 "                      (right-click reverses)",
+                "  Right-click header  full menu (mute/solo/loop/inst...)",
                 "",
                 "PATTERN / TRACKS",
                 "  Ctrl+Up/Dn   pattern length -/+ 1",
@@ -1833,7 +2276,11 @@ private:
     bool selActive     = false;
 
     struct ClipCell {
-        int type = 0; int note = 0; int velocity = 0; int delay = 0;
+        int type = 0; int note = 0; int velocity = 0;
+        int delay          = 0;
+        int prob           = 0;
+        int velocity_range = 0;
+        int delay_range    = 0;
         int fx[2] {0, 0};
         int fxParam[2] {0, 0};
     };
@@ -1843,7 +2290,7 @@ private:
     TrackerNode* trackerNode;
     int cursorRow    = 0;
     int cursorTrack  = 0;
-    int cursorSubCol = 0; // 0 = note, 1 = vel-hi, 2 = vel-lo
+    int cursorSubCol = 0; // see kColNote / kColVelHi / ... at file top
     int octave       = 4;
     int editStep     = 1; // auto-advance amount after a write (0 = no advance)
     bool editMode    = false;
@@ -1880,6 +2327,8 @@ public:
         configureButton (stepPlusBtn,  ">", [this]{ editor.changeEditStep ( 1); });
         configureButton (lenMinusBtn,  "-", [this]{ editor.changePatternLength (-1); });
         configureButton (lenPlusBtn,   "+", [this]{ editor.changePatternLength ( 1); });
+        configureButton (rpbMinusBtn,  "-", [this]{ editor.changeRpb (-1); });
+        configureButton (rpbPlusBtn,   "+", [this]{ editor.changeRpb ( 1); });
         configureButton (trkRemoveBtn, "-", [this]{ editor.deleteCurrentTrack(); });
         configureButton (trkAddBtn,    "+", [this]{ editor.addTrack(); });
         configureButton (patPrevBtn,   "<", [this]{ editor.switchPattern (-1); });
@@ -1899,6 +2348,7 @@ public:
         configureLabel (lenLabel);  lenLabel .setText ("LEN",  juce::dontSendNotification);
         configureLabel (trkLabel);  trkLabel .setText ("TRK",  juce::dontSendNotification);
         configureLabel (patLabel);  patLabel .setText ("PAT",  juce::dontSendNotification);
+        configureLabel (rpbLabel);  rpbLabel .setText ("RPB",  juce::dontSendNotification);
         configureLabel (bpmLabel);
 
         /* Editable value labels — double-click to type a target value
@@ -1924,6 +2374,7 @@ public:
         setupEditable (octValue,  [this] (int v) { editor.changeOctave        (v - editor.getOctave()); });
         setupEditable (stepValue, [this] (int v) { editor.changeEditStep      (v - editor.getEditStep()); });
         setupEditable (lenValue,  [this] (int v) { editor.changePatternLength (v - editor.getPatternLength()); });
+        setupEditable (rpbValue,  [this] (int v) { editor.changeRpb           (v - editor.getRpb()); });
         /* TRK + PAT also editable.  Per-step mutations are slightly
          * heavier (add/remove tracks; switch pattern jumps) but the
          * editable surface is the same UX win as direct LEN edit. */
@@ -1966,6 +2417,7 @@ public:
         pushValue (octValue,  juce::String (editor.getOctave()));
         pushValue (stepValue, juce::String (editor.getEditStep()));
         pushValue (lenValue,  juce::String (editor.getPatternLength()));
+        pushValue (rpbValue,  juce::String (editor.getRpb()));
         pushValue (trkValue,  juce::String (editor.getTrackCount()));
         pushValue (patValue,  juce::String::formatted ("%d/%d",
                                                        editor.getPatternIndex() + 1,
@@ -1981,23 +2433,39 @@ public:
 
     void resized() override
     {
-        int x = 6;
-        const int y = 4;
-        const int h = getHeight() - 8;
-        const int btnW   = 20;     /* tight nudge buttons */
-        const int nameW  = 32;     /* "OCT" / "STEP" / etc. */
-        const int valW   = 42;     /* "[16]" / "[1/1]" */
-        const int wideW  = 48;
+        /* Two-row toolbar.
+         *   Row 1 = "current state" controls (mode, octave / step / len
+         *           / trk, FOLLOW playback, help).
+         *   Row 2 = pattern + history (RPB, PAT picker + NEW/DUP/DEL,
+         *           UND/RED).
+         *
+         * Pattern-management used to live on row 1 alongside everything
+         * else, which truncated NEW/DUP and UND/RED to "N..." / "D..."
+         * / "U..." / "R...".  Moving them down lets us use full labels
+         * and keeps row 1 from overflowing in narrower windows. */
+        const int btnW    = 20;     /* tight nudge buttons */
+        const int nameW   = 32;     /* "OCT" / "STEP" / etc. */
+        const int valW    = 42;     /* "[16]" / "[1/1]" */
+        const int wideW   = 48;
+        const int patBtnW = 44;     /* fits "NEW" / "DUP" / "DEL" */
+        const int hisBtnW = 40;     /* fits "UND" / "RED" */
+        const int rowH    = (getHeight() - 8) / 2;
+        const int yRow1   = 2;
+        const int yRow2   = 2 + rowH + 2;
+
+        struct Row {
+            int x;
+            int y;
+            int h;
+        };
+        Row row { 6, yRow1, rowH };
 
         auto place = [&] (juce::Component& c, int w) {
-            c.setBounds (x, y, w, h);
-            x += w + 2;
+            c.setBounds (row.x, row.y, w, row.h);
+            row.x += w + 2;
         };
-        auto sep = [&] { x += 8; };
+        auto sep = [&] { row.x += 8; };
 
-        /* Per-setting group layout: NAME  [VALUE]  <  >
-         * Compact + readable: name on the left, double-clickable value
-         * in brackets, then both nudge buttons grouped on the right. */
         auto group = [&] (juce::Component& name, juce::Component& value,
                           juce::Component& minus, juce::Component& plus,
                           int valWidth) {
@@ -2008,20 +2476,30 @@ public:
             sep();
         };
 
+        /* --- Row 1: current-state controls --- */
         place (editBtn, wideW); sep();
         group (octLabel,  octValue,  octMinusBtn,   octPlusBtn,    valW);
         group (stepLabel, stepValue, stepMinusBtn,  stepPlusBtn,   valW);
         group (lenLabel,  lenValue,  lenMinusBtn,   lenPlusBtn,    valW);
         group (trkLabel,  trkValue,  trkRemoveBtn,  trkAddBtn,     valW);
-        group (patLabel,  patValue,  patPrevBtn,    patNextBtn,    52);
-        place (patNewBtn, 36);
-        place (patDupBtn, 36);
-        place (patDelBtn, 36);
-        sep();
         place (followBtn, 56); sep();
-        place (undoBtn, 32); place (redoBtn, 32); sep();
-        place (bpmLabel, 76); sep();
         place (helpBtn, btnW);
+
+        /* bpmLabel is reserved but never populated in the tracker
+         * context (Element's main transport owns the BPM display).
+         * Park it offscreen so it doesn't reserve a phantom gap. */
+        bpmLabel.setBounds (-100, -100, 1, 1);
+
+        /* --- Row 2: pattern picker + ops + history --- */
+        row = Row { 6, yRow2, rowH };
+        group (rpbLabel,  rpbValue,  rpbMinusBtn,   rpbPlusBtn,    valW);
+        group (patLabel,  patValue,  patPrevBtn,    patNextBtn,    52);
+        place (patNewBtn, patBtnW);
+        place (patDupBtn, patBtnW);
+        place (patDelBtn, patBtnW);
+        sep();
+        place (undoBtn, hisBtnW);
+        place (redoBtn, hisBtnW);
     }
 
 private:
@@ -2049,14 +2527,15 @@ private:
     juce::TextButton octMinusBtn,   octPlusBtn;
     juce::TextButton stepMinusBtn,  stepPlusBtn;
     juce::TextButton lenMinusBtn,   lenPlusBtn;
+    juce::TextButton rpbMinusBtn,   rpbPlusBtn;
     juce::TextButton trkRemoveBtn,  trkAddBtn;
     juce::TextButton patPrevBtn,    patNextBtn, patNewBtn, patDupBtn, patDelBtn;
     juce::TextButton followBtn;
     juce::TextButton undoBtn, redoBtn;
-    juce::Label octLabel, stepLabel, lenLabel, trkLabel, patLabel, bpmLabel;
+    juce::Label octLabel, stepLabel, lenLabel, rpbLabel, trkLabel, patLabel, bpmLabel;
     /* Editable value displays (boxed "[N]" beside the name label).
      * Double-click to type a target value directly. */
-    juce::Label octValue, stepValue, lenValue, trkValue, patValue;
+    juce::Label octValue, stepValue, lenValue, rpbValue, trkValue, patValue;
 };
 
 
@@ -2081,8 +2560,8 @@ TrackerEditor::TrackerEditor (const Node& n)
     patternView->grabKeyboardFocus();
 
     setResizable (true);
-    /* Toolbar is ~36 tall; default body fits ~24 rows × 4 tracks. */
-    constexpr int kToolbarH = 36;
+    /* Two-row toolbar; default body fits ~24 rows x 4 tracks. */
+    constexpr int kToolbarH = 68;
     setSize (juce::jmax (1020, kRowGutterWidth + 4 * kTrackWidth + 16),
              kToolbarH + kTrackHeaderH + 24 * kRowHeight + 4);
     startTimerHz (30);
@@ -2103,7 +2582,10 @@ void TrackerEditor::paint (juce::Graphics& g)
 
 void TrackerEditor::resized()
 {
-    constexpr int kToolbarH = 36;
+    /* Two-row toolbar: row 1 = transport / mode / pattern controls,
+     * row 2 = per-sequence / per-pattern fine config (currently
+     * RPB, reserved for trigger / loop / extras as they land). */
+    constexpr int kToolbarH = 68;
     auto r = getLocalBounds();
     if (toolbar)
         toolbar->setBounds (r.removeFromTop (kToolbarH));
@@ -2131,6 +2613,7 @@ void TrackerEditor::timerCallback()
     int   newOctave        = patternView ? patternView->getOctave() : 4;
     int   newEditStep      = patternView ? patternView->getEditStep() : 1;
     int   newPatternLength = patternView ? patternView->getPatternLength() : 0;
+    int   newRpb           = patternView ? patternView->getRpb() : 4;
     int   newTrackCount    = patternView ? patternView->getTrackCount() : 0;
     bool  newFollow        = patternView ? patternView->getFollowPlayhead() : false;
     bool  newCanUndo       = canUndo();
@@ -2143,6 +2626,7 @@ void TrackerEditor::timerCallback()
         || newOctave        != lastToolbarOctave_
         || newEditStep      != lastToolbarEditStep_
         || newPatternLength != lastToolbarPatternLength_
+        || newRpb           != lastToolbarRpb_
         || newTrackCount    != lastToolbarTrackCount_
         || newFollow        != lastToolbarFollow_
         || newCanUndo       != lastToolbarCanUndo_
@@ -2156,6 +2640,7 @@ void TrackerEditor::timerCallback()
         lastToolbarOctave_        = newOctave;
         lastToolbarEditStep_      = newEditStep;
         lastToolbarPatternLength_ = newPatternLength;
+        lastToolbarRpb_           = newRpb;
         lastToolbarTrackCount_    = newTrackCount;
         lastToolbarFollow_        = newFollow;
         lastToolbarCanUndo_       = newCanUndo;
@@ -2178,6 +2663,8 @@ int   TrackerEditor::getEditStep() const   { return patternView ? patternView->g
 void  TrackerEditor::changeEditStep (int d){ if (patternView) patternView->changeEditStep (d); }
 int   TrackerEditor::getPatternLength() const { return patternView ? patternView->getPatternLength() : 0; }
 void  TrackerEditor::changePatternLength (int d) { if (patternView) patternView->changePatternLength (d); }
+int   TrackerEditor::getRpb() const          { return patternView ? patternView->getRpb() : 4; }
+void  TrackerEditor::changeRpb (int d)       { if (patternView) patternView->changeRpb (d); }
 int   TrackerEditor::getTrackCount() const { return patternView ? patternView->getTrackCount() : 0; }
 void  TrackerEditor::addTrack()            { if (patternView) patternView->addTrack(); }
 void  TrackerEditor::deleteCurrentTrack()  { if (patternView) patternView->deleteCurrentTrack(); }
