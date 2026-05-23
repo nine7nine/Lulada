@@ -26,6 +26,29 @@
 
 namespace element {
 
+/* Shared paint helper for the LCD-style faceplate frame used by the
+ * main toolbar's button groups + central display.  Matte-black outer
+ * bezel + 1-px dark-grey rim + cool-grey vertical gradient inside. */
+static void paintLcdFrame (juce::Graphics& g, juce::Rectangle<int> r,
+                            float cornerSize = 4.0f)
+{
+    const auto frect = r.toFloat();
+    g.setColour (juce::Colour (0xff'08'08'08));
+    g.fillRoundedRectangle (frect, cornerSize);
+    g.setColour (juce::Colour (0xff'3a'3a'3a));
+    g.drawRoundedRectangle (frect.reduced (0.5f), cornerSize, 1.0f);
+
+    const auto inner = frect.reduced (3.0f);
+    juce::ColourGradient lcdGrad (
+        juce::Colour (0xff'14'19'1e),
+        inner.getX(), inner.getY(),
+        juce::Colour (0xff'0c'0f'12),
+        inner.getX(), inner.getBottom(),
+        false);
+    g.setGradientFill (lcdGrad);
+    g.fillRoundedRectangle (inner, juce::jmax (0.5f, cornerSize - 1.0f));
+}
+
 /* ===================================================================== */
 /* MainDisplayPanel: Bitwig-style central digital read-out for the top   */
 /* toolbar.  Custom-painted inset frame with large blue-cyan digits.     */
@@ -520,35 +543,36 @@ public:
          * menu + midi blinker right-aligned. */
         Rectangle<int> r = getLocalBounds();
         const int H = r.getHeight();
-        /* 7-px top/bottom padding so every button (transport, view
-         * selector, undo/redo, display, all of it) sits inside a
-         * clear breathing margin against the bar's top + bottom
-         * edges.  Previous 3-5 px ate the gap entirely. */
-        constexpr int kInnerPadY = 7;
+        /* Tightened external padding (was 7 -> now 3) so the LCD-
+         * framed clusters get more vertical real estate.  Frame is
+         * what gives them breathing room now, not bar-edge padding. */
+        constexpr int kInnerPadY = 3;
         const int innerPad = kInnerPadY;
         const int rowH = juce::jmax (20, H - innerPad * 2);
 
         constexpr int kSidePad   = 8;
         constexpr int kGap       = 14;
         constexpr int kIconGap   = 4;
+        constexpr int kFramePad  = 5;
         constexpr int kDisplayW  = 380;
-        /* Icon buttons share the per-row height so the leftmost
-         * trio reads as a 3-square cluster -- same shape, same
-         * inter-button gap as the view selector on the right. */
-        const int kIconBtnW = rowH;
+        /* Icon buttons fit inside the LCD frame; their square size
+         * is the row height minus the frame's top+bottom padding. */
+        const int kIconBtnW = juce::jmax (16, rowH - kFramePad * 2);
 
         r.reduce (kSidePad, 0);
         const int top = r.getY() + innerPad;
 
-        /* ---- LEFT cluster: Disk Op + Plugin Manager + Preferences.
-                Treated as a 3-square group; matches the right view
-                selector's shape + gap so the bar reads symmetric. */
-        diskOpBtn_   .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kIconGap);
-        pluginMgrBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kIconGap);
-        prefsBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kGap);
+        /* ---- LEFT cluster: Disk Op + Plugin Manager + Preferences
+                inside their LCD frame.  Cluster outer width =
+                kFramePad + 3*btn + 2*gap + kFramePad. */
+        const int leftClusterW = kFramePad * 2 + kIconBtnW * 3 + kIconGap * 2;
+        leftClusterRect_ = Rectangle<int> (r.getX(), top, leftClusterW, rowH);
+        const int leftBtnY = top + kFramePad;
+        int lx = r.getX() + kFramePad;
+        diskOpBtn_   .setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW); lx += kIconBtnW + kIconGap;
+        pluginMgrBtn_.setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW); lx += kIconBtnW + kIconGap;
+        prefsBtn_    .setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW);
+        r.removeFromLeft (leftClusterW + kGap);
 
         /* ---- Transport (Play / Stop / Record / SeekZero) ---- */
         if (transport.isVisible())
@@ -561,13 +585,16 @@ public:
             r.removeFromLeft (tW + kGap);
         }
 
-        /* ---- After transport: Virtual Keyboard, Undo, Redo ---- */
-        vKbdBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kIconGap);
-        undoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kIconGap);
-        redoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kGap);
+        /* ---- After transport: Virtual Keyboard, Undo, Redo --
+                same LCD-framed 3-square cluster as the left side. */
+        const int postClusterW = kFramePad * 2 + kIconBtnW * 3 + kIconGap * 2;
+        postXportRect_ = Rectangle<int> (r.getX(), top, postClusterW, rowH);
+        const int postBtnY = top + kFramePad;
+        int px = r.getX() + kFramePad;
+        vKbdBtn_.setBounds (px, postBtnY, kIconBtnW, kIconBtnW); px += kIconBtnW + kIconGap;
+        undoBtn_.setBounds (px, postBtnY, kIconBtnW, kIconBtnW); px += kIconBtnW + kIconGap;
+        redoBtn_.setBounds (px, postBtnY, kIconBtnW, kIconBtnW);
+        r.removeFromLeft (postClusterW + kGap);
 
         /* ---- RIGHT (right-aligned chain): viewSelector | pluginWin |
                 pluginMenu | midiBlinker.  Walk r.removeFromRight in
@@ -588,10 +615,9 @@ public:
         }
         if (viewSelector.isVisible())
         {
-            /* 5 view buttons -- Patch / Graph / Arr / Tracker /
-             * Session.  Disk Op + Plugin Manager moved to the
-             * leftmost cluster.  rowH * 5 + 4 gaps. */
-            const int vsW = rowH * 5 + 4 * 4;
+            /* 5 view buttons inside an LCD frame: framePad*2 +
+             * 5*btn + 4*gap. */
+            const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
             viewSelector.setBounds (r.removeFromRight (vsW)
                                        .withSizeKeepingCentre (vsW, rowH));
         }
@@ -621,13 +647,17 @@ public:
 
     void paint (Graphics& g) override
     {
-        /* Match the parent Content's backgroundColor (0xff16191A — the
-         * blue-grey tone) exactly.  This is the color the body area
-         * actually shows (Content::paint fills with backgroundColor,
-         * NOT contentBackgroundColor), so top + body + bottom read as
-         * one continuous frame. */
+        /* Background fill matches Content::paint so toolbar + body
+         * read as one continuous frame. */
         g.setColour (Colors::backgroundColor);
         g.fillRect (getLocalBounds());
+
+        /* LCD frames painted behind each button cluster.  Transport
+         * + central display + view selector all paint their own
+         * frames internally; left + post-transport clusters use the
+         * shared paintLcdFrame helper here. */
+        if (! leftClusterRect_.isEmpty())  paintLcdFrame (g, leftClusterRect_);
+        if (! postXportRect_  .isEmpty())  paintLcdFrame (g, postXportRect_);
     }
 
     void buttonClicked (Button* btn) override
@@ -691,6 +721,10 @@ private:
     BlockToolButton vKbdBtn_      { "" };
     BlockToolButton undoBtn_      { "" };
     BlockToolButton redoBtn_      { "" };
+
+    /* LCD-frame bounds captured in resized(), painted in paint(). */
+    Rectangle<int> leftClusterRect_;
+    Rectangle<int> postXportRect_;
 
     void runPluginMenu()
     {
