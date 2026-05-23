@@ -148,15 +148,12 @@ void TransportBar::paint (Graphics& g)
 
 void TransportBar::resized()
 {
-    /* Height-driven layout — fills whatever vertical space the parent
-     * toolbar gives us (typically tempoBarHeight ≈ 26px), so transport
-     * buttons read as the same family as the tempo / view-selector
-     * buttons rather than a hardcoded 16px sliver.  Widths:
-     *   - bar/beat/sub labels: 1.6× height (room for 2-3 digits)
-     *   - transport icon buttons: 1.25× height (a bit wider than tall
-     *     so the icon doesn't crowd the bold edge stroke)
-     *   - 2px gaps between cells, 6px gap between the position
-     *     labels and the transport buttons. */
+    /* Height-driven layout.  In the new MainDisplayPanel-led toolbar
+     * the bar/beat/sub labels are hidden (showPositionLabels_=false)
+     * so this lays out as a tight Play / Stop / Record / SeekZero
+     * cluster on the left.  When labels are shown (e.g. legacy
+     * standalone use) they precede the buttons with a small group
+     * gap, matching the original layout. */
     const int h = getHeight();
     const int labelW = juce::jmax (24, juce::roundToInt (h * 1.6f));
     const int btnW   = juce::jmax (22, juce::roundToInt (h * 1.25f));
@@ -164,14 +161,28 @@ void TransportBar::resized()
     constexpr int groupGap = 6;
 
     int x = 0;
-    barLabel->setBounds  (x, 0, labelW, h); x += labelW + gap;
-    beatLabel->setBounds (x, 0, labelW, h); x += labelW + gap;
-    subLabel->setBounds  (x, 0, labelW, h); x += labelW + groupGap;
+    if (showPositionLabels_)
+    {
+        barLabel->setBounds  (x, 0, labelW, h); x += labelW + gap;
+        beatLabel->setBounds (x, 0, labelW, h); x += labelW + gap;
+        subLabel->setBounds  (x, 0, labelW, h); x += labelW + groupGap;
+    }
 
     play->setBounds   (x, 0, btnW, h); x += btnW + gap;
     stop->setBounds   (x, 0, btnW, h); x += btnW + gap;
     record->setBounds (x, 0, btnW, h); x += btnW + gap;
     toZero->setBounds (x, 0, btnW, h);
+}
+
+void TransportBar::setShowPositionLabels (bool show)
+{
+    if (showPositionLabels_ == show) return;
+    showPositionLabels_ = show;
+    if (barLabel)  barLabel ->setVisible (show);
+    if (beatLabel) beatLabel->setVisible (show);
+    if (subLabel)  subLabel ->setVisible (show);
+    resized();
+    updateWidth();
 }
 
 void TransportBar::buttonClicked (Button* buttonThatWasClicked)

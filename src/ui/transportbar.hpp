@@ -23,6 +23,12 @@ public:
     void updateWidth();
     void stabilize();
 
+    /** Hide the bar / beat / sub labels and lay out as buttons-only.
+     *  Used by the redesigned Content::Toolbar where the position
+     *  read-out moved into MainDisplayPanel; TransportBar then reads
+     *  as a tight transport-button cluster on the left. */
+    void setShowPositionLabels (bool show);
+
     void paint (Graphics& g) override;
     void resized() override;
 
@@ -33,6 +39,7 @@ private:
 
     std::unique_ptr<SettingButton> play, stop, record, toZero;
     std::unique_ptr<DragableIntLabel> barLabel, beatLabel, subLabel;
+    bool showPositionLabels_ { true };
 
     friend class BarLabel;
     friend class Timer;

@@ -7,6 +7,8 @@
 #include <element/devices.hpp>
 #include <element/node.hpp>
 #include <element/plugins.hpp>
+#include <element/session.hpp>
+#include <element/tags.hpp>
 #include <element/ui/commands.hpp>
 #include <element/ui/content.hpp>
 #include <element/ui/style.hpp>
@@ -22,6 +24,242 @@
 #include "ui/viewhelpers.hpp"
 
 namespace element {
+
+/* ===================================================================== */
+/* MainDisplayPanel: Bitwig-style central digital read-out for the top   */
+/* toolbar.  Custom-painted inset frame with large blue-cyan digits.     */
+/* Reads transport monitor + session at 15 Hz; mouse wheel adjusts BPM;  */
+/* double-click on position seeks to zero.  Embeds 4 mini toggle dots    */
+/* (Sync / Metro / Loop / Count) for the secondary affordances.         */
+/* ===================================================================== */
+class MainDisplayPanel : public juce::Component,
+                         private juce::Timer
+{
+public:
+    MainDisplayPanel (Services* svc)
+        : services_ (svc)
+    {
+        setOpaque (false);
+
+        for (auto* b : { &syncBtn_, &metroBtn_, &loopBtn_, &countBtn_ })
+        {
+            addAndMakeVisible (*b);
+            b->setClickingTogglesState (true);
+            b->setActiveTint (juce::Colour (0xff'4a'a5'd5));   // matches digit blue
+        }
+        syncBtn_  .onClick = [this]() {
+            syncBtn_.setLabel (syncBtn_.getToggleState() ? "Ex" : "In");
+        };
+
+        startTimerHz (15);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds();
+
+        /* Outer bezel: matte black with a 1px dark-grey rim.  Same
+         * idiom as a piece of hardware faceplate inset into the bar. */
+        g.setColour (juce::Colour (0xff'08'08'08));
+        g.fillRoundedRectangle (bounds.toFloat(), 4.0f);
+        g.setColour (juce::Colour (0xff'3a'3a'3a));
+        g.drawRoundedRectangle (bounds.toFloat().reduced (0.5f), 4.0f, 1.0f);
+
+        const auto inner = bounds.reduced (4, 4);
+
+        /* Inner LCD-style fill -- very dark cool grey behind the
+         * digits, with a soft top-down gradient for depth. */
+        juce::ColourGradient lcdGrad (
+            juce::Colour (0xff'14'19'1e),
+            (float) inner.getX(), (float) inner.getY(),
+            juce::Colour (0xff'0c'0f'12),
+            (float) inner.getX(), (float) inner.getBottom(),
+            false);
+        g.setGradientFill (lcdGrad);
+        g.fillRoundedRectangle (inner.toFloat(), 3.0f);
+
+        /* Vertical divider between BPM and position columns. */
+        const int dividerX = bpmAreaRect_.getRight() + 6;
+        g.setColour (juce::Colour (0xff'2a'30'38));
+        g.drawVerticalLine (dividerX,
+                              (float) (inner.getY() + 4),
+                              (float) (inner.getBottom() - 4));
+
+        const juce::Colour digitCol  { 0xff'5a'be'e5 };   // bright cyan-blue
+        const juce::Colour digitDim  { 0xff'3a'78'9a };   // softer for sub-text
+        const juce::Colour labelCol  { 0xff'6a'7a'8a };
+
+        /* BPM (large) */
+        g.setColour (digitCol);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      20.0f, juce::Font::bold));
+        g.drawText (bpmStr_, bpmAreaRect_,
+                    juce::Justification::centred, false);
+
+        /* Time signature small below BPM. */
+        g.setColour (digitDim);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      10.5f, juce::Font::plain));
+        g.drawText (meterStr_,
+                    bpmAreaRect_.withY (bpmAreaRect_.getBottom() - 2)
+                                .withHeight (12),
+                    juce::Justification::centred, false);
+
+        /* Position (large) */
+        g.setColour (digitCol);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      20.0f, juce::Font::bold));
+        g.drawText (positionStr_, posAreaRect_,
+                    juce::Justification::centred, false);
+
+        /* Time elapsed small below position. */
+        g.setColour (digitDim);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      10.5f, juce::Font::plain));
+        g.drawText (timeStr_,
+                    posAreaRect_.withY (posAreaRect_.getBottom() - 2)
+                                .withHeight (12),
+                    juce::Justification::centred, false);
+
+        /* "BPM" + "POS" labels in the top corners, almost-tooltip
+         * tiny so they don't compete with the digits. */
+        g.setColour (labelCol);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      8.5f, juce::Font::bold));
+        g.drawText ("BPM", bpmAreaRect_.getX(), inner.getY() + 1,
+                    bpmAreaRect_.getWidth(), 9,
+                    juce::Justification::centredLeft, false);
+        g.drawText ("POS", posAreaRect_.getX(), inner.getY() + 1,
+                    posAreaRect_.getWidth(), 9,
+                    juce::Justification::centredLeft, false);
+    }
+
+    void resized() override
+    {
+        const auto inner = getLocalBounds().reduced (4, 4);
+
+        /* Left edge: 2 stacked mini-toggle dots (Sync + Metro). */
+        const int dotW = 22;
+        const int dotH = juce::jmax (12, (inner.getHeight() - 6) / 2);
+        Rectangle<int> leftCol (inner.getX() + 4, inner.getY() + 3, dotW, inner.getHeight() - 6);
+        syncBtn_ .setBounds (leftCol.removeFromTop (dotH));
+        leftCol.removeFromTop (2);
+        metroBtn_.setBounds (leftCol.removeFromTop (dotH));
+
+        /* Right edge: 2 stacked mini-toggle dots (Loop + Count). */
+        Rectangle<int> rightCol (inner.getRight() - dotW - 4, inner.getY() + 3,
+                                  dotW, inner.getHeight() - 6);
+        loopBtn_ .setBounds (rightCol.removeFromTop (dotH));
+        rightCol.removeFromTop (2);
+        countBtn_.setBounds (rightCol.removeFromTop (dotH));
+
+        /* Centre area holds the BPM and POS readouts on either side
+         * of a divider.  BPM column ~95 px (room for "999.99"), POS
+         * column ~125 px (room for "999.4.4.99"). */
+        const int leftEdge  = syncBtn_.getRight() + 6;
+        const int rightEdge = loopBtn_.getX() - 6;
+        const int textTop   = inner.getY() + 10;
+        const int textH     = inner.getHeight() - 24;
+        const int bpmW      = 95;
+        const int posW      = juce::jmax (110, rightEdge - leftEdge - bpmW - 12);
+        bpmAreaRect_ = Rectangle<int> (leftEdge, textTop, bpmW, textH);
+        posAreaRect_ = Rectangle<int> (leftEdge + bpmW + 12, textTop, posW, textH);
+    }
+
+    /* BPM scroll-to-edit: mouse wheel on the BPM cell nudges tempo
+     * by 1 (shift = 0.1).  Cheap, no popup needed. */
+    void mouseWheelMove (const juce::MouseEvent& e,
+                          const juce::MouseWheelDetails& w) override
+    {
+        if (! bpmAreaRect_.contains (e.x, e.y)) return;
+        if (services_ == nullptr) return;
+        auto session = services_->context().session();
+        if (session == nullptr) return;
+
+        const float step = e.mods.isShiftDown() ? 0.1f : 1.0f;
+        const float delta = (w.deltaY > 0 ? 1.0f : (w.deltaY < 0 ? -1.0f : 0.0f)) * step;
+        if (delta == 0.0f) return;
+
+        auto tempoVal = session->getPropertyAsValue (tags::tempo);
+        const float current = (float) (double) tempoVal.getValue();
+        const float next = juce::jlimit (20.0f, 999.0f, current + delta);
+        tempoVal.setValue ((double) next);
+    }
+
+    /* Double-click on the POS column seeks to zero.  Established
+     * convention from the legacy bar label. */
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (! posAreaRect_.contains (e.x, e.y)) return;
+        if (services_ == nullptr) return;
+        if (auto eng = services_->context().audio().get())
+            eng->seekToAudioFrame (0);
+    }
+
+private:
+    void timerCallback() override
+    {
+        if (services_ == nullptr) return;
+
+        if (monitor_ == nullptr)
+        {
+            if (auto eng = services_->context().audio().get())
+                monitor_ = eng->getTransportMonitor();
+        }
+        auto session = services_->context().session();
+        if (monitor_ == nullptr || session == nullptr) return;
+
+        const float bpm = monitor_->tempo.get();
+        const int bpb   = juce::jmax (1, monitor_->beatsPerBar.get());
+        const int bt    = juce::jmax (1, monitor_->beatType.get());
+
+        bool dirty = false;
+        const auto newBpm   = juce::String (bpm, 2);
+        const auto newMeter = juce::String (bpb) + "/" + juce::String (bt);
+        if (newBpm   != bpmStr_)   { bpmStr_   = newBpm;   dirty = true; }
+        if (newMeter != meterStr_) { meterStr_ = newMeter; dirty = true; }
+
+        int bars = 0, beats = 0, sub = 0;
+        monitor_->getBarsAndBeats (bars, beats, sub);
+        auto newPos = juce::String (bars + 1) + "."
+                    + juce::String (beats + 1) + "."
+                    + juce::String (sub + 1);
+        if (newPos != positionStr_) { positionStr_ = newPos; dirty = true; }
+
+        const double secs = monitor_->getPositionSeconds();
+        const int totalMs = (int) std::lround (secs * 1000.0);
+        const int mm = totalMs / 60000;
+        const int rest = totalMs - mm * 60000;
+        const int ss = rest / 1000;
+        const int ms = rest - ss * 1000;
+        juce::String newTime;
+        newTime << mm << ":";
+        if (ss < 10) newTime << "0";
+        newTime << ss << ".";
+        if (ms < 100) newTime << "0";
+        if (ms < 10)  newTime << "0";
+        newTime << ms;
+        if (newTime != timeStr_) { timeStr_ = newTime; dirty = true; }
+
+        if (dirty) repaint();
+    }
+
+    Services*               services_ { nullptr };
+    Transport::MonitorPtr   monitor_;
+
+    juce::String bpmStr_      { "120.00" };
+    juce::String meterStr_    { "4/4"     };
+    juce::String positionStr_ { "1.1.1"   };
+    juce::String timeStr_     { "0:00.000" };
+
+    Rectangle<int> bpmAreaRect_;
+    Rectangle<int> posAreaRect_;
+
+    BlockToolButton syncBtn_  { "In" };
+    BlockToolButton metroBtn_ { "Me" };
+    BlockToolButton loopBtn_  { "Lp" };
+    BlockToolButton countBtn_ { "Ct" };
+};
 
 ContentView::ContentView()
 {
@@ -145,40 +383,19 @@ public:
 
         addAndMakeVisible (midiBlinker);
 
-        /* Bottom-row secondary widgets (Bitwig-style depth). */
-        addAndMakeVisible (timeElapsedLabel_);
-        timeElapsedLabel_.setText ("0:00.000", juce::dontSendNotification);
-        timeElapsedLabel_.setJustificationType (juce::Justification::centred);
-        timeElapsedLabel_.setColour (juce::Label::textColourId,
-                                       juce::Colour (0xff'c0'd5'e5));
-        timeElapsedLabel_.setFont (juce::FontOptions (
-            juce::Font::getDefaultMonospacedFontName(), 13.0f, juce::Font::bold));
+        /* New central digital readout -- BPM + position + meter +
+         * elapsed all bundled in one inset Bitwig-style panel.
+         * Replaces TempoAndMeterBar's tiny BPM/TAP/4-4 cluster +
+         * TransportBar's bars/beats/sub labels in this toolbar. */
+        addAndMakeVisible (display_);
 
-        const juce::Colour kActiveTint { 0xff'4a'a5'5a };
-        addAndMakeVisible (metroBtn_);
-        metroBtn_.setClickingTogglesState (true);
-        metroBtn_.setActiveTint (kActiveTint);
-        metroBtn_.setTooltip ("Metronome (placeholder; click track wiring pending)");
-
-        addAndMakeVisible (loopGlobalBtn_);
-        loopGlobalBtn_.setClickingTogglesState (true);
-        loopGlobalBtn_.setActiveTint (kActiveTint);
-        loopGlobalBtn_.setTooltip ("Transport loop (set range on the timeline first)");
-
-        addAndMakeVisible (syncBtn_);
-        syncBtn_.setClickingTogglesState (true);
-        syncBtn_.setActiveTint (juce::Colour (0xff'b5'8a'4a));   // amber when on (Ext)
-        syncBtn_.setTooltip ("Sync source: Int / Ext (mirrors tempo bar)");
-        syncBtn_.onClick = [this]() {
-            const bool ext = syncBtn_.getToggleState();
-            syncBtn_.setLabel (ext ? "Ext" : "Int");
-        };
-
-        /* Always-on timer ticks the time-elapsed readout (~80 ms).
-         * Existing buttonClicked timer for mapButton learning also
-         * uses this Timer; both call timerCallback so we have a
-         * single dispatch -- check what reasonably wants the tick. */
-        startTimerHz (12);
+        /* Hide the redundant pieces: the legacy TempoAndMeterBar
+         * (BPM in display_), and TransportBar's position labels
+         * (also in display_).  TransportBar now reads as a tight
+         * Play/Stop/Record/SeekZero cluster on the left. */
+        tempoBar.setVisible (false);
+        transport.setShowPositionLabels (false);
+        transport.updateWidth();
     }
 
     ~Toolbar()
@@ -223,99 +440,71 @@ public:
 
     void resized() override
     {
-        Rectangle<int> bounds (getLocalBounds());
-        const int H = bounds.getHeight();
+        /* Single-row Bitwig-style layout:
+         *
+         *   [transport cluster ] [== central display ==] [view selector + extras]
+         *
+         * Transport buttons sit hard-left at full bar height (~44 px
+         * tall when toolBarSize=60).  Central display is a fixed-
+         * width inset panel taking ~380 px in the middle.  Right
+         * cluster (view selector + plugin menu + midi blinker) is
+         * right-aligned.  Map button + tempoBar are hidden in this
+         * layout. */
+        Rectangle<int> r = getLocalBounds();
+        const int H = r.getHeight();
+        const int innerPad = juce::jmax (3, (H - 50) / 2);   // vertical centre
+        const int rowH = H - innerPad * 2;
 
-        /* Two-row Bitwig-style layout when we have the height for it
-         * (>= 50 px); otherwise collapse back to a single row so
-         * settings.toolBarSize=32 still works.  Primary row (top):
-         * tempo / transport / view-selector.  Secondary row (bottom):
-         * time elapsed, Metro / Loop / Int.Ext sync. */
-        const bool twoRows = H >= 50;
-        Rectangle<int> topRow, botRow;
-        if (twoRows)
+        constexpr int kSidePad = 6;
+        constexpr int kGap     = 10;
+        constexpr int kDisplayW = 380;
+
+        r.reduce (kSidePad, 0);
+
+        /* ---- LEFT: transport (Play / Stop / Record / SeekZero) ---- */
+        if (transport.isVisible())
         {
-            topRow = bounds.removeFromTop (H / 2 + 2);
-            botRow = bounds;
+            transport.setShowPositionLabels (false);
+            transport.setSize (transport.getWidth(), rowH);
+            transport.updateWidth();
+            const int tW = juce::jmax (160, transport.getWidth());
+            const Rectangle<int> tr (r.getX(), innerPad, tW, rowH);
+            transport.setBounds (tr);
+            r.removeFromLeft (tW + kGap);
         }
-        else
-        {
-            topRow = bounds;
-        }
 
-        /* ---- Top row (existing layout) ---- */
-        Rectangle<int> r = topRow;
-        const int tempoBarHeight = juce::jmax (20, r.getHeight() - 6);
-        const int tempoBarWidth  = jmax (120, tempoBar.getWidth());
-
-        tempoBar.setBounds (4, r.getY() + 3, tempoBarWidth, tempoBarHeight);
-        r.removeFromRight (4);
-
+        /* ---- RIGHT: viewSelector + pluginMenu + midiBlinker ---- */
         if (pluginMenu.isVisible())
         {
-            int pms = tempoBarHeight + 3;
-            pluginMenu.setBounds (r.removeFromRight (tempoBarHeight).withSizeKeepingCentre (pms, pms));
-            r.removeFromRight (2);
+            const int pms = rowH + 3;
+            pluginMenu.setBounds (r.removeFromRight (rowH).withSizeKeepingCentre (pms, pms));
+            r.removeFromRight (kGap / 2);
         }
-
         if (midiBlinker.isVisible())
         {
             const int blinkerW = 8;
-            midiBlinker.setBounds (r.removeFromRight (blinkerW).withSizeKeepingCentre (blinkerW, tempoBarHeight));
-            r.removeFromRight (2);
+            midiBlinker.setBounds (r.removeFromRight (blinkerW)
+                                       .withSizeKeepingCentre (blinkerW, rowH));
+            r.removeFromRight (kGap / 2);
         }
-
         if (viewSelector.isVisible())
         {
-            viewSelector.setBounds (r.removeFromRight (tempoBarHeight * 4)
-                                       .withSizeKeepingCentre (tempoBarHeight * 4, tempoBarHeight));
+            viewSelector.setBounds (r.removeFromRight (rowH * 4)
+                                       .withSizeKeepingCentre (rowH * 4, rowH));
         }
-
         if (mapButton.isVisible())
         {
             r.removeFromRight (2);
-            mapButton.setBounds (r.removeFromRight (tempoBarHeight * 2)
-                                     .withSizeKeepingCentre (tempoBarHeight * 2, tempoBarHeight));
+            mapButton.setBounds (r.removeFromRight (rowH * 2)
+                                     .withSizeKeepingCentre (rowH * 2, rowH));
         }
 
-        if (transport.isVisible())
+        /* ---- CENTRE: digital display ---- */
         {
-            const int tW = transport.getWidth();
-            Rectangle<int> tr (topRow.getX() + (topRow.getWidth() / 2) - (tW / 2),
-                                topRow.getY(),
-                                tW, topRow.getHeight());
-            transport.setBounds (tr.withSizeKeepingCentre (tW, tempoBarHeight));
+            const int dispW = juce::jmin (kDisplayW, juce::jmax (240, r.getWidth() - 8));
+            const int dispX = r.getX() + (r.getWidth() - dispW) / 2;
+            display_.setBounds (dispX, innerPad, dispW, rowH);
         }
-
-        if (! twoRows)
-        {
-            timeElapsedLabel_.setVisible (false);
-            metroBtn_      .setVisible (false);
-            loopGlobalBtn_ .setVisible (false);
-            syncBtn_       .setVisible (false);
-            return;
-        }
-        timeElapsedLabel_.setVisible (true);
-        metroBtn_      .setVisible (true);
-        loopGlobalBtn_ .setVisible (true);
-        syncBtn_       .setVisible (true);
-
-        /* ---- Bottom row (Bitwig-style secondaries) ----
-         *
-         * Left:  time elapsed (mm:ss.mmm), big monospace readout.
-         * Centre: Metro / Loop / Sync trio of toggles.
-         * Right: reserved for future widgets (key sig, master meter)
-         *        -- visible blank space communicates the affordance
-         *        until those widgets land. */
-        Rectangle<int> br = botRow.reduced (4, 3);
-        const int rowH = br.getHeight();
-
-        timeElapsedLabel_.setBounds (br.removeFromLeft (140));
-        br.removeFromLeft (12);
-
-        metroBtn_      .setBounds (br.removeFromLeft (rowH * 3));   br.removeFromLeft (3);
-        loopGlobalBtn_ .setBounds (br.removeFromLeft (rowH * 3));   br.removeFromLeft (3);
-        syncBtn_       .setBounds (br.removeFromLeft (rowH * 2));
     }
 
     void paint (Graphics& g) override
@@ -347,43 +536,16 @@ public:
 
     void timerCallback() override
     {
-        /* Resolve the transport monitor lazily; the audio engine isn't
-         * ready until the session loads. */
-        if (transportMonitor_ == nullptr)
-        {
-            if (auto* g = ViewHelpers::getGlobals (this))
-                if (auto eng = g->audio())
-                    transportMonitor_ = eng->getTransportMonitor();
-        }
-
-        if (transportMonitor_ != nullptr)
-        {
-            const double secs = transportMonitor_->getPositionSeconds();
-            if (std::abs (secs - lastShownTimeSecs_) > 0.01)
-            {
-                lastShownTimeSecs_ = secs;
-                const int totalMs = (int) std::lround (secs * 1000.0);
-                const int mins    = totalMs / 60000;
-                const int rest    = totalMs - mins * 60000;
-                const int seconds = rest / 1000;
-                const int millis  = rest - seconds * 1000;
-                juce::String s;
-                s << mins << ":";
-                if (seconds < 10) s << "0";
-                s << seconds << ".";
-                if (millis < 100) s << "0";
-                if (millis < 10)  s << "0";
-                s << millis;
-                timeElapsedLabel_.setText (s, juce::dontSendNotification);
-            }
-        }
-
-        /* Mapping-learn auto-clear (legacy behaviour; harmless when
-         * mapping isn't engaged). */
+        /* MainDisplayPanel runs its own timer for the digital read-
+         * out.  Toolbar's timer is now used only for mapping-learn
+         * auto-clear (legacy behaviour). */
         if (auto* mapping = owner.services().find<MappingService>())
         {
             if (! mapping->isLearning() && mapButton.getToggleState())
+            {
                 mapButton.setToggleState (false, dontSendNotification);
+                stopTimer();
+            }
         }
     }
 
@@ -399,16 +561,11 @@ private:
     MidiBlinker midiBlinker;
     Array<SignalConnection> connections;
 
-    /* Bottom-row Bitwig-style secondary widgets.  Visual-only stubs
-     * for v1 -- engine wiring (metronome click track, transport-
-     * loop, MIDI / link sync mode) is queued.  Time elapsed reads
-     * the monitor directly so it lights up immediately. */
-    juce::Label      timeElapsedLabel_;
-    BlockToolButton  metroBtn_  { "Metro" };
-    BlockToolButton  loopGlobalBtn_ { "Loop" };
-    BlockToolButton  syncBtn_   { "Int" };
-    Transport::MonitorPtr transportMonitor_;
-    double           lastShownTimeSecs_ { -1.0 };
+    /* Central digital readout (Bitwig-style faceplate).  Holds BPM
+     * + meter + position + elapsed + Sync/Metro/Loop/Count micro
+     * toggles.  Self-timed at 15 Hz; pulls state directly from the
+     * transport monitor + session. */
+    MainDisplayPanel display_ { &owner.services() };
 
     void runPluginMenu()
     {
