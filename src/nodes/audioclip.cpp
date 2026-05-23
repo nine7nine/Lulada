@@ -221,7 +221,15 @@ AudioClipNode::processBlock (juce::AudioBuffer<float>& buffer,
          * envelope steps, inaudibly coarse for the typical fade
          * length.  Sample-accurate ramping (juce::AudioBuffer::
          * applyGainRamp) is a polish item. */
+        /* Base block gain.  Live override (from clip volume envelope
+         * evaluation on the message thread) supersedes the static
+         * per-launch gain when present.  Fades multiply on top so
+         * envelope + fade-in/out compose cleanly. */
         float blockGain = activeGainLinear_;
+        {
+            const float live = liveGainOverride_.load (std::memory_order_relaxed);
+            if (! std::isnan (live)) blockGain = live;
+        }
 
         if (activeFadeInSamples_ > 0 && activeSamplesPlayed_ < activeFadeInSamples_)
         {

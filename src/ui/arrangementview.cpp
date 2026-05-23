@@ -3223,6 +3223,37 @@ void ArrangementView::timerCallback()
         }
     }
 
+    /* Clip volume envelope -- push the evaluated live gain to each
+     * audio lane whose last-dispatched region carries an envelope.
+     * 30 Hz update rate; coarser than per-sample but matches Bitwig's
+     * display refresh + is plenty for most musical envelopes.  Lanes
+     * without an envelope clear the override (NaN) so the per-launch
+     * static gain takes back over. */
+    if (playing)
+    {
+        for (int i = 0; i < lanes_.size(); ++i)
+        {
+            auto& rs = laneRuntime_.getReference (i);
+            if (! rs.isAudioLane()) continue;
+            if (rs.lastDispatchedRegion.isNull())
+            {
+                rs.audioClipCache->setLiveGain (std::numeric_limits<float>::quiet_NaN());
+                continue;
+            }
+            const auto& lane = lanes_.getReference (i);
+            const auto* r = lane.playlist.findRegion (rs.lastDispatchedRegion);
+            if (r == nullptr || r->volumeEnvelope.size() < 2)
+            {
+                rs.audioClipCache->setLiveGain (std::numeric_limits<float>::quiet_NaN());
+                continue;
+            }
+            const double localBeat = beat - r->positionBeats;
+            const float  envDb = r->gainAtBeatOffset (localBeat);
+            const float  linear = juce::Decibels::decibelsToGain (envDb);
+            rs.audioClipCache->setLiveGain (linear);
+        }
+    }
+
     if (playing) dispatchAtBeat (beat);
 
     if (body_ != nullptr && (playing || wasPlaying_ != playing))
