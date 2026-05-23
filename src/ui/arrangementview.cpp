@@ -616,10 +616,13 @@ public:
 
         if (r->volumeEnvelope.empty())
         {
+            /* Seed at 0 dB (unity gain) so the envelope defaults to
+             * "no attenuation", not whatever the static gainDb was.
+             * The user drags individual points down from there. */
             EnvelopePoint anchor0; anchor0.id = juce::Uuid();
-            anchor0.beatOffset = 0.0; anchor0.gainDb = (float) r->gainDb;
+            anchor0.beatOffset = 0.0; anchor0.gainDb = 0.0f;
             EnvelopePoint anchorN; anchorN.id = juce::Uuid();
-            anchorN.beatOffset = r->lengthBeats; anchorN.gainDb = (float) r->gainDb;
+            anchorN.beatOffset = r->lengthBeats; anchorN.gainDb = 0.0f;
             r->volumeEnvelope.push_back (anchor0);
             r->volumeEnvelope.push_back (anchorN);
         }
@@ -1310,13 +1313,18 @@ private:
         return Rectangle<int> (laneButtonX(), y, kBtnW, kBtnH);
     }
 
-    /** Paint a volume envelope curve over the audio region body.
-     *  Always renders SOMETHING when the region is audio + body has
-     *  enough height: empty envelope -> single horizontal line at
-     *  the static gainDb; >=2 points -> connected segments coloured
-     *  per their curve type with breakpoint dots at each vertex.
-     *  Envelope sits on top of the waveform but below the borders
-     *  so the title strip + selection ring stay clean. */
+    /** Paint a volume envelope curve over the audio region body
+     *  plus an attenuation-shading polygon above the curve.
+     *
+     *  Visual: the area BETWEEN the top of the body and the envelope
+     *  curve is dimmed by a translucent black overlay, so the
+     *  shaded portion of the clip reads as "this much gain is being
+     *  cut here".  Below the curve stays at full waveform intensity.
+     *
+     *  Empty envelope -> single horizontal line at 0 dB (the curve
+     *  defaults to unity gain on first paint); the area above that
+     *  line is also shaded so the surface always has something to
+     *  read against. */
     void paintVolumeEnvelope (Graphics& g,
                                 const Rectangle<int>& body,
                                 const Region& r,
@@ -1327,8 +1335,7 @@ private:
         if (r.lengthBeats <= 1e-6) return;
 
         /* Map gainDb to Y over a [+6, -24] dB window.  0 dB sits at
-         * 80 % up the body; clipping the range keeps the line from
-         * leaving the rect on extreme gains. */
+         * 80 % up the body so the user can pull above unity gain too. */
         constexpr float kTopDb = 6.0f;
         constexpr float kBotDb = -24.0f;
         const int yPad = 3;
@@ -1349,56 +1356,103 @@ private:
             ? juce::Colours::white
             : tint.brighter (0.45f).withAlpha (0.85f);
 
-        if (r.volumeEnvelope.empty())
-        {
-            /* No breakpoints -> show the static gain as a horizontal
-             * line.  Double-click promotes this to an editable curve
-             * (Body::mouseDoubleClick inserts two anchor points). */
-            const float y = gainToY ((float) r.gainDb);
-            g.setColour (lineCol.withAlpha (0.55f));
-            g.drawLine ((float) body.getX(), y,
-                        (float) body.getRight(), y, 1.0f);
-            return;
-        }
-
-        /* Build the curve path.  N=12 segments per breakpoint pair
-         * is enough resolution for any of our curve shapes at typical
-         * zoom levels and stays cheap to repaint. */
-        juce::Path path;
-        const auto& first = r.volumeEnvelope.front();
-        path.startNewSubPath (beatToX (first.beatOffset), gainToY (first.gainDb));
+        /* Build a stroke path for the envelope curve AND an aligned
+         * polygon path for the attenuation shading above the curve.
+         * Both share the same per-segment subdivision so the shaded
+         * polygon's bottom edge sits perfectly on the line. */
+        juce::Path stroke;
+        juce::Path shadePoly;
 
         constexpr int kSubdiv = 12;
-        for (size_t i = 0; i + 1 < r.volumeEnvelope.size(); ++i)
+
+        auto pushSegment = [&] (double beatA, float dbA,
+                                 double beatB, float dbB,
+                                 EnvelopeCurve curve, bool first)
         {
-            const auto& a = r.volumeEnvelope[i];
-            const auto& b = r.volumeEnvelope[i + 1];
-            if (a.curve == EnvelopeCurve::Hold)
+            const float xA = beatToX (beatA);
+            const float yA = gainToY (dbA);
+            if (first)
             {
-                path.lineTo (beatToX (b.beatOffset), gainToY (a.gainDb));
-                path.lineTo (beatToX (b.beatOffset), gainToY (b.gainDb));
-                continue;
+                stroke.startNewSubPath (xA, yA);
+                shadePoly.startNewSubPath ((float) body.getX(), (float) body.getY());
+                shadePoly.lineTo (xA, (float) body.getY());
+                shadePoly.lineTo (xA, yA);
             }
-            if (a.curve == EnvelopeCurve::Linear)
+            if (curve == EnvelopeCurve::Hold)
             {
-                path.lineTo (beatToX (b.beatOffset), gainToY (b.gainDb));
-                continue;
+                const float xB = beatToX (beatB);
+                stroke.lineTo (xB, yA);
+                stroke.lineTo (xB, gainToY (dbB));
+                shadePoly.lineTo (xB, yA);
+                shadePoly.lineTo (xB, gainToY (dbB));
+                return;
+            }
+            if (curve == EnvelopeCurve::Linear)
+            {
+                const float xB = beatToX (beatB);
+                const float yB = gainToY (dbB);
+                stroke.lineTo (xB, yB);
+                shadePoly.lineTo (xB, yB);
+                return;
             }
             for (int k = 1; k <= kSubdiv; ++k)
             {
                 const double t = (double) k / (double) kSubdiv;
                 double shaped = t;
-                if (a.curve == EnvelopeCurve::Exponential) shaped = t * t;
-                if (a.curve == EnvelopeCurve::Smooth)
+                if (curve == EnvelopeCurve::Exponential) shaped = t * t;
+                if (curve == EnvelopeCurve::Smooth)
                     shaped = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * t);
-                const double beat = a.beatOffset + t * (b.beatOffset - a.beatOffset);
-                const double db   = a.gainDb + shaped * (b.gainDb - a.gainDb);
-                path.lineTo (beatToX (beat), gainToY ((float) db));
+                const double beat = beatA + t * (beatB - beatA);
+                const double db   = dbA + shaped * (dbB - dbA);
+                const float xK = beatToX (beat);
+                const float yK = gainToY ((float) db);
+                stroke.lineTo (xK, yK);
+                shadePoly.lineTo (xK, yK);
             }
+        };
+
+        if (r.volumeEnvelope.empty())
+        {
+            /* No breakpoints -> render an implicit "constant at 0 dB"
+             * line spanning the full region.  Shading above is still
+             * meaningful (zero, since 0 dB is at the top window edge,
+             * but the surface IS there to double-click). */
+            const float y = gainToY (0.0f);
+            stroke.startNewSubPath ((float) body.getX(),     y);
+            stroke.lineTo            ((float) body.getRight(), y);
+            shadePoly.startNewSubPath ((float) body.getX(),     (float) body.getY());
+            shadePoly.lineTo            ((float) body.getRight(), (float) body.getY());
+            shadePoly.lineTo            ((float) body.getRight(), y);
+            shadePoly.lineTo            ((float) body.getX(),     y);
+            shadePoly.closeSubPath();
+        }
+        else
+        {
+            for (size_t i = 0; i + 1 < r.volumeEnvelope.size(); ++i)
+            {
+                const auto& a = r.volumeEnvelope[i];
+                const auto& b = r.volumeEnvelope[i + 1];
+                pushSegment (a.beatOffset, a.gainDb,
+                              b.beatOffset, b.gainDb,
+                              a.curve, i == 0);
+            }
+            /* Close the shading polygon: traverse along the top edge
+             * back to the starting X. */
+            const auto& last = r.volumeEnvelope.back();
+            const float xEnd = beatToX (last.beatOffset);
+            shadePoly.lineTo (xEnd, (float) body.getY());
+            shadePoly.closeSubPath();
         }
 
+        /* Attenuation shading -- translucent black above the curve.
+         * Sits below the envelope line so it never hides the curve
+         * itself; sits above the waveform so the dimming is visible. */
+        g.setColour (juce::Colours::black.withAlpha (0.45f));
+        g.fillPath (shadePoly);
+
+        /* Envelope line on top of everything. */
         g.setColour (lineCol);
-        g.strokePath (path, juce::PathStrokeType (selected ? 1.5f : 1.0f));
+        g.strokePath (stroke, juce::PathStrokeType (selected ? 1.5f : 1.0f));
 
         /* Breakpoint dots -- larger + ringed when selected. */
         const float dotR = selected ? 3.0f : 2.5f;
@@ -1714,26 +1768,11 @@ private:
                 g.setColour (titleFill);
                 g.fillRect (titleRect);
 
-                /* Bitwig-style depth shading: subtle vertical gradient
-                 * over the top ~40% of the body, darkening at the
-                 * title-strip seam and fading to transparent toward
-                 * the centre.  Gives the clip a "lip" so the title
-                 * pops away from the waveform. */
-                if (bodyRect.getHeight() > 6)
-                {
-                    const int shadeH = juce::jmin (bodyRect.getHeight(),
-                                                    juce::jmax (8,
-                                                        (int) (bodyRect.getHeight() * 0.40f)));
-                    juce::ColourGradient grad (
-                        juce::Colours::black.withAlpha (0.45f),
-                        (float) bodyRect.getX(), (float) bodyRect.getY(),
-                        juce::Colours::black.withAlpha (0.0f),
-                        (float) bodyRect.getX(), (float) (bodyRect.getY() + shadeH),
-                        false);
-                    g.setGradientFill (grad);
-                    g.fillRect (bodyRect.getX(), bodyRect.getY(),
-                                bodyRect.getWidth(), shadeH);
-                }
+                /* (Envelope-driven attenuation shading is drawn by
+                 * paintVolumeEnvelope below -- it shades only the area
+                 * ABOVE the envelope curve, so the visible "dimmed"
+                 * region maps directly to how much gain is being cut.
+                 * No global gradient here.) */
             }
 
             /* Waveform overlay for audio regions (sequenceIdx < 0),
