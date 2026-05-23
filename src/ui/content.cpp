@@ -303,10 +303,12 @@ public:
           graphBtn   ("", juce::Colour::fromRGB (110, 170, 110)),
           arrBtn     ("", juce::Colour::fromRGB (220, 140,  60)),
           trkBtn     ("", juce::Colour::fromRGB (160, 100, 180)),
-          sessionBtn ("", juce::Colour::fromRGB ( 80, 200, 170)),
-          diskBtn    ("", juce::Colour::fromRGB (200, 180,  80)),
-          plugBtn    ("", juce::Colour::fromRGB (190, 110, 170))
+          sessionBtn ("", juce::Colour::fromRGB ( 80, 200, 170))
     {
+        /* Disk Op + Plugin Manager moved OUT of the view selector
+         * into the leftmost cluster of the main toolbar (Content::
+         * Toolbar handles those two now).  This selector shows the
+         * 5 graph-editing surfaces only. */
         using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
         auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID,
                               IconFn icon)
@@ -326,19 +328,14 @@ public:
         wire (arrBtn,     "Arrangement",    Commands::showArrangement,   &ui::iconArrangement);
         wire (trkBtn,     "Trackers",       Commands::showTrackerHost,   &ui::iconTracker);
         wire (sessionBtn, "Session",        Commands::showSessionView,   &ui::iconSession);
-        wire (diskBtn,    "Disk Op",        Commands::showDiskOp,        &ui::iconDisk);
-        wire (plugBtn,    "Plugin Manager", Commands::showPluginManager, &ui::iconPluginManager);
 
-        startTimer (150); // tick-state refresh; cheap, no repaint when nothing changed
+        startTimer (150);
     }
 
     void resized() override
     {
-        /* 4-px gap between buttons (matches the transport cluster
-         * spacing) so the bar reads as a row of distinct chips, not
-         * a single dark strip. */
         constexpr int kGap = 4;
-        const int n = 7;
+        const int n = 5;
         auto r = getLocalBounds();
         const int total = r.getWidth();
         const int w = (total - kGap * (n - 1)) / n;
@@ -352,9 +349,7 @@ public:
         place (graphBtn);
         place (arrBtn);
         place (trkBtn);
-        place (sessionBtn);
-        place (diskBtn);
-        plugBtn.setBounds (r);
+        sessionBtn.setBounds (r);
     }
 
 private:
@@ -379,12 +374,9 @@ private:
         refresh (arrBtn,     Commands::showArrangement);
         refresh (trkBtn,     Commands::showTrackerHost);
         refresh (sessionBtn, Commands::showSessionView);
-        refresh (diskBtn,    Commands::showDiskOp);
-        refresh (plugBtn,    Commands::showPluginManager);
     }
 
-    BlockToolButton patchBtn, graphBtn, arrBtn, trkBtn,
-                    sessionBtn, diskBtn, plugBtn;
+    BlockToolButton patchBtn, graphBtn, arrBtn, trkBtn, sessionBtn;
 };
 
 class Content::Toolbar : public Component,
@@ -428,26 +420,36 @@ public:
         transport.setShowPositionLabels (false);
         transport.updateWidth();
 
-        /* Leftmost cluster: file menu, virtual keyboard toggle, then
-         * Edit-menu Undo / Redo.  Bitwig puts the FILE button as the
-         * first thing on the bar -- mirror that. */
+        /* Reordered toolbar layout:
+         *   far-left:  Disk Op + Plugin Manager (file + plugin
+         *              browser shortcuts) + Preferences (cog).
+         *   then:      transport (Play / Stop / Record / SeekZero).
+         *   then:      Virtual Keyboard + Undo + Redo.
+         *   centre:    digital display.
+         *   right:     5-view selector + plugin menu + midi blinker. */
         using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
         auto wireBtn = [&] (BlockToolButton& b, const juce::String& tip,
-                              IconFn icon, std::function<void()> action)
+                              IconFn icon, std::function<void()> action,
+                              juce::Colour borderTint = {})
         {
             b.setTooltip (tip);
             b.setIcon ([icon] (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour fg)
                        { icon (g, r, fg); });
             b.onClick = std::move (action);
             addAndMakeVisible (b);
+            juce::ignoreUnused (borderTint);
         };
-        wireBtn (fileMenuBtn_, "File / Session menu", &ui::iconMenu,
-                  [this]() { runFileMenu(); });
-        wireBtn (vKbdBtn_,     "Virtual keyboard",     &ui::iconKeyboard,
+        wireBtn (diskOpBtn_,    "Disk Op",         &ui::iconDisk,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showDiskOp, true); });
+        wireBtn (pluginMgrBtn_, "Plugin Manager",  &ui::iconPluginManager,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showPluginManager, true); });
+        wireBtn (prefsBtn_,     "Preferences...",  &ui::iconCog,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showPreferences, true); });
+        wireBtn (vKbdBtn_,      "Virtual keyboard", &ui::iconKeyboard,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::toggleVirtualKeyboard, true); });
-        wireBtn (undoBtn_, "Undo", &ui::iconUndo,
+        wireBtn (undoBtn_,      "Undo",             &ui::iconUndo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::undo, true); });
-        wireBtn (redoBtn_, "Redo", &ui::iconRedo,
+        wireBtn (redoBtn_,      "Redo",             &ui::iconRedo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
 
         vKbdBtn_.setClickingTogglesState (true);
@@ -523,14 +525,13 @@ public:
         r.reduce (kSidePad, 0);
         const int top = r.getY() + innerPad;
 
-        /* ---- LEFT: file menu + virtual keyboard + undo + redo ---- */
-        fileMenuBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        /* ---- LEFT: Disk Op + Plugin Manager (file + plugin view
+                shortcuts), Preferences cog ---- */
+        diskOpBtn_   .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (kIconGap);
-        vKbdBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        pluginMgrBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (kGap);
-        undoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
-        r.removeFromLeft (kIconGap);
-        redoBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        prefsBtn_    .setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
         r.removeFromLeft (kGap);
 
         /* ---- Transport (Play / Stop / Record / SeekZero) ---- */
@@ -543,6 +544,14 @@ public:
             transport.setBounds (r.getX(), top, tW, rowH);
             r.removeFromLeft (tW + kGap);
         }
+
+        /* ---- After transport: Virtual Keyboard, Undo, Redo ---- */
+        vKbdBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (kIconGap);
+        undoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (kIconGap);
+        redoBtn_.setBounds (r.removeFromLeft (kIconBtnW).withY (top).withHeight (rowH));
+        r.removeFromLeft (kGap);
 
         /* ---- RIGHT (right-aligned chain): viewSelector | pluginWin |
                 pluginMenu | midiBlinker.  Walk r.removeFromRight in
@@ -563,10 +572,12 @@ public:
         }
         if (viewSelector.isVisible())
         {
-            /* 7 view buttons now: P G A T S D M.  Same per-button
-             * size as before (rowH wide each). */
-            viewSelector.setBounds (r.removeFromRight (rowH * 7)
-                                       .withSizeKeepingCentre (rowH * 7, rowH));
+            /* 5 view buttons -- Patch / Graph / Arr / Tracker /
+             * Session.  Disk Op + Plugin Manager moved to the
+             * leftmost cluster.  rowH * 5 + 4 gaps. */
+            const int vsW = rowH * 5 + 4 * 4;
+            viewSelector.setBounds (r.removeFromRight (vsW)
+                                       .withSizeKeepingCentre (vsW, rowH));
         }
         if (mapButton.isVisible())
         {
@@ -644,25 +655,18 @@ private:
      * transport monitor + session. */
     MainDisplayPanel display_ { &owner.services() };
 
-    /* Leftmost cluster: file menu, virtual keyboard toggle, undo, redo. */
-    BlockToolButton fileMenuBtn_ { "" };
-    BlockToolButton vKbdBtn_     { "" };
-    BlockToolButton undoBtn_     { "" };
-    BlockToolButton redoBtn_     { "" };
-
-    void runFileMenu()
-    {
-        auto* ui = owner.services().find<UI>();
-        if (ui == nullptr) return;
-        auto& cm = ui->commands();
-        juce::PopupMenu menu;
-        MainMenu::buildSessionMenu (cm, menu);
-        menu.addSeparator();
-        menu.addCommandItem (&cm, Commands::showPreferences, "Preferences...");
-        menu.addSeparator();
-        menu.addCommandItem (&cm, juce::StandardApplicationCommandIDs::quit);
-        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&fileMenuBtn_));
-    }
+    /* Toolbar buttons in left-to-right placement order:
+     *   diskOpBtn / pluginMgrBtn -- "file" view + plugin browser
+     *                                view shortcuts on the far left.
+     *   prefsBtn                 -- direct-invoke Preferences cog.
+     *   (transport between)
+     *   vKbdBtn / undoBtn / redoBtn -- post-transport cluster. */
+    BlockToolButton diskOpBtn_    { "" };
+    BlockToolButton pluginMgrBtn_ { "" };
+    BlockToolButton prefsBtn_     { "" };
+    BlockToolButton vKbdBtn_      { "" };
+    BlockToolButton undoBtn_      { "" };
+    BlockToolButton redoBtn_      { "" };
 
     void runPluginMenu()
     {
