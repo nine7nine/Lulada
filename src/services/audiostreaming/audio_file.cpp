@@ -11,6 +11,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>   // POSIX strcasecmp -- not in <cstring>'s std:: scope
 
 namespace element {
 
@@ -62,8 +63,8 @@ Audio_File::duplicate() noexcept
     {
         if (fn == nullptr) return false;
         const auto len = std::strlen (fn);
-        if (len > 4 && std::strcasecmp (fn + len - 4, ".ogg")  == 0) return true;
-        if (len > 5 && std::strcasecmp (fn + len - 5, ".flac") == 0) return true;
+        if (len > 4 && ::strcasecmp (fn + len - 4, ".ogg")  == 0) return true;
+        if (len > 5 && ::strcasecmp (fn + len - 5, ".flac") == 0) return true;
         return false;
     };
 

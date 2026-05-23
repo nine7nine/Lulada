@@ -86,7 +86,8 @@ Audio_File_SF::create (const char* filename,
     if (out == nullptr)
     {
         juce::Logger::writeToLog (
-            juce::String ("Audio_File_SF::create: sf_open failed for ") + name);
+            juce::String ("Audio_File_SF::create: sf_open failed for ")
+            + (const char*) name);
         std::free (name);
         return nullptr;
     }

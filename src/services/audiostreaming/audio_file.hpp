@@ -93,9 +93,11 @@ public:
      * the base implementation is a no-op. */
     virtual void finalize() {}
 
-protected:
+    /* Public so callers can validate a format string before opening a
+     * capture stream (Record_DS::create gates on this). */
     static const format_desc* find_format (const format_desc* fd, const char* name);
 
+protected:
     char*               _filename;     /* short name (basename) */
     char*               _path;         /* absolute path */
 
