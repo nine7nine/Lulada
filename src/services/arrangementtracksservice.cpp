@@ -14,6 +14,7 @@
 #include <element/engine.hpp>
 #include <element/node.h>
 #include <element/node.hpp>
+#include <element/porttype.hpp>
 #include <element/services.hpp>
 #include <element/session.hpp>
 #include <element/tags.hpp>
@@ -44,7 +45,14 @@ ArrangementTracksService::findOrCreateSubgraph (EngineService& engine,
 {
     Node existing = findSubgraph (session);
     if (existing.isValid())
+    {
+        /* Ensure existing subgraphs get the canonical name on first
+         * touch -- pre-rename sessions just show empty or the
+         * generic plugin id otherwise. */
+        if (existing.getName() != "Multi-Track")
+            existing.setName ("Multi-Track");
         return existing;
+    }
 
     /* EngineService::addNode adds to the active root graph by default
      * (see services/engineservice.cpp:570 -- delegates to addPlugin
@@ -52,12 +60,15 @@ ArrangementTracksService::findOrCreateSubgraph (EngineService& engine,
     Node created = engine.addNode (EL_NODE_ID_ARRANGEMENT_TRACKS,
                                    EL_NODE_FORMAT_NAME);
 
-    /* TODO Phase 5: auto-wire the subgraph's stereo output to the
-     * root graph's audio out.  v1 leaves it disconnected -- the user
-     * can wire manually, and the test path uses an explicit
-     * connect-to-master step.  Doing it here requires picking the
-     * right output port pair on the root graph's IO node, which
-     * varies by session config; safer to leave as Phase 5 polish. */
+    if (created.isValid())
+        created.setName ("Multi-Track");
+
+    /* Subgraph -> root sink (master Audio Out) wiring intentionally
+     * stays manual.  Per design philosophy, the main graph belongs
+     * to the user; we don't auto-wire anything visible to them.
+     * Auto-wiring happens ONLY INSIDE the subgraph (AudioClipNode
+     * outputs -> Multi-Track's internal audio output IO node);
+     * see addAudioClipNode. */
 
     return created;
 }
@@ -77,7 +88,36 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
 
     /* EngineService::addPlugin(graph, desc) adds inside the specified
      * graph -- see services/engineservice.cpp / engine.hpp:80 */
-    return engine.addPlugin (subgraph, desc);
+    Node clip = engine.addPlugin (subgraph, desc);
+    if (! clip.isValid())
+        return clip;
+
+    /* Auto-wire the new clip's audio output to the subgraph's internal
+     * audio.output IO node.  Connection happens INSIDE the subgraph
+     * only -- the subgraph face -> session master sink remains a
+     * user-controlled wiring on the main graph (per design: we don't
+     * touch the main graph).
+     *
+     * Multi-clip mixing: subsequent clips also wire to the same IO
+     * output; the graph processor sums their contributions before
+     * routing through the subgraph face.  Simple sum (no internal
+     * mixer node yet); upgrade to an AudioMixerNode if level control
+     * per clip becomes needed. */
+    const Node audioOutIO = subgraph.getIONode (PortType::Audio, false /*output*/);
+    if (audioOutIO.isValid())
+    {
+        const int channels = stereo ? 2 : 1;
+        for (int ch = 0; ch < channels; ++ch)
+            engine.connectChannels (subgraph, clip, ch, audioOutIO, ch);
+    }
+    else
+    {
+        juce::Logger::writeToLog (
+            "[ArrangementTracksService::addAudioClipNode] WARN: subgraph"
+            " has no audio.output IO node; clip remains disconnected");
+    }
+
+    return clip;
 }
 
 bool
