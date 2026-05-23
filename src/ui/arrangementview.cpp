@@ -63,7 +63,11 @@ class ArrangementView::Body : public juce::Component,
                               public juce::FileDragAndDropTarget
 {
 public:
-    explicit Body (ArrangementView& o) : owner (o) { setOpaque (true); }
+    explicit Body (ArrangementView& o) : owner (o)
+    {
+        setOpaque (true);
+        setWantsKeyboardFocus (true);   // Delete key handling
+    }
 
     void paint (Graphics& g) override
     {
@@ -198,6 +202,21 @@ public:
 
     //==========================================================================
     // Mouse interaction
+    //
+    // Gesture model:
+    //   - mouseDown on label arm-toggle  -> flip arm (audio lanes)
+    //   - mouseDown on region right-edge -> begin resize
+    //   - mouseDown on region body       -> select + arm potential drag
+    //   - mouseDrag (after threshold)    -> commit drag/resize and live-update
+    //   - mouseUp without drag           -> click-launch the region
+    //   - mouseUp after drag/resize      -> writeLanesToSession + repaint
+    //
+    // Keyboard:
+    //   - Delete / Backspace             -> remove selected region
+    //
+    // Hit-test sub-region for the resize handle is the last
+    // kEdgeHandlePx pixels of the region's strip rectangle.  Inside
+    // that band, mouseDown enters Resize mode; outside it's Move.
 
     void mouseDown (const MouseEvent& e) override
     {
@@ -206,8 +225,6 @@ public:
         auto& lane    = owner.lanes_.getReference (laneIdx);
         auto& runtime = owner.laneRuntime_.getReference (laneIdx);
 
-        /* Click on the label column = arm toggle for audio lanes;
-         * no-op for tracker lanes (tracker arming is a Phase 4 item). */
         if (e.x < kLabelW)
         {
             if (runtime.isAudioLane() && armToggleRect (laneIdx).contains (e.x, e.y))
@@ -220,7 +237,6 @@ public:
             return;
         }
 
-        /* Orphan lanes don't dispatch. */
         if (runtime.isOrphan()) return;
 
         const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
@@ -229,26 +245,180 @@ public:
         {
             if (! r.containsBeat (beat)) continue;
 
-            if (runtime.isTrackerLane() && r.sequenceIdx >= 0)
-            {
-                if (runtime.lastDispatchedSeqIdx >= 0
-                    && runtime.lastDispatchedSeqIdx != r.sequenceIdx)
-                    runtime.trackerCache->schedulePlaying (
-                        runtime.lastDispatchedSeqIdx, -1.0, false);
-                runtime.trackerCache->schedulePlaying (r.sequenceIdx, -1.0, true);
-            }
-            else if (runtime.isAudioLane())
-            {
-                /* Audio click-launch = immediate.  beatTarget=-1
-                 * fires on the next render block. */
-                runtime.audioClipCache->schedulePlay (
-                    r.id, r.sourceId, -1.0, 0 /*sampleOffset*/);
-            }
-            runtime.lastDispatchedRegion  = r.id;
-            runtime.lastDispatchedSeqIdx  = r.sequenceIdx;
+            /* Begin a gesture; whether it ends in move/resize/click
+             * is decided by what happens between mouseDown and
+             * mouseUp. */
+            gesture_.laneIdx         = laneIdx;
+            gesture_.regionId        = r.id;
+            gesture_.originalPos     = r.positionBeats;
+            gesture_.originalLen     = r.lengthBeats;
+            gesture_.mouseDownXBeats = beat;
+            gesture_.dragActive      = false;
+
+            /* Resize-vs-move hit test: cursor in the last kEdgeHandlePx
+             * pixels of the rendered region rect = Resize.  Otherwise
+             * Move. */
+            const int regionStartX = kLabelW + (int) (r.positionBeats * kPxPerBeat);
+            const int regionEndX   = kLabelW + (int) (r.endBeats()    * kPxPerBeat);
+            gesture_.mode = (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX)
+                              ? Gesture::Resize
+                              : Gesture::Move;
+
+            selectedLane_    = laneIdx;
+            selectedRegion_  = r.id;
+
+            grabKeyboardFocus();
             repaintLane (laneIdx);
             return;
         }
+
+        /* Empty area click -- clear selection. */
+        selectedLane_   = -1;
+        selectedRegion_ = juce::Uuid::null();
+        gesture_        = Gesture {};
+        repaint();
+    }
+
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (gesture_.laneIdx < 0) return;
+        if (e.getDistanceFromDragStart() < kDragThresholdPx && ! gesture_.dragActive)
+            return;
+        gesture_.dragActive = true;
+
+        if (gesture_.laneIdx >= owner.lanes_.size()) return;
+        auto& lane = owner.lanes_.getReference (gesture_.laneIdx);
+        auto* r = lane.playlist.findRegion (gesture_.regionId);
+        if (r == nullptr) return;
+
+        const double mouseBeat = juce::jmax (0.0,
+            (double) (e.x - kLabelW) / (double) kPxPerBeat);
+
+        if (gesture_.mode == Gesture::Move)
+        {
+            const double delta = mouseBeat - gesture_.mouseDownXBeats;
+            const double target = juce::jmax (0.0, gesture_.originalPos + delta);
+
+            /* moveRegion enforces no-overlap; if the target collides,
+             * snap to the latest non-overlapping position before it.
+             * For v1 we just attempt; failure leaves the region in
+             * place. */
+            lane.playlist.moveRegion (gesture_.regionId, target);
+        }
+        else /* Resize */
+        {
+            const double newLength = juce::jmax (kMinRegionBeats,
+                mouseBeat - gesture_.originalPos);
+            lane.playlist.resizeRegion (gesture_.regionId, newLength);
+        }
+
+        if (body_resizeNeeded()) resizeForLanes();
+        else                     repaintLane (gesture_.laneIdx);
+    }
+
+    void mouseUp (const MouseEvent& e) override
+    {
+        if (gesture_.laneIdx < 0) return;
+
+        const int   laneIdx     = gesture_.laneIdx;
+        const bool  wasDragged  = gesture_.dragActive;
+        const auto  gestureMode = gesture_.mode;
+        const auto  regionId    = gesture_.regionId;
+
+        gesture_ = Gesture {};
+
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& lane    = owner.lanes_.getReference (laneIdx);
+        auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+
+        if (! wasDragged)
+        {
+            /* Click without drag = launch the region.  Existing
+             * behaviour preserved. */
+            const auto* r = lane.playlist.findRegion (regionId);
+            if (r == nullptr) return;
+
+            if (runtime.isTrackerLane() && r->sequenceIdx >= 0)
+            {
+                if (runtime.lastDispatchedSeqIdx >= 0
+                    && runtime.lastDispatchedSeqIdx != r->sequenceIdx)
+                    runtime.trackerCache->schedulePlaying (
+                        runtime.lastDispatchedSeqIdx, -1.0, false);
+                runtime.trackerCache->schedulePlaying (r->sequenceIdx, -1.0, true);
+            }
+            else if (runtime.isAudioLane())
+            {
+                runtime.audioClipCache->schedulePlay (
+                    r->id, r->sourceId, -1.0, 0);
+            }
+            runtime.lastDispatchedRegion = r->id;
+            runtime.lastDispatchedSeqIdx = r->sequenceIdx;
+            repaintLane (laneIdx);
+            juce::ignoreUnused (e, gestureMode);
+            return;
+        }
+
+        /* Drag/resize finished -- persist + invalidate cached
+         * dispatch state so the new position fires next pass. */
+        runtime.lastDispatchedRegion = juce::Uuid::null();
+        owner.writeLanesToSession();
+        resizeForLanes();
+    }
+
+    void mouseMove (const MouseEvent& e) override
+    {
+        /* Cursor feedback: change to resize cursor when hovering a
+         * region's right-edge handle. */
+        const int laneIdx = e.y / kLaneH;
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size())
+        {
+            setMouseCursor (juce::MouseCursor::NormalCursor);
+            return;
+        }
+        if (e.x < kLabelW)
+        {
+            setMouseCursor (juce::MouseCursor::NormalCursor);
+            return;
+        }
+        const auto& lane = owner.lanes_.getReference (laneIdx);
+        for (const auto& r : lane.playlist.regions())
+        {
+            const int regionStartX = kLabelW + (int) (r.positionBeats * kPxPerBeat);
+            const int regionEndX   = kLabelW + (int) (r.endBeats()    * kPxPerBeat);
+            if (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX
+                && e.y >= laneIdx * kLaneH && e.y < (laneIdx + 1) * kLaneH)
+            {
+                setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
+                return;
+            }
+            if (e.x >= regionStartX && e.x < regionEndX
+                && e.y >= laneIdx * kLaneH && e.y < (laneIdx + 1) * kLaneH)
+            {
+                setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+                return;
+            }
+        }
+        setMouseCursor (juce::MouseCursor::NormalCursor);
+    }
+
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey)
+        {
+            if (selectedLane_ < 0 || selectedLane_ >= owner.lanes_.size())
+                return false;
+            auto& lane = owner.lanes_.getReference (selectedLane_);
+            if (! lane.playlist.removeRegion (selectedRegion_))
+                return false;
+            const int laneIdx = selectedLane_;
+            selectedLane_   = -1;
+            selectedRegion_ = juce::Uuid::null();
+            owner.writeLanesToSession();
+            resizeForLanes();
+            repaintLane (laneIdx);
+            return true;
+        }
+        return false;
     }
 
     //==========================================================================
@@ -289,9 +459,12 @@ public:
             repaint (juce::jlimit (0, W, newPxX - 1), 0, 3, H);
     }
 
-    static constexpr int kLabelW    = 160;
-    static constexpr int kLaneH     = 64;
-    static constexpr int kPxPerBeat = 24;
+    static constexpr int kLabelW         = 160;
+    static constexpr int kLaneH          = 64;
+    static constexpr int kPxPerBeat      = 24;
+    static constexpr int kEdgeHandlePx   = 6;    /* width of right-edge resize handle */
+    static constexpr int kDragThresholdPx = 4;   /* pixels before mouseDown -> drag */
+    static constexpr double kMinRegionBeats = 0.25;
 
 private:
     /** Bounding box of the arm-toggle dot within a lane's label area.
@@ -388,8 +561,18 @@ private:
 
             g.setColour (fill);
             g.fillRect (rect);
-            g.setColour (fill.brighter (0.4f));
-            g.drawRect (rect, 1);
+
+            const bool selected = (laneIdx == selectedLane_ && r.id == selectedRegion_);
+            if (selected)
+            {
+                g.setColour (Colours::white);
+                g.drawRect (rect, 2);
+            }
+            else
+            {
+                g.setColour (fill.brighter (0.4f));
+                g.drawRect (rect, 1);
+            }
             g.setColour (Colours::white);
             g.setFont (juce::FontOptions (11.0f));
 
@@ -412,11 +595,43 @@ private:
         }
     }
 
+    /** Returns true if the body's current size doesn't fit the
+     *  current lane content extent (e.g. resize pushed a region past
+     *  the existing total width).  resizeForLanes() recomputes. */
+    bool body_resizeNeeded() const noexcept
+    {
+        double maxEnd = 0.0;
+        for (const auto& l : owner.lanes_)
+            for (const auto& r : l.playlist.regions())
+                maxEnd = juce::jmax (maxEnd, r.endBeats());
+        const int needW = kLabelW + ((int) maxEnd + 8) * kPxPerBeat;
+        const int needH = juce::jmax (kLaneH, owner.lanes_.size() * kLaneH);
+        return needW != getWidth() || needH != getHeight();
+    }
+
     ArrangementView& owner;
 
     /* Drop hover state for visual feedback during external file drag. */
     bool dropHover_         = false;
     int  dropHoverLaneIdx_  = -1;
+
+    /* Region selection state.  selectedLane_ < 0 means no selection. */
+    int        selectedLane_   = -1;
+    juce::Uuid selectedRegion_;
+
+    /* Active gesture (move / resize) -- valid between mouseDown and
+     * mouseUp.  laneIdx < 0 means no gesture. */
+    struct Gesture {
+        enum Mode { Move, Resize };
+        int        laneIdx         = -1;
+        juce::Uuid regionId;
+        double     originalPos     = 0.0;
+        double     originalLen     = 0.0;
+        double     mouseDownXBeats = 0.0;
+        Mode       mode            = Move;
+        bool       dragActive      = false;
+    };
+    Gesture gesture_;
 };
 
 /* ===================================================================== */
