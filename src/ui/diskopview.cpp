@@ -395,9 +395,13 @@ public:
         int getNumRows() override { return model ? kNumSlotsPerBank : 0; }
         void paintListBoxItem (int row, Graphics& g, int w, int h, bool sel) override
             { if (model) model->paintSlotRow (row, g, w, h, sel); }
+        /* Double-click on a slot row -> inline rename, matching the
+         * bank list's rename gesture.  Loading from DiskOp goes
+         * through the explicit "Load to slot" button or the DiskOp
+         * activation listener (double-click in the file browser). */
         void listBoxItemDoubleClicked (int row, const MouseEvent&) override
             { if (model) { model->slotList_.list.selectRow (row);
-                           model->loadIntoSelectedSlot(); } }
+                           model->renameSlot (row); } }
         void deleteKeyPressed (int lastRow) override
             { if (model) model->clearSlotInPlace (lastRow); }
     } slotList_;
@@ -520,6 +524,35 @@ public:
                     if (auto inst2 = sn2->getInstrument (row))
                         inst2->name = txt;
                 self.instrumentList_.list.repaint();
+            });
+    }
+
+    void renameSlot (int row)
+    {
+        auto* sn = getSamplerProcessor (activeSampler_);
+        if (sn == nullptr) return;
+        if (activeInstrument_ < 0) return;
+        auto inst = sn->getInstrument (activeInstrument_);
+        if (inst == nullptr) return;
+        auto* slot = inst->getSlot (row);
+        if (slot == nullptr) return;
+
+        /* Slot row paint geometry (paintSlotRow):
+         *   slot number  x =  6, w = 30
+         *   name strip   x = 40, w = (rowW - 46) */
+        const auto rowLocal  = slotList_.list.getRowPosition (row, true);
+        auto editBounds = getLocalArea (&slotList_.list, rowLocal);
+        constexpr int kLeftInset  = 40;
+        constexpr int kRightInset = 6;
+        editBounds.removeFromLeft  (kLeftInset);
+        editBounds.removeFromRight (kRightInset);
+        showInlineRename (editBounds, slot->name,
+            [row] (SampleBankPane& self, const String& txt) {
+                if (auto* sn2 = self.getSamplerProcessor (self.activeSampler_))
+                    if (auto inst2 = sn2->getInstrument (self.activeInstrument_))
+                        if (auto* slot2 = inst2->getSlot (row))
+                            slot2->name = txt;
+                self.slotList_.list.repaint();
             });
     }
 
