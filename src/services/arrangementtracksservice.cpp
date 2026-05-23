@@ -4,6 +4,7 @@
 #include "services/arrangementtracksservice.hpp"
 
 #include "nodes/audioclip.hpp"
+#include "services/sessionservice.hpp"
 #include "services/sources/sourceregistry.hpp"
 #include "services/timeline/lane.hpp"
 #include "services/timeline/playlist.hpp"
@@ -92,21 +93,46 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
     if (! clip.isValid())
         return clip;
 
-    /* Auto-wire the new clip's audio output to the subgraph's internal
-     * audio.output IO node.  Connection happens INSIDE the subgraph
-     * only -- the subgraph face -> session master sink remains a
-     * user-controlled wiring on the main graph (per design: we don't
-     * touch the main graph).
+    /* Auto-wire inside the subgraph:
      *
-     * Multi-clip mixing: subsequent clips also wire to the same IO
-     * output; the graph processor sums their contributions before
-     * routing through the subgraph face.  Simple sum (no internal
-     * mixer node yet); upgrade to an AudioMixerNode if level control
-     * per clip becomes needed. */
+     *   subgraph audio.input  ->  AudioClipNode input   (record path)
+     *   AudioClipNode output  ->  subgraph audio.output (playback path)
+     *
+     * Both connections happen INSIDE the subgraph only -- the
+     * subgraph face <-> session master remains user-controlled on
+     * the main graph (per design: don't touch the main graph).
+     *
+     * Net effect: the user wires ONCE on the main graph -- their
+     * source goes into the Multi-Track input face, the Multi-Track
+     * output face goes to their master.  Every clip lane added
+     * after that point automatically picks up the input signal for
+     * recording AND mixes into the subgraph's output for playback.
+     *
+     * Multi-clip mixing: subsequent clips all wire to the same
+     * audio.input and audio.output IO nodes; the graph processor
+     * routes the input signal to all clip inputs (each lane's arm
+     * state gates capture independently) and sums the playback
+     * outputs.  Simple sum (no internal AudioMixerNode yet); upgrade
+     * for per-clip level control if needed. */
+    const int channels = stereo ? 2 : 1;
+
+    const Node audioInIO  = subgraph.getIONode (PortType::Audio, true  /*input*/);
     const Node audioOutIO = subgraph.getIONode (PortType::Audio, false /*output*/);
+
+    if (audioInIO.isValid())
+    {
+        for (int ch = 0; ch < channels; ++ch)
+            engine.connectChannels (subgraph, audioInIO, ch, clip, ch);
+    }
+    else
+    {
+        juce::Logger::writeToLog (
+            "[ArrangementTracksService::addAudioClipNode] WARN: subgraph"
+            " has no audio.input IO node; clip input not auto-wired");
+    }
+
     if (audioOutIO.isValid())
     {
-        const int channels = stereo ? 2 : 1;
         for (int ch = 0; ch < channels; ++ch)
             engine.connectChannels (subgraph, clip, ch, audioOutIO, ch);
     }
@@ -114,7 +140,35 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
     {
         juce::Logger::writeToLog (
             "[ArrangementTracksService::addAudioClipNode] WARN: subgraph"
-            " has no audio.output IO node; clip remains disconnected");
+            " has no audio.output IO node; clip output not auto-wired");
+    }
+
+    /* Point the new clip's recording target at a session-adjacent
+     * "recordings/" directory if the session is saved, else fall
+     * back to ~/Documents/Element Recordings/ (matches AudioClipNode
+     * default).  Session-adjacent keeps captures with the project
+     * file so a session move/copy keeps recordings together. */
+    if (auto* sessSvc = engine.sibling<SessionService>())
+    {
+        const juce::File sessionFile = sessSvc->getSessionFile();
+        if (sessionFile.existsAsFile())
+        {
+            const juce::File recDir =
+                sessionFile.getParentDirectory().getChildFile ("recordings");
+
+            if (auto* wrapper = clip.getObject())
+            {
+                if (auto* audioClipProc =
+                        dynamic_cast<AudioClipNode*> (wrapper->getAudioProcessor()))
+                {
+                    audioClipProc->setRecordingDirectory (recDir);
+                    juce::Logger::writeToLog (
+                        juce::String ("[ArrangementTracksService::addAudioClipNode]"
+                                       " recording dir set to ")
+                        + recDir.getFullPathName());
+                }
+            }
+        }
     }
 
     return clip;

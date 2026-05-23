@@ -5,6 +5,12 @@
 
 #include <element/juce/gui_basics.hpp>
 #include <element/juce/data_structures.hpp>
+#include <element/juce/audio_formats.hpp>
+/* AudioThumbnail / AudioThumbnailCache live in juce_audio_utils;
+ * Element doesn't ship an element/juce/audio_utils.hpp wrapper but
+ * the module is linked (see src/CMakeLists.txt) so direct include
+ * via the JUCE module path works. */
+#include <juce_audio_utils/juce_audio_utils.h>
 #include <element/node.hpp>
 #include <element/ui/content.hpp>
 #include <element/services.hpp>
@@ -207,8 +213,16 @@ private:
     bool lanesLoadedFromSession_ = false;
 
     Transport::MonitorPtr monitor_;
-    bool wasPlaying_ = false;
-    double lastBeat_ = 0.0;
+    bool wasPlaying_   = false;
+    bool wasRecording_ = false;
+    double lastBeat_   = 0.0;
+
+    /* Snapshot of the playhead position when transport-recording
+     * goes true.  Body paints a placeholder growing rect from this
+     * beat to the current playhead on each armed audio lane while
+     * recording, giving the user immediate visible feedback before
+     * the captured file finalises into a real Region. */
+    double recordStartBeat_ = 0.0;
 
     float lastBpmShown_ = -1.0f;
     double lastBeatShown_ = -999.0;

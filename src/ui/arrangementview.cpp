@@ -19,6 +19,8 @@
 #include "services/sources/sourceregistry.hpp"
 #include "services/timeline/audiolaneadapter.hpp"
 
+#include <unordered_map>
+
 namespace element {
 
 using juce::Colour;
@@ -60,10 +62,44 @@ bool anyAudioFileIn (const juce::StringArray& files) noexcept
 /* ===================================================================== */
 
 class ArrangementView::Body : public juce::Component,
-                              public juce::FileDragAndDropTarget
+                              public juce::FileDragAndDropTarget,
+                              private juce::ChangeListener
 {
 public:
-    explicit Body (ArrangementView& o) : owner (o) { setOpaque (true); }
+    explicit Body (ArrangementView& o)
+        : owner (o),
+          thumbnailCache_ (kThumbnailCacheEntries)
+    {
+        setOpaque (true);
+        setWantsKeyboardFocus (true);   // Delete key handling
+
+        /* Register stock audio formats once.  Same shape Sampler /
+         * AudioFilePlayerNode use; libsndfile is the underlying
+         * reader for WAV/AIF/FLAC under JUCE_LINUX (no wineserver). */
+        formatManager_.registerBasicFormats();
+    }
+
+    ~Body() override
+    {
+        /* Detach as a listener from any thumbnails we built so their
+         * background-thread completion doesn't fire callbacks into a
+         * dying Body. */
+        for (auto& kv : thumbnails_)
+            if (kv.second)
+                kv.second->removeChangeListener (this);
+    }
+
+private:
+    /** juce::AudioThumbnail emits a change notification each time the
+     *  background reader updates its peak-data window.  Repaint the
+     *  whole body when any thumbnail progresses -- cheap, JUCE
+     *  invalidates only what changed at the windowing layer. */
+    void changeListenerCallback (juce::ChangeBroadcaster*) override
+    {
+        repaint();
+    }
+
+public:
 
     void paint (Graphics& g) override
     {
@@ -198,6 +234,21 @@ public:
 
     //==========================================================================
     // Mouse interaction
+    //
+    // Gesture model:
+    //   - mouseDown on label arm-toggle  -> flip arm (audio lanes)
+    //   - mouseDown on region right-edge -> begin resize
+    //   - mouseDown on region body       -> select + arm potential drag
+    //   - mouseDrag (after threshold)    -> commit drag/resize and live-update
+    //   - mouseUp without drag           -> click-launch the region
+    //   - mouseUp after drag/resize      -> writeLanesToSession + repaint
+    //
+    // Keyboard:
+    //   - Delete / Backspace             -> remove selected region
+    //
+    // Hit-test sub-region for the resize handle is the last
+    // kEdgeHandlePx pixels of the region's strip rectangle.  Inside
+    // that band, mouseDown enters Resize mode; outside it's Move.
 
     void mouseDown (const MouseEvent& e) override
     {
@@ -206,8 +257,6 @@ public:
         auto& lane    = owner.lanes_.getReference (laneIdx);
         auto& runtime = owner.laneRuntime_.getReference (laneIdx);
 
-        /* Click on the label column = arm toggle for audio lanes;
-         * no-op for tracker lanes (tracker arming is a Phase 4 item). */
         if (e.x < kLabelW)
         {
             if (runtime.isAudioLane() && armToggleRect (laneIdx).contains (e.x, e.y))
@@ -220,7 +269,6 @@ public:
             return;
         }
 
-        /* Orphan lanes don't dispatch. */
         if (runtime.isOrphan()) return;
 
         const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
@@ -229,26 +277,180 @@ public:
         {
             if (! r.containsBeat (beat)) continue;
 
-            if (runtime.isTrackerLane() && r.sequenceIdx >= 0)
-            {
-                if (runtime.lastDispatchedSeqIdx >= 0
-                    && runtime.lastDispatchedSeqIdx != r.sequenceIdx)
-                    runtime.trackerCache->schedulePlaying (
-                        runtime.lastDispatchedSeqIdx, -1.0, false);
-                runtime.trackerCache->schedulePlaying (r.sequenceIdx, -1.0, true);
-            }
-            else if (runtime.isAudioLane())
-            {
-                /* Audio click-launch = immediate.  beatTarget=-1
-                 * fires on the next render block. */
-                runtime.audioClipCache->schedulePlay (
-                    r.id, r.sourceId, -1.0, 0 /*sampleOffset*/);
-            }
-            runtime.lastDispatchedRegion  = r.id;
-            runtime.lastDispatchedSeqIdx  = r.sequenceIdx;
+            /* Begin a gesture; whether it ends in move/resize/click
+             * is decided by what happens between mouseDown and
+             * mouseUp. */
+            gesture_.laneIdx         = laneIdx;
+            gesture_.regionId        = r.id;
+            gesture_.originalPos     = r.positionBeats;
+            gesture_.originalLen     = r.lengthBeats;
+            gesture_.mouseDownXBeats = beat;
+            gesture_.dragActive      = false;
+
+            /* Resize-vs-move hit test: cursor in the last kEdgeHandlePx
+             * pixels of the rendered region rect = Resize.  Otherwise
+             * Move. */
+            const int regionStartX = kLabelW + (int) (r.positionBeats * kPxPerBeat);
+            const int regionEndX   = kLabelW + (int) (r.endBeats()    * kPxPerBeat);
+            gesture_.mode = (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX)
+                              ? Gesture::Resize
+                              : Gesture::Move;
+
+            selectedLane_    = laneIdx;
+            selectedRegion_  = r.id;
+
+            grabKeyboardFocus();
             repaintLane (laneIdx);
             return;
         }
+
+        /* Empty area click -- clear selection. */
+        selectedLane_   = -1;
+        selectedRegion_ = juce::Uuid::null();
+        gesture_        = Gesture {};
+        repaint();
+    }
+
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (gesture_.laneIdx < 0) return;
+        if (e.getDistanceFromDragStart() < kDragThresholdPx && ! gesture_.dragActive)
+            return;
+        gesture_.dragActive = true;
+
+        if (gesture_.laneIdx >= owner.lanes_.size()) return;
+        auto& lane = owner.lanes_.getReference (gesture_.laneIdx);
+        auto* r = lane.playlist.findRegion (gesture_.regionId);
+        if (r == nullptr) return;
+
+        const double mouseBeat = juce::jmax (0.0,
+            (double) (e.x - kLabelW) / (double) kPxPerBeat);
+
+        if (gesture_.mode == Gesture::Move)
+        {
+            const double delta = mouseBeat - gesture_.mouseDownXBeats;
+            const double target = juce::jmax (0.0, gesture_.originalPos + delta);
+
+            /* moveRegion enforces no-overlap; if the target collides,
+             * snap to the latest non-overlapping position before it.
+             * For v1 we just attempt; failure leaves the region in
+             * place. */
+            lane.playlist.moveRegion (gesture_.regionId, target);
+        }
+        else /* Resize */
+        {
+            const double newLength = juce::jmax (kMinRegionBeats,
+                mouseBeat - gesture_.originalPos);
+            lane.playlist.resizeRegion (gesture_.regionId, newLength);
+        }
+
+        if (body_resizeNeeded()) resizeForLanes();
+        else                     repaintLane (gesture_.laneIdx);
+    }
+
+    void mouseUp (const MouseEvent& e) override
+    {
+        if (gesture_.laneIdx < 0) return;
+
+        const int   laneIdx     = gesture_.laneIdx;
+        const bool  wasDragged  = gesture_.dragActive;
+        const auto  gestureMode = gesture_.mode;
+        const auto  regionId    = gesture_.regionId;
+
+        gesture_ = Gesture {};
+
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+        auto& lane    = owner.lanes_.getReference (laneIdx);
+        auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+
+        if (! wasDragged)
+        {
+            /* Click without drag = launch the region.  Existing
+             * behaviour preserved. */
+            const auto* r = lane.playlist.findRegion (regionId);
+            if (r == nullptr) return;
+
+            if (runtime.isTrackerLane() && r->sequenceIdx >= 0)
+            {
+                if (runtime.lastDispatchedSeqIdx >= 0
+                    && runtime.lastDispatchedSeqIdx != r->sequenceIdx)
+                    runtime.trackerCache->schedulePlaying (
+                        runtime.lastDispatchedSeqIdx, -1.0, false);
+                runtime.trackerCache->schedulePlaying (r->sequenceIdx, -1.0, true);
+            }
+            else if (runtime.isAudioLane())
+            {
+                runtime.audioClipCache->schedulePlay (
+                    r->id, r->sourceId, -1.0, 0);
+            }
+            runtime.lastDispatchedRegion = r->id;
+            runtime.lastDispatchedSeqIdx = r->sequenceIdx;
+            repaintLane (laneIdx);
+            juce::ignoreUnused (e, gestureMode);
+            return;
+        }
+
+        /* Drag/resize finished -- persist + invalidate cached
+         * dispatch state so the new position fires next pass. */
+        runtime.lastDispatchedRegion = juce::Uuid::null();
+        owner.writeLanesToSession();
+        resizeForLanes();
+    }
+
+    void mouseMove (const MouseEvent& e) override
+    {
+        /* Cursor feedback: change to resize cursor when hovering a
+         * region's right-edge handle. */
+        const int laneIdx = e.y / kLaneH;
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size())
+        {
+            setMouseCursor (juce::MouseCursor::NormalCursor);
+            return;
+        }
+        if (e.x < kLabelW)
+        {
+            setMouseCursor (juce::MouseCursor::NormalCursor);
+            return;
+        }
+        const auto& lane = owner.lanes_.getReference (laneIdx);
+        for (const auto& r : lane.playlist.regions())
+        {
+            const int regionStartX = kLabelW + (int) (r.positionBeats * kPxPerBeat);
+            const int regionEndX   = kLabelW + (int) (r.endBeats()    * kPxPerBeat);
+            if (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX
+                && e.y >= laneIdx * kLaneH && e.y < (laneIdx + 1) * kLaneH)
+            {
+                setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
+                return;
+            }
+            if (e.x >= regionStartX && e.x < regionEndX
+                && e.y >= laneIdx * kLaneH && e.y < (laneIdx + 1) * kLaneH)
+            {
+                setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+                return;
+            }
+        }
+        setMouseCursor (juce::MouseCursor::NormalCursor);
+    }
+
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey)
+        {
+            if (selectedLane_ < 0 || selectedLane_ >= owner.lanes_.size())
+                return false;
+            auto& lane = owner.lanes_.getReference (selectedLane_);
+            if (! lane.playlist.removeRegion (selectedRegion_))
+                return false;
+            const int laneIdx = selectedLane_;
+            selectedLane_   = -1;
+            selectedRegion_ = juce::Uuid::null();
+            owner.writeLanesToSession();
+            resizeForLanes();
+            repaintLane (laneIdx);
+            return true;
+        }
+        return false;
     }
 
     //==========================================================================
@@ -289,9 +491,20 @@ public:
             repaint (juce::jlimit (0, W, newPxX - 1), 0, 3, H);
     }
 
-    static constexpr int kLabelW    = 160;
-    static constexpr int kLaneH     = 64;
-    static constexpr int kPxPerBeat = 24;
+    static constexpr int kLabelW         = 160;
+    static constexpr int kLaneH          = 64;
+    static constexpr int kPxPerBeat      = 24;
+    static constexpr int kEdgeHandlePx   = 6;    /* width of right-edge resize handle */
+    static constexpr int kDragThresholdPx = 4;   /* pixels before mouseDown -> drag */
+    static constexpr double kMinRegionBeats = 0.25;
+
+    /* AudioThumbnail config: 1024 source samples per thumbnail
+     * sample -- standard for DAW-style waveform overviews at the
+     * zoom levels arrangement view uses.  Cache holds up to 256
+     * recently-rendered sources; enough headroom that thumbnails
+     * survive across multiple lane-add cycles without reload. */
+    static constexpr int kThumbnailSamplesPerPixel = 1024;
+    static constexpr int kThumbnailCacheEntries    = 256;
 
 private:
     /** Bounding box of the arm-toggle dot within a lane's label area.
@@ -336,16 +549,39 @@ private:
         g.drawText (label, labelArea.reduced (8, 0),
                     juce::Justification::centredLeft, true);
 
-        /* Arm toggle (audio lanes only). */
+        /* Arm toggle (audio lanes only).  While the transport is
+         * actively recording AND this lane is armed, grow + brighten
+         * the dot and overlay a "REC" badge so the user knows capture
+         * is in flight. */
+        const bool transportRecording = owner.monitor_ != nullptr
+                                      && owner.monitor_->recording.get();
+        const bool capturing = isAudio && lane.armed && transportRecording;
+
         if (isAudio)
         {
-            const auto rect = armToggleRect (laneIdx);
-            g.setColour (lane.armed ? Colour::fromRGB (220, 70, 70)
-                                    : Colour::fromRGB (60, 60, 60));
+            const auto baseRect = armToggleRect (laneIdx);
+            const auto rect = capturing ? baseRect.expanded (2)
+                                        : baseRect;
+
+            const Colour fillCol = lane.armed
+                ? (capturing ? Colour::fromRGB (255, 60, 60)
+                             : Colour::fromRGB (220, 70, 70))
+                : Colour::fromRGB (60, 60, 60);
+            g.setColour (fillCol);
             g.fillRect (rect);
-            g.setColour (lane.armed ? Colour::fromRGB (255, 120, 120)
+            g.setColour (lane.armed ? Colour::fromRGB (255, 160, 160)
                                     : Colour::fromRGB (90, 90, 90));
-            g.drawRect (rect, 1);
+            g.drawRect (rect, capturing ? 2 : 1);
+
+            if (capturing)
+            {
+                g.setColour (Colour::fromRGB (255, 80, 80));
+                g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+                const Rectangle<int> badge (
+                    rect.getX() - 32, rect.getY(), 28, rect.getHeight());
+                g.drawText ("REC", badge,
+                            juce::Justification::centredRight, false);
+            }
         }
 
         /* Strip background + beat grid. */
@@ -388,9 +624,52 @@ private:
 
             g.setColour (fill);
             g.fillRect (rect);
-            g.setColour (fill.brighter (0.4f));
-            g.drawRect (rect, 1);
-            g.setColour (Colours::white);
+
+            /* Waveform overlay for audio regions (sequenceIdx < 0).
+             * Tracker regions paint label-only.  Thumbnail rendering
+             * scales the source's audible span (startBeats ->
+             * startBeats+lengthBeats) into the region rect; on first
+             * access the thumbnail builds asynchronously and emits a
+             * change message that triggers a repaint -- so freshly
+             * dropped regions look flat for a tick, then fill in. */
+            if (isAudio && r.sequenceIdx < 0)
+            {
+                if (auto* thumb = const_cast<Body*> (this)->getThumbnail (r.sourceId))
+                {
+                    const double totalSeconds = thumb->getTotalLength();
+                    if (totalSeconds > 0.0)
+                    {
+                        /* Map region.startBeats .. endBeats() into
+                         * seconds within the source.  v1 assumes the
+                         * source's intrinsic sample rate matches the
+                         * playback rate; tempo mapping is a v2 task. */
+                        const double bpm = owner.monitor_ != nullptr
+                                              ? (double) owner.monitor_->tempo.get()
+                                              : 120.0;
+                        const double srcStartSec = r.startBeats * 60.0 / bpm;
+                        const double srcLenSec   = r.lengthBeats * 60.0 / bpm;
+                        const double srcEndSec   = juce::jmin (totalSeconds,
+                                                                srcStartSec + srcLenSec);
+
+                        g.setColour (fill.brighter (0.45f));
+                        thumb->drawChannels (g, rect.reduced (2, 4),
+                                              srcStartSec, srcEndSec, 0.85f);
+                    }
+                }
+            }
+
+            const bool selected = (laneIdx == selectedLane_ && r.id == selectedRegion_);
+            if (selected)
+            {
+                g.setColour (Colours::white);
+                g.drawRect (rect, 2);
+            }
+            else
+            {
+                g.setColour (fill.brighter (0.4f));
+                g.drawRect (rect, 1);
+            }
+            g.setColour (Colours::white.withAlpha (0.95f));
             g.setFont (juce::FontOptions (11.0f));
 
             const juce::String tag = r.sequenceIdx >= 0
@@ -398,6 +677,35 @@ private:
                                         : (r.name.isNotEmpty() ? r.name : String ("Audio"));
             g.drawText (tag, rect.reduced (4, 0),
                         juce::Justification::centredLeft, true);
+        }
+
+        /* Live-recording placeholder: while transport is capturing
+         * + this lane is armed, paint a red translucent rect from
+         * recordStartBeat to the current playhead, with a
+         * "Recording..." label.  On stop, the AudioClipNode commit
+         * handler appends a real Region to the playlist and the
+         * placeholder vanishes (its source data lives in the
+         * playlist now). */
+        if (capturing)
+        {
+            const double startBeat = owner.recordStartBeat_;
+            const double endBeat   = owner.lastBeat_;
+            if (endBeat > startBeat)
+            {
+                const int rx = stripArea.getX() + (int) (startBeat * kPxPerBeat);
+                const int rw = juce::jmax (4, (int) ((endBeat - startBeat) * kPxPerBeat));
+                const Rectangle<int> recRect (rx, stripArea.getY() + 4,
+                                              rw, stripArea.getHeight() - 8);
+
+                g.setColour (Colour::fromRGB (220, 60, 60).withAlpha (0.55f));
+                g.fillRect (recRect);
+                g.setColour (Colour::fromRGB (255, 120, 120));
+                g.drawRect (recRect, 1);
+                g.setColour (Colours::white);
+                g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+                g.drawText ("Recording...", recRect.reduced (6, 0),
+                            juce::Justification::centredLeft, true);
+            }
         }
 
         /* Playhead overlay. */
@@ -412,11 +720,93 @@ private:
         }
     }
 
+    /** Returns true if the body's current size doesn't fit the
+     *  current lane content extent (e.g. resize pushed a region past
+     *  the existing total width).  resizeForLanes() recomputes. */
+    bool body_resizeNeeded() const noexcept
+    {
+        double maxEnd = 0.0;
+        for (const auto& l : owner.lanes_)
+            for (const auto& r : l.playlist.regions())
+                maxEnd = juce::jmax (maxEnd, r.endBeats());
+        const int needW = kLabelW + ((int) maxEnd + 8) * kPxPerBeat;
+        const int needH = juce::jmax (kLaneH, owner.lanes_.size() * kLaneH);
+        return needW != getWidth() || needH != getHeight();
+    }
+
+    /** Lookup or lazily-create the juce::AudioThumbnail for the given
+     *  AudioFileSource uuid.  Returns nullptr if the source isn't
+     *  registered (region might point at a missing source, e.g.
+     *  imported from a session whose source paths have moved). */
+    juce::AudioThumbnail* getThumbnail (juce::Uuid sourceId)
+    {
+        if (sourceId.isNull()) return nullptr;
+
+        UuidHashKey key { sourceId };
+        auto it = thumbnails_.find (key);
+        if (it != thumbnails_.end())
+            return it->second.get();
+
+        auto src = SourceRegistry::get().findAudioFile (sourceId);
+        if (src == nullptr)
+            return nullptr;
+
+        auto thumb = std::make_unique<juce::AudioThumbnail> (
+            kThumbnailSamplesPerPixel, formatManager_, thumbnailCache_);
+        /* setSource owns the InputSource; FileInputSource opens via
+         * juce::File which lives on the Linux path under our winelib
+         * build (_WIN32 undefined by winelib_compat.h).  Background-
+         * thread reader, not the audio thread. */
+        thumb->setSource (new juce::FileInputSource (src->file()));
+        thumb->addChangeListener (this);
+
+        auto* raw = thumb.get();
+        thumbnails_.emplace (key, std::move (thumb));
+        return raw;
+    }
+
     ArrangementView& owner;
 
     /* Drop hover state for visual feedback during external file drag. */
     bool dropHover_         = false;
     int  dropHoverLaneIdx_  = -1;
+
+    /* Region selection state.  selectedLane_ < 0 means no selection. */
+    int        selectedLane_   = -1;
+    juce::Uuid selectedRegion_;
+
+    /* Active gesture (move / resize) -- valid between mouseDown and
+     * mouseUp.  laneIdx < 0 means no gesture. */
+    struct Gesture {
+        enum Mode { Move, Resize };
+        int        laneIdx         = -1;
+        juce::Uuid regionId;
+        double     originalPos     = 0.0;
+        double     originalLen     = 0.0;
+        double     mouseDownXBeats = 0.0;
+        Mode       mode            = Move;
+        bool       dragActive      = false;
+    };
+    Gesture gesture_;
+
+    /* Thumbnail infrastructure.  AudioFormatManager + AudioThumbnailCache
+     * are per-Body; thumbnails_ is keyed by AudioFileSource uuid so
+     * regions referencing the same source share the same waveform
+     * peak data (cheap; one decode per source not per region). */
+    struct UuidHashKey {
+        juce::Uuid uuid;
+        bool operator== (const UuidHashKey& o) const noexcept { return uuid == o.uuid; }
+    };
+    struct UuidHashKeyHash {
+        std::size_t operator() (const UuidHashKey& k) const noexcept
+        {
+            return std::hash<std::string>{} (k.uuid.toString().toStdString());
+        }
+    };
+
+    juce::AudioFormatManager   formatManager_;
+    juce::AudioThumbnailCache  thumbnailCache_;
+    std::unordered_map<UuidHashKey, std::unique_ptr<juce::AudioThumbnail>, UuidHashKeyHash> thumbnails_;
 };
 
 /* ===================================================================== */
@@ -939,6 +1329,8 @@ double ArrangementView::computePlayheadBeats() const
 
 void ArrangementView::dispatchAtBeat (double beat)
 {
+    const double bpm = monitor_ != nullptr ? (double) monitor_->tempo.get() : 120.0;
+
     for (int laneIdx = 0; laneIdx < lanes_.size(); ++laneIdx)
     {
         const auto& lane    = lanes_.getReference (laneIdx);
@@ -946,8 +1338,43 @@ void ArrangementView::dispatchAtBeat (double beat)
         if (runtime.isOrphan()) continue;
 
         const Region* active = lane.playlist.regionAt (beat);
-        if (active == nullptr) continue;
-        if (active->id == runtime.lastDispatchedRegion) continue;
+
+        /* Case 1: playhead is outside any region.  Stop whatever was
+         * playing on this lane.  Tracker lanes don't auto-stop on
+         * gaps -- vht state persists between regions and the next
+         * region launch re-fires; audio lanes DO stop (DAW
+         * convention: gaps = silence). */
+        if (active == nullptr)
+        {
+            if (! runtime.lastDispatchedRegion.isNull())
+            {
+                if (runtime.isAudioLane())
+                    runtime.audioClipCache->scheduleStop (
+                        runtime.lastDispatchedRegion, -1.0);
+                runtime.lastDispatchedRegion = juce::Uuid::null();
+                runtime.lastDispatchedSeqIdx = -1;
+                if (body_ != nullptr) body_->repaintLane (laneIdx);
+            }
+            continue;
+        }
+
+        /* Case 2: still inside the same region the lane is already
+         * playing.  No state change. */
+        if (active->id == runtime.lastDispatchedRegion)
+            continue;
+
+        /* Case 3: entering a new region (either first region under
+         * the playhead OR transitioning from a different region).
+         * Stop the prior + launch the new. */
+        if (! runtime.lastDispatchedRegion.isNull())
+        {
+            if (runtime.isAudioLane())
+                runtime.audioClipCache->scheduleStop (
+                    runtime.lastDispatchedRegion, -1.0);
+            /* Tracker lanes: existing pattern stays "playing" in
+             * vht state; the new schedulePlaying below explicitly
+             * stops the old sequence + starts the new. */
+        }
 
         if (runtime.isTrackerLane())
         {
@@ -957,13 +1384,42 @@ void ArrangementView::dispatchAtBeat (double beat)
                     && runtime.lastDispatchedSeqIdx != active->sequenceIdx)
                     runtime.trackerCache->schedulePlaying (
                         runtime.lastDispatchedSeqIdx, -1.0, false);
-                runtime.trackerCache->schedulePlaying (active->sequenceIdx, -1.0, true);
+                runtime.trackerCache->schedulePlaying (
+                    active->sequenceIdx, -1.0, true);
             }
         }
         else if (runtime.isAudioLane())
         {
+            /* Mid-region launch: compute the source-sample offset so
+             * the playback head matches where the transport is
+             * within the region.  bumping into a region from beat 0
+             * fires the source from its beginning (modulo startBeats
+             * trim); bumping in at beat 2 of a 4-beat region whose
+             * startBeats=0 fires from 2 beats into the source. */
+            const double beatIntoRegion = juce::jmax (
+                0.0, beat - active->positionBeats);
+            const double sourceBeat = active->startBeats + beatIntoRegion;
+
+            juce::int64 sampleOffset = 0;
+            if (auto src = SourceRegistry::get().findAudioFile (active->sourceId))
+            {
+                if (src->sourceSampleRate() > 0 && bpm > 0.0)
+                {
+                    const double sourceSec = sourceBeat * (60.0 / bpm);
+                    sampleOffset = (juce::int64) (sourceSec
+                        * (double) src->sourceSampleRate());
+                }
+            }
+
+            /* beatTarget = the region's positionBeats so AudioClipNode's
+             * audio-thread applyPendingForBlock fires at the block
+             * whose range contains it (or catches up if we already
+             * passed it).  Sample-accurate to +/- one block ~ 5-10 ms,
+             * vs. ~33 ms latency on the prior immediate-only path. */
             runtime.audioClipCache->schedulePlay (
-                active->id, active->sourceId, -1.0, 0 /*sampleOffset*/);
+                active->id, active->sourceId,
+                active->positionBeats,
+                sampleOffset);
         }
 
         runtime.lastDispatchedRegion = active->id;
@@ -1183,8 +1639,9 @@ void ArrangementView::timerCallback()
 {
     if (monitor_ == nullptr) return;
 
-    const bool playing = monitor_->playing.get();
-    const double beat  = computePlayheadBeats();
+    const bool playing   = monitor_->playing.get();
+    const bool recording = monitor_->recording.get();
+    const double beat    = computePlayheadBeats();
 
     /* Transport start edge: clear per-lane "last dispatched" so the
      * first region under the playhead fires when playback resumes. */
@@ -1201,6 +1658,33 @@ void ArrangementView::timerCallback()
      * launch start.  DAW convention is audio stops with transport. */
     if (wasPlaying_ && ! playing)
         stopAllAudioLanes();
+
+    /* Transport-recording rising edge: snapshot playhead position
+     * so Body can paint a placeholder growing rect from here to
+     * the current playhead on each armed lane. */
+    if (recording && ! wasRecording_)
+        recordStartBeat_ = beat;
+
+    /* Repaint armed lanes while transport-recording so the REC
+     * indicator + growing-placeholder rect refresh.  The
+     * dispatchAtBeat path only repaints lanes that change region
+     * state -- which doesn't happen during capture (no region
+     * exists until finalise). */
+    const bool recordingStateChanged = (recording != wasRecording_);
+    if (recording || recordingStateChanged)
+    {
+        if (body_ != nullptr)
+        {
+            for (int i = 0; i < lanes_.size(); ++i)
+            {
+                const auto& l = lanes_.getReference (i);
+                const auto& rs = laneRuntime_.getReference (i);
+                if (rs.isAudioLane() && l.armed)
+                    body_->repaintLane (i);
+            }
+        }
+    }
+    wasRecording_ = recording;
 
     if (playing) dispatchAtBeat (beat);
 
