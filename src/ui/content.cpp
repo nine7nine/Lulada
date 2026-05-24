@@ -548,6 +548,8 @@ public:
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::showPluginManager, true); });
         wireBtn (prefsBtn_,     "Preferences...",  &ui::iconCog,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::showPreferences, true); });
+        wireBtn (graphMixBtn_,  "Graph Mixer",      &ui::iconMixer,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showGraphMixer, true); });
         wireBtn (vKbdBtn_,      "Virtual keyboard", &ui::iconKeyboard,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::toggleVirtualKeyboard, true); });
         wireBtn (undoBtn_,      "Undo",             &ui::iconUndo,
@@ -558,11 +560,12 @@ public:
         /* Per-button border + icon-halo tints.  Disk Op + Plugin
          * Manager carry the same colours they had inside the view
          * selector (gold + magenta) so muscle memory survives.
-         * Preferences cog gets a soft blue.  Post-transport trio
+         * Preferences cog gets a soft blue.  Trailing tools cluster
          * picks colours from the same Bitwig-ish family. */
         diskOpBtn_   .setTint (juce::Colour::fromRGB (200, 180,  80));
         pluginMgrBtn_.setTint (juce::Colour::fromRGB (190, 110, 170));
         prefsBtn_    .setTint (juce::Colour::fromRGB ( 90, 150, 210));
+        graphMixBtn_ .setTint (juce::Colour::fromRGB (170, 100, 200));
         vKbdBtn_     .setTint (juce::Colour::fromRGB ( 80, 200, 170));
         undoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
         redoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
@@ -681,18 +684,20 @@ public:
             r.removeFromLeft (vsW + kGap);
         }
 
-        /* ---- Virtual Keyboard / Undo / Redo last, 15 % smaller
-                so the cluster reads as a secondary tools group. */
+        /* ---- Graph Mixer + Virtual Keyboard + Undo + Redo last,
+                15 % smaller so the cluster reads as a secondary
+                tools group. */
         const int smallBtnW = juce::jmax (12, (int) std::lround (kIconBtnW * 0.85));
         const int smallClusterH = smallBtnW + kFramePad * 2;
-        const int smallClusterW = kFramePad * 2 + smallBtnW * 3 + kIconGap * 2;
+        const int smallClusterW = kFramePad * 2 + smallBtnW * 4 + kIconGap * 3;
         const int smallTop = top + (rowH - smallClusterH) / 2;
         postXportRect_ = Rectangle<int> (r.getX(), smallTop, smallClusterW, smallClusterH);
         const int smallBtnY = smallTop + kFramePad;
         int px = r.getX() + kFramePad;
-        vKbdBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        undoBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        redoBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW);
+        graphMixBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        vKbdBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        undoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        redoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW);
         r.removeFromLeft (smallClusterW + kGap);
 
         /* pluginMenu + mapButton stay on the far right (only visible
@@ -783,6 +788,7 @@ private:
     BlockToolButton diskOpBtn_    { "" };
     BlockToolButton pluginMgrBtn_ { "" };
     BlockToolButton prefsBtn_     { "" };
+    BlockToolButton graphMixBtn_  { "" };
     BlockToolButton vKbdBtn_      { "" };
     BlockToolButton undoBtn_      { "" };
     BlockToolButton redoBtn_      { "" };

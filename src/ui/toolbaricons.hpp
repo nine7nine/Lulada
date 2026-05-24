@@ -383,5 +383,27 @@ inline void iconChannelStrip (juce::Graphics& g, juce::Rectangle<float> b, juce:
                               capW, capH, 1.5f);
 }
 
+inline void iconMixer (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+{
+    /* 3-channel mixer: three vertical fader tracks side by side
+     * with caps at different positions -- reads as a mini mixing
+     * console at any button size. */
+    const auto box = b.reduced (b.getWidth() * 0.12f, b.getHeight() * 0.15f);
+    const float colSpan = box.getWidth() / 3.0f;
+    const float trackW = 1.5f;
+    const float capW = colSpan * 0.70f;
+    const float capH = box.getHeight() * 0.13f;
+    /* Cap Y-positions as a fraction down the column for each fader. */
+    const float capYFrac[3] = { 0.30f, 0.55f, 0.20f };
+    g.setColour (fg);
+    for (int i = 0; i < 3; ++i)
+    {
+        const float cx = box.getX() + colSpan * (i + 0.5f);
+        g.fillRect (cx - trackW * 0.5f, box.getY(), trackW, box.getHeight());
+        const float capY = box.getY() + box.getHeight() * capYFrac[i] - capH * 0.5f;
+        g.fillRoundedRectangle (cx - capW * 0.5f, capY, capW, capH, 1.0f);
+    }
+}
+
 } // namespace ui
 } // namespace element
