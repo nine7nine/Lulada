@@ -762,14 +762,43 @@ void SessionView::paint (Graphics& g)
     g.setFont (monoFont (
                                   kCellFontSize, juce::Font::plain));
 
+    /* Build sparse (scene, column) -> SessionClip* lookup once per
+     * paint so the inner cell loop drops from O(R*C*N) linear
+     * findClip scans to O(R*C) array indexes.  At 16 scenes x 8
+     * columns x 20 clips this cuts ~2560 compares per paint to one
+     * pass of the clips_ array. */
+    juce::Array<juce::Array<SessionClip*>> clipByCell;
+    clipByCell.ensureStorageAllocated (scenes_.size());
+    for (int r = 0; r < scenes_.size(); ++r)
+    {
+        juce::Array<SessionClip*> row;
+        row.insertMultiple (0, nullptr, columns_.size());
+        clipByCell.add (std::move (row));
+    }
+    for (auto* clipPtr : clips_)
+    {
+        if (clipPtr == nullptr) continue;
+        if (clipPtr->sceneRow >= 0 && clipPtr->sceneRow < scenes_.size()
+            && clipPtr->columnIdx >= 0 && clipPtr->columnIdx < columns_.size())
+            clipByCell.getReference (clipPtr->sceneRow).set (clipPtr->columnIdx, clipPtr);
+    }
+
+    /* Viewport-clip skip: only cells intersecting the dirty rect do
+     * any work.  Saves the per-cell fillRect + drawRect overhead
+     * (and per-playing-cell playhead bar + name draw) when a
+     * partial repaint covers a slice of the grid. */
+    const auto cellPaintClip = g.getClipBounds();
+
     for (int r = 0; r < scenes_.size(); ++r)
     {
         for (int c = 0; c < columns_.size(); ++c)
         {
             const auto cb    = cellBounds (r, c);
+            if (! cellPaintClip.intersects (cb))
+                continue;
             const auto inner = cb.reduced (2, 2);
 
-            SessionClip* clip = findClip (r, c);
+            SessionClip* clip = clipByCell.getReference (r).getReference (c);
             if (clip == nullptr)
             {
                 /* Empty cell -- flat dark with thin outline. */
