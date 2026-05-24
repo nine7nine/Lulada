@@ -68,6 +68,15 @@ public:
     /** Get a reference to Sesison data */
     SessionRef session();
 
+    /** Global application UndoManager.  All undoable mutations across
+     *  the app -- graph view (via the Message + UndoableAction pattern),
+     *  arrangement view region/lane edits, session view clip/scene
+     *  edits, tracker editor pattern edits, sampler slot edits --
+     *  push their actions here so a single Cmd+Z / Cmd+Shift+Z
+     *  unwinds the user's last operation regardless of which view it
+     *  originated from. */
+    juce::UndoManager& getUndoManager();
+
     /** Show plugin windows for a node */
     void showPluginWindowsFor (const Node& node,
                                const bool recursive = true,

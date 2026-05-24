@@ -20,6 +20,7 @@
 #include "scripting.hpp"
 #include <element/datapath.hpp>
 #include "services/sessionservice.hpp"
+#include "ui/sessionpromptdialog.hpp"
 #include "log.hpp"
 #include "messages.hpp"
 #include "auth.hpp"
@@ -316,34 +317,49 @@ void Application::systemRequestedQuit()
 
     auto* sc = world->services().find<SessionService>();
 
+    /* Confirm-on-quit moved to async native-window dialog
+     * (SessionPromptDialog) -- replaces juce::AlertWindow which
+     * painted as an in-process modal overlay inside the main
+     * window's canvas.  systemRequestedQuit returns immediately;
+     * the dialog's callback drives saveSession / quit. */
+    auto handleSavePromptResult = [sc] (SessionPromptDialog::Result r)
+    {
+        if (r == SessionPromptDialog::Result::Yes)
+            sc->saveSession();
+        if (r != SessionPromptDialog::Result::Cancel)
+            Application::quit();
+    };
+
     if (world->settings().askToSaveSession())
     {
-        // - 0 if the third button was pressed ('cancel')
-        // - 1 if the first button was pressed ('yes')
-        // - 2 if the middle button was pressed ('no')
-        const int res = ! sc->hasSessionChanged() ? 2
-                                                  : AlertWindow::showYesNoCancelBox (AlertWindow::NoIcon, "Save Session", "This session may have changes. Would you like to save before exiting?");
-
-        if (res == 1)
-            sc->saveSession();
-        if (res != 0)
-            Application::quit();
+        if (! sc->hasSessionChanged())
+        {
+            handleSavePromptResult (SessionPromptDialog::Result::No);
+            return;
+        }
+        SessionPromptDialog::showYesNoCancel (
+            "Save Session",
+            "This session may have changes. Would you like to save before exiting?",
+            handleSavePromptResult);
     }
     else
     {
         if (sc->getSessionFile().existsAsFile())
         {
             sc->saveSession (false, false, false);
+            Application::quit();
         }
         else
         {
-            if (AlertWindow::showOkCancelBox (AlertWindow::NoIcon, "Save Session", "This session has not been saved to disk yet.\nWould you like to before exiting?", "Yes", "No"))
-            {
-                sc->saveSession();
-            }
+            SessionPromptDialog::showYesNo (
+                "Save Session",
+                "This session has not been saved to disk yet.\nWould you like to before exiting?",
+                [sc] (SessionPromptDialog::Result r) {
+                    if (r == SessionPromptDialog::Result::Yes)
+                        sc->saveSession();
+                    Application::quit();
+                });
         }
-
-        Application::quit();
     }
 }
 

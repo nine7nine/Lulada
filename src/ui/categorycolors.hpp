@@ -5,6 +5,9 @@
 
 #include "ElementApp.h"
 
+#include <element/node.hpp>
+#include <element/tags.hpp>
+
 namespace element {
 
 /* Shared category / format / node colour palette.
@@ -115,6 +118,39 @@ inline juce::Colour colorForCategoryOrFormat (const juce::String& category,
             return c;
     }
     return defaultColorForFormat (format);
+}
+
+/* Resolved per-node accent colour.  Single source of truth for the
+ * "what kind of node is this" tint surfaced by graph block borders
+ * (block.cpp), graph mixer strips (nodechannelstrip.hpp), node-strip
+ * dock + anywhere else that wants this signal.  Priority:
+ *   1. Audio / MIDI I/O pseudo-nodes -- match their wire colour.
+ *   2. Plugin category (via tags::category property, or the live
+ *      Processor's PluginDescription as fallback for sessions saved
+ *      before tags::category existed).
+ *   3. Plugin format (VST / VST3 / CLAP / LV2 / AU / Element) when
+ *      there's no category at all. */
+inline juce::Colour colorForNode (const Node& node)
+{
+    if (! node.isValid())
+        return juce::Colour (0xff'bd'bd'bd);
+
+    if (node.isAudioInputNode() || node.isAudioOutputNode())
+        return juce::Colour (0xff'00'e6'76);   // green A400 -- matches audio wire
+    if (node.isMidiInputNode() || node.isMidiOutputNode())
+        return juce::Colour (0xff'ff'a7'26);   // orange 400 -- matches MIDI wire
+
+    auto category = node.getProperty (tags::category).toString();
+    if (category.isEmpty())
+    {
+        if (auto obj = node.getObject())
+        {
+            juce::PluginDescription pd;
+            obj->getPluginDescription (pd);
+            category = pd.category;
+        }
+    }
+    return colorForCategoryOrFormat (category, node.getFormat().toString());
 }
 
 } // namespace element

@@ -19,9 +19,6 @@ public:
     Content (GuiService& g)
         : NodeChannelStripComponent (g)
     {
-        // Channel-name label pops in white so it stays legible against
-        // the type-tinted strip background regardless of node format.
-        setNodeNameColour (Colours::white);
         bindSignals();
         _conns.push_back (g.sibling<SessionService>()->sigSessionLoaded.connect ([this, &g]() {
             auto graph = g.session()->getActiveGraph();
@@ -38,18 +35,10 @@ public:
         unbindSignals();
     }
 
-    void paint (Graphics& g) override
-    {
-        // Match the mixer strip — subdued bg with a low-alpha tint of
-        // the node-type accent.  This view always shows the active
-        // node, so no selection state is layered on top.
-        const auto accent = nodeTypeColour (getNode());
-        const auto base   = Colors::widgetBackgroundColor.darker (0.45f);
-        g.setColour (base.interpolatedWith (accent, 0.07f));
-        g.fillAll();
-        g.setColour (Colors::contentBackgroundColor);
-        g.drawLine (0.0, 0.0, 0.0, getHeight());
-    }
+    /* No paint() override -- parent NodeChannelStripComponent::paint
+     * draws the session-style tint band + MUTE / SOLO row.  The prior
+     * override flat-filled the strip with an interpolated low-strength
+     * tint that hid the band. */
 
     std::vector<boost::signals2::connection> _conns;
 };

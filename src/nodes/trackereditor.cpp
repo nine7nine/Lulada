@@ -4,8 +4,12 @@
 #include "nodes/trackereditor.hpp"
 #include "nodes/tracker.hpp"
 
+#include <element/services.hpp>
+#include <element/ui.hpp>
+#include <element/ui/commands.hpp>
 #include "ui/fontcache.hpp"
 #include "ui/lanepalette.hpp"
+#include "ui/viewhelpers.hpp"
 
 namespace element {
 
@@ -155,12 +159,80 @@ int qwertyToSemitone (int keyCode)
 /* ===========================================================================
  * PatternView — the grid.  Owns the edit cursor + handles keyboard input.
  * =========================================================================*/
+/* Bridge action: delegates global UndoManager calls back to a specific
+ * TrackerNode's local undo / redo stack.  Each TrackerNode::pushUndo
+ * mirror one of these into the global manager so Cmd+Z / Cmd+Shift+Z
+ * unwind tracker mutations alongside other views.  Holds a
+ * ProcessorPtr (reference-counted) so the action survives if the
+ * tracker node is removed from the graph while still in undo
+ * history -- it'll keep the node alive long enough to apply the
+ * state restore, then drop when the action is itself dropped. */
+class TrackerBridgeAction : public juce::UndoableAction
+{
+public:
+    explicit TrackerBridgeAction (ProcessorPtr node)
+        : node_ (node) {}
+
+    bool perform() override
+    {
+        /* First perform fires immediately on UndoManager::perform()
+         * when the action is enqueued -- the mutation has ALREADY
+         * been applied by the editor code before pushUndo fired,
+         * so we do nothing.  Subsequent performs are user-driven
+         * redos. */
+        if (firstPerform_)
+        {
+            firstPerform_ = false;
+            return true;
+        }
+        if (auto* tn = dynamic_cast<TrackerNode*> (node_.get()))
+        {
+            tn->redo();
+            return true;
+        }
+        return false;
+    }
+
+    bool undo() override
+    {
+        if (auto* tn = dynamic_cast<TrackerNode*> (node_.get()))
+        {
+            tn->undo();
+            return true;
+        }
+        return false;
+    }
+
+private:
+    ProcessorPtr node_;
+    bool firstPerform_ { true };
+};
+
 class TrackerEditor::PatternView : public juce::Component
 {
 public:
     explicit PatternView (TrackerNode* node) : trackerNode (node)
     {
         setWantsKeyboardFocus (true);
+
+        /* Bridge pushUndo into the global GuiService UndoManager.
+         * Captured lambda re-walks the parent chain at fire time so
+         * we don't need a Services* at construction (PatternView
+         * isn't attached to a parent yet here).  The bridge action
+         * itself keeps the node alive via ProcessorPtr even if the
+         * graph removes it mid-undo-history. */
+        if (trackerNode != nullptr)
+        {
+            trackerNode->onPushUndo = [this]() {
+                if (trackerNode == nullptr) return;
+                if (auto* gui = ViewHelpers::getGuiController (this))
+                {
+                    auto& undo = gui->getUndoManager();
+                    undo.beginNewTransaction();
+                    undo.perform (new TrackerBridgeAction (ProcessorPtr (trackerNode)));
+                }
+            };
+        }
     }
 
     void paint (juce::Graphics& g) override
@@ -1932,12 +2004,24 @@ public:
 
     void undoOp()
     {
-        if (trackerNode) trackerNode->undo();
+        /* Route through the global GuiService UndoManager so Cmd+Z
+         * fires the bridge action which then delegates back to
+         * TrackerNode::undo().  Keeps the local undo / redo stack
+         * (source of truth for state mementos) in lockstep with
+         * the global manager.  Falls back to direct local undo if
+         * the view isn't attached to a Content tree yet. */
+        if (auto* gui = ViewHelpers::getGuiController (this))
+            gui->commands().invokeDirectly (Commands::undo, true);
+        else if (trackerNode)
+            trackerNode->undo();
         clearSelection();
     }
     void redoOp()
     {
-        if (trackerNode) trackerNode->redo();
+        if (auto* gui = ViewHelpers::getGuiController (this))
+            gui->commands().invokeDirectly (Commands::redo, true);
+        else if (trackerNode)
+            trackerNode->redo();
         clearSelection();
     }
 

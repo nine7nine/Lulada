@@ -389,6 +389,12 @@ void TrackerNode::pushUndo()
         undoStack_.remove (0);
     undoStack_.add (block);
     redoStack_.clearQuick();
+
+    /* Notify the editor (or any other observer) that a checkpoint
+     * was just taken.  Used to mirror this transaction into the
+     * global GuiService UndoManager via a bridge action. */
+    if (onPushUndo)
+        onPushUndo();
 }
 
 bool TrackerNode::canUndo() const noexcept { return ! undoStack_.isEmpty(); }

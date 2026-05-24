@@ -13,6 +13,7 @@
 
 #include "services/deviceservice.hpp"
 #include "services/mappingservice.hpp"
+#include "ui/sessionpromptdialog.hpp"
 #include "services/presetservice.hpp"
 #include "services/sessionservice.hpp"
 
@@ -285,28 +286,42 @@ bool SessionService::saveSessionTo (const File& target)
 void SessionService::newSession()
 {
     jassert (document && currentSession);
-    // - 0 if the third button was pressed ('cancel')
-    // - 1 if the first button was pressed ('yes')
-    // - 2 if the middle button was pressed ('no')
-    int res = 2;
-    if (document->hasChangedSinceSaved())
-        res = AlertWindow::showYesNoCancelBox (AlertWindow::InfoIcon,
-                                               "Save Session?",
-                                               "The current session has changes. Would you like to save it?",
-                                               "Save Session",
-                                               "Don't Save",
-                                               "Cancel");
-    if (res == 1)
-        document->save (true, true);
 
-    if (res == 1 || res == 2)
+    /* Common reset path that runs after either the user picked Save
+     * (and we saved) or Don't Save -- skip on Cancel. */
+    auto finishNewSession = [this]()
     {
         sibling<GuiService>()->closeAllPluginWindows();
         loadNewSessionData();
         refreshOtherControllers();
         sibling<GuiService>()->stabilizeContent();
         resetChanges (true);
+    };
+
+    if (! document->hasChangedSinceSaved())
+    {
+        finishNewSession();
+        return;
     }
+
+    /* Native top-level confirm dialog (SessionPromptDialog).  Replaces
+     * juce::AlertWindow's in-process modal overlay. */
+    SessionPromptDialog::showYesNoCancel (
+        "Save Session?",
+        "The current session has changes. Would you like to save it?",
+        [this, finishNewSession] (SessionPromptDialog::Result r)
+        {
+            if (r == SessionPromptDialog::Result::Yes)
+            {
+                document->save (true, true);
+                finishNewSession();
+            }
+            else if (r == SessionPromptDialog::Result::No)
+            {
+                finishNewSession();
+            }
+            /* Cancel -- do nothing, session stays as-is. */
+        });
 }
 
 void SessionService::loadNewSessionData()

@@ -28,9 +28,6 @@ public:
             setNodeNameEditable (! (getNode().isIONode()));
             repaint();
         };
-        // Channel-name label pops in white so it stays legible against
-        // the type-tinted strip background regardless of node format.
-        setNodeNameColour (Colours::white);
         listener.reset (new ChildListener (*this));
         addMouseListener (listener.get(), true);
     }
@@ -98,26 +95,18 @@ public:
         repaint();
     }
 
-    void paint (Graphics& g) override
-    {
-        // Background stays subdued in every state — the type colour is
-        // mixed in at low strength so the strip carries the cue without
-        // shouting.  Selection is signalled by the saturated border in
-        // paintOverChildren, not by flooding the bg.
-        const auto accent = nodeTypeColour (getNode());
-        const auto base   = Colors::widgetBackgroundColor.darker (0.45f);
-        g.setColour (base.interpolatedWith (accent, 0.07f));
-        g.fillAll();
-        // Preserve the 1px right-edge separator from the parent paint.
-        g.setColour (Colors::contentBackgroundColor);
-        g.drawLine (getWidth() - 1.f, 0.0, getWidth() - 1.f, getHeight());
-    }
+    /* No paint() override -- NodeChannelStripComponent::paint draws
+     * the session-style tint band + MUTE / SOLO row wash + name text.
+     * The previous override was masking the band entirely by doing
+     * its own fillAll with an interpolated low-strength tint.
+     * Selection / hover state is layered on top via paintOverChildren
+     * below. */
 
     void paintOverChildren (Graphics& g) override
     {
         if (selected || (hover && ! dragging && ! down))
         {
-            const auto accent = nodeTypeColour (getNode());
+            const auto accent = colorForNode (getNode());
             g.setColour (selected ? accent : accent.withAlpha (0.6f));
             g.drawRect (0.f, 0.f, (float) getWidth(), (float) getHeight(), selected ? 1.4f : 1.0f);
         }
