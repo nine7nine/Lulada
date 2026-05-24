@@ -168,8 +168,21 @@ public:
         paintRuler (g);
 
         const int laneCount = owner.lanes_.size();
+        /* Viewport-clip skip: at high lane counts + zoomed-in vertical
+         * extent, the dirty rect from a scroll / playhead / zoom only
+         * intersects a handful of lanes.  Walking paintLane for the
+         * rest is wasted work (each lane builds Paths + reads thumbs +
+         * paints region fills).  JUCE clips the actual draw calls, but
+         * the per-region preamble runs anyway -- skipping at the lane
+         * level kills the whole branch. */
+        const auto laneClip = g.getClipBounds();
         for (int i = 0; i < laneCount; ++i)
+        {
+            const int laneY = kRulerH + i * kLaneH;
+            if (laneClip.getBottom() <= laneY || laneClip.getY() >= laneY + kLaneH)
+                continue;
             paintLane (g, i);
+        }
 
         if (laneCount == 0)
         {
@@ -1240,7 +1253,19 @@ private:
         g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
                                       10.0f, juce::Font::bold));
 
-        for (int beat = 0; beat <= totalBeats; ++beat)
+        /* Viewport-clip the beat loop.  At low kPxPerBeat (zoomed out)
+         * + a wide strip this loop fires drawVerticalLine + drawText
+         * thousands of times per repaint; only beats whose tick X lies
+         * inside the clip rect are observable.  +/-1 padding on each
+         * end protects bar-number labels that overhang their tick by
+         * a few px. */
+        const auto rulerClip = g.getClipBounds();
+        const int beatStart = juce::jmax (0,
+            (rulerClip.getX() - stripX) / kPxPerBeat - 1);
+        const int beatEnd   = juce::jmin (totalBeats,
+            (rulerClip.getRight() - stripX) / kPxPerBeat + 1);
+
+        for (int beat = beatStart; beat <= beatEnd; ++beat)
         {
             const int x = stripX + beat * kPxPerBeat;
             const bool barLine = (beat % beatsPerBar) == 0;
@@ -1706,7 +1731,18 @@ private:
         }
 
         g.setColour (Colors::widgetBackgroundColor.brighter (0.05f));
-        for (int x = 0; x < stripArea.getWidth(); x += kPxPerBeat * 4)
+        /* Bar-line grid: same viewport-clip idiom as paintRuler.
+         * Only the bars whose X is inside the clip rect contribute
+         * pixels; iterating the full stripArea wastes drawVerticalLine
+         * calls when only a slice is dirty (which is the common case
+         * for a playhead repaint at high zoom). */
+        const auto gridClip = g.getClipBounds();
+        const int gridStep = kPxPerBeat * 4;
+        const int gridStartLocal = juce::jmax (0,
+            ((gridClip.getX() - stripArea.getX()) / gridStep) * gridStep);
+        const int gridEndLocal   = juce::jmin (stripArea.getWidth(),
+            gridClip.getRight() - stripArea.getX() + gridStep);
+        for (int x = gridStartLocal; x < gridEndLocal; x += gridStep)
             g.drawVerticalLine (stripArea.getX() + x,
                                 (float) stripArea.getY(),
                                 (float) stripArea.getBottom());
@@ -1717,12 +1753,24 @@ private:
          * BlockComponent::paint at ui/block.cpp:915-921 so the
          * arrangement reads as a row of mini graph blocks. */
         constexpr float kCornerSize = 2.0f;
+        /* Viewport-clip the regions loop.  Each per-region branch
+         * builds 2-3 Paths + sets a clip + walks the audio thumbnail
+         * (or paintTrackerThumb) + paintVolumeEnvelope.  Skipping the
+         * branch entirely when the region rect is outside the dirty
+         * area is the biggest single timeline-zoom + scroll win at
+         * high clip counts -- the dirty rect from a playhead tick is
+         * a thin vertical strip, so all but a handful of regions per
+         * lane drop out. */
+        const auto regionClip = g.getClipBounds();
         for (const auto& r : lane.playlist.regions())
         {
             const int xs = stripArea.getX() + (int) (r.positionBeats * kPxPerBeat);
             const int ws = juce::jmax (4, (int) (r.lengthBeats * kPxPerBeat));
             Rectangle<int> rect (xs, stripArea.getY() + 4,
                                  ws, stripArea.getHeight() - 8);
+
+            if (! regionClip.intersects (rect))
+                continue;
 
             const bool active   = (r.id == runtime.lastDispatchedRegion);
             const bool selected = (laneIdx == selectedLane_ && r.id == selectedRegion_);

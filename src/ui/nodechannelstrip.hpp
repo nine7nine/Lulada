@@ -150,6 +150,16 @@ public:
 
     inline void timerCallback() override
     {
+        /* Skip the per-tick meter poll + diff-gated setter sweep when
+         * the strip itself isn't on screen.  Volume / power / mute are
+         * already short-circuited internally (channelstrip.hpp setters
+         * early-return on no-change), but getInputRMS / getOutputRMS +
+         * meter.setValue still cross the audio side and walk every
+         * SimpleMeterValue per tick.  Pattern matches meterbridge.cpp:28
+         * + sessionview / diskopview / sampler editors per
+         * feedback_gui_must_stay_fast. */
+        if (! isShowing()) return;
+
         auto& meter = channelStrip.getSimpleMeter();
         if (ProcessorPtr ptr = node.getObject())
         {
