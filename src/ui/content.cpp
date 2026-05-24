@@ -168,8 +168,12 @@ public:
                               (float) (inner.getBottom() - 4));
 
         const juce::Colour digitCol  { 0xff'5a'be'e5 };   // bright cyan-blue
-        const juce::Colour digitDim  { 0xff'3a'78'9a };   // softer for sub-text
-        const juce::Colour labelCol  { 0xff'6a'7a'8a };
+        /* Bright green for the secondary labels + sub-digits --
+         * "4/4" under BPM + "0:00.000" under POS + the "BPM" / "POS"
+         * corner labels.  Picks up against the cyan main digits like
+         * a hardware multi-line LCD. */
+        const juce::Colour digitDim  { 0xff'7a'e0'8a };
+        const juce::Colour labelCol  { 0xff'7a'e0'8a };
 
         /* BPM (large) */
         g.setColour (digitCol);
