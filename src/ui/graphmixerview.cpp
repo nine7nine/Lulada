@@ -104,7 +104,7 @@ public:
         // mixed in at low strength so the strip carries the cue without
         // shouting.  Selection is signalled by the saturated border in
         // paintOverChildren, not by flooding the bg.
-        const auto accent = nodeTypeColour (getNode());
+        const auto accent = colorForNode (getNode());
         const auto base   = Colors::widgetBackgroundColor.darker (0.45f);
         g.setColour (base.interpolatedWith (accent, 0.07f));
         g.fillAll();
@@ -117,7 +117,7 @@ public:
     {
         if (selected || (hover && ! dragging && ! down))
         {
-            const auto accent = nodeTypeColour (getNode());
+            const auto accent = colorForNode (getNode());
             g.setColour (selected ? accent : accent.withAlpha (0.6f));
             g.drawRect (0.f, 0.f, (float) getWidth(), (float) getHeight(), selected ? 1.4f : 1.0f);
         }

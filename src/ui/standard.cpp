@@ -174,9 +174,14 @@ public:
          * StandardContent::viewCache_; this method just routes
          * willBeRemoved / willBecomeActive / didBecomeActive +
          * Component parent membership.  Passing nullptr detaches
-         * the current view. */
-        if (view)
-            view->initializeView (owner.services());
+         * the current view.
+         *
+         * initializeView is NOT called here -- it runs exactly once
+         * per cached view instance at cache-population time inside
+         * StandardContent::lookupOrCreateMainView.  Re-invoking it
+         * on every attach was destroying / recreating child trees
+         * for views with initializeView impls that allocate (e.g.
+         * GraphMixerView's content.reset(new Content)). */
 
         if (primary != nullptr && primary != view)
         {
@@ -203,9 +208,9 @@ public:
 
     void setSecondaryView (ContentView* view)
     {
-        /* Non-owning attach -- mirror of setMainView. */
-        if (view)
-            view->initializeView (owner.services());
+        /* Non-owning attach -- mirror of setMainView.  initializeView
+         * is handled at cache-population time, not per-attach (see
+         * setMainView for rationale). */
 
         if (secondary != nullptr && secondary != view)
         {
@@ -623,6 +628,13 @@ ContentView* StandardContent::lookupOrCreateMainView (const String& name)
 
     if (! v) return nullptr;
     v->setName (name);
+    /* One-shot initializeView: runs exactly once per cached instance,
+     * here at cache population.  Re-invoking on every attach would
+     * trigger destruction / recreation in views that allocate inside
+     * initializeView (e.g. GraphMixerView::initializeView does
+     * content.reset (new Content), which was wiping the inner tree
+     * every hide/show cycle once the cache landed). */
+    v->initializeView (services());
     ContentView* raw = v.get();
     viewCache_[name] = std::move (v);
     return raw;
@@ -642,6 +654,7 @@ ContentView* StandardContent::lookupOrCreateSecondaryView (const String& name)
 
     if (! v) return nullptr;
     v->setName (name);
+    v->initializeView (services());
     ContentView* raw = v.get();
     viewCache_[name] = std::move (v);
     return raw;
@@ -721,6 +734,7 @@ void StandardContent::setContentView (ContentView* view, const bool accessory)
     const juce::String name = view->getName();
 
     ContentView* toAttach = view;
+    bool freshlyCached = false;
     if (name.isNotEmpty())
     {
         auto it = viewCache_.find (name);
@@ -735,6 +749,7 @@ void StandardContent::setContentView (ContentView* view, const bool accessory)
         {
             toAttach = incoming.get();
             viewCache_[name] = std::move (incoming);
+            freshlyCached = true;
         }
     }
     else
@@ -749,7 +764,12 @@ void StandardContent::setContentView (ContentView* view, const bool accessory)
         view->setName (synthKey);
         toAttach = incoming.get();
         viewCache_[synthKey] = std::move (incoming);
+        freshlyCached = true;
     }
+
+    /* One-shot initializeView -- mirrors the lookupOrCreate* paths. */
+    if (freshlyCached)
+        toAttach->initializeView (services());
 
     if (accessory)
     {

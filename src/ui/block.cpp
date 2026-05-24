@@ -878,38 +878,7 @@ void BlockComponent::paint (Graphics& g)
          * keep the color from bleeding into the block contents when
          * the colorize fill (or a brightened-selection bg) is the same
          * family of hue as the type. */
-        const auto typeColor = [this]() -> Colour {
-            /* Border colour priority:
-             *   1. Audio / MIDI IO pseudo-nodes — match their wire colour.
-             *   2. Plugin category — Instrument / Sequencer / MIDI / Effect
-             *      / etc. via defaultColorForCategory.  Works for Element
-             *      internals (whose desc.category we populate) and for
-             *      hosted plugins whose vendor sets one.
-             *   3. Plugin format fallback (VST / VST3 / CLAP / LV2 / AU)
-             *      when there's no category at all. */
-            if (node.isAudioInputNode() || node.isAudioOutputNode())
-                return Colour (0xff00e676);      // green A400 — matches audio wire
-            if (node.isMidiInputNode() || node.isMidiOutputNode())
-                return Colour (0xffffa726);      // orange 400 — matches MIDI wire
-
-            /* Prefer the ValueTree property when it's there (set in
-             * graphmanager when a node is freshly added).  Sessions
-             * saved before tags::category existed won't have it on
-             * restore — fall back to the live Processor's
-             * PluginDescription so the block still gets a colour
-             * (e.g. JACK MIDI nodes loaded from an old session). */
-            auto category = node.getProperty (tags::category).toString();
-            if (category.isEmpty())
-            {
-                if (auto obj = node.getObject())
-                {
-                    juce::PluginDescription pd;
-                    obj->getPluginDescription (pd);
-                    category = pd.category;
-                }
-            }
-            return colorForCategoryOrFormat (category, node.getFormat().toString());
-        }();
+        const auto typeColor = colorForNode (node);
 
         g.setColour (typeColor);
         g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.5f);

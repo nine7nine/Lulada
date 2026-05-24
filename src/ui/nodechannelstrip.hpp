@@ -8,48 +8,12 @@
 #include <element/signals.hpp>
 
 #include "ElementApp.h"
+#include "ui/categorycolors.hpp"
 #include "ui/channelstrip.hpp"
+#include "ui/fontcache.hpp"
 #include "services/sessionservice.hpp"
 
 namespace element {
-
-/* Per-node-type accent colour shared by the channel-strip family
- * (graph mixer strips, the standalone node-strip dock).  Mirrors the
- * block-border palette in block.cpp — duplicated there because block
- * coloring layers selection state into its own logic; here the strip
- * paint paths only need the raw type → colour mapping.  If a fourth
- * consumer turns up, fold block.cpp's local copy into this header. */
-inline juce::Colour nodeTypeColour (const Node& n)
-{
-    using juce::Colour;
-    if (! n.isValid())
-        return Colour (0xffbdbdbd); // gray 400 fallback
-
-    if (n.isAudioInputNode() || n.isAudioOutputNode())
-        return Colour (0xff00e676);      // green A400 — Audio I/O
-    if (n.isMidiInputNode() || n.isMidiOutputNode())
-        return Colour (0xffffa726);      // orange 400 — MIDI I/O
-
-    const auto format = n.getFormat().toString();
-    const auto id     = n.getIdentifier().toString();
-
-    if (format == EL_NODE_FORMAT_NAME)
-    {
-        if (id == EL_NODE_ID_JACK_MIDI_INPUT
-         || id == EL_NODE_ID_JACK_MIDI_OUTPUT
-         || id == EL_NODE_ID_JACK_MIDI_INPUT_ALL
-         || id == EL_NODE_ID_JACK_MIDI_OUTPUT_ALL)
-            return Colour (0xffffa726);  // orange 400 — JACK MIDI
-        return Colour (0xffff4081);      // pink A400  — Element internal
-    }
-
-    if (format == "VST")       return Colour (0xff3d5afe);  // indigo A400 — VST2
-    if (format == "VST3")      return Colour (0xffd500f9);  // purple A400 — VST3
-    if (format == "CLAP")      return Colour (0xff00e5ff);  // cyan   A400 — CLAP
-    if (format == "LV2")       return Colour (0xffff1744);  // red    A400 — LV2
-    if (format == "AudioUnit") return Colour (0xffff9100);  // orange A400 — AudioUnit
-    return Colour (0xffbdbdbd);                              // gray 400 fallback
-}
 
 class NodeChannelStripComponent : public Component,
                                   public Timer,
@@ -66,7 +30,11 @@ public:
         nodeName.setText ("", dontSendNotification);
         nodeName.setJustificationType (Justification::centredBottom);
         nodeName.setEditable (false, true, false);
-        nodeName.setFont (Font (FontOptions (10.f)));
+        /* Mono bold to match session view column headers + arrangement
+         * view lane labels.  Colour is updated on setNode() to track
+         * the node's type-tint so the name reads against the matching
+         * top tint band painted in paint(). */
+        nodeName.setFont (monoFont (11.0f, juce::Font::bold));
         nodeName.onTextChange = [this] {
             if (node.isValid())
                 node.setProperty (tags::name, nodeName.getText());
@@ -142,10 +110,38 @@ public:
 
     inline virtual void paint (Graphics& g) override
     {
-        g.setColour (Colors::widgetBackgroundColor);
-        g.fillAll();
-        g.setColour (Colors::contentBackgroundColor);
-        g.drawLine (getWidth() - 1.f, 0.0, getWidth() - 1.f, getHeight());
+        /* Visual style matches SessionView column headers +
+         * ArrangementView lane labels + TrackerEditor track headers:
+         *   - Dark gutter base (tracker / session shared colour)
+         *   - Top tint band (full width) using colorForNode
+         *   - Low-alpha tint wash across the body below the band
+         *   - Hairline divider on the right edge between strips
+         * Brings the graph mixer in line with the rest of the app's
+         * column/row idiom -- nodes are tinted by category (Audio I/O,
+         * MIDI, VST/VST3/CLAP/LV2/AU, Element internal) and the strip
+         * carries that identity in its top band + wash. */
+        const juce::Colour kGutterColour     { 0xff'14'14'14 };
+        const juce::Colour kRowDividerColour { 0xff'22'22'22 };
+        const juce::Colour tint = colorForNode (node);
+
+        const auto bounds = getLocalBounds();
+        constexpr int kTintBandH = 4;
+
+        g.setColour (kGutterColour);
+        g.fillRect (bounds);
+
+        g.setColour (tint);
+        g.fillRect (bounds.getX(), bounds.getY(),
+                    bounds.getWidth() - 1, kTintBandH);
+
+        g.setColour (tint.withAlpha (0.10f));
+        g.fillRect (bounds.getX(), bounds.getY() + kTintBandH,
+                    bounds.getWidth() - 1,
+                    bounds.getHeight() - kTintBandH - 1);
+
+        g.setColour (kRowDividerColour);
+        g.drawLine ((float) getWidth() - 1.f, 0.0f,
+                    (float) getWidth() - 1.f, (float) getHeight());
     }
 
     inline void timerCallback() override
@@ -260,7 +256,12 @@ public:
         stabilizeContent();
         startTimerHz (meterSpeedHz);
 
-        // Strip bg is type-dependent (see nodeTypeColour) — a node
+        /* Re-tint the name label to track the new node's type colour.
+         * paint() draws the matching top band + wash from the same
+         * colorForNode() source so name + band always agree. */
+        nodeName.setColour (Label::textColourId, colorForNode (node));
+
+        // Strip bg is type-dependent (see colorForNode) — a node
         // swap has to repaint the strip itself, not just refresh the
         // children that listen to model values.
         repaint();

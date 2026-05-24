@@ -43,7 +43,7 @@ public:
         // Match the mixer strip — subdued bg with a low-alpha tint of
         // the node-type accent.  This view always shows the active
         // node, so no selection state is layered on top.
-        const auto accent = nodeTypeColour (getNode());
+        const auto accent = colorForNode (getNode());
         const auto base   = Colors::widgetBackgroundColor.darker (0.45f);
         g.setColour (base.interpolatedWith (accent, 0.07f));
         g.fillAll();
