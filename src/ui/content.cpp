@@ -32,21 +32,33 @@ namespace element {
 static void paintLcdFrame (juce::Graphics& g, juce::Rectangle<int> r,
                             float cornerSize = 4.0f)
 {
+    /* LCD-style faceplate: deep-black outer bezel + brighter rim
+     * highlight so the frame pops against the toolbar's blue-grey
+     * background (Colors::backgroundColor ~= 0xff16191A), plus a
+     * cool-grey inner gradient.  Previous matte-black blended with
+     * the bar; this brighter rim is what makes the frame visible. */
     const auto frect = r.toFloat();
-    g.setColour (juce::Colour (0xff'08'08'08));
+    g.setColour (juce::Colour (0xff'05'05'05));
     g.fillRoundedRectangle (frect, cornerSize);
-    g.setColour (juce::Colour (0xff'3a'3a'3a));
+    g.setColour (juce::Colour (0xff'5a'5a'5a));
     g.drawRoundedRectangle (frect.reduced (0.5f), cornerSize, 1.0f);
 
     const auto inner = frect.reduced (3.0f);
     juce::ColourGradient lcdGrad (
-        juce::Colour (0xff'14'19'1e),
+        juce::Colour (0xff'1a'1f'24),
         inner.getX(), inner.getY(),
         juce::Colour (0xff'0c'0f'12),
         inner.getX(), inner.getBottom(),
         false);
     g.setGradientFill (lcdGrad);
     g.fillRoundedRectangle (inner, juce::jmax (0.5f, cornerSize - 1.0f));
+
+    /* 1-px top highlight line inside the rim, same "lit from above"
+     * cue BlockToolButton uses -- ties the frame to the button
+     * family. */
+    g.setColour (juce::Colours::white.withAlpha (0.06f));
+    g.drawLine (inner.getX() + 1.0f, inner.getY() + 0.5f,
+                inner.getRight() - 1.0f, inner.getY() + 0.5f, 1.0f);
 }
 
 /* ===================================================================== */
@@ -679,17 +691,15 @@ public:
         r.removeFromRight (kGap);
 
         /* ---- CENTRE: digital display anchored to the toolbar's
-                actual centre (not the leftover-area centre, which
-                shifts as side clusters resize).  Slimmer than the
-                rest of the bar by 6 px (3 px above + 3 px below)
-                so the LCD reads as a recessed faceplate. */
+                geometric centre.  Uses getLocalBounds() (full bar
+                width) rather than the leftover `r` so the panel
+                stays put regardless of side-cluster widths. */
         {
-            const int fullW = getLocalBounds().getWidth();
-            const int dispW = juce::jmin (kDisplayW,
-                                            juce::jmax (240, r.getWidth() - 8));
-            const int dispH = juce::jmax (24, rowH - 6);
-            const int dispX = (fullW - dispW) / 2;
-            const int dispY = r.getY() + (H - dispH) / 2;
+            const auto fullBounds = getLocalBounds();
+            const int dispW = kDisplayW;
+            const int dispH = juce::jmax (24, rowH);
+            const int dispX = fullBounds.getX() + (fullBounds.getWidth() - dispW) / 2;
+            const int dispY = top;
             display_.setBounds (dispX, dispY, dispW, dispH);
         }
     }
