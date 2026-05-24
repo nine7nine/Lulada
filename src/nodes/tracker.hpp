@@ -156,6 +156,15 @@ public:
     void redo();
     void clearUndoHistory();
 
+    /** Callback invoked right after each pushUndo() local-stack
+     *  snapshot fires.  The TrackerEditor binds this to push a
+     *  bridge UndoableAction into the global GuiService UndoManager
+     *  so Cmd+Z / Cmd+Shift+Z unwind tracker mutations alongside
+     *  graph / arrangement / session view edits.  Local undo / redo
+     *  remain the source of truth for state mementos; the bridge
+     *  action delegates back via TrackerNode::undo() / redo(). */
+    std::function<void()> onPushUndo;
+
 protected:
     void refreshPorts() override;
 
