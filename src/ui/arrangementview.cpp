@@ -1228,12 +1228,19 @@ public:
 
     void repaintPlayhead (int oldPxX, int newPxX)
     {
+        /* 5-px clear strip per side (was 3) -- gives the regions /
+         * grid AA an extra pixel of overlap so partial repaint of
+         * the lane row catches stale pixels from a 1-2 px AA fringe.
+         * The playhead jump artifact reported 2026-05-24 had leftover
+         * green at the OLD position because a 3-px strip plus a
+         * strict-intersect region clip-skip missed pixels at the
+         * boundary. */
         const int W = getWidth();
         const int H = getHeight();
         if (oldPxX >= 0)
-            repaint (juce::jlimit (0, W, oldPxX - 1), 0, 3, H);
+            repaint (juce::jlimit (0, W, oldPxX - 2), 0, 5, H);
         if (newPxX >= 0)
-            repaint (juce::jlimit (0, W, newPxX - 1), 0, 3, H);
+            repaint (juce::jlimit (0, W, newPxX - 2), 0, 5, H);
     }
 
     static constexpr int kLabelW         = 130;
@@ -1865,8 +1872,17 @@ private:
          * area is the biggest single timeline-zoom + scroll win at
          * high clip counts -- the dirty rect from a playhead tick is
          * a thin vertical strip, so all but a handful of regions per
-         * lane drop out. */
-        const auto regionClip = g.getClipBounds();
+         * lane drop out.
+         *
+         * The clip is expanded by a few pixels before the intersect
+         * test so a region rect ending just outside the dirty strip
+         * is still repainted -- fillRoundedRectangle +
+         * drawRoundedRectangle antialias 1-2 px outside the rect's
+         * geometric boundary, and skipping a region whose stroke
+         * fringe leaks into the dirty strip would leave stale pixels
+         * behind on partial repaints (e.g. the playhead-jump
+         * artifact reported 2026-05-24). */
+        const auto regionClip = g.getClipBounds().expanded (3);
         for (const auto& r : lane.playlist.regions())
         {
             const int xs = stripArea.getX() + (int) (r.positionBeats * kPxPerBeat);
