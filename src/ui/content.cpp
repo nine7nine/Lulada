@@ -419,6 +419,20 @@ public:
         wire (trkBtn,     "Trackers",       Commands::showTrackerHost,   &ui::iconTracker);
         wire (sessionBtn, "Session",        Commands::showSessionView,   &ui::iconSession);
 
+        /* Active-state body wash for each view button -- darker +
+         * slightly desaturated version of the border tint, so the
+         * currently-active view reads clearly without overpowering
+         * the icon glyph.  Wired to commands' isTicked flag below. */
+        auto setActiveFromTint = [] (BlockToolButton& b, juce::Colour tint)
+        {
+            b.setActiveTint (tint.withMultipliedBrightness (0.40f)
+                                  .withMultipliedSaturation (0.95f));
+        };
+        setActiveFromTint (graphBtn,   juce::Colour::fromRGB (110, 170, 110));
+        setActiveFromTint (arrBtn,     juce::Colour::fromRGB (220, 140,  60));
+        setActiveFromTint (trkBtn,     juce::Colour::fromRGB (160, 100, 180));
+        setActiveFromTint (sessionBtn, juce::Colour::fromRGB ( 80, 200, 170));
+
         startTimer (150);
     }
 
@@ -552,14 +566,38 @@ public:
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::showPatchBay, true); });
 
         /* Per-button border + icon-halo tints. */
-        diskOpBtn_   .setTint (juce::Colour::fromRGB (200, 180,  80));
-        pluginMgrBtn_.setTint (juce::Colour::fromRGB (190, 110, 170));
-        prefsBtn_    .setTint (juce::Colour::fromRGB ( 90, 150, 210));
-        graphMixBtn_ .setTint (juce::Colour::fromRGB (170, 100, 200));
-        vKbdBtn_     .setTint (juce::Colour::fromRGB ( 80, 200, 170));
-        undoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
-        redoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
-        patchBayBtn_ .setTint (juce::Colour::fromRGB ( 80, 160, 200));
+        const auto tintDisk    = juce::Colour::fromRGB (200, 180,  80);
+        const auto tintPlugMgr = juce::Colour::fromRGB (190, 110, 170);
+        const auto tintPrefs   = juce::Colour::fromRGB ( 90, 150, 210);
+        const auto tintMixer   = juce::Colour::fromRGB (170, 100, 200);
+        const auto tintVKbd    = juce::Colour::fromRGB ( 80, 200, 170);
+        const auto tintEdit    = juce::Colour::fromRGB (200, 160,  80);
+        const auto tintPatch   = juce::Colour::fromRGB ( 80, 160, 200);
+        diskOpBtn_   .setTint (tintDisk);
+        pluginMgrBtn_.setTint (tintPlugMgr);
+        prefsBtn_    .setTint (tintPrefs);
+        graphMixBtn_ .setTint (tintMixer);
+        vKbdBtn_     .setTint (tintVKbd);
+        undoBtn_     .setTint (tintEdit);
+        redoBtn_     .setTint (tintEdit);
+        patchBayBtn_ .setTint (tintPatch);
+
+        /* Active-state body wash for the view-style buttons (Disk
+         * Op, Plugin Manager, Graph Mixer, Patch Bay) + VKbd toggle
+         * -- darker desaturated version of the border tint so the
+         * active view reads clearly when its command is ticked.
+         * Undo / Redo are momentary so no active state. */
+        auto activeWash = [] (juce::Colour tint) {
+            return tint.withMultipliedBrightness (0.40f)
+                       .withMultipliedSaturation (0.95f);
+        };
+        diskOpBtn_   .setActiveTint (activeWash (tintDisk));
+        pluginMgrBtn_.setActiveTint (activeWash (tintPlugMgr));
+        graphMixBtn_ .setActiveTint (activeWash (tintMixer));
+        vKbdBtn_     .setActiveTint (activeWash (tintVKbd));
+        patchBayBtn_ .setActiveTint (activeWash (tintPatch));
+
+        startTimerHz (8);   // refresh active-view toggle states
 
         vKbdBtn_.setClickingTogglesState (true);
         vKbdBtn_.setActiveTint (juce::Colour (0xff'4a'a5'5a));
@@ -742,16 +780,32 @@ public:
 
     void timerCallback() override
     {
-        /* MainDisplayPanel runs its own timer for the digital read-
-         * out.  Toolbar's timer is now used only for mapping-learn
-         * auto-clear (legacy behaviour). */
+        /* Refresh view-style buttons' toggle state from their
+         * commands' isTicked flag so the active surface always
+         * lights up (same idiom ViewSelectorBar uses). */
+        if (auto* gui = ViewHelpers::getGuiController (this))
+        {
+            auto& cm = gui->commands();
+            auto refresh = [&cm] (BlockToolButton& b, int id)
+            {
+                const auto* info = cm.getCommandForID (id);
+                const bool ticked = info != nullptr
+                    && (info->flags & juce::ApplicationCommandInfo::isTicked) != 0;
+                if (b.getToggleState() != ticked)
+                    b.setToggleState (ticked, juce::dontSendNotification);
+            };
+            refresh (diskOpBtn_,    Commands::showDiskOp);
+            refresh (pluginMgrBtn_, Commands::showPluginManager);
+            refresh (graphMixBtn_,  Commands::showGraphMixer);
+            refresh (vKbdBtn_,      Commands::toggleVirtualKeyboard);
+            refresh (patchBayBtn_,  Commands::showPatchBay);
+        }
+
+        /* Mapping-learn auto-clear (legacy behaviour). */
         if (auto* mapping = owner.services().find<MappingService>())
         {
             if (! mapping->isLearning() && mapButton.getToggleState())
-            {
                 mapButton.setToggleState (false, dontSendNotification);
-                stopTimer();
-            }
         }
     }
 
