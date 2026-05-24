@@ -75,8 +75,16 @@ public:
             syncBtn_.setLabel (syncBtn_.getToggleState() ? "Ex" : "In");
         };
 
+        addAndMakeVisible (midiBlinker_);
+        midiBlinker_.setInputOutputVisibility (true, true);
+
         startTimerHz (15);
     }
+
+    /** Access the embedded MIDI blinker so the toolbar can hook its
+     *  triggerSent / triggerReceived signals from the audio engine
+     *  monitor.  Replaces the standalone toolbar-side blinker. */
+    MidiBlinker& getMidiBlinker() noexcept { return midiBlinker_; }
 
     void paint (juce::Graphics& g) override
     {
@@ -176,6 +184,16 @@ public:
         loopBtn_ .setBounds (rightCol.removeFromTop (dotH));
         rightCol.removeFromTop (2);
         countBtn_.setBounds (rightCol.removeFromTop (dotH));
+
+        /* Tiny MIDI in/out blinker sits at the bottom-right of the
+         * panel, above the right-cluster mini buttons.  Small enough
+         * to read as a status pip without competing with the digit
+         * read-outs. */
+        const int blinkerW = 14;
+        const int blinkerH = 8;
+        midiBlinker_.setBounds (inner.getRight() - blinkerW - 4,
+                                 inner.getBottom() - blinkerH - 1,
+                                 blinkerW, blinkerH);
 
         /* Centre area holds the BPM and POS readouts on either side
          * of a divider.  BPM column ~95 px (room for "999.99"), POS
@@ -283,6 +301,7 @@ private:
     BlockToolButton metroBtn_ { "Me" };
     BlockToolButton loopBtn_  { "Lp" };
     BlockToolButton countBtn_ { "Ct" };
+    MidiBlinker     midiBlinker_;
 };
 
 ContentView::ContentView()
@@ -427,7 +446,8 @@ public:
         if (owner.services().getRunMode() == RunMode::Plugin)
             addAndMakeVisible (pluginMenu);
 
-        addAndMakeVisible (midiBlinker);
+        /* MidiBlinker moved INTO the central display panel; no
+         * standalone copy on the toolbar. */
 
         /* New central digital readout -- BPM + position + meter +
          * elapsed all bundled in one inset Bitwig-style panel.
@@ -510,9 +530,9 @@ public:
         {
             midiIOMonitor = engine->getMidiIOMonitor();
             connections.add (midiIOMonitor->sigSent.connect (
-                std::bind (&MidiBlinker::triggerSent, &midiBlinker)));
+                std::bind (&MidiBlinker::triggerSent,    &display_.getMidiBlinker())));
             connections.add (midiIOMonitor->sigReceived.connect (
-                std::bind (&MidiBlinker::triggerReceived, &midiBlinker)));
+                std::bind (&MidiBlinker::triggerReceived, &display_.getMidiBlinker())));
         }
 
         auto* props = settings.getUserSettings();
@@ -606,13 +626,7 @@ public:
                                        .withSizeKeepingCentre (pms, pms));
             r.removeFromRight (kGap / 2);
         }
-        if (midiBlinker.isVisible())
-        {
-            const int blinkerW = 8;
-            midiBlinker.setBounds (r.removeFromRight (blinkerW)
-                                       .withSizeKeepingCentre (blinkerW, rowH));
-            r.removeFromRight (kGap / 2);
-        }
+        /* Standalone midiBlinker slot removed -- in-display now. */
         if (viewSelector.isVisible())
         {
             /* 5 view buttons inside an LCD frame: framePad*2 +
@@ -700,7 +714,6 @@ private:
     TempoAndMeterBar tempoBar;
     TransportBar transport;
     IconButton pluginMenu;
-    MidiBlinker midiBlinker;
     Array<SignalConnection> connections;
 
     /* Central digital readout (Bitwig-style faceplate).  Holds BPM
