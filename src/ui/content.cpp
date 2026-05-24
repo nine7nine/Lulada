@@ -395,11 +395,12 @@ public:
         : graphBtn   ("", juce::Colour::fromRGB (110, 170, 110)),
           arrBtn     ("", juce::Colour::fromRGB (220, 140,  60)),
           trkBtn     ("", juce::Colour::fromRGB (160, 100, 180)),
-          sessionBtn ("", juce::Colour::fromRGB ( 80, 200, 170))
+          sessionBtn ("", juce::Colour::fromRGB ( 80, 200, 170)),
+          patchBtn   ("", juce::Colour::fromRGB ( 80, 160, 200))
     {
-        /* Disk Op + Plugin Manager moved to the leftmost cluster.
-         * Patch Bay moved to the trailing tools cluster.  This
-         * selector now shows the 4 main graph-editing surfaces. */
+        /* Disk Op + Plugin Manager live in the leftmost cluster;
+         * this selector covers the 5 graph-surface views, in order:
+         * Graph / Arr / Tracker / Session / Patch Bay. */
         using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
         auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID,
                               IconFn icon)
@@ -418,11 +419,8 @@ public:
         wire (arrBtn,     "Arrangement",    Commands::showArrangement,   &ui::iconArrangement);
         wire (trkBtn,     "Trackers",       Commands::showTrackerHost,   &ui::iconTracker);
         wire (sessionBtn, "Session",        Commands::showSessionView,   &ui::iconSession);
+        wire (patchBtn,   "Patch Bay",      Commands::showPatchBay,      &ui::iconPatchBay);
 
-        /* Active-state body wash for each view button -- full-
-         * strength tint so the active view reads brightly.  Icon
-         * foreground auto-adjusts (near-black on light tints, white
-         * on dark) inside BlockToolButton's paint. */
         auto setActiveFromTint = [] (BlockToolButton& b, juce::Colour tint)
         {
             b.setActiveTint (tint);
@@ -431,6 +429,7 @@ public:
         setActiveFromTint (arrBtn,     juce::Colour::fromRGB (220, 140,  60));
         setActiveFromTint (trkBtn,     juce::Colour::fromRGB (160, 100, 180));
         setActiveFromTint (sessionBtn, juce::Colour::fromRGB ( 80, 200, 170));
+        setActiveFromTint (patchBtn,   juce::Colour::fromRGB ( 80, 160, 200));
 
         startTimer (150);
     }
@@ -444,7 +443,7 @@ public:
     {
         constexpr int kFramePad = 5;
         constexpr int kGap = 4;
-        const int n = 4;
+        const int n = 5;
         auto r = getLocalBounds().reduced (kFramePad, kFramePad);
         const int total = r.getWidth();
         const int w = (total - kGap * (n - 1)) / n;
@@ -457,7 +456,8 @@ public:
         place (graphBtn);
         place (arrBtn);
         place (trkBtn);
-        sessionBtn.setBounds (r);
+        place (sessionBtn);
+        patchBtn.setBounds (r);
     }
 
 private:
@@ -481,9 +481,10 @@ private:
         refresh (arrBtn,     Commands::showArrangement);
         refresh (trkBtn,     Commands::showTrackerHost);
         refresh (sessionBtn, Commands::showSessionView);
+        refresh (patchBtn,   Commands::showPatchBay);
     }
 
-    BlockToolButton graphBtn, arrBtn, trkBtn, sessionBtn;
+    BlockToolButton graphBtn, arrBtn, trkBtn, sessionBtn, patchBtn;
 };
 
 class Content::Toolbar : public Component,
@@ -561,8 +562,6 @@ public:
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::undo, true); });
         wireBtn (redoBtn_,      "Redo",             &ui::iconRedo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
-        wireBtn (patchBayBtn_,  "Patch Bay",        &ui::iconPatchBay,
-                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showPatchBay, true); });
 
         /* Per-button border + icon-halo tints. */
         const auto tintDisk    = juce::Colour::fromRGB (200, 180,  80);
@@ -571,7 +570,6 @@ public:
         const auto tintMixer   = juce::Colour::fromRGB (170, 100, 200);
         const auto tintVKbd    = juce::Colour::fromRGB ( 80, 200, 170);
         const auto tintEdit    = juce::Colour::fromRGB (200, 160,  80);
-        const auto tintPatch   = juce::Colour::fromRGB ( 80, 160, 200);
         diskOpBtn_   .setTint (tintDisk);
         pluginMgrBtn_.setTint (tintPlugMgr);
         prefsBtn_    .setTint (tintPrefs);
@@ -579,7 +577,6 @@ public:
         vKbdBtn_     .setTint (tintVKbd);
         undoBtn_     .setTint (tintEdit);
         redoBtn_     .setTint (tintEdit);
-        patchBayBtn_ .setTint (tintPatch);
 
         /* Active-state body wash for the view-style buttons (Disk
          * Op, Plugin Manager, Graph Mixer, Patch Bay) + VKbd toggle.
@@ -593,7 +590,6 @@ public:
         pluginMgrBtn_.setActiveTint (activeWash (tintPlugMgr));
         graphMixBtn_ .setActiveTint (activeWash (tintMixer));
         vKbdBtn_     .setActiveTint (activeWash (tintVKbd));
-        patchBayBtn_ .setActiveTint (activeWash (tintPatch));
 
         startTimerHz (8);   // refresh active-view toggle states
 
@@ -706,18 +702,17 @@ public:
         /* ---- View selector right after the display. ---- */
         if (viewSelector.isVisible())
         {
-            /* 4 view buttons now (Graph / Arr / Tracker / Session)
-             * -- Patch Bay moved to the trailing tools cluster. */
-            const int vsW = kFramePad * 2 + kIconBtnW * 4 + kIconGap * 3;
+            /* 5 view buttons: Graph / Arr / Tracker / Session / Patch. */
+            const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
             viewSelector.setBounds (r.getX(), top, vsW, rowH);
             r.removeFromLeft (vsW + kGap);
         }
 
         /* ---- Trailing tools cluster (15 % smaller buttons):
-                Graph Mixer | VKbd | Undo | Redo | Patch Bay. */
+                Graph Mixer | VKbd | Undo | Redo. */
         const int smallBtnW = juce::jmax (12, (int) std::lround (kIconBtnW * 0.85));
         const int smallClusterH = smallBtnW + kFramePad * 2;
-        const int smallClusterW = kFramePad * 2 + smallBtnW * 5 + kIconGap * 4;
+        const int smallClusterW = kFramePad * 2 + smallBtnW * 4 + kIconGap * 3;
         const int smallTop = top + (rowH - smallClusterH) / 2;
         postXportRect_ = Rectangle<int> (r.getX(), smallTop, smallClusterW, smallClusterH);
         const int smallBtnY = smallTop + kFramePad;
@@ -725,8 +720,7 @@ public:
         graphMixBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
         vKbdBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
         undoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        redoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        patchBayBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW);
+        redoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW);
         r.removeFromLeft (smallClusterW + kGap);
 
         /* pluginMenu + mapButton stay on the far right (only visible
@@ -796,7 +790,6 @@ public:
             refresh (pluginMgrBtn_, Commands::showPluginManager);
             refresh (graphMixBtn_,  Commands::showGraphMixer);
             refresh (vKbdBtn_,      Commands::toggleVirtualKeyboard);
-            refresh (patchBayBtn_,  Commands::showPatchBay);
         }
 
         /* Mapping-learn auto-clear (legacy behaviour). */
@@ -837,7 +830,6 @@ private:
     BlockToolButton vKbdBtn_      { "" };
     BlockToolButton undoBtn_      { "" };
     BlockToolButton redoBtn_      { "" };
-    BlockToolButton patchBayBtn_  { "" };
 
     /* LCD-frame bounds captured in resized(), painted in paint(). */
     Rectangle<int> leftClusterRect_;
