@@ -421,11 +421,20 @@ public:
         startTimer (150);
     }
 
+    void paint (juce::Graphics& g) override
+    {
+        paintLcdFrame (g, getLocalBounds());
+    }
+
     void resized() override
     {
+        /* 5-px frame pad on every side so the LCD frame painted in
+         * paint() stays visible around the 5 view buttons.  4-px
+         * gap between siblings matches the transport cluster. */
+        constexpr int kFramePad = 5;
         constexpr int kGap = 4;
         const int n = 5;
-        auto r = getLocalBounds();
+        auto r = getLocalBounds().reduced (kFramePad, kFramePad);
         const int total = r.getWidth();
         const int w = (total - kGap * (n - 1)) / n;
 
