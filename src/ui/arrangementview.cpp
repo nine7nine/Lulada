@@ -989,74 +989,12 @@ public:
         setMouseCursor (juce::MouseCursor::NormalCursor);
     }
 
-    /** Sampler-style zoom on mouse wheel.
-     *
-     *  - Plain wheel: horizontal zoom (px-per-beat).  Beat under the
-     *    cursor stays under the cursor after zoom.
-     *  - Ctrl/Cmd + wheel: vertical zoom (lane height).  Lane row
-     *    under the cursor stays under the cursor after zoom.
-     *  - Trackpad horizontal swipes (deltaX dominant) pass through
-     *    to the viewport's default scroll handling. */
-    void mouseWheelMove (const MouseEvent& e,
-                          const juce::MouseWheelDetails& w) override
-    {
-        if (std::abs (w.deltaX) > std::abs (w.deltaY))
-        {
-            juce::Component::mouseWheelMove (e, w);
-            return;
-        }
-        if (std::abs (w.deltaY) < 0.001f) return;
-
-        const double factor = (w.deltaY > 0) ? 1.20 : (1.0 / 1.20);
-
-        /* Ctrl/Cmd modifier -> vertical (lane height) zoom.  Anchor:
-         * keep the lane row directly under the cursor pinned to its
-         * current screen Y. */
-        if (e.mods.isCtrlDown() || e.mods.isCommandDown())
-        {
-            const int anchorBodyY = e.y;
-            const int oldScrollY  = owner.viewport_.getViewPositionY();
-            const int anchorScreenY = anchorBodyY - oldScrollY;
-
-            const int relY = juce::jmax (0, anchorBodyY - kRulerH);
-            const int oldLaneIdx   = relY / kLaneH;
-            const double yRelInLane = (double) (relY - oldLaneIdx * kLaneH)
-                                     / (double) kLaneH;
-
-            const int newH = juce::jlimit (kLaneHMin, kLaneHMax,
-                                            (int) std::lround (kLaneH * factor));
-            if (newH == kLaneH) return;
-            kLaneH = newH;
-            resizeForLanes();
-
-            const int newAnchorBodyY = kRulerH + oldLaneIdx * kLaneH
-                                     + (int) (yRelInLane * kLaneH);
-            const int newScrollY = juce::jmax (0, newAnchorBodyY - anchorScreenY);
-            const auto viewArea = owner.viewport_.getViewArea();
-            owner.viewport_.setViewPosition (viewArea.getX(), newScrollY);
-            return;
-        }
-
-        /* Plain wheel -> horizontal (px-per-beat) zoom.  Anchor: keep
-         * the beat directly under the cursor pinned to its current
-         * screen X. */
-        const int anchorPxX  = e.x;
-        const int stripPxX   = anchorPxX - kLabelW;
-        const double anchorBeat = (stripPxX <= 0)
-            ? 0.0
-            : (double) stripPxX / (double) kPxPerBeat;
-
-        const int newPxPerBeat = juce::jlimit (kPxPerBeatMin, kPxPerBeatMax,
-                                                (int) std::lround (kPxPerBeat * factor));
-        if (newPxPerBeat == kPxPerBeat) return;
-        kPxPerBeat = newPxPerBeat;
-        resizeForLanes();
-
-        const int newAnchorBodyX = kLabelW + (int) (anchorBeat * kPxPerBeat);
-        const int newScrollX     = juce::jmax (0, newAnchorBodyX - anchorPxX);
-        const auto viewArea = owner.viewport_.getViewArea();
-        owner.viewport_.setViewPosition (newScrollX, viewArea.getY());
-    }
+    /* Wheel-zoom removed per UX feedback 2026-05-24 -- the mouse wheel
+     * + Ctrl/Cmd modifier overloaded scroll with zoom, which made
+     * accidental zooms common.  Zoom now lives exclusively on the
+     * toolbar +/- buttons + Shift +/- keys (Body::zoomBy entry).
+     * The default Component::mouseWheelMove forwards to the parent
+     * Viewport which gives standard vertical-scroll behaviour. */
 
     /** Build + show the region right-click popup.  Stop-gap UI until
      *  the Ardour-style tool-mode toolbar lands -- once the toolbar
@@ -1189,6 +1127,40 @@ public:
         const int anchorScreenX  = anchorBodyX - viewArea.getX();
         const int newScrollX     = juce::jmax (0, newAnchorBodyX - anchorScreenX);
         owner.viewport_.setViewPosition (newScrollX, viewArea.getY());
+
+        /* Persist zoom + scroll on the actual change.  Eliminates the
+         * willBeRemoved write-on-detach pattern that was racy with
+         * session reload and unreliable for view-switch persistence. */
+        owner.writeViewStateToSession();
+    }
+
+    /** Zoom out until the longest region's end fits inside the visible
+     *  viewport width.  Scrolls back to x=0 (overview).  No-op if
+     *  there are no regions or the visible width is non-positive. */
+    void zoomToFit()
+    {
+        double maxEndBeats = 0.0;
+        for (const auto& l : owner.lanes_)
+            for (const auto& r : l.playlist.regions())
+                maxEndBeats = juce::jmax (maxEndBeats, r.endBeats());
+        if (maxEndBeats <= 0.0) return;
+
+        const auto viewArea = owner.viewport_.getViewArea();
+        const int availPx = viewArea.getWidth() - kLabelW - 8;
+        if (availPx <= 0) return;
+
+        const int newPxPerBeat = juce::jlimit (kPxPerBeatMin, kPxPerBeatMax,
+            (int) std::floor ((double) availPx / maxEndBeats));
+        if (newPxPerBeat == kPxPerBeat)
+        {
+            owner.viewport_.setViewPosition (0, viewArea.getY());
+            owner.writeViewStateToSession();
+            return;
+        }
+        kPxPerBeat = newPxPerBeat;
+        resizeForLanes();
+        owner.viewport_.setViewPosition (0, viewArea.getY());
+        owner.writeViewStateToSession();
     }
 
     //==========================================================================
@@ -2229,14 +2201,17 @@ ArrangementView::ArrangementView()
     addAndMakeVisible (snapBox_);
     addAndMakeVisible (zoomOutBtn_);
     addAndMakeVisible (zoomInBtn_);
+    addAndMakeVisible (zoomFitBtn_);
     addAndMakeVisible (viewport_);
 
-    /* Horizontal zoom +/- step.  Mirrors the body's mouse-wheel pinch
-     * factor (1.20).  Anchor stays at viewport-centre so the visible
-     * beats roughly hold across taps.  Shift +/- key shortcuts route
-     * to the same zoomBy() entry point on Body. */
+    /* Horizontal zoom controls in an LCD-style cluster on the
+     * toolbar:  [ -  +  Fit ].  -/+ step zoom in/out by 1.20 around
+     * the viewport centre; Fit chooses kPxPerBeat so the longest
+     * region fits the visible width (overview).  Shift +/- key
+     * shortcuts route to the same Body::zoomBy entry point. */
     zoomOutBtn_.onClick = [this]() { if (body_) body_->zoomBy (1.0 / 1.20); };
     zoomInBtn_ .onClick = [this]() { if (body_) body_->zoomBy (1.20); };
+    zoomFitBtn_.onClick = [this]() { if (body_) body_->zoomToFit(); };
 
     /* Snap controls.  snapBtn toggles snap on/off; snapBox picks
      * the snap unit in beats.  Visual highlight = on. */
@@ -2472,6 +2447,12 @@ void ArrangementView::initializeView (Services& s)
     services_ = &s;
     if (auto* eng = s.context().audio().get())
         monitor_ = eng->getTransportMonitor();
+    /* Capture the session VT identity we were built against.
+     * writeViewStateToSession compares against the live session and
+     * skips the write if they differ -- prevents stale-state writes
+     * after a session reload (see initialSessionTree_ in the header). */
+    if (auto sess = s.context().session())
+        initialSessionTree_ = sess->data();
 }
 
 void ArrangementView::didBecomeActive()
@@ -2503,7 +2484,13 @@ void ArrangementView::didBecomeActive()
 
 void ArrangementView::willBeRemoved()
 {
-    writeViewStateToSession();
+    /* No writeViewStateToSession here.  Zoom + scroll persist via
+     * Body::zoomBy / zoomToFit + PersistingViewport::visibleAreaChanged
+     * which write on the actual user action.  Removing the
+     * detach-time write eliminates the session-reload race entirely
+     * (sigSessionLoaded fires after the context's session pointer
+     * swaps, and a willBeRemoved write would overwrite the new
+     * session's view state). */
     cancelPendingUpdate();
     stopTimer();
     detachFromActiveGraph();
@@ -2583,10 +2570,27 @@ void ArrangementView::resized()
     snapBtn_        .setBounds (top.removeFromLeft (52)); top.removeFromLeft (4);
     snapBox_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (12);
 
-    /* Horizontal zoom step buttons, narrow square footprint.  Shift
-     * +/- on the keyboard does the same action. */
-    zoomOutBtn_     .setBounds (top.removeFromLeft (28)); top.removeFromLeft (2);
-    zoomInBtn_      .setBounds (top.removeFromLeft (28));
+    /* Zoom cluster -- LCD-framed group of three buttons.  Inner
+     * geometry: [ -  +  Fit ] with 2 px between buttons + 4 px
+     * inset from the frame on every side.  The frame itself is
+     * painted in paint() around this rect (zoomFrameBounds_). */
+    constexpr int kFrameInset = 4;
+    constexpr int kBtnGap     = 2;
+    const int btnH      = top.getHeight() - kFrameInset * 2;
+    const int dashW     = 22;
+    const int plusW     = 22;
+    const int fitW      = 32;
+    const int clusterW  = kFrameInset * 2 + dashW + kBtnGap + plusW + kBtnGap + fitW;
+
+    auto cluster = top.removeFromLeft (clusterW);
+    zoomFrameBounds_ = cluster;
+    auto inside = cluster.reduced (kFrameInset);
+    zoomOutBtn_.setBounds (inside.removeFromLeft (dashW));
+    inside.removeFromLeft (kBtnGap);
+    zoomInBtn_ .setBounds (inside.removeFromLeft (plusW));
+    inside.removeFromLeft (kBtnGap);
+    zoomFitBtn_.setBounds (inside.removeFromLeft (fitW));
+    juce::ignoreUnused (btnH);
 
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
@@ -2688,6 +2692,30 @@ void ArrangementView::paint (Graphics& g)
     g.fillAll (Colors::contentBackgroundColor);
     g.setColour (Colors::backgroundColor);
     g.fillRect (getLocalBounds().removeFromTop (kHeaderH));
+
+    /* LCD-style frame around the zoom cluster -- mirrors the
+     * TransportBar's matte-black bezel + cool-grey vertical gradient
+     * inset.  Three buttons (-/+/Fit) sit inside; the frame reads as
+     * a single hardware-style group.  zoomFrameBounds_ is computed
+     * in resized(). */
+    if (! zoomFrameBounds_.isEmpty())
+    {
+        const auto frect = zoomFrameBounds_.toFloat();
+        g.setColour (juce::Colour (0xff'08'08'08));
+        g.fillRoundedRectangle (frect, 4.0f);
+        g.setColour (juce::Colour (0xff'3a'3a'3a));
+        g.drawRoundedRectangle (frect.reduced (0.5f), 4.0f, 1.0f);
+
+        const auto inner = frect.reduced (3.0f);
+        juce::ColourGradient lcdGrad (
+            juce::Colour (0xff'14'19'1e),
+            inner.getX(), inner.getY(),
+            juce::Colour (0xff'0c'0f'12),
+            inner.getX(), inner.getBottom(),
+            false);
+        g.setGradientFill (lcdGrad);
+        g.fillRoundedRectangle (inner, 3.0f);
+    }
 }
 
 /* ===================================================================== */
@@ -3176,6 +3204,14 @@ void ArrangementView::writeViewStateToSession()
     if (services_ == nullptr || body_ == nullptr) return;
     auto sess = services_->context().session();
     if (sess == nullptr) return;
+    /* Session-identity guard: sigSessionLoaded fires AFTER the
+     * context's session pointer swaps, so willBeRemoved on this
+     * cached view runs against the NEW session.  Without the guard
+     * we'd overwrite the freshly-loaded NEW session's viewState VT
+     * with this OLD view's zoom/scroll.  Mirrors the SessionView
+     * fix that resolved the test.sls clip-wipe regression. */
+    if (initialSessionTree_.isValid() && sess->data() != initialSessionTree_)
+        return;
     auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
     auto vs   = tree.getOrCreateChildWithName ("viewState", nullptr);
     vs.setProperty ("pxPerBeat", body_->kPxPerBeat,           nullptr);

@@ -253,8 +253,29 @@ private:
     BlockToolButton loopBtn_         { "Loop" };
     BlockToolButton zoomOutBtn_      { "-" };
     BlockToolButton zoomInBtn_       { "+" };
+    BlockToolButton zoomFitBtn_      { "Fit" };
+    /* Bounds of the LCD-style frame wrapping the zoom cluster.
+     * Computed in resized(); painted by paint() so the three zoom
+     * buttons read as a single LCD-framed group like the transport
+     * cluster up the toolbar. */
+    juce::Rectangle<int> zoomFrameBounds_;
     juce::ComboBox snapBox_;
-    juce::Viewport viewport_;
+    /* Viewport subclass that persists scroll position to the session
+     * on every visibleAreaChanged callback.  Pairs with Body::zoomBy /
+     * zoomToFit's writeViewStateToSession calls so view-state writes
+     * happen on the actual user action -- no willBeRemoved write,
+     * no race with session reload. */
+    struct PersistingViewport : juce::Viewport
+    {
+        ArrangementView& owner;
+        PersistingViewport (ArrangementView& o) : owner (o) {}
+        void visibleAreaChanged (const juce::Rectangle<int>&) override
+        {
+            if (owner.body_ != nullptr)
+                owner.writeViewStateToSession();
+        }
+    };
+    PersistingViewport viewport_ { *this };
     std::unique_ptr<Body> body_;
 
     /** Synchronise tool-button toggle states so only one tool reads
@@ -293,6 +314,16 @@ private:
     bool wasPlaying_   = false;
     bool wasRecording_ = false;
     double lastBeat_   = 0.0;
+
+    /* Captured at initializeView -- identity of the session
+     * ValueTree this view was built against.  writeViewStateToSession
+     * compares against the live session before writing; if a session
+     * reload swapped the context's session pointer (sigSessionLoaded
+     * fires AFTER the swap), the comparison fails and the write is
+     * skipped so we don't overwrite the freshly-loaded NEW session's
+     * arrangement / viewState tree with this stale view's data.
+     * Same race that wiped SessionView clips on test.sls reload. */
+    juce::ValueTree initialSessionTree_;
 
     /* Snapshot of the playhead position when transport-recording
      * goes true.  Body paints a placeholder growing rect from this

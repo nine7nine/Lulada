@@ -300,7 +300,15 @@ void SessionView::didBecomeActive()
 void SessionView::willBeRemoved()
 {
     stopTimer();
-    writeToSession();
+    /* No writeToSession here -- mutations write through it on every
+     * change, so this would be redundant in the steady state.  More
+     * importantly, on session reload sigSessionLoaded fires AFTER
+     * the context's session pointer swaps to the new session.  The
+     * outer cache-clear handler then detaches this view, willBeRemoved
+     * runs, and a writeToSession at this point would overwrite the
+     * freshly-loaded NEW session's clips_/scenes_/columns_ tree with
+     * this OLD view's stale data -- wiping all the user's saved
+     * clips.  Bug observed 2026-05-24 with test.sls reload. */
 }
 
 void SessionView::stabilizeContent()

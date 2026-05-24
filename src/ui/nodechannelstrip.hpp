@@ -15,6 +15,44 @@
 
 namespace element {
 
+/* Flat session-style toggle button.  juce::TextButton routes through
+ * LookAndFeel which adds rounded corners + saturation/alpha
+ * adjustments + gradient shading -- not the flat fillRect + drawRect
+ * idiom that SessionView paints directly for its MUTE / SOLO
+ * buttons.  This class paints exactly that: solid fill + 1-px outline
+ * + centered mono-bold label.  Caller sets onBg / offBg / onFg /
+ * offFg via the public fields and triggers repaint(); the button's
+ * toggle state determines which pair fires. */
+class FlatTintedButton : public juce::Button
+{
+public:
+    explicit FlatTintedButton (const juce::String& label)
+        : juce::Button (label) {}
+
+    juce::Colour onBg  { 0xff'40'40'40 };
+    juce::Colour offBg { 0xff'20'20'20 };
+    juce::Colour onFg  { juce::Colours::white };
+    juce::Colour offFg { juce::Colours::white.withAlpha (0.70f) };
+    juce::Colour border { 0xff'22'22'22 };
+
+    void paintButton (juce::Graphics& g, bool isOver, bool isDown) override
+    {
+        const auto rect = getLocalBounds();
+        const bool on = getToggleState();
+        auto bg = on ? onBg : offBg;
+        if (isDown)        bg = bg.brighter (0.10f);
+        else if (isOver)   bg = bg.brighter (0.06f);
+
+        g.setColour (bg);
+        g.fillRect (rect);
+        g.setColour (border);
+        g.drawRect (rect, 1);
+        g.setColour (on ? onFg : offFg);
+        g.setFont (monoFont (9.0f, juce::Font::bold));
+        g.drawText (getButtonText(), rect, juce::Justification::centred);
+    }
+};
+
 class NodeChannelStripComponent : public Component,
                                   public Timer,
                                   public ComboBox::Listener,
@@ -26,18 +64,54 @@ public:
         : gui (g), listenForNodeSelected (handleNodeSelected)
     {
         addAndMakeVisible (channelStrip);
-        addAndMakeVisible (nodeName);
-        nodeName.setText ("", dontSendNotification);
-        nodeName.setJustificationType (Justification::centredBottom);
-        nodeName.setEditable (false, true, false);
-        /* Mono bold to match session view column headers + arrangement
-         * view lane labels.  Colour is updated on setNode() to track
-         * the node's type-tint so the name reads against the matching
-         * top tint band painted in paint(). */
-        nodeName.setFont (monoFont (11.0f, juce::Font::bold));
-        nodeName.onTextChange = [this] {
+        /* Hide the inner ChannelStripComponent's own M button -- the
+         * MUTE pill at the top of the strip (added below) is the
+         * promoted control.  Same model state via channelStrip.setMuted
+         * / channelStrip.isMuted; both buttons would otherwise drive
+         * the same flag from two visually-disjoint places. */
+        channelStrip.setMuteButtonVisible (false);
+
+        /* No Label sub-component for the name -- session view paints
+         * its column names directly via g.drawText (no juce::Label
+         * intermediary), and a Label here was preventing the tint
+         * band from being visible (transparent-bg defaults notwith-
+         * standing, some paint-order edge case under the GL renderer
+         * left the band hidden).  Drawing directly mirrors session's
+         * approach exactly.  Editable-rename via double-click was the
+         * Label feature we drop here; rename now goes through node
+         * inspector / right-click property edit (consistent with how
+         * session columns work). */
+
+        /* MUTE + SOLO pills side-by-side below the name band.
+         * Matches SessionView column header MUTE / SOLO idiom: tint-
+         * derived backgrounds when off, signature colours when on
+         * (amber-red for MUTE, mustard-yellow for SOLO), full-word
+         * labels.  MUTE drives channelStrip.setMuted() so the
+         * existing muteChanged signal chain (engine bypass etc.)
+         * fires unchanged.  SOLO writes a tags::solo property and
+         * fires a callback that consumers (graph host) can hook for
+         * solo bus logic when added. */
+        addAndMakeVisible (muteButton_);
+        muteButton_.setButtonText ("MUTE");
+        muteButton_.setClickingTogglesState (true);
+        muteButton_.onClick = [this] {
+            channelStrip.setMuted (muteButton_.getToggleState(), true);
+        };
+
+        addAndMakeVisible (soloButton_);
+        soloButton_.setButtonText ("SOLO");
+        soloButton_.setClickingTogglesState (true);
+        soloButton_.onClick = [this] {
+            /* SOLO is visual-only for now (no engine solo bus
+             * support); onSoloChanged fires for callers that want
+             * to hook in their own routing.  Persisted via the
+             * "soloed" Identifier on the node so session save / load
+             * round-trips the user's choice. */
+            const bool soloed = soloButton_.getToggleState();
             if (node.isValid())
-                node.setProperty (tags::name, nodeName.getText());
+                node.setProperty (juce::Identifier ("soloed"), soloed);
+            if (onSoloChanged)
+                onSoloChanged (soloed);
         };
 
         addAndMakeVisible (channelBox);
@@ -97,9 +171,22 @@ public:
 
     void resized() override
     {
+        /* Header layout matches SessionView column headers:
+         *   - 22 px tint band carrying the name
+         *   - 18 px MUTE / SOLO row (split horizontally 50/50)
+         *   - then existing IO boxes + ChannelStripComponent below */
+        constexpr int kNameBandH = 22;
+        constexpr int kMuteRowH  = 18;
+        constexpr int kHeaderPad = 4;
+
         auto r (getLocalBounds());
-        nodeName.setBounds (r.removeFromTop (22).reduced (2));
-        r.removeFromTop (10); // padding between strip title and IO boxes
+        r.removeFromTop (kNameBandH);  // name painted directly; no Label child here
+        auto buttonRow = r.removeFromTop (kMuteRowH).reduced (4, 1);
+        const int halfW = buttonRow.getWidth() / 2;
+        muteButton_.setBounds (buttonRow.removeFromLeft (halfW - 1));
+        buttonRow.removeFromLeft (2);
+        soloButton_.setBounds (buttonRow);
+        r.removeFromTop (kHeaderPad);
 
         auto r2 = r.removeFromBottom (jmin (268, r.getHeight()));
         int boxSize = r2.getWidth() - 8;
@@ -110,38 +197,78 @@ public:
 
     inline virtual void paint (Graphics& g) override
     {
-        /* Visual style matches SessionView column headers +
-         * ArrangementView lane labels + TrackerEditor track headers:
-         *   - Dark gutter base (tracker / session shared colour)
-         *   - Top tint band (full width) using colorForNode
-         *   - Low-alpha tint wash across the body below the band
-         *   - Hairline divider on the right edge between strips
-         * Brings the graph mixer in line with the rest of the app's
-         * column/row idiom -- nodes are tinted by category (Audio I/O,
-         * MIDI, VST/VST3/CLAP/LV2/AU, Element internal) and the strip
-         * carries that identity in its top band + wash. */
+        /* Style matches SessionView column headers + ArrangementView
+         * lane labels + TrackerEditor track headers:
+         *   - Dark gutter base for the strip body
+         *   - Solid tint band wrapping the full name row at the top
+         *     (the band IS the strip's visual identity, not just an
+         *     accent stripe)
+         *   - Tinted MUTE pill row below the name band (paint draws
+         *     the row wash; muteButton_ overlays its own tinted pill)
+         *   - Hairline right-edge divider between strips
+         * Same idiom across the four primary views. */
         const juce::Colour kGutterColour     { 0xff'14'14'14 };
         const juce::Colour kRowDividerColour { 0xff'22'22'22 };
         const juce::Colour tint = colorForNode (node);
 
         const auto bounds = getLocalBounds();
-        constexpr int kTintBandH = 4;
+        constexpr int kNameBandH = 22;
+        constexpr int kMuteRowH  = 18;
 
         g.setColour (kGutterColour);
         g.fillRect (bounds);
 
-        g.setColour (tint);
+        /* Name band -- exact replica of SessionView column header:
+         *   - top 4 px = softened tint strip
+         *   - below = 0.10-alpha tint wash where the name sits
+         *
+         * The session column-tint palette uses pre-muted hues like
+         * 0xff'c5'5a'5a (~77% RGB).  colorForNode returns fully-
+         * saturated A400 colours (0xff'00'e6'76 etc.) -- using them
+         * raw made the mixer strip too bright vs. session.  Multiply
+         * saturation + brightness down to approximate the same
+         * visual weight as session's pre-muted palette. */
+        constexpr int kTintStripH = 4;
+        const auto softTint = tint.withMultipliedSaturation (0.65f)
+                                  .withMultipliedBrightness (0.78f);
+        g.setColour (softTint);
         g.fillRect (bounds.getX(), bounds.getY(),
-                    bounds.getWidth() - 1, kTintBandH);
+                    bounds.getWidth() - 1, kTintStripH);
 
         g.setColour (tint.withAlpha (0.10f));
-        g.fillRect (bounds.getX(), bounds.getY() + kTintBandH,
-                    bounds.getWidth() - 1,
-                    bounds.getHeight() - kTintBandH - 1);
+        g.fillRect (bounds.getX(), bounds.getY() + kTintStripH,
+                    bounds.getWidth() - 1, kNameBandH - kTintStripH);
+
+        g.setColour (juce::Colours::white);
+        g.setFont (monoFont (11.0f, juce::Font::bold));
+        g.drawText (nodeNameStr_,
+                    bounds.getX() + 2, bounds.getY() + kTintStripH,
+                    bounds.getWidth() - 4, kNameBandH - kTintStripH,
+                    juce::Justification::centred);
 
         g.setColour (kRowDividerColour);
         g.drawLine ((float) getWidth() - 1.f, 0.0f,
                     (float) getWidth() - 1.f, (float) getHeight());
+
+        /* MUTE / SOLO pill colours -- signature on-state colours
+         * (amber-red for MUTE, mustard-yellow for SOLO), tint-derived
+         * dim off-state.  Same formula SessionView uses for its
+         * column-header buttons.  Set every paint so node-swap
+         * re-tints follow.  FlatTintedButton paints raw fillRect +
+         * drawRect directly (no LookAndFeel rounded corners /
+         * gradients) so the result matches session 1:1. */
+        const juce::Colour btnOffBg = tint.withMultipliedSaturation (0.6f)
+                                          .withMultipliedBrightness (0.55f);
+
+        muteButton_.onBg   = juce::Colour { 0xff'c0'30'30 };       // amber-red
+        muteButton_.offBg  = btnOffBg;
+        muteButton_.onFg   = juce::Colours::white;
+        muteButton_.offFg  = juce::Colours::white.withAlpha (0.70f);
+
+        soloButton_.onBg   = juce::Colour { 0xff'd5'b0'30 };       // mustard-yellow
+        soloButton_.offBg  = btnOffBg;
+        soloButton_.onFg   = juce::Colours::black;
+        soloButton_.offFg  = juce::Colours::white.withAlpha (0.70f);
     }
 
     inline void timerCallback() override
@@ -230,18 +357,16 @@ public:
         }
     }
 
-    inline void setNodeNameEditable (const bool isEditable)
+    inline void setNodeNameEditable (const bool)
     {
-        nodeName.setEditable (false, isEditable, false);
+        /* No-op since the Label was removed.  Name editing moved to
+         * the node inspector / right-click property edit -- consistent
+         * with how session-view column names are renamed. */
     }
 
-    /* Element: override the channel-name label's text colour.  Used by
-     * the graph mixer strip to push the name to pure white so it pops
-     * against the type-tinted background. */
-    inline void setNodeNameColour (Colour c)
-    {
-        nodeName.setColour (Label::textColourId, c);
-    }
+    /* No-op compatibility shim for the old per-strip name colour
+     * override.  The name now paints in white directly via paint(). */
+    inline void setNodeNameColour (Colour) {}
 
     inline void setNode (const Node& newNode)
     {
@@ -256,10 +381,12 @@ public:
         stabilizeContent();
         startTimerHz (meterSpeedHz);
 
-        /* Re-tint the name label to track the new node's type colour.
-         * paint() draws the matching top band + wash from the same
-         * colorForNode() source so name + band always agree. */
-        nodeName.setColour (Label::textColourId, colorForNode (node));
+        /* Sync MUTE / SOLO pill toggles from the new node's stored
+         * properties.  channelStrip's existing muteChanged signal
+         * mirror also fires post-stabilizeContent for the MUTE side. */
+        muteButton_.setToggleState (channelStrip.isMuted(), dontSendNotification);
+        soloButton_.setToggleState ((bool) node.getProperty (juce::Identifier ("soloed"), false),
+                                     dontSendNotification);
 
         // Strip bg is type-dependent (see colorForNode) — a node
         // swap has to repaint the strip itself, not just refresh the
@@ -307,10 +434,27 @@ protected:
         return Decibels::gainToDecibels (gain, -60.f);
     }
 
+public:
+    /** Fires when the SOLO pill is toggled.  Visual-only for now --
+     *  consumers (graph host, mixer view) can hook this to drive
+     *  whatever solo-bus semantics they want.  No-op if unset. */
+    std::function<void (bool)> onSoloChanged;
+
 private:
     friend class NodeChannelStripView;
     GuiService& gui;
-    Label nodeName;
+    /* Name painted directly in paint() (no Label sub-component) so
+     * the tint band beneath always shows.  updateNodeName syncs from
+     * node.getDisplayName() + repaints. */
+    juce::String nodeNameStr_;
+    /* Top-level MUTE + SOLO pills -- promoted from inside
+     * ChannelStripComponent so the strip's column header reads like
+     * SessionView's columns.  MUTE drives channelStrip.setMuted; the
+     * inner mute2 button is hidden via channelStrip.setMuteButtonVisible
+     * (false) in the ctor.  SOLO writes the "soloed" property + fires
+     * onSoloChanged. */
+    FlatTintedButton muteButton_ { "MUTE" };
+    FlatTintedButton soloButton_ { "SOLO" };
     Node node;
     PortArray audioIns, audioOuts;
     ComboBox channelBox, flowBox;
@@ -347,11 +491,8 @@ private:
     {
         if (node.isValid())
         {
-            nodeName.setText (node.getDisplayName(), dontSendNotification);
-            String tooltip = node.getDisplayName();
-            if (node.hasModifiedName())
-                tooltip << " (" << node.getPluginName() << ")";
-            nodeName.setTooltip (tooltip);
+            nodeNameStr_ = node.getDisplayName();
+            repaint();
         }
     }
 
@@ -457,10 +598,17 @@ private:
 
     void muteChanged()
     {
+        const bool muted = channelStrip.isMuted();
         if (node.isValid())
-            node.setProperty (tags::mute, channelStrip.isMuted());
+            node.setProperty (tags::mute, muted);
         if (auto* obj = node.getObject())
-            obj->setMuted (channelStrip.isMuted());
+            obj->setMuted (muted);
+        /* Sync the top-level pill button.  When mute is driven by the
+         * model (engine bypass, session restore, undo, etc.) the inner
+         * channelStrip.mute2 toggle fires this -- mirror it on the
+         * promoted muteButton_ so the visual stays in sync. */
+        if (muteButton_.getToggleState() != muted)
+            muteButton_.setToggleState (muted, dontSendNotification);
     }
 
     void setUnityGain()
