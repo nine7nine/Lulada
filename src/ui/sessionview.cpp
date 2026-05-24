@@ -10,6 +10,7 @@
 #include <element/node.hpp>
 #include <element/session.hpp>
 #include <element/tags.hpp>
+#include <element/ui.hpp>
 #include <element/ui/style.hpp>
 
 #include "nodes/tracker.hpp"
@@ -285,6 +286,9 @@ void SessionView::initializeView (Services& s)
     if (auto* eng = s.context().audio().get())
         monitor_ = eng->getTransportMonitor();
     readFromSession();
+    /* Seed the undo baseline against the session's on-disk state.
+     * Future writeToSession calls diff against this snapshot. */
+    lastCommittedSnapshot_ = getOrCreateSessionViewTree().createCopy();
 }
 
 void SessionView::didBecomeActive()
@@ -3061,6 +3065,13 @@ void SessionView::deleteClip (SessionClip& clip)
 
 void SessionView::rescanColumns()
 {
+    /* Suppress undo tracking: graph-driven column reconciliation is
+     * a side effect of node add / remove in the graph view, which
+     * already pushes its own undo action for the underlying user
+     * action.  We don't want the user's Cmd+Z to also unwind the
+     * session view's column reflow. */
+    juce::ScopedValueSetter<bool> suppressGuard (applyingUndoAction_, true);
+
     if (services_ == nullptr) return;
     auto sess = services_->context().session();
     if (sess == nullptr) return;
@@ -3216,6 +3227,49 @@ void SessionView::readFromSession()
     }
 }
 
+/* Undoable snapshot action for SessionView mutations.  Stored in the
+ * global GuiService::UndoManager.  Holds independent copies of the
+ * sessionView ValueTree on either side of one user mutation;
+ * perform() / undo() swap via SessionView::applySessionSnapshot.
+ * SafePointer guards the cached-view-destroyed case (session reload
+ * clears the cache + undo history together, but defence in depth). */
+class SessionViewSnapshotAction : public juce::UndoableAction
+{
+public:
+    SessionViewSnapshotAction (juce::Component::SafePointer<SessionView> v,
+                                juce::ValueTree before,
+                                juce::ValueTree after)
+        : view_ (v),
+          before_ (std::move (before)),
+          after_  (std::move (after))
+    {}
+
+    bool perform() override
+    {
+        if (auto* v = view_.getComponent())
+        {
+            v->applySessionSnapshot (after_);
+            return true;
+        }
+        return false;
+    }
+
+    bool undo() override
+    {
+        if (auto* v = view_.getComponent())
+        {
+            v->applySessionSnapshot (before_);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    juce::Component::SafePointer<SessionView> view_;
+    juce::ValueTree before_;
+    juce::ValueTree after_;
+};
+
 void SessionView::writeToSession()
 {
     auto tree = getOrCreateSessionViewTree();
@@ -3270,6 +3324,60 @@ void SessionView::writeToSession()
         clipsTree.appendChild (cn, nullptr);
     }
     tree.appendChild (clipsTree, nullptr);
+
+    /* Push an undo step.  writeToSession is the natural transaction
+     * choke point -- every clip add / remove, scene add / remove,
+     * column add / remove, scene rename / colour edit, ARM / MUTE /
+     * SOLO toggle, and quant setting writes through here.  Skip
+     * during undo replay (applyingUndoAction_) and during the
+     * initial first-write (lastCommittedSnapshot_ invalid) so the
+     * baseline doesn't generate a stray action. */
+    if (! applyingUndoAction_ && lastCommittedSnapshot_.isValid() && services_ != nullptr)
+    {
+        auto currentCopy = tree.createCopy();
+        if (auto* gui = services_->find<GuiService>())
+        {
+            auto& undo = gui->getUndoManager();
+            undo.beginNewTransaction();
+            undo.perform (new SessionViewSnapshotAction (this,
+                                                          lastCommittedSnapshot_,
+                                                          currentCopy));
+        }
+        lastCommittedSnapshot_ = std::move (currentCopy);
+    }
+    else
+    {
+        lastCommittedSnapshot_ = tree.createCopy();
+    }
+}
+
+void SessionView::applySessionSnapshot (const juce::ValueTree& snap)
+{
+    /* Re-entrancy guard mirrors ArrangementView::applyLaneSnapshot --
+     * writeToSession runs inside this method (for persistence via
+     * subsequent mutation paths) and must skip the action push. */
+    juce::ScopedValueSetter<bool> guard (applyingUndoAction_, true);
+
+    auto tree = getOrCreateSessionViewTree();
+    if (! tree.isValid()) return;
+
+    /* Replace tree contents with the snapshot: copy props + children
+     * in-place so listeners remain bound to the same VT identity.
+     * Removing-and-re-adding the entire sessionView child would
+     * invalidate any external listeners. */
+    tree.removeAllProperties (nullptr);
+    tree.removeAllChildren (nullptr);
+    for (int i = 0; i < snap.getNumProperties(); ++i)
+    {
+        const auto& propName = snap.getPropertyName (i);
+        tree.setProperty (propName, snap.getProperty (propName), nullptr);
+    }
+    for (int i = 0; i < snap.getNumChildren(); ++i)
+        tree.appendChild (snap.getChild (i).createCopy(), nullptr);
+
+    readFromSession();
+    lastCommittedSnapshot_ = tree.createCopy();
+    repaint();
 }
 
 /* === 30 Hz state poll ================================================== */
