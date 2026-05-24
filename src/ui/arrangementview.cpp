@@ -1143,7 +1143,52 @@ public:
             repaintLane (laneIdx);
             return true;
         }
+
+        /* Shift + = / + : zoom in.  Shift + - : zoom out.  Mirrors the
+         * mouse-wheel pinch step; anchor stays at the viewport centre
+         * since there's no cursor X for keyboard zoom. */
+        if (key.getModifiers().isShiftDown())
+        {
+            if (key.isKeyCode ('=') || key.isKeyCode ('+'))
+            {
+                zoomBy (1.20);
+                return true;
+            }
+            if (key.isKeyCode ('-') || key.isKeyCode ('_'))
+            {
+                zoomBy (1.0 / 1.20);
+                return true;
+            }
+        }
         return false;
+    }
+
+    /** Step the horizontal zoom by `factor` (>1 zooms in).  When
+     *  `anchorBodyX < 0` the anchor is the centre of the visible
+     *  viewport area so the user keeps roughly the same beats on
+     *  screen across the step.  Shared between toolbar +/- buttons
+     *  and the keyboard Shift +/- shortcut. */
+    void zoomBy (double factor, int anchorBodyX = -1)
+    {
+        const auto viewArea = owner.viewport_.getViewArea();
+        if (anchorBodyX < 0)
+            anchorBodyX = viewArea.getCentreX();
+
+        const int stripPxX = anchorBodyX - kLabelW;
+        const double anchorBeat = (stripPxX <= 0)
+            ? 0.0
+            : (double) stripPxX / (double) kPxPerBeat;
+
+        const int newPxPerBeat = juce::jlimit (kPxPerBeatMin, kPxPerBeatMax,
+                                                (int) std::lround (kPxPerBeat * factor));
+        if (newPxPerBeat == kPxPerBeat) return;
+        kPxPerBeat = newPxPerBeat;
+        resizeForLanes();
+
+        const int newAnchorBodyX = kLabelW + (int) (anchorBeat * kPxPerBeat);
+        const int anchorScreenX  = anchorBodyX - viewArea.getX();
+        const int newScrollX     = juce::jmax (0, newAnchorBodyX - anchorScreenX);
+        owner.viewport_.setViewPosition (newScrollX, viewArea.getY());
     }
 
     //==========================================================================
@@ -1151,13 +1196,20 @@ public:
 
     void resizeForLanes()
     {
-        int maxBeats = 32;
+        /* Floor + per-lane padding tuned to keep the strip flush with
+         * content.  Floor of 16 beats = 4 bars at 4/4 -- enough empty
+         * timeline to be a drop target on a fresh session, no further.
+         * Padding of +4 beats past the last region = ~1 bar buffer to
+         * make trailing drag-resize feel snappy without leaving a
+         * sea of empty area past the content.  Was 32 + 8 which left
+         * 8 bars of wasted scroll area on session open. */
+        int maxBeats = 16;
         for (const auto& l : owner.lanes_)
         {
             double end = 0.0;
             for (const auto& r : l.playlist.regions())
                 end = juce::jmax (end, r.endBeats());
-            const int needed = (int) end + 8;
+            const int needed = (int) end + 4;
             if (needed > maxBeats) maxBeats = needed;
         }
         const int w = kLabelW + maxBeats * kPxPerBeat;
@@ -1214,29 +1266,53 @@ public:
 
 private:
     /** Paint the bars:beats ruler row at the top of the strip area.
-     *  Style matches Element's tracker gutter: dark background, mono
-     *  font, minor ticks per beat + major ticks per bar with the bar
-     *  number above.  Bar count derives from the session's
-     *  beatsPerBar (default 4 in 4/4); ruler updates each timer tick
-     *  via the existing paint plumbing. */
+     *  LCD-style faceplate matching TransportBar + MainDisplayPanel
+     *  (matte-black bezel + cool-grey vertical gradient inside), bar
+     *  numbers + ticks in LCD digit blue so the ruler reads as a
+     *  hardware-style display flush with the transport cluster.  Bar
+     *  count derives from the session's beatsPerBar (default 4 in
+     *  4/4). */
     void paintRuler (Graphics& g)
     {
-        const juce::Colour kGutterColour     { 0xff'14'14'14 };
-        const juce::Colour kRowTextColour    { 0xff'a8'a8'a8 };
-        const juce::Colour kRowDividerColour { 0xff'22'22'22 };
+        /* LCD palette: matches the digit blue used in MainDisplayPanel
+         * (content.cpp BPM / POS displays) so the ruler + transport
+         * read as one continuous LCD strip.  Brightened from the
+         * initial pass per visual feedback -- the body text + bar
+         * markers now read clearly against the LCD gradient. */
+        const juce::Colour kBezel       { 0xff'08'08'08 };
+        const juce::Colour kBezelEdge   { 0xff'3a'3a'3a };
+        const juce::Colour kLcdTop      { 0xff'14'19'1e };
+        const juce::Colour kLcdBot      { 0xff'0c'0f'12 };
+        const juce::Colour kLcdBlue     { 0xff'9e'dc'ff };  // bar marker / text -- bright
+        const juce::Colour kLcdBlueMid  { 0xff'6f'b0'e0 };  // beat tick -- mid
+        const juce::Colour kLcdBlueDim  { 0xff'4a'7c'a0 };  // sub-beat tick -- dim
 
         const Rectangle<int> rulerArea (0, 0, getWidth(), kRulerH);
-        g.setColour (kGutterColour);
+
+        /* Outer matte-black bezel, then cool-grey vertical gradient
+         * inset by 2 px so the bezel band is visible top + bottom.
+         * Mirrors the TransportBar paint structure without rounded
+         * corners -- the ruler spans the full width and clips to the
+         * viewport edges, so rounded ends never show. */
+        g.setColour (kBezel);
         g.fillRect (rulerArea);
 
-        /* Bottom divider line. */
-        g.setColour (kRowDividerColour);
+        const auto inner = rulerArea.reduced (0, 2).toFloat();
+        juce::ColourGradient lcdGrad (kLcdTop,
+                                       inner.getX(), inner.getY(),
+                                       kLcdBot,
+                                       inner.getX(), inner.getBottom(),
+                                       false);
+        g.setGradientFill (lcdGrad);
+        g.fillRect (inner);
+
+        /* Hairline below the ruler against the lane bodies. */
+        g.setColour (kBezelEdge);
         g.drawHorizontalLine (kRulerH - 1, 0.0f, (float) getWidth());
 
-        /* Label column header: "Bars:Beats". */
-        g.setColour (kRowTextColour);
-        g.setFont (monoFont (
-                                      10.0f, juce::Font::bold));
+        /* Label column header: "Bars:Beats" in LCD blue. */
+        g.setColour (kLcdBlue);
+        g.setFont (monoFont (10.0f, juce::Font::bold));
         g.drawText ("Bars:Beats",
                     Rectangle<int> (6, 0, kLabelW - 12, kRulerH),
                     juce::Justification::centredLeft, true);
@@ -1251,37 +1327,57 @@ private:
         const int stripW = getWidth() - kLabelW;
         const int totalBeats = stripW / kPxPerBeat + 1;
 
-        g.setFont (monoFont (
-                                      10.0f, juce::Font::bold));
+        g.setFont (monoFont (10.0f, juce::Font::bold));
 
-        /* Viewport-clip the beat loop.  At low kPxPerBeat (zoomed out)
+        /* Tick subdivision scales with zoom so more ruler resolution
+         * appears as the user zooms in.  Threshold = ~8 px between
+         * adjacent ticks so they don't blur into a solid line:
+         *   kPxPerBeat >= 32  -> 4 ticks/beat (1/16 in 4/4 if beat=quarter)
+         *   kPxPerBeat >= 16  -> 2 ticks/beat (1/2 beat)
+         *   else              -> 1 tick/beat (beats only). */
+        const int subdiv = (kPxPerBeat >= 32) ? 4
+                        : (kPxPerBeat >= 16) ? 2
+                        : 1;
+        const int subStepPx   = kPxPerBeat / subdiv;
+        const int totalSubticks = totalBeats * subdiv;
+
+        /* Viewport-clip the tick loop.  At low kPxPerBeat (zoomed out)
          * + a wide strip this loop fires drawVerticalLine + drawText
-         * thousands of times per repaint; only beats whose tick X lies
-         * inside the clip rect are observable.  +/-1 padding on each
-         * end protects bar-number labels that overhang their tick by
-         * a few px. */
+         * thousands of times per repaint; only ticks whose X lies
+         * inside the clip rect are observable.  +/-1 sub padding on
+         * each end protects bar-number labels that overhang their
+         * tick by a few px. */
         const auto rulerClip = g.getClipBounds();
-        const int beatStart = juce::jmax (0,
-            (rulerClip.getX() - stripX) / kPxPerBeat - 1);
-        const int beatEnd   = juce::jmin (totalBeats,
-            (rulerClip.getRight() - stripX) / kPxPerBeat + 1);
+        const int subStart = juce::jmax (0,
+            (rulerClip.getX() - stripX) / subStepPx - 1);
+        const int subEnd   = juce::jmin (totalSubticks,
+            (rulerClip.getRight() - stripX) / subStepPx + 1);
 
-        for (int beat = beatStart; beat <= beatEnd; ++beat)
+        for (int sub = subStart; sub <= subEnd; ++sub)
         {
-            const int x = stripX + beat * kPxPerBeat;
-            const bool barLine = (beat % beatsPerBar) == 0;
+            const int x      = stripX + sub * subStepPx;
+            const int beat   = sub / subdiv;
+            const int phase  = sub % subdiv;
+            const bool atBeat = (phase == 0);
+            const bool atBar  = atBeat && (beat % beatsPerBar) == 0;
 
-            g.setColour (barLine ? kRowTextColour
-                                 : kRowTextColour.withAlpha (0.30f));
-            const int tickTop = barLine ? 4 : kRulerH - 8;
-            g.drawVerticalLine (x,
-                                (float) tickTop,
-                                (float) (kRulerH - 2));
+            /* Tick height + colour by class:
+             *   bar  -> full height, bright LCD blue (and bar number above)
+             *   beat -> half height, mid LCD blue
+             *   sub  -> short stub at bottom, dim LCD blue */
+            int tickTop;
+            juce::Colour tickCol;
+            if (atBar)        { tickTop = 3;            tickCol = kLcdBlue;    }
+            else if (atBeat)  { tickTop = kRulerH - 12; tickCol = kLcdBlueMid; }
+            else              { tickTop = kRulerH - 6;  tickCol = kLcdBlueDim; }
 
-            if (barLine)
+            g.setColour (tickCol);
+            g.drawVerticalLine (x, (float) tickTop, (float) (kRulerH - 2));
+
+            if (atBar)
             {
                 const int barNum = beat / beatsPerBar + 1;
-                g.setColour (kRowTextColour);
+                g.setColour (kLcdBlue);
                 g.drawText (juce::String (barNum),
                             x + 3, 1, 28, kRulerH - 4,
                             juce::Justification::topLeft);
@@ -1378,8 +1474,11 @@ private:
             return (float) body.getX() + (float) (t * body.getWidth());
         };
 
+        /* Selection brightens the curve (no more hard white -- matches
+         * the body-fill brightening above so the region reads as
+         * "selected" without three different highlight colours). */
         const juce::Colour lineCol = selected
-            ? juce::Colours::white
+            ? tint.brighter (0.75f)
             : tint.brighter (0.45f).withAlpha (0.85f);
 
         /* Build a stroke path for the envelope curve AND an aligned
@@ -1603,12 +1702,13 @@ private:
             ? fullTint.withSaturation (0.2f).withBrightness (0.4f)
             : fullTint;
 
-        /* Alternating row backgrounds via brightness offset on the
-         * tracker gutter colour, kept dark to match Element style. */
-        const bool alt = (laneIdx & 1) != 0;
-        g.setColour (alt ? Colour { 0xff'1a'1a'1a } : Colour { 0xff'17'17'17 });
-        g.fillRect (bounds);
-
+        /* Label area background only -- the strip area to the right
+         * inherits the Body's contentBackgroundColor fill from paint()
+         * so lanes don't repaint the entire row width every tick.
+         * Per-row alternating fills + strip-area tint wash were
+         * removed per visual-design call 2026-05-24: only the label
+         * column carries the gutter / tint identity; the strip body
+         * stays uniform background with regions floating on top. */
         const Rectangle<int> labelArea (0, y, kLabelW, kLaneH);
         g.setColour (kGutterColour);
         g.fillRect (labelArea);
@@ -1715,38 +1815,42 @@ private:
             g.drawText ("REC", rect, juce::Justification::centred);
         }
 
-        /* Strip background + beat grid. */
+        /* Strip area beat grid only -- no per-lane background fill or
+         * tint wash.  Body::paint's fillAll handles the strip's base
+         * colour and regions paint themselves on top; what's left for
+         * paintLane to draw across the strip is the bar + beat grid
+         * lines.  Bar lines slightly darker than the body bg, beat
+         * lines (1/4-note in 4/4) one notch dimmer below that so the
+         * timeline tempo reads as a glanceable grid behind regions. */
         const Rectangle<int> stripArea (kLabelW, y, getWidth() - kLabelW, kLaneH);
-        g.setColour (Colors::widgetBackgroundColor.darker (0.4f));
-        g.fillRect (stripArea);
 
-        /* Bitwig-style whole-lane tint wash: low-alpha lane colour over
-         * the full strip so a row is colour-coded between regions, not
-         * just inside them.  Skipped for orphans (their tint is already
-         * desaturated and they shouldn't compete with live lanes for
-         * visual weight). */
-        if (! orphan)
-        {
-            g.setColour (tint.withAlpha (0.08f));
-            g.fillRect (stripArea);
-        }
+        const int gridBeatsPerBar = owner.monitor_ != nullptr
+            ? juce::jmax (1, (int) owner.monitor_->beatsPerBar.get())
+            : 4;
+        const juce::Colour kStripGridBar  { 0xff'2a'2a'2a };
+        const juce::Colour kStripGridBeat { 0xff'1c'1c'1c };
 
-        g.setColour (Colors::widgetBackgroundColor.brighter (0.05f));
-        /* Bar-line grid: same viewport-clip idiom as paintRuler.
-         * Only the bars whose X is inside the clip rect contribute
-         * pixels; iterating the full stripArea wastes drawVerticalLine
-         * calls when only a slice is dirty (which is the common case
-         * for a playhead repaint at high zoom). */
         const auto gridClip = g.getClipBounds();
-        const int gridStep = kPxPerBeat * 4;
-        const int gridStartLocal = juce::jmax (0,
-            ((gridClip.getX() - stripArea.getX()) / gridStep) * gridStep);
-        const int gridEndLocal   = juce::jmin (stripArea.getWidth(),
-            gridClip.getRight() - stripArea.getX() + gridStep);
-        for (int x = gridStartLocal; x < gridEndLocal; x += gridStep)
-            g.drawVerticalLine (stripArea.getX() + x,
+        const int laneBeatStart = juce::jmax (0,
+            (gridClip.getX() - stripArea.getX()) / kPxPerBeat - 1);
+        const int laneBeatEnd   = juce::jmin (stripArea.getWidth() / kPxPerBeat + 1,
+            (gridClip.getRight() - stripArea.getX()) / kPxPerBeat + 1);
+
+        /* Beat lines only show when each beat is at least ~10 px wide;
+         * below that the grid would solid-fill the strip with dim
+         * gray.  Bar lines always draw. */
+        const bool showBeatLines = (kPxPerBeat >= 10);
+
+        for (int beat = laneBeatStart; beat <= laneBeatEnd; ++beat)
+        {
+            const bool barLine = (beat % gridBeatsPerBar) == 0;
+            if (! barLine && ! showBeatLines) continue;
+
+            g.setColour (barLine ? kStripGridBar : kStripGridBeat);
+            g.drawVerticalLine (stripArea.getX() + beat * kPxPerBeat,
                                 (float) stripArea.getY(),
                                 (float) stripArea.getBottom());
+        }
 
         /* Regions painted in the graph-block visual language: filled
          * body in a desaturated lane-tint, then a tint outer stroke
@@ -1773,19 +1877,29 @@ private:
             if (! regionClip.intersects (rect))
                 continue;
 
-            const bool active   = (r.id == runtime.lastDispatchedRegion);
             const bool selected = (laneIdx == selectedLane_ && r.id == selectedRegion_);
 
-            /* Tint = lane colour, brightened/saturated when active,
-             * desaturated + dimmed for orphan lanes. */
+            /* Tint = lane colour, desaturated + dimmed for orphan
+             * lanes.  The previous active-region brightening (when
+             * the playhead crossed into a region) was removed -- it
+             * fired a per-region repaint on every dispatch transition
+             * across every lane, which doesn't scale to 32-64 track
+             * sessions and the visual delta was modest enough that
+             * the playhead line itself reads as the "now playing"
+             * marker. */
             juce::Colour borderTint = lane.colour;
-            if (active)  borderTint = borderTint.withMultipliedSaturation (1.2f)
-                                                 .withMultipliedBrightness (1.15f);
             if (orphan)  borderTint = borderTint.withMultipliedSaturation (0.3f)
                                                  .withMultipliedBrightness (0.6f);
 
-            const juce::Colour fill = borderTint.withMultipliedSaturation (0.55f)
-                                                .withMultipliedBrightness (0.45f);
+            /* Selection visual = slight brightening of the body +
+             * title fills.  The earlier white outer stroke read as
+             * over-emphasized (and read worse when 32+ tracks were
+             * stacked); a small brightness bump keeps the selected
+             * region visible without competing with playhead /
+             * recording indicators. */
+            juce::Colour fill = borderTint.withMultipliedSaturation (0.55f)
+                                          .withMultipliedBrightness (0.45f);
+            if (selected) fill = fill.brighter (0.30f);
 
             /* Region body fill (rounded). */
             g.setColour (fill);
@@ -1804,8 +1918,9 @@ private:
                                             rect.getY() + titleRect.getHeight(),
                                             rect.getWidth(),
                                             juce::jmax (0, rect.getHeight() - titleRect.getHeight()));
-            const juce::Colour titleFill = borderTint.withMultipliedBrightness (0.70f)
-                                                      .withMultipliedSaturation (1.10f);
+            juce::Colour titleFill = borderTint.withMultipliedBrightness (0.70f)
+                                                .withMultipliedSaturation (1.10f);
+            if (selected) titleFill = titleFill.brighter (0.25f);
             {
                 /* Clip to the rounded outer rect so the title band's
                  * top corners follow the region's rounding while its
@@ -1889,15 +2004,12 @@ private:
             }
 
             /* Graph-block borders: tinted outer stroke + black inner
-             * ring with rounded corners.  Selected region overrides
-             * the outer stroke with bright white to stay visible
-             * against any tint. */
-            const juce::Colour outerStrokeCol = selected
-                ? juce::Colours::white
-                : borderTint;
-            const float outerWidth = selected ? 2.0f : 1.5f;
-
-            g.setColour (outerStrokeCol);
+             * ring with rounded corners.  Selection is now signalled
+             * by the brighter body / title fills above; the outer
+             * stroke stays at the lane tint regardless so multiple
+             * stacked tracks don't compete with hard white outlines. */
+            constexpr float outerWidth = 1.5f;
+            g.setColour (borderTint);
             g.drawRoundedRectangle (rect.toFloat(), kCornerSize, outerWidth);
             g.setColour (juce::Colours::black.withAlpha (0.6f));
             g.drawRoundedRectangle (
@@ -2099,7 +2211,16 @@ ArrangementView::ArrangementView()
     addAndMakeVisible (loopBtn_);
     addAndMakeVisible (snapBtn_);
     addAndMakeVisible (snapBox_);
+    addAndMakeVisible (zoomOutBtn_);
+    addAndMakeVisible (zoomInBtn_);
     addAndMakeVisible (viewport_);
+
+    /* Horizontal zoom +/- step.  Mirrors the body's mouse-wheel pinch
+     * factor (1.20).  Anchor stays at viewport-centre so the visible
+     * beats roughly hold across taps.  Shift +/- key shortcuts route
+     * to the same zoomBy() entry point on Body. */
+    zoomOutBtn_.onClick = [this]() { if (body_) body_->zoomBy (1.0 / 1.20); };
+    zoomInBtn_ .onClick = [this]() { if (body_) body_->zoomBy (1.20); };
 
     /* Snap controls.  snapBtn toggles snap on/off; snapBox picks
      * the snap unit in beats.  Visual highlight = on. */
@@ -2342,10 +2463,24 @@ void ArrangementView::didBecomeActive()
     attachToActiveGraph();
     rescanLaneTargets();
     startTimerHz (30);
+
+    /* View-state restore deferred to the next message-thread tick:
+     * the parent setContentView path has not yet invoked our resized(),
+     * so viewport_ has zero dimensions at this point and an immediate
+     * setViewPosition would clamp to (0, 0).  callAsync defers past
+     * resized() so loadViewStateFromSession applies against the real
+     * viewport area. */
+    juce::Component::SafePointer<ArrangementView> self (this);
+    juce::MessageManager::callAsync ([self]()
+    {
+        if (auto* v = self.getComponent())
+            v->loadViewStateFromSession();
+    });
 }
 
 void ArrangementView::willBeRemoved()
 {
+    writeViewStateToSession();
     stopTimer();
     detachFromActiveGraph();
 }
@@ -2408,7 +2543,12 @@ void ArrangementView::resized()
     loopBtn_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (12);
 
     snapBtn_        .setBounds (top.removeFromLeft (52)); top.removeFromLeft (4);
-    snapBox_        .setBounds (top.removeFromLeft (64));
+    snapBox_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (12);
+
+    /* Horizontal zoom step buttons, narrow square footprint.  Shift
+     * +/- on the keyboard does the same action. */
+    zoomOutBtn_     .setBounds (top.removeFromLeft (28)); top.removeFromLeft (2);
+    zoomInBtn_      .setBounds (top.removeFromLeft (28));
 
     viewport_.setBounds (r);
     if (body_ != nullptr) body_->resizeForLanes();
@@ -2827,6 +2967,43 @@ void ArrangementView::writeLanesToSession()
         lanesTree.appendChild (l.toValueTree(), nullptr);
 }
 
+void ArrangementView::loadViewStateFromSession()
+{
+    if (services_ == nullptr || body_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto tree = sess->data().getChildWithName (tags::arrangement);
+    if (! tree.isValid()) return;
+    auto vs = tree.getChildWithName ("viewState");
+    if (! vs.isValid()) return;
+
+    /* Horizontal + vertical zoom are clamped to Body's defined limits
+     * so a session edited under a different build can't park kPxPerBeat
+     * outside [4, 256] or kLaneH outside [40, 240]. */
+    body_->kPxPerBeat = juce::jlimit (Body::kPxPerBeatMin, Body::kPxPerBeatMax,
+        (int) vs.getProperty ("pxPerBeat", body_->kPxPerBeat));
+    body_->kLaneH = juce::jlimit (Body::kLaneHMin, Body::kLaneHMax,
+        (int) vs.getProperty ("laneH", body_->kLaneH));
+    body_->resizeForLanes();
+
+    const int scrollX = (int) vs.getProperty ("scrollX", 0);
+    const int scrollY = (int) vs.getProperty ("scrollY", 0);
+    viewport_.setViewPosition (scrollX, scrollY);
+}
+
+void ArrangementView::writeViewStateToSession()
+{
+    if (services_ == nullptr || body_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
+    auto vs   = tree.getOrCreateChildWithName ("viewState", nullptr);
+    vs.setProperty ("pxPerBeat", body_->kPxPerBeat,           nullptr);
+    vs.setProperty ("laneH",     body_->kLaneH,               nullptr);
+    vs.setProperty ("scrollX",   viewport_.getViewPositionX(), nullptr);
+    vs.setProperty ("scrollY",   viewport_.getViewPositionY(), nullptr);
+}
+
 double ArrangementView::computePlayheadBeats() const
 {
     if (monitor_ == nullptr) return 0.0;
@@ -2859,7 +3036,9 @@ void ArrangementView::dispatchAtBeat (double beat)
                         runtime.lastDispatchedRegion, -1.0);
                 runtime.lastDispatchedRegion = juce::Uuid::null();
                 runtime.lastDispatchedSeqIdx = -1;
-                if (body_ != nullptr) body_->repaintLane (laneIdx);
+                /* No repaintLane: per-region visual no longer differs
+                 * by active state, so the dispatch transition is
+                 * model-only. */
             }
             continue;
         }
@@ -2946,7 +3125,8 @@ void ArrangementView::dispatchAtBeat (double beat)
 
         runtime.lastDispatchedRegion = active->id;
         runtime.lastDispatchedSeqIdx = active->sequenceIdx;
-        if (body_ != nullptr) body_->repaintLane (laneIdx);
+        /* No repaintLane on dispatch transition -- per-region visual
+         * is invariant to playhead-over-region state now. */
     }
 }
 

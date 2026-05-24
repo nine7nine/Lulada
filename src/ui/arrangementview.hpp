@@ -163,6 +163,14 @@ private:
     void loadLanesFromSession();
     void writeLanesToSession();
 
+    /** View-state persistence -- horizontal zoom (pxPerBeat), vertical
+     *  zoom (laneH), and viewport scroll position survive view
+     *  switches.  Written on willBeRemoved; loaded async on
+     *  didBecomeActive so the viewport has been sized by the parent
+     *  before setViewPosition fires. */
+    void loadViewStateFromSession();
+    void writeViewStateToSession();
+
     void autoFillLaneForTracker (Lane& lane, TrackerNode* trk);
 
     /** Resolve a target node uuid to a TrackerNode* via graph walk.
@@ -217,6 +225,8 @@ private:
     BlockToolButton toolTrimBtn_     { "Trim" };
     BlockToolButton toolAuditionBtn_ { "Audit" };
     BlockToolButton loopBtn_         { "Loop" };
+    BlockToolButton zoomOutBtn_      { "-" };
+    BlockToolButton zoomInBtn_       { "+" };
     juce::ComboBox snapBox_;
     juce::Viewport viewport_;
     std::unique_ptr<Body> body_;
