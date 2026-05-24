@@ -2462,14 +2462,21 @@ void ArrangementView::didBecomeActive()
 {
     attachToActiveGraph();
     rescanLaneTargets();
+
+    /* Zoom restored synchronously BEFORE the first paint so the user
+     * never sees the default kPxPerBeat/kLaneH flash through.
+     * Previously the entire view-state was deferred via callAsync
+     * which left one paint frame of unstyled content visible. */
+    loadZoomFromSession();
+
     startTimerHz (30);
 
-    /* View-state restore deferred to the next message-thread tick:
-     * the parent setContentView path has not yet invoked our resized(),
+    /* Scroll restore deferred to the next message-thread tick: the
+     * parent setContentView path has not yet invoked our resized(),
      * so viewport_ has zero dimensions at this point and an immediate
      * setViewPosition would clamp to (0, 0).  callAsync defers past
-     * resized() so loadViewStateFromSession applies against the real
-     * viewport area. */
+     * resized() so loadViewStateFromSession (scroll only) applies
+     * against the real viewport area. */
     juce::Component::SafePointer<ArrangementView> self (this);
     juce::MessageManager::callAsync ([self]()
     {
@@ -2481,11 +2488,22 @@ void ArrangementView::didBecomeActive()
 void ArrangementView::willBeRemoved()
 {
     writeViewStateToSession();
+    cancelPendingUpdate();
     stopTimer();
     detachFromActiveGraph();
 }
 
 void ArrangementView::stabilizeContent()
+{
+    /* Coalesce multiple stabilize requests fired in one event-loop
+     * tick into one rescan on the next tick.  Triggers include
+     * post-rescan callbacks + ValueTree-listener cascades + outer
+     * GuiService stabilizeContent fan-outs.  handleAsyncUpdate does
+     * the actual attach + rescan once. */
+    triggerAsyncUpdate();
+}
+
+void ArrangementView::handleAsyncUpdate()
 {
     attachToActiveGraph();
     rescanLaneTargets();
@@ -2516,14 +2534,18 @@ void ArrangementView::detachFromActiveGraph()
 
 void ArrangementView::valueTreeChildAdded (juce::ValueTree&, juce::ValueTree& child)
 {
+    /* Graph mutations may fire a burst of child-added events (e.g.
+     * adding a subgraph with several nodes drops one event per
+     * node).  Route to triggerAsyncUpdate so a burst collapses to a
+     * single rescan on the next tick. */
     if (child.hasType (types::Node) || child.hasType (tags::nodes))
-        rescanLaneTargets();
+        triggerAsyncUpdate();
 }
 
 void ArrangementView::valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree& child, int)
 {
     if (child.hasType (types::Node) || child.hasType (tags::nodes))
-        rescanLaneTargets();
+        triggerAsyncUpdate();
 }
 
 void ArrangementView::resized()
@@ -2671,6 +2693,8 @@ void collectLaneTargetsFromGraph (const Node& graph,
         if (! child.isValid()) continue;
         if (auto* proc = child.getObject())
         {
+            /* TrackerNode IS-A element::Processor directly so the
+             * cast is on `proc` itself. */
             if (auto* t = dynamic_cast<TrackerNode*> (proc))
             {
                 outNodes.add (child);
@@ -2678,12 +2702,22 @@ void collectLaneTargetsFromGraph (const Node& graph,
                 outAudioClips.add (nullptr);
                 continue;
             }
-            if (auto* a = dynamic_cast<AudioClipNode*> (proc))
+            /* AudioClipNode is a juce::AudioPluginInstance wrapped by
+             * element::Processor -- Node::getObject() returns the
+             * wrapper, so we have to go through proc->getAudioProcessor()
+             * to reach the underlying AudioClipNode.  Mirrors
+             * resolveAudioClipByUuid's unwrap; before this helper
+             * never populated outAudioClips and audio lanes were
+             * silently sent to the orphan path. */
+            if (auto* ap = proc->getAudioProcessor())
             {
-                outNodes.add (child);
-                outTrackers.add (nullptr);
-                outAudioClips.add (a);
-                continue;
+                if (auto* a = dynamic_cast<AudioClipNode*> (ap))
+                {
+                    outNodes.add (child);
+                    outTrackers.add (nullptr);
+                    outAudioClips.add (a);
+                    continue;
+                }
             }
         }
         if (child.isGraph())
@@ -2822,24 +2856,37 @@ void ArrangementView::rescanLaneTargets()
 
     /* Rebuild runtime state in lockstep.  For each persisted lane,
      * resolve which kind of node it binds to + wire up the
-     * AudioLaneAdapter / record commit handler if applicable. */
+     * AudioLaneAdapter / record commit handler if applicable.
+     *
+     * Optimisation: replace the per-lane resolveTrackerByUuid +
+     * resolveAudioClipByUuid calls (each a recursive findNodeByUuid
+     * graph walk = O(M) for M=graph node count) with a linear scan
+     * over the foundNodes array that collectLaneTargetsFromGraph
+     * already populated.  Lookup cost drops from O(N*M) to O(N*F)
+     * where F=N tracker+audio nodes (typically <50), eliminating
+     * most of the graph -> timeline switch latency on dense sessions.
+     * collectLaneTargetsFromGraph now properly unwraps
+     * proc->getAudioProcessor() for AudioClipNodes so foundAudioClips
+     * is correctly populated.
+     *
+     * Per-lane Logger::writeToLog (sync disk IO on the message
+     * thread) is also gone -- the other dominant cost in this loop. */
     laneRuntime_.clearQuick();
     laneRuntime_.ensureStorageAllocated (lanes_.size());
     for (int i = 0; i < lanes_.size(); ++i)
     {
         const auto& l = lanes_.getReference (i);
         LaneRuntimeState s;
-        s.trackerCache   = resolveTrackerByUuid (l.targetNodeUuid);
-        s.audioClipCache = (s.trackerCache != nullptr)
-                              ? nullptr
-                              : resolveAudioClipByUuid (l.targetNodeUuid);
 
-        juce::Logger::writeToLog (
-            juce::String ("[ArrangementView::rescanLaneTargets] lane[")
-            + juce::String (i) + "] name=" + l.name
-            + " targetUuid=" + l.targetNodeUuid.toString()
-            + " tracker=" + (s.trackerCache   ? "yes" : "no")
-            + " audio="   + (s.audioClipCache ? "yes" : "no"));
+        for (int j = 0; j < foundNodes.size(); ++j)
+        {
+            if (foundNodes.getReference (j).getUuid() == l.targetNodeUuid)
+            {
+                s.trackerCache   = foundTrackers  [j];
+                s.audioClipCache = foundAudioClips[j];
+                break;
+            }
+        }
 
         if (s.audioClipCache != nullptr)
         {
@@ -2967,7 +3014,7 @@ void ArrangementView::writeLanesToSession()
         lanesTree.appendChild (l.toValueTree(), nullptr);
 }
 
-void ArrangementView::loadViewStateFromSession()
+void ArrangementView::loadZoomFromSession()
 {
     if (services_ == nullptr || body_ == nullptr) return;
     auto sess = services_->context().session();
@@ -2985,6 +3032,22 @@ void ArrangementView::loadViewStateFromSession()
     body_->kLaneH = juce::jlimit (Body::kLaneHMin, Body::kLaneHMax,
         (int) vs.getProperty ("laneH", body_->kLaneH));
     body_->resizeForLanes();
+}
+
+void ArrangementView::loadViewStateFromSession()
+{
+    /* Scroll only -- zoom is applied synchronously by
+     * loadZoomFromSession from didBecomeActive so the first paint
+     * already has the saved kPxPerBeat / kLaneH.  This deferred path
+     * waits for the parent's resized() to size viewport_, then
+     * restores the saved scroll offset. */
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto tree = sess->data().getChildWithName (tags::arrangement);
+    if (! tree.isValid()) return;
+    auto vs = tree.getChildWithName ("viewState");
+    if (! vs.isValid()) return;
 
     const int scrollX = (int) vs.getProperty ("scrollX", 0);
     const int scrollY = (int) vs.getProperty ("scrollY", 0);

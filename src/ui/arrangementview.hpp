@@ -61,7 +61,8 @@ class TrackerNode;
 class ArrangementView : public ContentView,
                         public juce::FileDragAndDropTarget,
                         private juce::Timer,
-                        private juce::ValueTree::Listener
+                        private juce::ValueTree::Listener,
+                        private juce::AsyncUpdater
 {
 public:
     ArrangementView();
@@ -165,11 +166,21 @@ private:
 
     /** View-state persistence -- horizontal zoom (pxPerBeat), vertical
      *  zoom (laneH), and viewport scroll position survive view
-     *  switches.  Written on willBeRemoved; loaded async on
-     *  didBecomeActive so the viewport has been sized by the parent
-     *  before setViewPosition fires. */
+     *  switches.  Written on willBeRemoved.  loadZoomFromSession runs
+     *  synchronously in didBecomeActive (before first paint) so the
+     *  view never flashes the default zoom; loadViewStateFromSession
+     *  (scroll only) is deferred via callAsync to the message-thread
+     *  tick after the parent's resized() has sized the viewport. */
+    void loadZoomFromSession();
     void loadViewStateFromSession();
     void writeViewStateToSession();
+
+    /** AsyncUpdater target -- coalesces N stabilizeContent + N
+     *  ValueTree-listener triggers in one event-loop tick into one
+     *  attachToActiveGraph + rescanLaneTargets pass on the next.
+     *  didBecomeActive still calls these synchronously since the
+     *  view must be fully laned before the first paint. */
+    void handleAsyncUpdate() override;
 
     void autoFillLaneForTracker (Lane& lane, TrackerNode* trk);
 
