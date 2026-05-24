@@ -362,6 +362,15 @@ private:
     friend class Timer;
     void timerCallback() override
     {
+        /* Skip the per-strip walk when the mixer editor isn't on
+         * screen.  Each strip's processMeter + stabilizeContent are
+         * already diff-gated internally (Monitor atomic reads + value
+         * compares), but the iteration cost + Monitor->getLevel calls
+         * still fire 24x/sec per strip with the window hidden.  Pattern
+         * matches meterbridge.cpp:28 + diskopview / sessionview
+         * timers per feedback_gui_must_stay_fast. */
+        if (! isShowing()) return;
+
         for (auto* const strip : strips)
         {
             strip->processMeter();

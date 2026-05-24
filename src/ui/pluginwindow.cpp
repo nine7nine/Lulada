@@ -302,6 +302,35 @@ PluginWindow::PluginWindow (GuiService& g, Component* const ui, const Node& n)
     setContentOwned (content, true);
     setResizable (windowResize, useResizeHandle);
 
+    /* GPU renderer for native editors only.  Detect a Wine-bridged
+     * plugin editor by checking the editor (and its direct children)
+     * for a WineHWNDEmbedComponent.  VST/VST3/CLAP editors hold the
+     * embed as a direct member added via addAndMakeVisible in their
+     * ctor -- see juce_CLAPPluginFormat.cpp:57, juce_VST3PluginFormat
+     * .cpp:575.  juce::Component has no findChildComponentOfClass<>,
+     * so the scan is hand-rolled.  If no embed is found, the editor
+     * is a pure-JUCE Component tree and attaching OpenGLContext lifts
+     * its paint onto the GPU like MainWindow does -- big win for
+     * SamplerEditor / TrackerEditor / CompressorEditor + GenericAPE
+     * waveform / curve repaints under load.  Continuous repaint stays
+     * off; JUCE invalidates regions and the GL renderer handles the
+     * upload. */
+    auto hasWineEmbed = [] (juce::Component* c) -> bool
+    {
+        if (c == nullptr) return false;
+        if (dynamic_cast<juce::WineHWNDEmbedComponent*> (c) != nullptr) return true;
+        for (int i = 0; i < c->getNumChildComponents(); ++i)
+            if (dynamic_cast<juce::WineHWNDEmbedComponent*> (c->getChildComponent (i)) != nullptr)
+                return true;
+        return false;
+    };
+    if (! hasWineEmbed (ui))
+    {
+        glContext = std::make_unique<juce::OpenGLContext>();
+        glContext->setContinuousRepainting (false);
+        glContext->attachTo (*this);
+    }
+
     addToDesktop();
     content->stabilizeComponents();
 }
@@ -309,6 +338,8 @@ PluginWindow::PluginWindow (GuiService& g, Component* const ui, const Node& n)
 PluginWindow::~PluginWindow()
 {
     delayedNodeFocus.stopTimer();
+    if (glContext != nullptr)
+        glContext->detach();
     name.removeListener (this);
     clearContentComponent();
     setLookAndFeel (nullptr);

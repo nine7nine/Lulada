@@ -4,6 +4,7 @@
 #include "nodes/trackereditor.hpp"
 #include "nodes/tracker.hpp"
 
+#include "ui/fontcache.hpp"
 #include "ui/lanepalette.hpp"
 
 namespace element {
@@ -754,7 +755,7 @@ private:
         }
         // Octave indicator (top-left of gutter, lower band).
         g.setColour (kRowTextColour);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       kHeaderFontSize - 2.0f, juce::Font::plain));
         g.drawText (juce::String ("o") + juce::String (octave),
                     2, kTrackHeaderH - 14, kRowGutterWidth - 4, 12,
@@ -776,7 +777,7 @@ private:
             g.fillRect (x, 6, kTrackWidth - 1, kTrackHeaderH - 6);
 
             /* Track name in the upper strip. */
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           kHeaderFontSize, juce::Font::bold));
             g.setColour (tint);
             g.drawText (juce::String::formatted ("Track%02d", t),
@@ -788,7 +789,7 @@ private:
                                 ? s.tracks[(size_t) t].channel + 1
                                 : t + 1;
             g.setColour (juce::Colours::white.withAlpha (0.55f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           kHeaderFontSize - 2.0f, juce::Font::plain));
             g.drawText (juce::String::formatted ("ch%02d", chan),
                         x + kTrackWidth - 36, 6, 28, 14,
@@ -819,7 +820,7 @@ private:
             g.drawRect (muteR, 1);
             g.setColour (muted ? juce::Colours::white
                                : juce::Colours::white.withAlpha (0.70f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           kHeaderFontSize - 2.0f, juce::Font::bold));
             g.drawText ("MUTE", muteR, juce::Justification::centred);
 
@@ -835,7 +836,7 @@ private:
              * sub-col's actual X so it reads as a header for the data
              * directly below.  Brighter than the previous "0.45 white"
              * to stand out from the cell text. */
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           kHeaderFontSize - 3.0f, juce::Font::bold));
             g.setColour (juce::Colour { 0xff'd0'd0'd0 });
             auto drawLabel = [&] (const char* txt, int colX, int w) {
@@ -858,7 +859,7 @@ private:
         g.setColour (kGutterColour);
         g.fillRect (0, kTrackHeaderH, kRowGutterWidth, s.rows * kRowHeight);
 
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       kCellFontSize, juce::Font::plain));
 
         for (int r = 0; r < s.rows; ++r)
@@ -885,7 +886,7 @@ private:
 
     void paintCells (juce::Graphics& g, const Snapshot& s)
     {
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       kCellFontSize, juce::Font::plain));
 
         for (int t = 0; t < s.ntrk; ++t)
@@ -2193,7 +2194,7 @@ private:
             g.setColour (juce::Colour { 0xee'08'08'08 });
             g.fillRect (vis);
             g.setColour (juce::Colours::white.withAlpha (0.85f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           13.0f, juce::Font::plain));
 
             const juce::StringArray lines = {
@@ -2356,7 +2357,7 @@ public:
          * the existing change* path. */
         auto setupEditable = [this] (juce::Label& l, std::function<void (int)> commit) {
             l.setJustificationType (juce::Justification::centred);
-            l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            l.setFont (monoFont (
                                           12.0f, juce::Font::bold));
             l.setColour (juce::Label::textColourId,           juce::Colour { 0xff'ff'ff'ff });
             l.setColour (juce::Label::backgroundColourId,     juce::Colour { 0xff'18'18'18 });
@@ -2515,7 +2516,7 @@ private:
     void configureLabel (juce::Label& l)
     {
         l.setJustificationType (juce::Justification::centred);
-        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        l.setFont (monoFont (
                                       12.0f, juce::Font::plain));
         l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
         addAndMakeVisible (l);

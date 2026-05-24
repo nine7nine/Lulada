@@ -6,6 +6,8 @@
 #include "ElementApp.h"
 #include <element/node.hpp>
 
+#include <juce_opengl/juce_opengl.h>
+
 namespace element {
 
 class Content;
@@ -55,6 +57,16 @@ private:
     Processor* owner;
     Node node;
     Value name;
+
+    /* GPU-backed rendering for Element-native plugin editors (Tracker,
+     * Sampler, Compressor, MIDI Monitor, OSC, GenericAudioProcessorEditor,
+     * etc.).  Skipped for Wine VST/VST3/CLAP editors -- their
+     * WineHWNDEmbedComponent reparents an X11 child window from the
+     * plugin's PE side into our X11 tree, and stacking an OpenGLContext
+     * on that embed risks the renderer-hang failure mode documented in
+     * memory:winelib-custom-renderer-x11-embed-hangs.  Mirrors the
+     * pattern used by MainWindow (mainwindow.cpp:45). */
+    std::unique_ptr<juce::OpenGLContext> glContext;
 
     struct DelayedNodeFocus : public Timer
     {

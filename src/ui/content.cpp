@@ -13,6 +13,8 @@
 #include <element/ui/content.hpp>
 #include <element/ui/style.hpp>
 
+#include "ui/fontcache.hpp"
+
 #include "services/mappingservice.hpp"
 #include "services/sessionservice.hpp"
 #include "ui/blocktoolbutton.hpp"
@@ -177,14 +179,14 @@ public:
 
         /* BPM (large) */
         g.setColour (digitCol);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       20.0f, juce::Font::bold));
         g.drawText (bpmStr_, bpmAreaRect_,
                     juce::Justification::centred, false);
 
         /* Time signature small below BPM. */
         g.setColour (digitDim);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       10.5f, juce::Font::plain));
         g.drawText (meterStr_,
                     bpmAreaRect_.withY (bpmAreaRect_.getBottom() - 2)
@@ -193,14 +195,14 @@ public:
 
         /* Position (large) */
         g.setColour (digitCol);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       20.0f, juce::Font::bold));
         g.drawText (positionStr_, posAreaRect_,
                     juce::Justification::centred, false);
 
         /* Time elapsed small below position. */
         g.setColour (digitDim);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       10.5f, juce::Font::plain));
         g.drawText (timeStr_,
                     posAreaRect_.withY (posAreaRect_.getBottom() - 2)
@@ -210,7 +212,7 @@ public:
         /* "BPM" + "POS" labels in the top corners, almost-tooltip
          * tiny so they don't compete with the digits. */
         g.setColour (labelCol);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       8.5f, juce::Font::bold));
         g.drawText ("BPM", bpmAreaRect_.getX(), inner.getY() + 1,
                     bpmAreaRect_.getWidth(), 9,

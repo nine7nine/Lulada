@@ -43,7 +43,14 @@ void GraphEditorView::willBeRemoved()
     if (world)
         world->midi().removeChangeListener (this);
     saveSettings();
-    _editor.setNode (Node());
+    /* Don't reset _editor's node here -- under the StandardContent
+     * view cache, this instance is kept alive across switches and
+     * resetting would force the next switch-back to rebuild every
+     * BlockComponent / ConnectorComponent from scratch (was ~15 ms on
+     * a dense session).  The setNode early-return in
+     * GraphEditorComponent::setNode handles the "same graph" case
+     * cheaply when we resume.  Destruction (cache clear / app close)
+     * cleans state naturally via the implicit destructors. */
 }
 
 bool GraphEditorView::keyPressed (const KeyPress& key)

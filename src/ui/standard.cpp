@@ -100,16 +100,17 @@ public:
     ContentContainer (StandardContent& cc, Services& app)
         : owner (cc)
     {
-        primary.reset (new ContentView());
-        addAndMakeVisible (primary.get());
+        /* No default-placeholder ContentView -- primary + secondary
+         * start null and the first setMainView / setSecondaryView
+         * attaches a cached instance owned by StandardContent.
+         * resized() and getMainViewName() both already guard the
+         * null case. */
         bar.reset (new SmartLayoutResizeBar (&layout, 1, false));
         addAndMakeVisible (bar.get());
         bar->mousePressed.connect (
             std::bind (&ContentContainer::updateLayout, this));
         bar->mouseReleased.connect (
             std::bind (&ContentContainer::lockLayout, this));
-        secondary.reset (new ContentView());
-        addAndMakeVisible (primary.get());
 
         bottom.reset (new Bottom (cc));
         addAndMakeVisible (bottom.get());
@@ -141,9 +142,9 @@ public:
         if (showAccessoryView && secondary != nullptr)
         {
             Component* comps[] = {
-                primary.get(),
+                primary,
                 bar.get(),
-                secondary.get()
+                secondary
             };
 
             layout.layOutComponents (comps, 3, 0, 0, r.getWidth(), r.getHeight(), true, true);
@@ -157,11 +158,11 @@ public:
 
     void setNode (const Node& node)
     {
-        if (auto* gdv = dynamic_cast<GraphDisplayView*> (primary.get()))
+        if (auto* gdv = dynamic_cast<GraphDisplayView*> (primary))
             gdv->setNode (node);
-        else if (auto* grid = dynamic_cast<ConnectionGrid*> (primary.get()))
+        else if (auto* grid = dynamic_cast<ConnectionGrid*> (primary))
             grid->setNode (node);
-        else if (auto* ed = dynamic_cast<GraphEditorView*> (primary.get()))
+        else if (auto* ed = dynamic_cast<GraphEditorView*> (primary))
             ed->setNode (node);
         else if (nullptr != primary)
             primary->stabilizeContent();
@@ -169,21 +170,26 @@ public:
 
     void setMainView (ContentView* view)
     {
+        /* Non-owning attach.  The view's lifetime is managed by
+         * StandardContent::viewCache_; this method just routes
+         * willBeRemoved / willBecomeActive / didBecomeActive +
+         * Component parent membership.  Passing nullptr detaches
+         * the current view. */
         if (view)
             view->initializeView (owner.services());
 
-        if (primary)
+        if (primary != nullptr && primary != view)
         {
             primary->willBeRemoved();
-            removeChildComponent (primary.get());
+            removeChildComponent (primary);
         }
 
-        primary.reset (view);
+        primary = view;
 
         if (primary)
         {
             primary->willBecomeActive();
-            addAndMakeVisible (primary.get());
+            addAndMakeVisible (primary);
         }
 
         resized();
@@ -197,21 +203,22 @@ public:
 
     void setSecondaryView (ContentView* view)
     {
+        /* Non-owning attach -- mirror of setMainView. */
         if (view)
             view->initializeView (owner.services());
 
-        if (secondary)
+        if (secondary != nullptr && secondary != view)
         {
             secondary->willBeRemoved();
-            removeChildComponent (secondary.get());
+            removeChildComponent (secondary);
         }
 
-        secondary.reset (view);
+        secondary = view;
 
         if (secondary)
         {
             secondary->willBecomeActive();
-            addAndMakeVisible (secondary.get());
+            addAndMakeVisible (secondary);
         }
 
         setShowAccessoryView (secondary != nullptr, true);
@@ -267,9 +274,12 @@ private:
     StandardContent& owner;
 
     StretchableLayoutManager layout;
-    std::unique_ptr<ContentView> primary;
+    /* Non-owning -- views live in StandardContent::viewCache_.  See
+     * the note in standard.hpp + the cache rationale above the
+     * viewCache_ member. */
+    ContentView* primary { nullptr };
     std::unique_ptr<SmartLayoutResizeBar> bar;
-    std::unique_ptr<ContentView> secondary;
+    ContentView* secondary { nullptr };
 
     class Bottom : public juce::Component
     {
@@ -501,6 +511,26 @@ StandardContent::StandardContent (Context& ctl_)
 
     auto& srv = *ctl_.services().find<SessionService>();
     sessionLoadedConn = srv.sigSessionLoaded.connect ([this]() {
+        /* New session loaded: drop the view cache so views rebuild
+         * against the new session's state.  Without this,
+         * ArrangementView's lanesLoadedFromSession_ stays true and
+         * lane state goes stale across session loads; SessionView /
+         * others have similar one-shot init.  Captures the current
+         * primary + secondary view names BEFORE clearing so we can
+         * restore the user's selection against fresh instances. */
+        const juce::String prevMain = getMainViewName();
+        const juce::String prevAcc  = getAccessoryViewName();
+
+        if (container)
+        {
+            container->setMainView (nullptr);
+            container->setSecondaryView (nullptr);
+        }
+        viewCache_.clear();
+
+        if (prevMain.isNotEmpty())  setMainView (prevMain);
+        if (prevAcc.isNotEmpty())   setSecondaryView (prevAcc);
+
         setCurrentNode (session()->getActiveGraph());
     });
 }
@@ -508,21 +538,28 @@ StandardContent::StandardContent (Context& ctl_)
 StandardContent::~StandardContent() noexcept
 {
     sessionLoadedConn.disconnect();
-    setContentView (nullptr, false);
-    setContentView (nullptr, true);
+    /* Detach the container's raw pointers BEFORE viewCache_ destroys
+     * the underlying ContentView instances, otherwise the container's
+     * implicit destruction would dereference dangling pointers. */
+    if (container)
+    {
+        container->setMainView (nullptr);
+        container->setSecondaryView (nullptr);
+    }
+    viewCache_.clear();
 }
 
 String StandardContent::getMainViewName() const
 {
     String name;
-    if (auto c1 = container->primary.get())
+    if (auto c1 = container->primary)
         name = c1->getName();
     return name;
 }
 
 Component* StandardContent::getMainViewComponent() const
 {
-    if (auto c1 = container->primary.get())
+    if (auto c1 = container->primary)
         return c1;
     return nullptr;
 }
@@ -530,7 +567,7 @@ Component* StandardContent::getMainViewComponent() const
 String StandardContent::getAccessoryViewName() const
 {
     String name;
-    if (auto c2 = container->secondary.get())
+    if (auto c2 = container->secondary)
         name = c2->getName();
     return name;
 }
@@ -540,83 +577,97 @@ int StandardContent::getNavSize()
     return nav != nullptr ? nav->getWidth() : 220;
 }
 
-void StandardContent::setMainView (const String& name)
+ContentView* StandardContent::lookupOrCreateMainView (const String& name)
 {
-    if (auto v = createContentView (name))
+    auto it = viewCache_.find (name);
+    if (it != viewCache_.end())
+        return it->second.get();
+
+    /* Cache miss -- factory.  createContentView is the subclass hook
+     * (returns nullptr by default); fall through to the named built-ins
+     * if it doesn't supply one. */
+    std::unique_ptr<ContentView> v;
+    if (auto* custom = createContentView (name))
+        v.reset (custom);
+    else if (name == "PatchBay")                            v = std::make_unique<ConnectionGrid>();
+    else if (name == EL_VIEW_GRAPH_EDITOR)                  v = std::make_unique<GraphEditorView>();
+    else if (name == EL_VIEW_PLUGIN_MANAGER)                v = std::make_unique<PluginManagerContentView>();
+    else if (name == EL_VIEW_SESSION_SETTINGS
+             || name == "SessionProperties")                v = std::make_unique<SessionContentView>();
+    else if (name == "GraphSettings")                       v = std::make_unique<GraphSettingsView>();
+    else if (name == EL_VIEW_KEYMAP_EDITOR)                 v = std::make_unique<KeymapEditorView>();
+    else if (name == EL_VIEW_CONTROLLERS)                   v = std::make_unique<ControllersView>();
+    else if (name == EL_VIEW_ARRANGEMENT)                   v = std::make_unique<ArrangementView>();
+    else if (name == EL_VIEW_TRACKER_HOST)                  v = std::make_unique<TrackerHostView>();
+    else if (name == EL_VIEW_SESSION_VIEW)                  v = std::make_unique<SessionView>();
+    else if (name == EL_VIEW_DISK_OP)                       v = std::make_unique<DiskOpContentView>();
+    else
     {
-        v->setName (name);
-        setContentView (v, false);
-        return;
+        /* Fallback: GraphEditorView if any graph exists in the session,
+         * else EmptyContentView. */
+        if (auto s = context().session())
+            v = s->getNumGraphs() > 0
+                  ? std::unique_ptr<ContentView> (new GraphEditorView())
+                  : std::unique_ptr<ContentView> (new EmptyContentView());
+        else
+            v = std::make_unique<EmptyContentView>();
     }
 
+    if (! v) return nullptr;
+    v->setName (name);
+    ContentView* raw = v.get();
+    viewCache_[name] = std::move (v);
+    return raw;
+}
+
+ContentView* StandardContent::lookupOrCreateSecondaryView (const String& name)
+{
+    auto it = viewCache_.find (name);
+    if (it != viewCache_.end())
+        return it->second.get();
+
+    std::unique_ptr<ContentView> v;
+    if (auto* custom = createContentView (name))
+        v.reset (custom);
+    else if (name == EL_VIEW_GRAPH_MIXER) v = std::make_unique<GraphMixerView>();
+    else if (name == EL_VIEW_CONSOLE)     v = std::make_unique<LuaConsoleView>();
+
+    if (! v) return nullptr;
+    v->setName (name);
+    ContentView* raw = v.get();
+    viewCache_[name] = std::move (v);
+    return raw;
+}
+
+void StandardContent::setMainView (const String& name)
+{
+    /* Pre-switch: capture state from outgoing view for cross-view
+     * handoffs (e.g. PatchBay reads the GraphEditor's current graph;
+     * GraphEditor reads the PatchBay's). */
+    Node handoffGraph;
     if (name == "PatchBay")
     {
-        Node g;
-        auto grid = new ConnectionGrid();
-        if (auto gev = dynamic_cast<GraphEditorView*> (getMainViewComponent()))
-            g = gev->getGraph();
-        setContentView (grid, false);
-        if (g.isValid())
-            grid->setNode (g);
+        if (auto* gev = dynamic_cast<GraphEditorView*> (getMainViewComponent()))
+            handoffGraph = gev->getGraph();
     }
     else if (name == EL_VIEW_GRAPH_EDITOR)
     {
-        GraphEditorView* ged = nullptr;
-        if (auto gev = dynamic_cast<ConnectionGrid*> (getMainViewComponent()))
-            ged = new GraphEditorView (gev->getGraph());
-        else
-            ged = new GraphEditorView();
-        setContentView (ged);
+        if (auto* grid = dynamic_cast<ConnectionGrid*> (getMainViewComponent()))
+            handoffGraph = grid->getGraph();
     }
-    else if (name == EL_VIEW_PLUGIN_MANAGER)
+
+    auto* view = lookupOrCreateMainView (name);
+    if (view == nullptr) return;
+
+    lastMainView = getMainViewName();
+    container->setMainView (view);
+
+    if (handoffGraph.isValid())
     {
-        setContentView (new PluginManagerContentView());
-    }
-    else if (name == EL_VIEW_SESSION_SETTINGS || name == "SessionProperties")
-    {
-        setContentView (new SessionContentView());
-    }
-    else if (name == "GraphSettings")
-    {
-        setContentView (new GraphSettingsView());
-    }
-    else if (name == EL_VIEW_KEYMAP_EDITOR)
-    {
-        setContentView (new KeymapEditorView());
-    }
-    else if (name == EL_VIEW_CONTROLLERS)
-    {
-        setContentView (new ControllersView());
-    }
-    else if (name == EL_VIEW_ARRANGEMENT)
-    {
-        setContentView (new ArrangementView());
-    }
-    else if (name == EL_VIEW_TRACKER_HOST)
-    {
-        setContentView (new TrackerHostView());
-    }
-    else if (name == EL_VIEW_SESSION_VIEW)
-    {
-        setContentView (new SessionView());
-    }
-    else if (name == EL_VIEW_DISK_OP)
-    {
-        setContentView (new DiskOpContentView());
-    }
-    else
-    {
-        if (auto s = context().session())
-        {
-            if (s->getNumGraphs() > 0)
-                setContentView (new GraphEditorView());
-            else
-                setContentView (new EmptyContentView());
-        }
-        else
-        {
-            setContentView (new EmptyContentView());
-        }
+        if (auto* grid = dynamic_cast<ConnectionGrid*> (view))
+            grid->setNode (handoffGraph);
+        else if (auto* gev = dynamic_cast<GraphEditorView*> (view))
+            gev->setNode (handoffGraph);
     }
 }
 
@@ -636,35 +687,78 @@ void StandardContent::nextMainView()
 
 void StandardContent::setContentView (ContentView* view, const bool accessory)
 {
-    std::unique_ptr<ContentView> deleter (view);
+    /* Cache-routing attach: callers may pass either a freshly-new'd
+     * ContentView (which we take ownership of via the cache) or
+     * nullptr to detach.  If a cached instance with the same name
+     * already exists, the incoming view is discarded and the cached
+     * one is reused -- mirrors the lookupOrCreateMainView path so
+     * stray `setContentView(new X())` call sites still work.
+     *
+     * For nullptr detach, route straight to the container. */
+    if (view == nullptr)
+    {
+        if (accessory)
+        {
+            container->setSecondaryView (nullptr);
+        }
+        else
+        {
+            lastMainView = getMainViewName();
+            container->setMainView (nullptr);
+        }
+        return;
+    }
+
+    std::unique_ptr<ContentView> incoming (view);
+    const juce::String name = view->getName();
+
+    ContentView* toAttach = view;
+    if (name.isNotEmpty())
+    {
+        auto it = viewCache_.find (name);
+        if (it != viewCache_.end())
+        {
+            /* Cache hit -- drop the freshly-constructed view and
+             * reuse the existing instance.  `incoming` falls out of
+             * scope after this branch, deleting the duplicate. */
+            toAttach = it->second.get();
+        }
+        else
+        {
+            toAttach = incoming.get();
+            viewCache_[name] = std::move (incoming);
+        }
+    }
+    else
+    {
+        /* Unnamed views: assign a synthetic key so the cache can own
+         * the lifetime.  Synthetic-keyed views aren't reused (they're
+         * one-off wrappers from callers like presentView), but we
+         * still need the cache to hold them so the container's
+         * non-owning pointer stays valid. */
+        static int synthCounter = 0;
+        const auto synthKey = juce::String ("__synth_") + juce::String (++synthCounter);
+        view->setName (synthKey);
+        toAttach = incoming.get();
+        viewCache_[synthKey] = std::move (incoming);
+    }
+
     if (accessory)
     {
-        container->setSecondaryView (deleter.release());
+        container->setSecondaryView (toAttach);
     }
     else
     {
         lastMainView = getMainViewName();
-        container->setMainView (deleter.release());
+        container->setMainView (toAttach);
     }
 }
 
 void StandardContent::setSecondaryView (const String& name)
 {
-    if (auto v = createContentView (name))
-    {
-        v->setName (name);
-        setContentView (v, true);
-        return;
-    }
-
-    if (name == EL_VIEW_GRAPH_MIXER)
-    {
-        setContentView (new GraphMixerView(), true);
-    }
-    else if (name == EL_VIEW_CONSOLE)
-    {
-        setContentView (new LuaConsoleView(), true);
-    }
+    auto* view = lookupOrCreateSecondaryView (name);
+    if (view == nullptr) return;
+    container->setSecondaryView (view);
 }
 
 void StandardContent::resizeContent (const Rectangle<int>& area)
@@ -816,7 +910,7 @@ void StandardContent::stabilizeViews()
 {
     if (container->primary)
         container->primary->stabilizeContent();
-    if (auto c2 = container->secondary.get())
+    if (auto c2 = container->secondary)
         c2->stabilizeContent();
     if (nodeStrip)
         nodeStrip->stabilizeContent();
@@ -880,7 +974,7 @@ void StandardContent::restoreState (PropertiesFile* props)
 void StandardContent::setCurrentNode (const Node& node)
 {
     // clang-format off
-    if ((nullptr != dynamic_cast<EmptyContentView*> (container->primary.get()) || 
+    if ((nullptr != dynamic_cast<EmptyContentView*> (container->primary) || 
         getMainViewName() == EL_VIEW_SESSION_SETTINGS || 
         getMainViewName() == EL_VIEW_PLUGIN_MANAGER || 
         getMainViewName() == EL_VIEW_CONTROLLERS) && 
@@ -1247,7 +1341,7 @@ bool StandardContent::perform (const InvocationInfo& info)
             nextMainView();
             break;
         case Commands::selectAll: {
-            if (auto view = dynamic_cast<GraphEditorView*> (container->primary.get()))
+            if (auto view = dynamic_cast<GraphEditorView*> (container->primary))
                 view->selectAllNodes();
             break;
         }

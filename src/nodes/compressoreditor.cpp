@@ -69,6 +69,13 @@ void CompressorNodeEditor::CompViz::updateInGainDB (float inDB)
 
 void CompressorNodeEditor::CompViz::timerCallback()
 {
+    /* Skip the 25Hz blanket repaint when the viz isn't on screen.
+     * The curve only changes via updateCurve() (driven from a knob
+     * onChange) and the input-level dot via updateInGainDB() from
+     * the audio-side listener, so a hidden viz has nothing fresh
+     * to draw.  Pattern matches meterbridge.cpp:28 per
+     * feedback_gui_must_stay_fast. */
+    if (! isShowing()) return;
     repaint();
 }
 

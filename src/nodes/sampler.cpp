@@ -4,6 +4,7 @@
 #include "nodes/sampler.hpp"
 #include "services/diskopservice.hpp"
 #include "services/samplebankpool.hpp"
+#include "ui/fontcache.hpp"
 
 #include <pthread.h>
 #include <sched.h>
@@ -1560,7 +1561,7 @@ public:
         if (slot == nullptr || ! slot->isLoaded())
         {
             g.setColour (Colour { 0xff'5a'5a'5a });
-            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+            g.setFont (monoFont ( 11.0f, Font::plain));
             g.drawText ("(load a sample to set loop points)",
                         bounds.toFloat(), Justification::centred);
             lastSeenN_ = 0;
@@ -1671,7 +1672,7 @@ public:
         {
             const float zoomX = (float) n / (float) vRange;
             g.setColour (Colour { 0xff'7a'7a'7a });
-            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 10.0f, Font::plain));
+            g.setFont (monoFont ( 10.0f, Font::plain));
             const String label = (zoomX < 9.99f)
                                  ? String::formatted ("%.2fx", zoomX)
                                  : String::formatted ("%.1fx", zoomX);
@@ -1887,7 +1888,7 @@ public:
 
         /* Title + flag chips. */
         g.setColour (Colour { 0xff'9a'9a'9a });
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 10.0f, Font::plain));
+        g.setFont (monoFont ( 10.0f, Font::plain));
         const String flagStr = String::formatted ("%s%s%s",
             (env.flags & FT2Envelope::kEnabled) ? "ON "  : "off ",
             (env.flags & FT2Envelope::kSustain) ? "SUS " : "",
@@ -2182,7 +2183,7 @@ public:
             if (hasAssign)
             {
                 g.setColour (Colours::white);
-                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                g.setFont (monoFont (
                                         16.0f, Font::bold));
                 g.drawText (String (assignedSlot + 1),
                             Rectangle<float> (x, bounds.getCentreY() - 8,
@@ -2192,7 +2193,7 @@ public:
             else
             {
                 g.setColour (Colour { 0xff'40'40'40 });
-                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                g.setFont (monoFont (
                                         13.0f, Font::bold));
                 g.drawText (String (CharPointer_UTF8 ("\xe2\x80\x94")),
                             Rectangle<float> (x, bounds.getCentreY() - 8,
@@ -2242,7 +2243,7 @@ public:
             if (hasAssign)
             {
                 g.setColour (Colours::white);
-                g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+                g.setFont (monoFont (
                                         12.0f, Font::bold));
                 g.drawText (String (assignedSlot + 1),
                             Rectangle<float> (x, bounds.getY() + blackH * 0.5f - 8,
@@ -2253,7 +2254,7 @@ public:
 
         /* Octave labels. */
         g.setColour (Colour { 0xff'70'70'70 });
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                 10.0f, Font::bold));
         for (int oct = 0; oct < 2; ++oct)
         {
@@ -2409,13 +2410,13 @@ public:
 
         slotPickLbl.setText ("Paint slot:", dontSendNotification);
         slotPickLbl.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
-        slotPickLbl.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        slotPickLbl.setFont (monoFont (
                                           11.0f, Font::plain));
         addAndMakeVisible (slotPickLbl);
 
         slotPickValue.setJustificationType (Justification::centred);
         slotPickValue.setColour (Label::textColourId, Colour { 0xff'd0'80'40 });
-        slotPickValue.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        slotPickValue.setFont (monoFont (
                                             13.0f, Font::bold));
         addAndMakeVisible (slotPickValue);
 
@@ -2465,7 +2466,7 @@ public:
                          &predefLbl, &keymapLbl })
         {
             l->setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
-            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+            l->setFont (monoFont ( 11.0f, Font::plain));
             addAndMakeVisible (*l);
         }
         volSusLbl   .setText ("Sust",    dontSendNotification);
@@ -2540,7 +2541,7 @@ public:
 
         portaLbl.setText ("Porta", dontSendNotification);
         portaLbl.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
-        portaLbl.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+        portaLbl.setFont (monoFont ( 11.0f, Font::plain));
         addAndMakeVisible (portaLbl);
 
         configureSlider (portamentoSlider, 0.0, 1000.0, 1.0, [this] (double v) {
@@ -2993,7 +2994,7 @@ public:
         if (slot == nullptr || ! slot->isLoaded())
         {
             g.setColour (Colour { 0xff'5a'5a'5a });
-            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 12.0f, Font::plain));
+            g.setFont (monoFont ( 12.0f, Font::plain));
             g.drawText ("(no sample loaded for this slot)",
                         bounds, Justification::centred);
             return;
@@ -3380,7 +3381,7 @@ public:
         for (auto* l : { &infoLength, &infoSel, &infoLoop, &infoView })
         {
             l->setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
-            l->setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+            l->setFont (monoFont ( 11.0f, Font::plain));
             addAndMakeVisible (*l);
         }
     }
@@ -4520,7 +4521,7 @@ public:
          * by refreshInstLabel() on every refresh() tick + on nav
          * presses.  Matches the tracker editor's bank-display pattern. */
         instLabel.setJustificationType (Justification::centredLeft);
-        instLabel.setFont (FontOptions (Font::getDefaultMonospacedFontName(),
+        instLabel.setFont (monoFont (
                                         13.0f, Font::plain));
         instLabel.setColour (Label::backgroundColourId, Colour { 0xff'24'24'24 });
         instLabel.setColour (Label::textColourId,       Colour { 0xff'd0'd0'd0 });
@@ -4739,7 +4740,7 @@ public:
 
         status.setJustificationType (Justification::centredLeft);
         status.setColour (Label::textColourId, Colour { 0xff'b0'b0'b0 });
-        status.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::plain));
+        status.setFont (monoFont ( 11.0f, Font::plain));
         addAndMakeVisible (status);
 
         setOpaque (true);
@@ -4961,7 +4962,7 @@ public:
                                : Colour { 0xff'2a'2a'2a });
         g.fillRect (0, 0, 6, height);
 
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 12.0f, Font::plain));
+        g.setFont (monoFont ( 12.0f, Font::plain));
 
         g.setColour (slot != nullptr ? Colour { 0xff'd4'd4'd4 } : Colour { 0xff'5a'5a'5a });
         g.drawText (String::formatted ("%02d", row + 1), 12, 0, 28, height,
@@ -5006,7 +5007,7 @@ public:
             g.setColour (Colour { 0xff'd0'80'40 });
             g.drawRoundedRectangle (badgeR.toFloat(), 3.0f, 1.0f);
             g.setColour (Colours::white);
-            g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 11.0f, Font::bold));
+            g.setFont (monoFont ( 11.0f, Font::bold));
             g.drawText ("Bus " + String (bIdx + 1), badgeR,
                         Justification::centred);
         }

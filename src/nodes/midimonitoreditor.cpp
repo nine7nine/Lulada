@@ -4,6 +4,7 @@
 
 #include "nodes/midimonitor.hpp"
 #include "nodes/midimonitoredtor.hpp"
+#include "ui/fontcache.hpp"
 #include "ui/viewhelpers.hpp"
 
 namespace element {
@@ -38,7 +39,7 @@ public:
     {
         const auto& logList = node->logger();
         ignoreUnused (rowIsSelected);
-        g.setFont (FontOptions (Font::getDefaultMonospacedFontName(), g.getCurrentFont().getHeight(), 0));
+        g.setFont (monoFont ( g.getCurrentFont().getHeight(), 0));
         if (isPositiveAndBelow (row, logList.size()))
             ViewHelpers::drawBasicTextRow (logList[row], g, width, height, false);
     }
