@@ -9,6 +9,9 @@
 
 #include <boost/signals2/connection.hpp>
 
+#include <memory>
+#include <unordered_map>
+
 namespace element {
 
 class Context;
@@ -110,6 +113,26 @@ private:
     std::unique_ptr<juce::Component> _extra;
 
     boost::signals2::connection sessionLoadedConn;
+
+    /* ContentView caching: views are constructed once on first
+     * request and reused across switches.  Replaces the previous
+     * destroy/recreate dance, where switching back to a view (e.g.
+     * GraphEditorView) paid the full BlockComponent + ConnectorComponent
+     * rebuild cost (~15 ms on a dense session) on every entry.
+     *
+     * The map owns the views; ContentContainer's primary/secondary
+     * are non-owning raw pointers into this map.  Map is declared
+     * BEFORE container in the destruction-order sense so the views
+     * outlive the container's reference-clear sequence run from
+     * StandardContent's destructor. */
+    std::unordered_map<juce::String, std::unique_ptr<ContentView>> viewCache_;
+
+    /** Cache-aware view lookup -- returns an existing instance for
+     *  `name` or constructs a new one (and inserts into viewCache_)
+     *  if none exists.  Returns nullptr only when no view type
+     *  matches the name. */
+    ContentView* lookupOrCreateMainView (const juce::String& name);
+    ContentView* lookupOrCreateSecondaryView (const juce::String& name);
 
     void resizerMouseDown();
     void resizerMouseUp();
