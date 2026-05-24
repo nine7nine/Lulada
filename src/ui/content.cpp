@@ -56,6 +56,45 @@ static void paintLcdFrame (juce::Graphics& g, juce::Rectangle<int> r,
 /* double-click on position seeks to zero.  Embeds 4 mini toggle dots    */
 /* (Sync / Metro / Loop / Count) for the secondary affordances.         */
 /* ===================================================================== */
+/* Tiny stacked I/O pips for MIDI in / out activity inside the LCD
+ * panel.  Two squares; cyan (matches the digit colour) when active,
+ * dim cool-grey when idle.  Activity holds for 100 ms then fades. */
+class MidiPips : public juce::Component, private juce::Timer
+{
+public:
+    MidiPips() = default;
+    void triggerSent()     { haveOut_ = true; repaint(); startTimer (kHoldMs); }
+    void triggerReceived() { haveIn_  = true; repaint(); startTimer (kHoldMs); }
+
+    void paint (juce::Graphics& g) override
+    {
+        const juce::Colour onCol  { 0xff'5a'be'e5 };   // LCD blue
+        const juce::Colour offCol { 0xff'1d'25'2c };
+        const juce::Colour edge   { 0xff'3a'4a'56 };
+        const auto b = getLocalBounds();
+        const int half = b.getHeight() / 2;
+        const auto in  = juce::Rectangle<int> (b.getX(), b.getY(),
+                                                 b.getWidth(), half - 1);
+        const auto out = juce::Rectangle<int> (b.getX(), b.getY() + half + 1,
+                                                 b.getWidth(), half - 1);
+        g.setColour (haveIn_  ? onCol : offCol); g.fillRect (in);
+        g.setColour (haveOut_ ? onCol : offCol); g.fillRect (out);
+        g.setColour (edge);
+        g.drawRect (in,  1);
+        g.drawRect (out, 1);
+    }
+
+private:
+    void timerCallback() override
+    {
+        haveIn_ = haveOut_ = false;
+        stopTimer();
+        repaint();
+    }
+    static constexpr int kHoldMs = 100;
+    bool haveIn_ { false }, haveOut_ { false };
+};
+
 class MainDisplayPanel : public juce::Component,
                          private juce::Timer
 {
@@ -75,16 +114,15 @@ public:
             syncBtn_.setLabel (syncBtn_.getToggleState() ? "Ex" : "In");
         };
 
-        addAndMakeVisible (midiBlinker_);
-        midiBlinker_.setInputOutputVisibility (true, true);
+        addAndMakeVisible (midiPips_);
 
         startTimerHz (15);
     }
 
-    /** Access the embedded MIDI blinker so the toolbar can hook its
+    /** Access the embedded MIDI pips so the toolbar can hook
      *  triggerSent / triggerReceived signals from the audio engine
-     *  monitor.  Replaces the standalone toolbar-side blinker. */
-    MidiBlinker& getMidiBlinker() noexcept { return midiBlinker_; }
+     *  monitor. */
+    MidiPips& getMidiPips() noexcept { return midiPips_; }
 
     void paint (juce::Graphics& g) override
     {
@@ -178,22 +216,19 @@ public:
         leftCol.removeFromTop (2);
         metroBtn_.setBounds (leftCol.removeFromTop (dotH));
 
-        /* Right edge: 2 stacked mini-toggle dots (Loop + Count). */
-        Rectangle<int> rightCol (inner.getRight() - dotW - 4, inner.getY() + 3,
+        /* Right edge of the inner panel: the MIDI in/out pips sit
+         * in their own slim column at the far right; the Loop +
+         * Count mini-buttons sit just to the LEFT of the pips. */
+        const int pipW = 10;
+        Rectangle<int> pipsCol (inner.getRight() - pipW - 2, inner.getY() + 3,
+                                  pipW, inner.getHeight() - 6);
+        midiPips_.setBounds (pipsCol);
+
+        Rectangle<int> rightCol (pipsCol.getX() - dotW - 4, inner.getY() + 3,
                                   dotW, inner.getHeight() - 6);
         loopBtn_ .setBounds (rightCol.removeFromTop (dotH));
         rightCol.removeFromTop (2);
         countBtn_.setBounds (rightCol.removeFromTop (dotH));
-
-        /* Tiny MIDI in/out blinker sits at the bottom-right of the
-         * panel, above the right-cluster mini buttons.  Small enough
-         * to read as a status pip without competing with the digit
-         * read-outs. */
-        const int blinkerW = 14;
-        const int blinkerH = 8;
-        midiBlinker_.setBounds (inner.getRight() - blinkerW - 4,
-                                 inner.getBottom() - blinkerH - 1,
-                                 blinkerW, blinkerH);
 
         /* Centre area holds the BPM and POS readouts on either side
          * of a divider.  BPM column ~95 px (room for "999.99"), POS
@@ -301,7 +336,7 @@ private:
     BlockToolButton metroBtn_ { "Me" };
     BlockToolButton loopBtn_  { "Lp" };
     BlockToolButton countBtn_ { "Ct" };
-    MidiBlinker     midiBlinker_;
+    MidiPips        midiPips_;
 };
 
 ContentView::ContentView()
@@ -530,9 +565,9 @@ public:
         {
             midiIOMonitor = engine->getMidiIOMonitor();
             connections.add (midiIOMonitor->sigSent.connect (
-                std::bind (&MidiBlinker::triggerSent,    &display_.getMidiBlinker())));
+                std::bind (&MidiPips::triggerSent,    &display_.getMidiPips())));
             connections.add (midiIOMonitor->sigReceived.connect (
-                std::bind (&MidiBlinker::triggerReceived, &display_.getMidiBlinker())));
+                std::bind (&MidiPips::triggerReceived, &display_.getMidiPips())));
         }
 
         auto* props = settings.getUserSettings();
