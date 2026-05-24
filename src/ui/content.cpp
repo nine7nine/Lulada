@@ -665,47 +665,43 @@ public:
             r.removeFromLeft (tW + kGap);
         }
 
-        /* ---- After transport: Virtual Keyboard, Undo, Redo --
-                same LCD-framed 3-square cluster as the left side. */
-        const int postClusterW = kFramePad * 2 + kIconBtnW * 3 + kIconGap * 2;
-        postXportRect_ = Rectangle<int> (r.getX(), top, postClusterW, rowH);
-        const int postBtnY = top + kFramePad;
-        int px = r.getX() + kFramePad;
-        vKbdBtn_.setBounds (px, postBtnY, kIconBtnW, kIconBtnW); px += kIconBtnW + kIconGap;
-        undoBtn_.setBounds (px, postBtnY, kIconBtnW, kIconBtnW); px += kIconBtnW + kIconGap;
-        redoBtn_.setBounds (px, postBtnY, kIconBtnW, kIconBtnW);
-        r.removeFromLeft (postClusterW + kGap);
+        /* ---- LCD display sits right after the transport. ---- */
+        {
+            const int dispW = kDisplayW;
+            const int dispH = juce::jmax (24, rowH);
+            display_.setBounds (r.getX(), top, dispW, dispH);
+            r.removeFromLeft (dispW + kGap);
+        }
 
-        /* ---- RIGHT chain, laid out right-to-left:
-                  pluginMenu | display | viewSelector | mapButton.
-                User moved the LCD display to sit AFTER the view
-                selector group instead of centred in the bar. */
+        /* ---- View selector right after the display. ---- */
+        if (viewSelector.isVisible())
+        {
+            const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
+            viewSelector.setBounds (r.getX(), top, vsW, rowH);
+            r.removeFromLeft (vsW + kGap);
+        }
+
+        /* ---- Virtual Keyboard / Undo / Redo last, 15 % smaller
+                so the cluster reads as a secondary tools group. */
+        const int smallBtnW = juce::jmax (12, (int) std::lround (kIconBtnW * 0.85));
+        const int smallClusterH = smallBtnW + kFramePad * 2;
+        const int smallClusterW = kFramePad * 2 + smallBtnW * 3 + kIconGap * 2;
+        const int smallTop = top + (rowH - smallClusterH) / 2;
+        postXportRect_ = Rectangle<int> (r.getX(), smallTop, smallClusterW, smallClusterH);
+        const int smallBtnY = smallTop + kFramePad;
+        int px = r.getX() + kFramePad;
+        vKbdBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        undoBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        redoBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW);
+        r.removeFromLeft (smallClusterW + kGap);
+
+        /* pluginMenu + mapButton stay on the far right (only visible
+         * in Plugin run mode + when mapping is on, respectively). */
         if (pluginMenu.isVisible())
         {
             const int pms = rowH + 3;
             pluginMenu.setBounds (r.removeFromRight (rowH)
                                        .withSizeKeepingCentre (pms, pms));
-            r.removeFromRight (kGap / 2);
-        }
-
-        {
-            /* Central LCD display, now right-anchored after the
-             * pluginMenu slot.  Same dimensions as before; the
-             * geometric-centre attempt drifted with side widths so
-             * a right-aligned position is more predictable. */
-            const int dispW = kDisplayW;
-            const int dispH = juce::jmax (24, rowH);
-            display_.setBounds (r.removeFromRight (dispW)
-                                    .withSizeKeepingCentre (dispW, dispH)
-                                    .withY (top));
-            r.removeFromRight (kGap);
-        }
-
-        if (viewSelector.isVisible())
-        {
-            const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
-            viewSelector.setBounds (r.removeFromRight (vsW)
-                                       .withSizeKeepingCentre (vsW, rowH));
         }
         if (mapButton.isVisible())
         {
