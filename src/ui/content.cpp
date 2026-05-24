@@ -419,14 +419,13 @@ public:
         wire (trkBtn,     "Trackers",       Commands::showTrackerHost,   &ui::iconTracker);
         wire (sessionBtn, "Session",        Commands::showSessionView,   &ui::iconSession);
 
-        /* Active-state body wash for each view button -- darker +
-         * slightly desaturated version of the border tint, so the
-         * currently-active view reads clearly without overpowering
-         * the icon glyph.  Wired to commands' isTicked flag below. */
+        /* Active-state body wash for each view button -- full-
+         * strength tint so the active view reads brightly.  Icon
+         * foreground auto-adjusts (near-black on light tints, white
+         * on dark) inside BlockToolButton's paint. */
         auto setActiveFromTint = [] (BlockToolButton& b, juce::Colour tint)
         {
-            b.setActiveTint (tint.withMultipliedBrightness (0.40f)
-                                  .withMultipliedSaturation (0.95f));
+            b.setActiveTint (tint);
         };
         setActiveFromTint (graphBtn,   juce::Colour::fromRGB (110, 170, 110));
         setActiveFromTint (arrBtn,     juce::Colour::fromRGB (220, 140,  60));
@@ -583,14 +582,13 @@ public:
         patchBayBtn_ .setTint (tintPatch);
 
         /* Active-state body wash for the view-style buttons (Disk
-         * Op, Plugin Manager, Graph Mixer, Patch Bay) + VKbd toggle
-         * -- darker desaturated version of the border tint so the
-         * active view reads clearly when its command is ticked.
-         * Undo / Redo are momentary so no active state. */
-        auto activeWash = [] (juce::Colour tint) {
-            return tint.withMultipliedBrightness (0.40f)
-                       .withMultipliedSaturation (0.95f);
-        };
+         * Op, Plugin Manager, Graph Mixer, Patch Bay) + VKbd toggle.
+         * Full-strength tint so the active view button reads bright
+         * (was 0.4 brightness which was barely distinguishable from
+         * the at-rest state).  Icon foreground auto-flips to near-
+         * black on light tints + white on dark tints inside
+         * BlockToolButton's paint. */
+        auto activeWash = [] (juce::Colour tint) { return tint; };
         diskOpBtn_   .setActiveTint (activeWash (tintDisk));
         pluginMgrBtn_.setActiveTint (activeWash (tintPlugMgr));
         graphMixBtn_ .setActiveTint (activeWash (tintMixer));
