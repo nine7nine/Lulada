@@ -717,6 +717,11 @@ SessionRef GuiService::session()
     return sessionRef;
 }
 
+juce::UndoManager& GuiService::getUndoManager()
+{
+    return impl->undo;
+}
+
 ApplicationCommandTarget* GuiService::getNextCommandTarget()
 {
     if (auto tgt = dynamic_cast<ApplicationCommandTarget*> (_content.get()))

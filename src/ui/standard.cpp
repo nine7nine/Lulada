@@ -528,6 +528,14 @@ StandardContent::StandardContent (Context& ctl_)
         }
         viewCache_.clear();
 
+        /* Clear the global UndoManager too -- any actions queued
+         * against the old session's views/state become dangling
+         * SafePointers once the cache cleared, and even those that
+         * survive (graph-side actions) would replay against a
+         * different session's data tree, corrupting state. */
+        if (auto* gui = services().find<GuiService>())
+            gui->getUndoManager().clearUndoHistory();
+
         if (prevMain.isNotEmpty())  setMainView (prevMain);
         if (prevAcc.isNotEmpty())   setSecondaryView (prevAcc);
 

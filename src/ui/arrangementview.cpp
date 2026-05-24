@@ -2800,10 +2800,22 @@ void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)
 
 void ArrangementView::rescanLaneTargets()
 {
+    /* Suppress undo tracking during rescan: any auto-fill of newly-
+     * discovered tracker lanes is a side effect of graph state, not
+     * a user mutation -- the user already has graph-side undo for
+     * the underlying add-node action.  ScopedValueSetter restores
+     * the prior flag on function exit so nested calls (rescan
+     * invoked from applyLaneSnapshot during undo replay) keep their
+     * own suppression intact. */
+    juce::ScopedValueSetter<bool> suppressGuard (applyingUndoAction_, true);
+
     if (! lanesLoadedFromSession_)
     {
         loadLanesFromSession();
         lanesLoadedFromSession_ = true;
+        /* Seed the undo baseline: future writeLanesToSession calls
+         * diff against this initial post-load lanes_ state. */
+        lastCommittedSnapshot_ = lanes_;
     }
 
     juce::Array<Node>            foundNodes;
@@ -3001,9 +3013,78 @@ void ArrangementView::loadLanesFromSession()
     }
 }
 
+/* Undoable snapshot action for ArrangementView mutations.  Stored
+ * in the global GuiService::UndoManager.  Holds copies of the lanes_
+ * array on either side of one user mutation; perform() / undo() swap
+ * via ArrangementView::applyLaneSnapshot.  SafePointer guards the
+ * cached-view-destroyed case (session reload clears the cache + the
+ * undo history at the same time, but defence in depth). */
+class ArrangementSnapshotAction : public juce::UndoableAction
+{
+public:
+    ArrangementSnapshotAction (juce::Component::SafePointer<ArrangementView> v,
+                                juce::Array<Lane> before,
+                                juce::Array<Lane> after)
+        : view_ (v),
+          before_ (std::move (before)),
+          after_  (std::move (after))
+    {}
+
+    bool perform() override
+    {
+        if (auto* v = view_.getComponent())
+        {
+            v->applyLaneSnapshot (after_);
+            return true;
+        }
+        return false;
+    }
+
+    bool undo() override
+    {
+        if (auto* v = view_.getComponent())
+        {
+            v->applyLaneSnapshot (before_);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    juce::Component::SafePointer<ArrangementView> view_;
+    juce::Array<Lane> before_;
+    juce::Array<Lane> after_;
+};
+
 void ArrangementView::writeLanesToSession()
 {
     if (services_ == nullptr) return;
+
+    /* Diff against the last-committed snapshot.  If we're inside an
+     * undo/redo replay, OR we haven't loaded from session yet (initial
+     * baseline state), OR the snapshot is unchanged, skip the action
+     * push.  Otherwise enqueue a new undo step and update the
+     * committed snapshot to the post-mutation state.
+     *
+     * The natural choke point is writeLanesToSession itself: every
+     * arrangement mutation (region add / remove / move / resize /
+     * split, lane add / remove, envelope edits, gain / fade edits,
+     * ARM / MUTE / SOLO toggles, loop toggle) writes via this method,
+     * so wiring undo here covers all current and future mutation
+     * sites without per-callsite refactoring. */
+    if (! applyingUndoAction_ && lanesLoadedFromSession_)
+    {
+        if (auto* gui = services_->find<GuiService>())
+        {
+            auto& undo = gui->getUndoManager();
+            undo.beginNewTransaction();
+            undo.perform (new ArrangementSnapshotAction (this,
+                                                          lastCommittedSnapshot_,
+                                                          lanes_));
+        }
+        lastCommittedSnapshot_ = lanes_;
+    }
+
     auto sess = services_->context().session();
     if (sess == nullptr) return;
 
@@ -3012,6 +3093,26 @@ void ArrangementView::writeLanesToSession()
     lanesTree.removeAllChildren (nullptr);
     for (const auto& l : lanes_)
         lanesTree.appendChild (l.toValueTree(), nullptr);
+}
+
+void ArrangementView::applyLaneSnapshot (const juce::Array<Lane>& snap)
+{
+    /* Re-entrancy guard: writeLanesToSession runs inside this method
+     * (for persistence) and rescanLaneTargets may also call it via
+     * its "mutated" path -- both must skip pushing a new action since
+     * the change came from the UndoManager replay, not the user. */
+    applyingUndoAction_ = true;
+    lanes_ = snap;
+    lastCommittedSnapshot_ = snap;
+    writeLanesToSession();
+    rescanLaneTargets();
+    applyingUndoAction_ = false;
+
+    if (body_ != nullptr)
+    {
+        body_->resizeForLanes();
+        body_->repaint();
+    }
 }
 
 void ArrangementView::loadZoomFromSession()
