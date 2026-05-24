@@ -672,9 +672,10 @@ public:
         redoBtn_.setBounds (px, postBtnY, kIconBtnW, kIconBtnW);
         r.removeFromLeft (postClusterW + kGap);
 
-        /* ---- RIGHT (right-aligned chain): viewSelector | pluginWin |
-                pluginMenu | midiBlinker.  Walk r.removeFromRight in
-                the visible order. ---- */
+        /* ---- RIGHT chain, laid out right-to-left:
+                  pluginMenu | display | viewSelector | mapButton.
+                User moved the LCD display to sit AFTER the view
+                selector group instead of centred in the bar. */
         if (pluginMenu.isVisible())
         {
             const int pms = rowH + 3;
@@ -682,11 +683,22 @@ public:
                                        .withSizeKeepingCentre (pms, pms));
             r.removeFromRight (kGap / 2);
         }
-        /* Standalone midiBlinker slot removed -- in-display now. */
+
+        {
+            /* Central LCD display, now right-anchored after the
+             * pluginMenu slot.  Same dimensions as before; the
+             * geometric-centre attempt drifted with side widths so
+             * a right-aligned position is more predictable. */
+            const int dispW = kDisplayW;
+            const int dispH = juce::jmax (24, rowH);
+            display_.setBounds (r.removeFromRight (dispW)
+                                    .withSizeKeepingCentre (dispW, dispH)
+                                    .withY (top));
+            r.removeFromRight (kGap);
+        }
+
         if (viewSelector.isVisible())
         {
-            /* 5 view buttons inside an LCD frame: framePad*2 +
-             * 5*btn + 4*gap. */
             const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
             viewSelector.setBounds (r.removeFromRight (vsW)
                                        .withSizeKeepingCentre (vsW, rowH));
@@ -696,20 +708,6 @@ public:
             r.removeFromRight (4);
             mapButton.setBounds (r.removeFromRight (rowH * 2)
                                      .withSizeKeepingCentre (rowH * 2, rowH));
-        }
-        r.removeFromRight (kGap);
-
-        /* ---- CENTRE: digital display anchored to the toolbar's
-                geometric centre.  Uses getLocalBounds() (full bar
-                width) rather than the leftover `r` so the panel
-                stays put regardless of side-cluster widths. */
-        {
-            const auto fullBounds = getLocalBounds();
-            const int dispW = kDisplayW;
-            const int dispH = juce::jmax (24, rowH);
-            const int dispX = fullBounds.getX() + (fullBounds.getWidth() - dispW) / 2;
-            const int dispY = top;
-            display_.setBounds (dispX, dispY, dispW, dispH);
         }
     }
 
