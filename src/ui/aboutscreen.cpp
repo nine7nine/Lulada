@@ -5,6 +5,7 @@
 
 #include "appinfo.hpp"
 #include "ui/aboutscreen.hpp"
+#include "ui/fontcache.hpp"
 
 #include "binarydata.hpp"
 
@@ -51,7 +52,7 @@ static void setupMonoEditor (TextEditor& text)
 {
     text.setCaretVisible (false);
     text.setMultiLine (true, false);
-    text.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 13.f, 0));
+    text.setFont (monoFont ( 13.f, 0));
     text.setReadOnly (true);
 }
 

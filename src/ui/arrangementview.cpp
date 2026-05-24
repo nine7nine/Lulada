@@ -18,6 +18,7 @@
 #include "services/arrangementtracksservice.hpp"
 #include "services/sources/sourceregistry.hpp"
 #include "services/timeline/audiolaneadapter.hpp"
+#include "ui/fontcache.hpp"
 #include "ui/lanepalette.hpp"
 
 #include <unordered_map>
@@ -231,7 +232,7 @@ public:
             if (loopActive_)
             {
                 g.setColour (juce::Colours::black);
-                g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                g.setFont (monoFont (
                                               9.0f, juce::Font::bold));
                 g.drawText ("LOOP", xs + 4, 2, juce::jmin (40, w - 8), kRulerH - 4,
                             juce::Justification::centredLeft, false);
@@ -1234,7 +1235,7 @@ private:
 
         /* Label column header: "Bars:Beats". */
         g.setColour (kRowTextColour);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       10.0f, juce::Font::bold));
         g.drawText ("Bars:Beats",
                     Rectangle<int> (6, 0, kLabelW - 12, kRulerH),
@@ -1250,7 +1251,7 @@ private:
         const int stripW = getWidth() - kLabelW;
         const int totalBeats = stripW / kPxPerBeat + 1;
 
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       10.0f, juce::Font::bold));
 
         /* Viewport-clip the beat loop.  At low kPxPerBeat (zoomed out)
@@ -1628,7 +1629,7 @@ private:
         const int labelInset = kTintStripW + 4;
         const int leftColW   = laneButtonX() - labelInset - 2;
         g.setColour (orphan ? tint.withAlpha (0.55f) : tint);
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       12.0f, juce::Font::bold));
         juce::String label = lane.name.isNotEmpty()
                                 ? lane.name
@@ -1641,7 +1642,7 @@ private:
                     juce::Justification::centredLeft, true);
 
         g.setColour (juce::Colours::white.withAlpha (0.55f));
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       10.0f, juce::Font::plain));
         const juce::String pill = isAudio ? "audio"
                                 : runtime.isTrackerLane() ? "trk"
@@ -1671,7 +1672,7 @@ private:
             g.drawRect (rect, 1);
             g.setColour (active ? activeText
                                 : juce::Colours::white.withAlpha (0.70f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           9.0f, juce::Font::bold));
             g.drawText (label, rect, juce::Justification::centred);
         };
@@ -1706,7 +1707,7 @@ private:
             g.drawRect (rect, capturing ? 2 : 1);
             g.setColour (lane.armed ? juce::Colours::white
                                     : juce::Colours::white.withAlpha (0.70f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           9.0f, juce::Font::bold));
             /* "REC" both at-rest and while capturing -- the fill
              * colour conveys state (dim/bright red when armed-but-
@@ -1922,7 +1923,7 @@ private:
                              (r.name.isNotEmpty() ? r.name : String ("Audio"));
 
             g.setColour (juce::Colours::white.withAlpha (0.92f));
-            g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+            g.setFont (monoFont (
                                           10.0f, juce::Font::bold));
             g.drawText (labelText,
                         titleRect.reduced (5, 0),

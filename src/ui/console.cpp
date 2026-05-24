@@ -4,13 +4,15 @@
 #include "ui/console.hpp"
 #include <element/ui/style.hpp>
 
+#include "ui/fontcache.hpp"
+
 using namespace juce;
 
 namespace element {
 
 static void setupEditor (TextEditor& editor)
 {
-    editor.setFont (FontOptions (Font::getDefaultMonospacedFontName(), 15.0f, 0));
+    editor.setFont (monoFont ( 15.0f, 0));
 }
 
 //=============================================================================

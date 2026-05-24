@@ -13,6 +13,7 @@
 #include <element/ui/style.hpp>
 
 #include "nodes/tracker.hpp"
+#include "ui/fontcache.hpp"
 #include "nodes/trackereditor.hpp"
 #include "tempo.hpp"   // BeatType::fromDivisor for scene sig overrides
 
@@ -138,7 +139,7 @@ SessionView::SessionView()
     inlineEditor_.setMultiLine (false);
     inlineEditor_.setReturnKeyStartsNewLine (false);
     inlineEditor_.setSelectAllWhenFocused (true);
-    inlineEditor_.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+    inlineEditor_.setFont (monoFont (
                                               12.0f, juce::Font::plain));
     inlineEditor_.setColour (juce::TextEditor::backgroundColourId,
                              juce::Colour { 0xff'18'18'18 });
@@ -200,7 +201,7 @@ void SessionView::configureToolbarLabel (juce::Label& l,
 {
     l.setText (text, juce::dontSendNotification);
     l.setJustificationType (juce::Justification::centred);
-    l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+    l.setFont (monoFont (
                                   12.0f, editable ? juce::Font::bold : juce::Font::plain));
     l.setColour (juce::Label::textColourId,
                  editable ? juce::Colour { 0xff'ff'ff'ff }
@@ -655,7 +656,7 @@ void SessionView::paint (Graphics& g)
     g.fillRect (Rectangle<int> (header.getX(), header.getY(),
                                 kSceneLabelW, header.getHeight()));
 
-    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+    g.setFont (monoFont (
                                   kHeaderFontSize, juce::Font::bold));
 
     for (int c = 0; c < columns_.size(); ++c)
@@ -677,7 +678,7 @@ void SessionView::paint (Graphics& g)
         g.fillRect (h.getX(), h.getY() + 4, h.getWidth() - 1, nameR.getHeight() - 4);
 
         /* Column name -- top half of the header. */
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       kHeaderFontSize, juce::Font::bold));
         g.setColour (tint);
         g.drawText (columns_.getReference (c).name,
@@ -689,7 +690,7 @@ void SessionView::paint (Graphics& g)
         const Colour btnTint = tint.withMultipliedSaturation (0.6f)
                                    .withMultipliedBrightness (0.55f);
 
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       9.0f, juce::Font::bold));
 
         /* MUTE -- amber-red when user-muted (NOT when muted by
@@ -730,7 +731,7 @@ void SessionView::paint (Graphics& g)
     g.setColour (kGutterColour);
     g.fillRect (labels);
 
-    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+    g.setFont (monoFont (
                                   kLabelFontSize, juce::Font::plain));
 
     for (int r = 0; r < scenes_.size(); ++r)
@@ -758,7 +759,7 @@ void SessionView::paint (Graphics& g)
     }
 
     /* --- Grid body (cells) --- */
-    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+    g.setFont (monoFont (
                                   kCellFontSize, juce::Font::plain));
 
     for (int r = 0; r < scenes_.size(); ++r)
@@ -952,7 +953,7 @@ void SessionView::paint (Graphics& g)
                             (float) masterCol.getY(),
                             (float) masterCol.getBottom());
 
-        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        g.setFont (monoFont (
                                       kCellFontSize, juce::Font::plain));
 
         /* Current session-wide tempo + signature -- shown dimmed in
@@ -1132,7 +1133,7 @@ void SessionView::paint (Graphics& g)
     g.drawHorizontalLine (footer.getY(), 0.0f, (float) getWidth());
 
     g.setColour (kRowTextColour);
-    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+    g.setFont (monoFont (
                                   kLabelFontSize, juce::Font::plain));
     String hint;
     if (columns_.isEmpty())
@@ -2546,7 +2547,7 @@ private:
                          float pt, int style)
     {
         l.setText (text, juce::dontSendNotification);
-        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        l.setFont (monoFont (
                                       pt, style));
         l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
         addAndMakeVisible (l);
@@ -2557,7 +2558,7 @@ private:
         e.setMultiLine (false);
         e.setReturnKeyStartsNewLine (false);
         e.setSelectAllWhenFocused (true);
-        e.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        e.setFont (monoFont (
                                       12.0f, juce::Font::plain));
         e.setColour (juce::TextEditor::backgroundColourId, juce::Colour { 0xff'20'20'20 });
         e.setColour (juce::TextEditor::textColourId,       juce::Colour { 0xff'ff'ff'ff });
@@ -2768,7 +2769,7 @@ private:
                          float pt, int style)
     {
         l.setText (text, juce::dontSendNotification);
-        l.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        l.setFont (monoFont (
                                       pt, style));
         l.setColour (juce::Label::textColourId, juce::Colour { 0xff'c0'c0'c0 });
         addAndMakeVisible (l);
@@ -2779,7 +2780,7 @@ private:
         e.setMultiLine (false);
         e.setReturnKeyStartsNewLine (false);
         e.setSelectAllWhenFocused (true);
-        e.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+        e.setFont (monoFont (
                                       12.0f, juce::Font::plain));
         e.setColour (juce::TextEditor::backgroundColourId, juce::Colour { 0xff'20'20'20 });
         e.setColour (juce::TextEditor::textColourId,       juce::Colour { 0xff'ff'ff'ff });
