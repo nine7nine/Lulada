@@ -7,6 +7,8 @@
 #include <element/devices.hpp>
 #include <element/node.hpp>
 #include <element/plugins.hpp>
+#include <element/session.hpp>
+#include <element/tags.hpp>
 #include <element/ui/commands.hpp>
 #include <element/ui/content.hpp>
 #include <element/ui/style.hpp>
@@ -18,10 +20,340 @@
 #include <element/ui/mainwindow.hpp>
 #include "ui/mainmenu.hpp"
 #include "ui/tempoandmeterbar.hpp"
+#include "ui/toolbaricons.hpp"
 #include "ui/transportbar.hpp"
 #include "ui/viewhelpers.hpp"
 
 namespace element {
+
+/* Shared paint helper for the LCD-style faceplate frame used by the
+ * main toolbar's button groups + central display.  Matte-black outer
+ * bezel + 1-px dark-grey rim + cool-grey vertical gradient inside. */
+static void paintLcdFrame (juce::Graphics& g, juce::Rectangle<int> r,
+                            float cornerSize = 4.0f)
+{
+    /* LCD-style faceplate: deep-black outer bezel + brighter rim
+     * highlight so the frame pops against the toolbar's blue-grey
+     * background (Colors::backgroundColor ~= 0xff16191A), plus a
+     * cool-grey inner gradient.  Previous matte-black blended with
+     * the bar; this brighter rim is what makes the frame visible. */
+    const auto frect = r.toFloat();
+    g.setColour (juce::Colour (0xff'05'05'05));
+    g.fillRoundedRectangle (frect, cornerSize);
+    g.setColour (juce::Colour (0xff'5a'5a'5a));
+    g.drawRoundedRectangle (frect.reduced (0.5f), cornerSize, 1.0f);
+
+    const auto inner = frect.reduced (3.0f);
+    juce::ColourGradient lcdGrad (
+        juce::Colour (0xff'1a'1f'24),
+        inner.getX(), inner.getY(),
+        juce::Colour (0xff'0c'0f'12),
+        inner.getX(), inner.getBottom(),
+        false);
+    g.setGradientFill (lcdGrad);
+    g.fillRoundedRectangle (inner, juce::jmax (0.5f, cornerSize - 1.0f));
+
+    /* 1-px top highlight line inside the rim, same "lit from above"
+     * cue BlockToolButton uses -- ties the frame to the button
+     * family. */
+    g.setColour (juce::Colours::white.withAlpha (0.06f));
+    g.drawLine (inner.getX() + 1.0f, inner.getY() + 0.5f,
+                inner.getRight() - 1.0f, inner.getY() + 0.5f, 1.0f);
+}
+
+/* ===================================================================== */
+/* MainDisplayPanel: Bitwig-style central digital read-out for the top   */
+/* toolbar.  Custom-painted inset frame with large blue-cyan digits.     */
+/* Reads transport monitor + session at 15 Hz; mouse wheel adjusts BPM;  */
+/* double-click on position seeks to zero.  Embeds 4 mini toggle dots    */
+/* (Sync / Metro / Loop / Count) for the secondary affordances.         */
+/* ===================================================================== */
+/* Tiny stacked I/O pips for MIDI in / out activity inside the LCD
+ * panel.  Two squares; cyan (matches the digit colour) when active,
+ * dim cool-grey when idle.  Activity holds for 100 ms then fades. */
+class MidiPips : public juce::Component, private juce::Timer
+{
+public:
+    MidiPips() = default;
+    void triggerSent()     { haveOut_ = true; repaint(); startTimer (kHoldMs); }
+    void triggerReceived() { haveIn_  = true; repaint(); startTimer (kHoldMs); }
+
+    void paint (juce::Graphics& g) override
+    {
+        const juce::Colour onCol  { 0xff'5a'be'e5 };   // LCD blue
+        const juce::Colour offCol { 0xff'1d'25'2c };
+        const juce::Colour edge   { 0xff'3a'4a'56 };
+        const auto b = getLocalBounds();
+        const int half = b.getHeight() / 2;
+        const auto in  = juce::Rectangle<int> (b.getX(), b.getY(),
+                                                 b.getWidth(), half - 1);
+        const auto out = juce::Rectangle<int> (b.getX(), b.getY() + half + 1,
+                                                 b.getWidth(), half - 1);
+        g.setColour (haveIn_  ? onCol : offCol); g.fillRect (in);
+        g.setColour (haveOut_ ? onCol : offCol); g.fillRect (out);
+        g.setColour (edge);
+        g.drawRect (in,  1);
+        g.drawRect (out, 1);
+    }
+
+private:
+    void timerCallback() override
+    {
+        haveIn_ = haveOut_ = false;
+        stopTimer();
+        repaint();
+    }
+    static constexpr int kHoldMs = 100;
+    bool haveIn_ { false }, haveOut_ { false };
+};
+
+class MainDisplayPanel : public juce::Component,
+                         private juce::Timer
+{
+public:
+    MainDisplayPanel (Services* svc)
+        : services_ (svc)
+    {
+        setOpaque (false);
+
+        for (auto* b : { &syncBtn_, &metroBtn_, &loopBtn_, &countBtn_ })
+        {
+            addAndMakeVisible (*b);
+            b->setClickingTogglesState (true);
+            b->setActiveTint (juce::Colour (0xff'4a'a5'd5));   // matches digit blue
+        }
+        syncBtn_  .onClick = [this]() {
+            syncBtn_.setLabel (syncBtn_.getToggleState() ? "Ex" : "In");
+        };
+
+        addAndMakeVisible (midiPips_);
+
+        startTimerHz (15);
+    }
+
+    /** Access the embedded MIDI pips so the toolbar can hook
+     *  triggerSent / triggerReceived signals from the audio engine
+     *  monitor. */
+    MidiPips& getMidiPips() noexcept { return midiPips_; }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds();
+
+        /* Outer bezel: matte black with a 1px dark-grey rim.  Same
+         * idiom as a piece of hardware faceplate inset into the bar. */
+        g.setColour (juce::Colour (0xff'08'08'08));
+        g.fillRoundedRectangle (bounds.toFloat(), 4.0f);
+        g.setColour (juce::Colour (0xff'3a'3a'3a));
+        g.drawRoundedRectangle (bounds.toFloat().reduced (0.5f), 4.0f, 1.0f);
+
+        const auto inner = bounds.reduced (4, 4);
+
+        /* Inner LCD-style fill -- very dark cool grey behind the
+         * digits, with a soft top-down gradient for depth. */
+        juce::ColourGradient lcdGrad (
+            juce::Colour (0xff'14'19'1e),
+            (float) inner.getX(), (float) inner.getY(),
+            juce::Colour (0xff'0c'0f'12),
+            (float) inner.getX(), (float) inner.getBottom(),
+            false);
+        g.setGradientFill (lcdGrad);
+        g.fillRoundedRectangle (inner.toFloat(), 3.0f);
+
+        /* Vertical divider between BPM and position columns. */
+        const int dividerX = bpmAreaRect_.getRight() + 6;
+        g.setColour (juce::Colour (0xff'2a'30'38));
+        g.drawVerticalLine (dividerX,
+                              (float) (inner.getY() + 4),
+                              (float) (inner.getBottom() - 4));
+
+        const juce::Colour digitCol  { 0xff'5a'be'e5 };   // bright cyan-blue
+        /* Bright green for the secondary labels + sub-digits --
+         * "4/4" under BPM + "0:00.000" under POS + the "BPM" / "POS"
+         * corner labels.  Picks up against the cyan main digits like
+         * a hardware multi-line LCD. */
+        const juce::Colour digitDim  { 0xff'7a'e0'8a };
+        const juce::Colour labelCol  { 0xff'7a'e0'8a };
+
+        /* BPM (large) */
+        g.setColour (digitCol);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      20.0f, juce::Font::bold));
+        g.drawText (bpmStr_, bpmAreaRect_,
+                    juce::Justification::centred, false);
+
+        /* Time signature small below BPM. */
+        g.setColour (digitDim);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      10.5f, juce::Font::plain));
+        g.drawText (meterStr_,
+                    bpmAreaRect_.withY (bpmAreaRect_.getBottom() - 2)
+                                .withHeight (12),
+                    juce::Justification::centred, false);
+
+        /* Position (large) */
+        g.setColour (digitCol);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      20.0f, juce::Font::bold));
+        g.drawText (positionStr_, posAreaRect_,
+                    juce::Justification::centred, false);
+
+        /* Time elapsed small below position. */
+        g.setColour (digitDim);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      10.5f, juce::Font::plain));
+        g.drawText (timeStr_,
+                    posAreaRect_.withY (posAreaRect_.getBottom() - 2)
+                                .withHeight (12),
+                    juce::Justification::centred, false);
+
+        /* "BPM" + "POS" labels in the top corners, almost-tooltip
+         * tiny so they don't compete with the digits. */
+        g.setColour (labelCol);
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                      8.5f, juce::Font::bold));
+        g.drawText ("BPM", bpmAreaRect_.getX(), inner.getY() + 1,
+                    bpmAreaRect_.getWidth(), 9,
+                    juce::Justification::centredLeft, false);
+        g.drawText ("POS", posAreaRect_.getX(), inner.getY() + 1,
+                    posAreaRect_.getWidth(), 9,
+                    juce::Justification::centredLeft, false);
+    }
+
+    void resized() override
+    {
+        const auto inner = getLocalBounds().reduced (4, 4);
+
+        /* Left edge: 2 stacked mini-toggle dots (Sync + Metro). */
+        const int dotW = 22;
+        const int dotH = juce::jmax (12, (inner.getHeight() - 6) / 2);
+        Rectangle<int> leftCol (inner.getX() + 4, inner.getY() + 3, dotW, inner.getHeight() - 6);
+        syncBtn_ .setBounds (leftCol.removeFromTop (dotH));
+        leftCol.removeFromTop (2);
+        metroBtn_.setBounds (leftCol.removeFromTop (dotH));
+
+        /* Right edge of the inner panel: the MIDI in/out pips sit
+         * in their own slim column at the far right; the Loop +
+         * Count mini-buttons sit just to the LEFT of the pips. */
+        const int pipW = 10;
+        Rectangle<int> pipsCol (inner.getRight() - pipW - 2, inner.getY() + 3,
+                                  pipW, inner.getHeight() - 6);
+        midiPips_.setBounds (pipsCol);
+
+        Rectangle<int> rightCol (pipsCol.getX() - dotW - 4, inner.getY() + 3,
+                                  dotW, inner.getHeight() - 6);
+        loopBtn_ .setBounds (rightCol.removeFromTop (dotH));
+        rightCol.removeFromTop (2);
+        countBtn_.setBounds (rightCol.removeFromTop (dotH));
+
+        /* Centre area holds the BPM and POS readouts on either side
+         * of a divider.  BPM column ~95 px (room for "999.99"), POS
+         * column ~125 px (room for "999.4.4.99"). */
+        const int leftEdge  = syncBtn_.getRight() + 6;
+        const int rightEdge = loopBtn_.getX() - 6;
+        const int textTop   = inner.getY() + 10;
+        const int textH     = inner.getHeight() - 24;
+        const int bpmW      = 95;
+        const int posW      = juce::jmax (110, rightEdge - leftEdge - bpmW - 12);
+        bpmAreaRect_ = Rectangle<int> (leftEdge, textTop, bpmW, textH);
+        posAreaRect_ = Rectangle<int> (leftEdge + bpmW + 12, textTop, posW, textH);
+    }
+
+    /* BPM scroll-to-edit: mouse wheel on the BPM cell nudges tempo
+     * by 1 (shift = 0.1).  Cheap, no popup needed. */
+    void mouseWheelMove (const juce::MouseEvent& e,
+                          const juce::MouseWheelDetails& w) override
+    {
+        if (! bpmAreaRect_.contains (e.x, e.y)) return;
+        if (services_ == nullptr) return;
+        auto session = services_->context().session();
+        if (session == nullptr) return;
+
+        const float step = e.mods.isShiftDown() ? 0.1f : 1.0f;
+        const float delta = (w.deltaY > 0 ? 1.0f : (w.deltaY < 0 ? -1.0f : 0.0f)) * step;
+        if (delta == 0.0f) return;
+
+        auto tempoVal = session->getPropertyAsValue (tags::tempo);
+        const float current = (float) (double) tempoVal.getValue();
+        const float next = juce::jlimit (20.0f, 999.0f, current + delta);
+        tempoVal.setValue ((double) next);
+    }
+
+    /* Double-click on the POS column seeks to zero.  Established
+     * convention from the legacy bar label. */
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (! posAreaRect_.contains (e.x, e.y)) return;
+        if (services_ == nullptr) return;
+        if (auto eng = services_->context().audio().get())
+            eng->seekToAudioFrame (0);
+    }
+
+private:
+    void timerCallback() override
+    {
+        if (services_ == nullptr) return;
+
+        if (monitor_ == nullptr)
+        {
+            if (auto eng = services_->context().audio().get())
+                monitor_ = eng->getTransportMonitor();
+        }
+        auto session = services_->context().session();
+        if (monitor_ == nullptr || session == nullptr) return;
+
+        const float bpm = monitor_->tempo.get();
+        const int bpb   = juce::jmax (1, monitor_->beatsPerBar.get());
+        const int bt    = juce::jmax (1, monitor_->beatType.get());
+
+        bool dirty = false;
+        const auto newBpm   = juce::String (bpm, 2);
+        const auto newMeter = juce::String (bpb) + "/" + juce::String (bt);
+        if (newBpm   != bpmStr_)   { bpmStr_   = newBpm;   dirty = true; }
+        if (newMeter != meterStr_) { meterStr_ = newMeter; dirty = true; }
+
+        int bars = 0, beats = 0, sub = 0;
+        monitor_->getBarsAndBeats (bars, beats, sub);
+        auto newPos = juce::String (bars + 1) + "."
+                    + juce::String (beats + 1) + "."
+                    + juce::String (sub + 1);
+        if (newPos != positionStr_) { positionStr_ = newPos; dirty = true; }
+
+        const double secs = monitor_->getPositionSeconds();
+        const int totalMs = (int) std::lround (secs * 1000.0);
+        const int mm = totalMs / 60000;
+        const int rest = totalMs - mm * 60000;
+        const int ss = rest / 1000;
+        const int ms = rest - ss * 1000;
+        juce::String newTime;
+        newTime << mm << ":";
+        if (ss < 10) newTime << "0";
+        newTime << ss << ".";
+        if (ms < 100) newTime << "0";
+        if (ms < 10)  newTime << "0";
+        newTime << ms;
+        if (newTime != timeStr_) { timeStr_ = newTime; dirty = true; }
+
+        if (dirty) repaint();
+    }
+
+    Services*               services_ { nullptr };
+    Transport::MonitorPtr   monitor_;
+
+    juce::String bpmStr_      { "120.00" };
+    juce::String meterStr_    { "4/4"     };
+    juce::String positionStr_ { "1.1.1"   };
+    juce::String timeStr_     { "0:00.000" };
+
+    Rectangle<int> bpmAreaRect_;
+    Rectangle<int> posAreaRect_;
+
+    BlockToolButton syncBtn_  { "In" };
+    BlockToolButton metroBtn_ { "Me" };
+    BlockToolButton loopBtn_  { "Lp" };
+    BlockToolButton countBtn_ { "Ct" };
+    MidiPips        midiPips_;
+};
 
 ContentView::ContentView()
 {
@@ -60,36 +392,72 @@ class ViewSelectorBar : public juce::Component,
 {
 public:
     ViewSelectorBar()
-        : patchBtn ("P", juce::Colour::fromRGB ( 80, 160, 200)),
-          graphBtn ("G", juce::Colour::fromRGB (110, 170, 110)),
-          arrBtn   ("A", juce::Colour::fromRGB (220, 140,  60)),
-          trkBtn   ("T", juce::Colour::fromRGB (160, 100, 180))
+        : graphBtn   ("", juce::Colour::fromRGB (110, 170, 110)),
+          arrBtn     ("", juce::Colour::fromRGB (220, 140,  60)),
+          trkBtn     ("", juce::Colour::fromRGB (160, 100, 180)),
+          sessionBtn ("", juce::Colour::fromRGB ( 80, 200, 170)),
+          patchBtn   ("", juce::Colour::fromRGB ( 80, 160, 200))
     {
-        auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID)
+        /* Disk Op + Plugin Manager live in the leftmost cluster;
+         * this selector covers the 5 graph-surface views, in order:
+         * Graph / Arr / Tracker / Session / Patch Bay. */
+        using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
+        auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID,
+                              IconFn icon)
         {
             b.setTooltip (tip);
+            b.setIcon ([icon] (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour fg)
+            {
+                icon (g, r, fg);
+            });
             b.onClick = [this, commandID]() {
                 ViewHelpers::invokeDirectly (this, commandID, true);
             };
             addAndMakeVisible (b);
         };
-        wire (patchBtn, "Patch Bay",    Commands::showPatchBay);
-        wire (graphBtn, "Graph Editor", Commands::showGraphEditor);
-        wire (arrBtn,   "Arrangement",  Commands::showArrangement);
-        wire (trkBtn,   "Trackers",     Commands::showTrackerHost);
+        wire (graphBtn,   "Graph Editor",   Commands::showGraphEditor,   &ui::iconGraph);
+        wire (arrBtn,     "Arrangement",    Commands::showArrangement,   &ui::iconArrangement);
+        wire (trkBtn,     "Trackers",       Commands::showTrackerHost,   &ui::iconTracker);
+        wire (sessionBtn, "Session",        Commands::showSessionView,   &ui::iconSession);
+        wire (patchBtn,   "Patch Bay",      Commands::showPatchBay,      &ui::iconPatchBay);
 
-        startTimer (150); // tick-state refresh; cheap, no repaint when nothing changed
+        auto setActiveFromTint = [] (BlockToolButton& b, juce::Colour tint)
+        {
+            b.setActiveTint (tint);
+        };
+        setActiveFromTint (graphBtn,   juce::Colour::fromRGB (110, 170, 110));
+        setActiveFromTint (arrBtn,     juce::Colour::fromRGB (220, 140,  60));
+        setActiveFromTint (trkBtn,     juce::Colour::fromRGB (160, 100, 180));
+        setActiveFromTint (sessionBtn, juce::Colour::fromRGB ( 80, 200, 170));
+        setActiveFromTint (patchBtn,   juce::Colour::fromRGB ( 80, 160, 200));
+
+        startTimer (150);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        paintLcdFrame (g, getLocalBounds());
     }
 
     void resized() override
     {
-        auto r = getLocalBounds();
-        const int n  = 4;
-        const int w  = r.getWidth() / n;
-        patchBtn.setBounds (r.removeFromLeft (w));
-        graphBtn.setBounds (r.removeFromLeft (w));
-        arrBtn  .setBounds (r.removeFromLeft (w));
-        trkBtn  .setBounds (r);
+        constexpr int kFramePad = 5;
+        constexpr int kGap = 4;
+        const int n = 5;
+        auto r = getLocalBounds().reduced (kFramePad, kFramePad);
+        const int total = r.getWidth();
+        const int w = (total - kGap * (n - 1)) / n;
+
+        auto place = [&] (BlockToolButton& b)
+        {
+            b.setBounds (r.removeFromLeft (w));
+            if (! r.isEmpty()) r.removeFromLeft (kGap);
+        };
+        place (graphBtn);
+        place (arrBtn);
+        place (trkBtn);
+        place (sessionBtn);
+        patchBtn.setBounds (r);
     }
 
 private:
@@ -109,13 +477,14 @@ private:
                 b.repaint();
             }
         };
-        refresh (patchBtn, Commands::showPatchBay);
-        refresh (graphBtn, Commands::showGraphEditor);
-        refresh (arrBtn,   Commands::showArrangement);
-        refresh (trkBtn,   Commands::showTrackerHost);
+        refresh (graphBtn,   Commands::showGraphEditor);
+        refresh (arrBtn,     Commands::showArrangement);
+        refresh (trkBtn,     Commands::showTrackerHost);
+        refresh (sessionBtn, Commands::showSessionView);
+        refresh (patchBtn,   Commands::showPatchBay);
     }
 
-    BlockToolButton patchBtn, graphBtn, arrBtn, trkBtn;
+    BlockToolButton graphBtn, arrBtn, trkBtn, sessionBtn, patchBtn;
 };
 
 class Content::Toolbar : public Component,
@@ -143,7 +512,89 @@ public:
         if (owner.services().getRunMode() == RunMode::Plugin)
             addAndMakeVisible (pluginMenu);
 
-        addAndMakeVisible (midiBlinker);
+        /* MidiBlinker moved INTO the central display panel; no
+         * standalone copy on the toolbar. */
+
+        /* New central digital readout -- BPM + position + meter +
+         * elapsed all bundled in one inset Bitwig-style panel.
+         * Replaces TempoAndMeterBar's tiny BPM/TAP/4-4 cluster +
+         * TransportBar's bars/beats/sub labels in this toolbar. */
+        addAndMakeVisible (display_);
+
+        /* Hide the redundant pieces: the legacy TempoAndMeterBar
+         * (BPM in display_), and TransportBar's position labels
+         * (also in display_).  TransportBar now reads as a tight
+         * Play/Stop/Record/SeekZero cluster on the left. */
+        tempoBar.setVisible (false);
+        transport.setShowPositionLabels (false);
+        transport.updateWidth();
+
+        /* Reordered toolbar layout:
+         *   far-left:  Disk Op + Plugin Manager (file + plugin
+         *              browser shortcuts) + Preferences (cog).
+         *   then:      transport (Play / Stop / Record / SeekZero).
+         *   then:      Virtual Keyboard + Undo + Redo.
+         *   centre:    digital display.
+         *   right:     5-view selector + plugin menu + midi blinker. */
+        using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
+        auto wireBtn = [&] (BlockToolButton& b, const juce::String& tip,
+                              IconFn icon, std::function<void()> action,
+                              juce::Colour borderTint = {})
+        {
+            b.setTooltip (tip);
+            b.setIcon ([icon] (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour fg)
+                       { icon (g, r, fg); });
+            b.onClick = std::move (action);
+            addAndMakeVisible (b);
+            juce::ignoreUnused (borderTint);
+        };
+        wireBtn (diskOpBtn_,    "Disk Op",         &ui::iconDisk,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showDiskOp, true); });
+        wireBtn (pluginMgrBtn_, "Plugin Manager",  &ui::iconPluginManager,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showPluginManager, true); });
+        wireBtn (prefsBtn_,     "Preferences...",  &ui::iconCog,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showPreferences, true); });
+        wireBtn (graphMixBtn_,  "Graph Mixer",      &ui::iconMixer,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showGraphMixer, true); });
+        wireBtn (vKbdBtn_,      "Virtual keyboard", &ui::iconKeyboard,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::toggleVirtualKeyboard, true); });
+        wireBtn (undoBtn_,      "Undo",             &ui::iconUndo,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::undo, true); });
+        wireBtn (redoBtn_,      "Redo",             &ui::iconRedo,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
+
+        /* Per-button border + icon-halo tints. */
+        const auto tintDisk    = juce::Colour::fromRGB (200, 180,  80);
+        const auto tintPlugMgr = juce::Colour::fromRGB (190, 110, 170);
+        const auto tintPrefs   = juce::Colour::fromRGB ( 90, 150, 210);
+        const auto tintMixer   = juce::Colour::fromRGB (170, 100, 200);
+        const auto tintVKbd    = juce::Colour::fromRGB ( 80, 200, 170);
+        const auto tintEdit    = juce::Colour::fromRGB (200, 160,  80);
+        diskOpBtn_   .setTint (tintDisk);
+        pluginMgrBtn_.setTint (tintPlugMgr);
+        prefsBtn_    .setTint (tintPrefs);
+        graphMixBtn_ .setTint (tintMixer);
+        vKbdBtn_     .setTint (tintVKbd);
+        undoBtn_     .setTint (tintEdit);
+        redoBtn_     .setTint (tintEdit);
+
+        /* Active-state body wash for the view-style buttons (Disk
+         * Op, Plugin Manager, Graph Mixer, Patch Bay) + VKbd toggle.
+         * Full-strength tint so the active view button reads bright
+         * (was 0.4 brightness which was barely distinguishable from
+         * the at-rest state).  Icon foreground auto-flips to near-
+         * black on light tints + white on dark tints inside
+         * BlockToolButton's paint. */
+        auto activeWash = [] (juce::Colour tint) { return tint; };
+        diskOpBtn_   .setActiveTint (activeWash (tintDisk));
+        pluginMgrBtn_.setActiveTint (activeWash (tintPlugMgr));
+        graphMixBtn_ .setActiveTint (activeWash (tintMixer));
+        vKbdBtn_     .setActiveTint (activeWash (tintVKbd));
+
+        startTimerHz (8);   // refresh active-view toggle states
+
+        vKbdBtn_.setClickingTogglesState (true);
+        vKbdBtn_.setActiveTint (juce::Colour (0xff'4a'a5'5a));
     }
 
     ~Toolbar()
@@ -165,9 +616,9 @@ public:
         {
             midiIOMonitor = engine->getMidiIOMonitor();
             connections.add (midiIOMonitor->sigSent.connect (
-                std::bind (&MidiBlinker::triggerSent, &midiBlinker)));
+                std::bind (&MidiPips::triggerSent,    &display_.getMidiPips())));
             connections.add (midiIOMonitor->sigReceived.connect (
-                std::bind (&MidiBlinker::triggerReceived, &midiBlinker)));
+                std::bind (&MidiPips::triggerReceived, &display_.getMidiPips())));
         }
 
         auto* props = settings.getUserSettings();
@@ -188,65 +639,119 @@ public:
 
     void resized() override
     {
-        Rectangle<int> r (getLocalBounds());
+        /* Single-row Bitwig-style layout:
+         *
+         *   [menu | undo | redo] [transport] [== display ==] [pluginwin] [view selector ...]
+         *
+         * Migrated-from-menus icon buttons hard-left, transport just
+         * to their right, central display floats with the leftover
+         * mid-width, view selector + plugin window toggle + plugin
+         * menu + midi blinker right-aligned. */
+        Rectangle<int> r = getLocalBounds();
+        const int H = r.getHeight();
+        /* Tightened external padding (was 7 -> now 3) so the LCD-
+         * framed clusters get more vertical real estate.  Frame is
+         * what gives them breathing room now, not bar-edge padding. */
+        constexpr int kInnerPadY = 3;
+        const int innerPad = kInnerPadY;
+        const int rowH = juce::jmax (20, H - innerPad * 2);
 
-        /* Tight padding — was 10px outer + 16px vertical, now 4px outer
-         * + 6px vertical.  Keeps the strip slim like the bottom
-         * statusbar and stops the top tempo/transport row from
-         * floating in dead space. */
-        const int tempoBarWidth = jmax (120, tempoBar.getWidth());
-        const int tempoBarHeight = getHeight() - 6;
+        constexpr int kSidePad   = 8;
+        constexpr int kGap       = 14;
+        constexpr int kIconGap   = 4;
+        constexpr int kFramePad  = 5;
+        constexpr int kDisplayW  = 380;
+        /* Icon buttons fit inside the LCD frame; their square size
+         * is the row height minus the frame's top+bottom padding. */
+        const int kIconBtnW = juce::jmax (16, rowH - kFramePad * 2);
 
-        tempoBar.setBounds (4, 3, tempoBarWidth, tempoBarHeight);
+        r.reduce (kSidePad, 0);
+        const int top = r.getY() + innerPad;
 
-        r.removeFromRight (4);
+        /* ---- LEFT cluster: Disk Op + Plugin Manager + Preferences
+                inside their LCD frame.  Cluster outer width =
+                kFramePad + 3*btn + 2*gap + kFramePad. */
+        const int leftClusterW = kFramePad * 2 + kIconBtnW * 3 + kIconGap * 2;
+        leftClusterRect_ = Rectangle<int> (r.getX(), top, leftClusterW, rowH);
+        const int leftBtnY = top + kFramePad;
+        int lx = r.getX() + kFramePad;
+        diskOpBtn_   .setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW); lx += kIconBtnW + kIconGap;
+        pluginMgrBtn_.setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW); lx += kIconBtnW + kIconGap;
+        prefsBtn_    .setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW);
+        r.removeFromLeft (leftClusterW + kGap);
 
-        if (pluginMenu.isVisible())
-        {
-            int pms = tempoBarHeight + 3;
-            pluginMenu.setBounds (r.removeFromRight (tempoBarHeight).withSizeKeepingCentre (pms, pms));
-            r.removeFromRight (2);
-        }
-
-        if (midiBlinker.isVisible())
-        {
-            const int blinkerW = 8;
-            midiBlinker.setBounds (r.removeFromRight (blinkerW).withSizeKeepingCentre (blinkerW, tempoBarHeight));
-            r.removeFromRight (2);
-        }
-
-        if (viewSelector.isVisible())
-        {
-            /* 4 colour-coded view buttons, each ~tempoBarHeight wide,
-             * total ~4× the old viewBtn footprint. */
-            viewSelector.setBounds (r.removeFromRight (tempoBarHeight * 4)
-                                       .withSizeKeepingCentre (tempoBarHeight * 4, tempoBarHeight));
-        }
-
-        if (mapButton.isVisible())
-        {
-            r.removeFromRight (2);
-            mapButton.setBounds (r.removeFromRight (tempoBarHeight * 2)
-                                     .withSizeKeepingCentre (tempoBarHeight * 2, tempoBarHeight));
-        }
-
+        /* ---- Transport (Play / Stop / Record / SeekZero) ---- */
         if (transport.isVisible())
         {
-            r = getLocalBounds().withX ((getWidth() / 2) - (transport.getWidth() / 2));
-            r.setWidth (transport.getWidth());
-            transport.setBounds (r.withSizeKeepingCentre (r.getWidth(), tempoBarHeight));
+            transport.setShowPositionLabels (false);
+            transport.setSize (transport.getWidth(), rowH);
+            transport.updateWidth();
+            const int tW = juce::jmax (160, transport.getWidth());
+            transport.setBounds (r.getX(), top, tW, rowH);
+            r.removeFromLeft (tW + kGap);
+        }
+
+        /* ---- LCD display sits right after the transport. ---- */
+        {
+            const int dispW = kDisplayW;
+            const int dispH = juce::jmax (24, rowH);
+            display_.setBounds (r.getX(), top, dispW, dispH);
+            r.removeFromLeft (dispW + kGap);
+        }
+
+        /* ---- View selector right after the display. ---- */
+        if (viewSelector.isVisible())
+        {
+            /* 5 view buttons: Graph / Arr / Tracker / Session / Patch. */
+            const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
+            viewSelector.setBounds (r.getX(), top, vsW, rowH);
+            r.removeFromLeft (vsW + kGap);
+        }
+
+        /* ---- Trailing tools cluster (15 % smaller buttons):
+                Graph Mixer | VKbd | Undo | Redo. */
+        const int smallBtnW = juce::jmax (12, (int) std::lround (kIconBtnW * 0.85));
+        const int smallClusterH = smallBtnW + kFramePad * 2;
+        const int smallClusterW = kFramePad * 2 + smallBtnW * 4 + kIconGap * 3;
+        const int smallTop = top + (rowH - smallClusterH) / 2;
+        postXportRect_ = Rectangle<int> (r.getX(), smallTop, smallClusterW, smallClusterH);
+        const int smallBtnY = smallTop + kFramePad;
+        int px = r.getX() + kFramePad;
+        graphMixBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        vKbdBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        undoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        redoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW);
+        r.removeFromLeft (smallClusterW + kGap);
+
+        /* pluginMenu + mapButton stay on the far right (only visible
+         * in Plugin run mode + when mapping is on, respectively). */
+        if (pluginMenu.isVisible())
+        {
+            const int pms = rowH + 3;
+            pluginMenu.setBounds (r.removeFromRight (rowH)
+                                       .withSizeKeepingCentre (pms, pms));
+        }
+        if (mapButton.isVisible())
+        {
+            r.removeFromRight (4);
+            mapButton.setBounds (r.removeFromRight (rowH * 2)
+                                     .withSizeKeepingCentre (rowH * 2, rowH));
         }
     }
 
     void paint (Graphics& g) override
     {
-        /* Match the parent Content's backgroundColor (0xff16191A — the
-         * blue-grey tone) exactly.  This is the color the body area
-         * actually shows (Content::paint fills with backgroundColor,
-         * NOT contentBackgroundColor), so top + body + bottom read as
-         * one continuous frame. */
+        /* Background fill matches Content::paint so toolbar + body
+         * read as one continuous frame. */
         g.setColour (Colors::backgroundColor);
         g.fillRect (getLocalBounds());
+
+        /* LCD frames painted behind each button cluster.  Transport
+         * + central display + view selector all paint their own
+         * frames internally; left + post-transport clusters use the
+         * shared paintLcdFrame helper here. */
+        if (! leftClusterRect_.isEmpty())  paintLcdFrame (g, leftClusterRect_);
+        if (! postXportRect_  .isEmpty())  paintLcdFrame (g, postXportRect_);
     }
 
     void buttonClicked (Button* btn) override
@@ -267,13 +772,31 @@ public:
 
     void timerCallback() override
     {
+        /* Refresh view-style buttons' toggle state from their
+         * commands' isTicked flag so the active surface always
+         * lights up (same idiom ViewSelectorBar uses). */
+        if (auto* gui = ViewHelpers::getGuiController (this))
+        {
+            auto& cm = gui->commands();
+            auto refresh = [&cm] (BlockToolButton& b, int id)
+            {
+                const auto* info = cm.getCommandForID (id);
+                const bool ticked = info != nullptr
+                    && (info->flags & juce::ApplicationCommandInfo::isTicked) != 0;
+                if (b.getToggleState() != ticked)
+                    b.setToggleState (ticked, juce::dontSendNotification);
+            };
+            refresh (diskOpBtn_,    Commands::showDiskOp);
+            refresh (pluginMgrBtn_, Commands::showPluginManager);
+            refresh (graphMixBtn_,  Commands::showGraphMixer);
+            refresh (vKbdBtn_,      Commands::toggleVirtualKeyboard);
+        }
+
+        /* Mapping-learn auto-clear (legacy behaviour). */
         if (auto* mapping = owner.services().find<MappingService>())
         {
-            if (! mapping->isLearning())
-            {
+            if (! mapping->isLearning() && mapButton.getToggleState())
                 mapButton.setToggleState (false, dontSendNotification);
-                stopTimer();
-            }
         }
     }
 
@@ -286,8 +809,31 @@ private:
     TempoAndMeterBar tempoBar;
     TransportBar transport;
     IconButton pluginMenu;
-    MidiBlinker midiBlinker;
     Array<SignalConnection> connections;
+
+    /* Central digital readout (Bitwig-style faceplate).  Holds BPM
+     * + meter + position + elapsed + Sync/Metro/Loop/Count micro
+     * toggles.  Self-timed at 15 Hz; pulls state directly from the
+     * transport monitor + session. */
+    MainDisplayPanel display_ { &owner.services() };
+
+    /* Toolbar buttons in left-to-right placement order:
+     *   diskOpBtn / pluginMgrBtn -- "file" view + plugin browser
+     *                                view shortcuts on the far left.
+     *   prefsBtn                 -- direct-invoke Preferences cog.
+     *   (transport between)
+     *   vKbdBtn / undoBtn / redoBtn -- post-transport cluster. */
+    BlockToolButton diskOpBtn_    { "" };
+    BlockToolButton pluginMgrBtn_ { "" };
+    BlockToolButton prefsBtn_     { "" };
+    BlockToolButton graphMixBtn_  { "" };
+    BlockToolButton vKbdBtn_      { "" };
+    BlockToolButton undoBtn_      { "" };
+    BlockToolButton redoBtn_      { "" };
+
+    /* LCD-frame bounds captured in resized(), painted in paint(). */
+    Rectangle<int> leftClusterRect_;
+    Rectangle<int> postXportRect_;
 
     void runPluginMenu()
     {
@@ -456,7 +1002,10 @@ Content::Content (Context& ctx)
     addAndMakeVisible (toolBar.get());
     toolBar->setSession (context().session());
     toolBarVisible = true;
-    toolBarSize = 32;
+    /* Thicker bar to fit the secondary Bitwig-style row beneath the
+     * primary tempo / transport row.  32 -> 60 = +28 px; the two-row
+     * layout in Content::Toolbar::resized() splits it ~50/50. */
+    toolBarSize = 60;
 
     const Node node (context().session()->getCurrentGraph());
     setCurrentNode (node);

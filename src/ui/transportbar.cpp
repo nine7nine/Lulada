@@ -3,7 +3,9 @@
 
 #include <element/session.hpp>
 
+#include "ui/blocktoolbutton.hpp"
 #include "ui/guicommon.hpp"
+#include "ui/toolbaricons.hpp"
 #include "ui/transportbar.hpp"
 
 namespace element {
@@ -45,42 +47,44 @@ public:
 
 TransportBar::TransportBar()
 {
-    /* Transport icons are colour-coded so they read against the bold
-     * neutral border + dark body: play=green, stop=blue, record=red,
-     * rewind=white.  These tint the icon glyph itself, independent of
-     * any toggle-on body wash from backgroundOnColourId. */
-    play = std::make_unique<PlayButton>();
+    /* Transport cluster rebuilt on BlockToolButton so the icons
+     * render in the same vector-glyph family as the view selector +
+     * undo/redo (consistent inset, gradient, hover behaviour).
+     * Bright orange Play, warm-white Stop, bright red Record,
+     * soft-white SeekZero.  Active tints push the body wash so the
+     * armed/playing state stays clearly visible. */
+    auto setIcon = [] (BlockToolButton& b,
+                        void (*fn)(juce::Graphics&, juce::Rectangle<float>, juce::Colour))
+    {
+        b.setIcon ([fn] (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour fg)
+                   { fn (g, r, fg); });
+    };
+
+    auto playB = std::make_unique<BlockToolButton> ("", Colour (0xff'ff'8a'30));
+    setIcon (*playB, &ui::iconPlay);
+    playB->setActiveTint (Colour (0xff'5a'2d'10));
+    playB->addListener (this);
+    play = std::move (playB);
     addAndMakeVisible (play.get());
-    play->setPath (getIcons().fasPlay, 4.4f);
-    play->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    play->addListener (this);
-    play->setIconColour (Colour (0xff5cd65c));
-    play->setColour (TextButton::buttonOnColourId, Colours::chartreuse);
-    play->setColour (SettingButton::backgroundOnColourId, Colors::toggleGreen);
 
-    stop = std::make_unique<StopButton>();
+    auto stopB = std::make_unique<BlockToolButton> ("", Colour (0xff'b0'b0'b0));
+    setIcon (*stopB, &ui::iconStop);
+    stopB->addListener (this);
+    stop = std::move (stopB);
     addAndMakeVisible (stop.get());
-    stop->setPath (getIcons().fasStop, 4.4f);
-    stop->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    stop->addListener (this);
-    stop->setIconColour (Colour (0xff4ea1ff));
 
-    record = std::make_unique<RecordButton>();
+    auto recB = std::make_unique<BlockToolButton> ("", Colour (0xff'ff'4d'4d));
+    setIcon (*recB, &ui::iconRecord);
+    recB->setActiveTint (Colour (0xff'7a'1a'1a));
+    recB->addListener (this);
+    record = std::move (recB);
     addAndMakeVisible (record.get());
-    record->setPath (getIcons().fasCircle, 4.4f);
-    record->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    record->addListener (this);
-    record->setIconColour (Colour (0xffff4d4d));
-    record->setColour (SettingButton::backgroundOnColourId, Colours::red);
 
-    toZero = std::make_unique<SeekZeroButton>();
+    auto seekB = std::make_unique<BlockToolButton> ("", Colour (0xff'9a'9a'9a));
+    setIcon (*seekB, &ui::iconSeekZero);
+    seekB->addListener (this);
+    toZero = std::move (seekB);
     addAndMakeVisible (toZero.get());
-    auto toZeroPath = getIcons().fasChevronRight;
-    toZeroPath.applyTransform (AffineTransform().rotated (juce::MathConstants<float>::pi));
-    toZero->setPath (toZeroPath, 4.4f);
-    toZero->setConnectedEdges (Button::ConnectedOnLeft | Button::ConnectedOnRight | Button::ConnectedOnTop | Button::ConnectedOnBottom);
-    toZero->addListener (this);
-    toZero->setIconColour (Colours::white);
 
     barLabel = std::make_unique<BarLabel> (*this);
     addAndMakeVisible (barLabel.get());
@@ -144,34 +148,66 @@ void TransportBar::timerCallback()
 
 void TransportBar::paint (Graphics& g)
 {
+    /* LCD-style faceplate frame matching MainDisplayPanel.  Outer
+     * matte-black bezel + cool-grey vertical gradient inside.  The
+     * 4 transport buttons sit on top of this inset, so the whole
+     * cluster reads as one hardware-style panel just like the
+     * central digital display. */
+    const auto frect = getLocalBounds().toFloat();
+
+    g.setColour (juce::Colour (0xff'08'08'08));
+    g.fillRoundedRectangle (frect, 4.0f);
+    g.setColour (juce::Colour (0xff'3a'3a'3a));
+    g.drawRoundedRectangle (frect.reduced (0.5f), 4.0f, 1.0f);
+
+    const auto inner = frect.reduced (3.0f);
+    juce::ColourGradient lcdGrad (
+        juce::Colour (0xff'14'19'1e),
+        inner.getX(), inner.getY(),
+        juce::Colour (0xff'0c'0f'12),
+        inner.getX(), inner.getBottom(),
+        false);
+    g.setGradientFill (lcdGrad);
+    g.fillRoundedRectangle (inner, 3.0f);
 }
 
 void TransportBar::resized()
 {
-    /* Height-driven layout — fills whatever vertical space the parent
-     * toolbar gives us (typically tempoBarHeight ≈ 26px), so transport
-     * buttons read as the same family as the tempo / view-selector
-     * buttons rather than a hardcoded 16px sliver.  Widths:
-     *   - bar/beat/sub labels: 1.6× height (room for 2-3 digits)
-     *   - transport icon buttons: 1.25× height (a bit wider than tall
-     *     so the icon doesn't crowd the bold edge stroke)
-     *   - 2px gaps between cells, 6px gap between the position
-     *     labels and the transport buttons. */
-    const int h = getHeight();
+    /* Children inset by kFramePad on every side so the LCD frame
+     * painted in paint() stays visible around them.  Each button is
+     * a square with a 4-px gap between siblings. */
+    constexpr int kFramePad = 5;
+    const int outerH = getHeight();
+    const int h = juce::jmax (16, outerH - kFramePad * 2);
     const int labelW = juce::jmax (24, juce::roundToInt (h * 1.6f));
-    const int btnW   = juce::jmax (22, juce::roundToInt (h * 1.25f));
-    constexpr int gap = 2;
-    constexpr int groupGap = 6;
+    const int btnW   = h;
+    constexpr int gap = 4;
+    constexpr int groupGap = 10;
 
-    int x = 0;
-    barLabel->setBounds  (x, 0, labelW, h); x += labelW + gap;
-    beatLabel->setBounds (x, 0, labelW, h); x += labelW + gap;
-    subLabel->setBounds  (x, 0, labelW, h); x += labelW + groupGap;
+    int x = kFramePad;
+    const int y = kFramePad;
+    if (showPositionLabels_)
+    {
+        barLabel->setBounds  (x, y, labelW, h); x += labelW + 2;
+        beatLabel->setBounds (x, y, labelW, h); x += labelW + 2;
+        subLabel->setBounds  (x, y, labelW, h); x += labelW + groupGap;
+    }
 
-    play->setBounds   (x, 0, btnW, h); x += btnW + gap;
-    stop->setBounds   (x, 0, btnW, h); x += btnW + gap;
-    record->setBounds (x, 0, btnW, h); x += btnW + gap;
-    toZero->setBounds (x, 0, btnW, h);
+    play->setBounds   (x, y, btnW, h); x += btnW + gap;
+    stop->setBounds   (x, y, btnW, h); x += btnW + gap;
+    record->setBounds (x, y, btnW, h); x += btnW + gap;
+    toZero->setBounds (x, y, btnW, h);
+}
+
+void TransportBar::setShowPositionLabels (bool show)
+{
+    if (showPositionLabels_ == show) return;
+    showPositionLabels_ = show;
+    if (barLabel)  barLabel ->setVisible (show);
+    if (beatLabel) beatLabel->setVisible (show);
+    if (subLabel)  subLabel ->setVisible (show);
+    resized();
+    updateWidth();
 }
 
 void TransportBar::buttonClicked (Button* buttonThatWasClicked)
@@ -229,7 +265,9 @@ void TransportBar::stabilize()
 
 void TransportBar::updateWidth()
 {
-    setSize (toZero->getRight(), getHeight());
+    /* +5 px on the right so the LCD frame's right padding matches
+     * the left.  kFramePad in resized() is the same value. */
+    setSize (toZero->getRight() + 5, getHeight());
 }
 
 } // namespace element

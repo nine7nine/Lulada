@@ -25,34 +25,50 @@ void IconButton::paintButton (Graphics& g, bool isMouseOverButton, bool isButton
 
 void SettingButton::paintButton (Graphics& g, bool isMouseOverButton, bool isButtonDown)
 {
-    /* Tracker-toolbar consistency: flat dark grey body, visible neutral
-     * border that reads as bold against the dark toolbar background.
-     * Toggle-on tints the body via `backgroundOnColourId` so
-     * play/record can still show green/red, but as a body wash —
-     * never as a coloured outer stroke. */
+    /* Modernised flat-panel paint -- matches BlockToolButton family.
+     * Subtle vertical gradient (top brighter, bottom darker) + 1-px
+     * highlight line for "lit from above" depth cue.  Toggle-on
+     * tints the body via backgroundOnColourId so Play / Record can
+     * still flash green / red as a body wash. */
     const bool isOn = getToggleState();
-    constexpr float cornerSize = 2.0f;
-    const auto borderCol = Colour (0xff5a5a5a);
+    constexpr float cornerSize = 3.0f;
+    const auto borderCol = Colour (0xff'5a'5a'5a);
 
     Colour fill;
     if (isOn)
     {
         const auto onTint = findColour (backgroundOnColourId);
         fill = onTint.isTransparent()
-                   ? Colour (0xff3a3a3a)
-                   : onTint.withMultipliedSaturation (0.65f).withMultipliedBrightness (0.7f);
+                   ? Colour (0xff'3a'3a'3a)
+                   : onTint;
     }
     else
     {
-        fill = Colour (0xff2c2c2c);
+        fill = Colour (0xff'2c'2c'2c);
     }
 
     auto box = getLocalBounds().reduced (1);
-    g.setColour (fill);
-    g.fillRoundedRectangle (box.toFloat(), cornerSize);
+    const auto frect = box.toFloat();
+
+    juce::ColourGradient bodyGrad (fill.brighter (0.12f),
+                                     frect.getX(), frect.getY(),
+                                     fill.darker (0.18f),
+                                     frect.getX(), frect.getBottom(),
+                                     false);
+    g.setGradientFill (bodyGrad);
+    g.fillRoundedRectangle (frect, cornerSize);
+
+    /* Top highlight line. */
+    g.setColour (Colours::white.withAlpha (0.06f));
+    g.drawLine (frect.getX() + 1.5f, frect.getY() + 1.0f,
+                frect.getRight() - 1.5f, frect.getY() + 1.0f, 1.0f);
 
     g.setColour (borderCol);
-    g.drawRoundedRectangle (box.toFloat(), cornerSize, 1.0f);
+    g.drawRoundedRectangle (frect, cornerSize, 1.2f);
+    g.setColour (Colours::black.withAlpha (0.55f));
+    g.drawRoundedRectangle (frect.reduced (1.2f, 1.2f),
+                            juce::jmax (0.5f, cornerSize - 1.2f),
+                            1.0f);
 
     if (! path.isEmpty())
     {
@@ -83,13 +99,13 @@ void SettingButton::paintButton (Graphics& g, bool isMouseOverButton, bool isBut
      * + text without recolouring them via fill alpha. */
     if (isButtonDown)
     {
-        g.setColour (Colours::white.withAlpha (0.10f));
-        g.fillRoundedRectangle (box.toFloat(), cornerSize);
+        g.setColour (Colours::black.withAlpha (0.18f));
+        g.fillRoundedRectangle (frect, cornerSize);
     }
     else if (isMouseOverButton)
     {
-        g.setColour (Colours::white.withAlpha (0.05f));
-        g.fillRoundedRectangle (box.toFloat(), cornerSize);
+        g.setColour (Colours::white.withAlpha (0.06f));
+        g.fillRoundedRectangle (frect, cornerSize);
     }
 }
 
