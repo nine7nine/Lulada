@@ -392,16 +392,14 @@ class ViewSelectorBar : public juce::Component,
 {
 public:
     ViewSelectorBar()
-        : patchBtn   ("", juce::Colour::fromRGB ( 80, 160, 200)),
-          graphBtn   ("", juce::Colour::fromRGB (110, 170, 110)),
+        : graphBtn   ("", juce::Colour::fromRGB (110, 170, 110)),
           arrBtn     ("", juce::Colour::fromRGB (220, 140,  60)),
           trkBtn     ("", juce::Colour::fromRGB (160, 100, 180)),
           sessionBtn ("", juce::Colour::fromRGB ( 80, 200, 170))
     {
-        /* Disk Op + Plugin Manager moved OUT of the view selector
-         * into the leftmost cluster of the main toolbar (Content::
-         * Toolbar handles those two now).  This selector shows the
-         * 5 graph-editing surfaces only. */
+        /* Disk Op + Plugin Manager moved to the leftmost cluster.
+         * Patch Bay moved to the trailing tools cluster.  This
+         * selector now shows the 4 main graph-editing surfaces. */
         using IconFn = void(*)(juce::Graphics&, juce::Rectangle<float>, juce::Colour);
         auto wire = [this] (BlockToolButton& b, const juce::String& tip, int commandID,
                               IconFn icon)
@@ -416,7 +414,6 @@ public:
             };
             addAndMakeVisible (b);
         };
-        wire (patchBtn,   "Patch Bay",      Commands::showPatchBay,      &ui::iconPatchBay);
         wire (graphBtn,   "Graph Editor",   Commands::showGraphEditor,   &ui::iconGraph);
         wire (arrBtn,     "Arrangement",    Commands::showArrangement,   &ui::iconArrangement);
         wire (trkBtn,     "Trackers",       Commands::showTrackerHost,   &ui::iconTracker);
@@ -432,12 +429,9 @@ public:
 
     void resized() override
     {
-        /* 5-px frame pad on every side so the LCD frame painted in
-         * paint() stays visible around the 5 view buttons.  4-px
-         * gap between siblings matches the transport cluster. */
         constexpr int kFramePad = 5;
         constexpr int kGap = 4;
-        const int n = 5;
+        const int n = 4;
         auto r = getLocalBounds().reduced (kFramePad, kFramePad);
         const int total = r.getWidth();
         const int w = (total - kGap * (n - 1)) / n;
@@ -447,7 +441,6 @@ public:
             b.setBounds (r.removeFromLeft (w));
             if (! r.isEmpty()) r.removeFromLeft (kGap);
         };
-        place (patchBtn);
         place (graphBtn);
         place (arrBtn);
         place (trkBtn);
@@ -471,14 +464,13 @@ private:
                 b.repaint();
             }
         };
-        refresh (patchBtn,   Commands::showPatchBay);
         refresh (graphBtn,   Commands::showGraphEditor);
         refresh (arrBtn,     Commands::showArrangement);
         refresh (trkBtn,     Commands::showTrackerHost);
         refresh (sessionBtn, Commands::showSessionView);
     }
 
-    BlockToolButton patchBtn, graphBtn, arrBtn, trkBtn, sessionBtn;
+    BlockToolButton graphBtn, arrBtn, trkBtn, sessionBtn;
 };
 
 class Content::Toolbar : public Component,
@@ -556,12 +548,10 @@ public:
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::undo, true); });
         wireBtn (redoBtn_,      "Redo",             &ui::iconRedo,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::redo, true); });
+        wireBtn (patchBayBtn_,  "Patch Bay",        &ui::iconPatchBay,
+                  [this]() { ViewHelpers::invokeDirectly (this, Commands::showPatchBay, true); });
 
-        /* Per-button border + icon-halo tints.  Disk Op + Plugin
-         * Manager carry the same colours they had inside the view
-         * selector (gold + magenta) so muscle memory survives.
-         * Preferences cog gets a soft blue.  Trailing tools cluster
-         * picks colours from the same Bitwig-ish family. */
+        /* Per-button border + icon-halo tints. */
         diskOpBtn_   .setTint (juce::Colour::fromRGB (200, 180,  80));
         pluginMgrBtn_.setTint (juce::Colour::fromRGB (190, 110, 170));
         prefsBtn_    .setTint (juce::Colour::fromRGB ( 90, 150, 210));
@@ -569,6 +559,7 @@ public:
         vKbdBtn_     .setTint (juce::Colour::fromRGB ( 80, 200, 170));
         undoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
         redoBtn_     .setTint (juce::Colour::fromRGB (200, 160,  80));
+        patchBayBtn_ .setTint (juce::Colour::fromRGB ( 80, 160, 200));
 
         vKbdBtn_.setClickingTogglesState (true);
         vKbdBtn_.setActiveTint (juce::Colour (0xff'4a'a5'5a));
@@ -679,17 +670,18 @@ public:
         /* ---- View selector right after the display. ---- */
         if (viewSelector.isVisible())
         {
-            const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
+            /* 4 view buttons now (Graph / Arr / Tracker / Session)
+             * -- Patch Bay moved to the trailing tools cluster. */
+            const int vsW = kFramePad * 2 + kIconBtnW * 4 + kIconGap * 3;
             viewSelector.setBounds (r.getX(), top, vsW, rowH);
             r.removeFromLeft (vsW + kGap);
         }
 
-        /* ---- Graph Mixer + Virtual Keyboard + Undo + Redo last,
-                15 % smaller so the cluster reads as a secondary
-                tools group. */
+        /* ---- Trailing tools cluster (15 % smaller buttons):
+                Graph Mixer | VKbd | Undo | Redo | Patch Bay. */
         const int smallBtnW = juce::jmax (12, (int) std::lround (kIconBtnW * 0.85));
         const int smallClusterH = smallBtnW + kFramePad * 2;
-        const int smallClusterW = kFramePad * 2 + smallBtnW * 4 + kIconGap * 3;
+        const int smallClusterW = kFramePad * 2 + smallBtnW * 5 + kIconGap * 4;
         const int smallTop = top + (rowH - smallClusterH) / 2;
         postXportRect_ = Rectangle<int> (r.getX(), smallTop, smallClusterW, smallClusterH);
         const int smallBtnY = smallTop + kFramePad;
@@ -697,7 +689,8 @@ public:
         graphMixBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
         vKbdBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
         undoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        redoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW);
+        redoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
+        patchBayBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW);
         r.removeFromLeft (smallClusterW + kGap);
 
         /* pluginMenu + mapButton stay on the far right (only visible
@@ -792,6 +785,7 @@ private:
     BlockToolButton vKbdBtn_      { "" };
     BlockToolButton undoBtn_      { "" };
     BlockToolButton redoBtn_      { "" };
+    BlockToolButton patchBayBtn_  { "" };
 
     /* LCD-frame bounds captured in resized(), painted in paint(). */
     Rectangle<int> leftClusterRect_;

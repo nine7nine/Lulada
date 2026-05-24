@@ -137,26 +137,28 @@ inline void iconWindows (juce::Graphics& g, juce::Rectangle<float> b, juce::Colo
 
 inline void iconPatchBay (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
 {
-    /* Three jacks connected by a curve -- patch-bay glyph. */
-    const auto box = b.reduced (b.getWidth() * 0.18f, b.getHeight() * 0.22f);
+    /* Patch-bay matrix glyph: 4x4 grid of small squares with a
+     * diagonal of "active" cells filled solid, the rest outlined.
+     * Mirrors Element's actual patch bay routing grid where each
+     * cell is one possible row/column connection. */
+    const auto box = b.reduced (b.getWidth() * 0.12f, b.getHeight() * 0.12f);
+    constexpr int n = 4;
+    const float cellW = (box.getWidth()  - 1.0f * (n - 1)) / (float) n;
+    const float cellH = (box.getHeight() - 1.0f * (n - 1)) / (float) n;
     g.setColour (fg);
-    const float r = juce::jmin (box.getWidth(), box.getHeight()) * 0.14f;
-    auto dot = [&] (float fx, float fy) {
-        g.fillEllipse (box.getX() + fx * box.getWidth() - r,
-                       box.getY() + fy * box.getHeight() - r,
-                       r * 2, r * 2);
-    };
-    dot (0.10f, 0.85f);
-    dot (0.50f, 0.20f);
-    dot (0.90f, 0.85f);
-    juce::Path arc;
-    arc.startNewSubPath (box.getX() + 0.10f * box.getWidth(),
-                          box.getY() + 0.85f * box.getHeight());
-    arc.quadraticTo (box.getX() + 0.50f * box.getWidth(),
-                       box.getY() + 0.10f * box.getHeight(),
-                       box.getX() + 0.90f * box.getWidth(),
-                       box.getY() + 0.85f * box.getHeight());
-    g.strokePath (arc, juce::PathStrokeType (1.3f));
+    for (int row = 0; row < n; ++row)
+        for (int col = 0; col < n; ++col)
+        {
+            const float x = box.getX() + col * (cellW + 1.0f);
+            const float y = box.getY() + row * (cellH + 1.0f);
+            const bool filled = (row == col)               /* main diagonal */
+                              || (row == 1 && col == 3)   /* extra accents */
+                              || (row == 3 && col == 1);
+            if (filled)
+                g.fillRect (x, y, cellW, cellH);
+            else
+                g.drawRect (x, y, cellW, cellH, 1.0f);
+        }
 }
 
 inline void iconGraph (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
