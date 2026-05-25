@@ -814,8 +814,8 @@ public:
                 if (! body.contains (e.x, e.y)) continue;
                 if (auto* sc = dynamic_cast<StandardContent*> (
                         ViewHelpers::findContentComponent (this)))
-                    sc->showTrackerStripForNode (lane.targetNodeUuid,
-                                                  r.sequenceIdx);
+                    sc->showTrackerDockForNode (lane.targetNodeUuid,
+                                                 r.sequenceIdx);
                 return;
             }
             return;

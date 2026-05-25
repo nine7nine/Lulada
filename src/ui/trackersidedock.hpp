@@ -12,26 +12,22 @@ namespace element {
 class TrackerNode;
 class TrackerEditor;
 
-/** Bottom-attach tracker editor strip.  Bitwig / Ableton / Ardour
- *  pattern: lets the user keep the timeline (or any other main
- *  view) visible while editing a tracker sequence below.
+/** Right-side tracker editor dock.  Mirrors a tracker's natural
+ *  vertical orientation (rows flow downward, time forward) by
+ *  docking the editor to the right edge of the main window where it
+ *  has full-height room for the row grid.
  *
- *  Layout (inside the strip's own bounds):
- *   - Top edge: thin drag handle for vertical resize (mirrors the
- *     SmartLayoutResizeBar between primary + secondary in
- *     ContentContainer; we own ours since the strip lives outside
- *     the container).
+ *  Layout (inside the dock's own bounds):
+ *   - Left edge: thin drag handle for HORIZONTAL resize.
  *   - Header: tracker selector dropdown (lists every TrackerNode in
  *     the active graph) + close button.
  *   - Body:   TrackerEditor for the currently-selected tracker.
  *
- *  Position in StandardContent layout:  removed from bottom after
- *  _extra (status / midi blinker overlay) but BEFORE the
- *  ContentContainer's bounds are computed.  Graph Mixer lives
- *  INSIDE the container (as its secondary view), so when both are
- *  visible the order top-to-bottom is:
- *     main view  |  graph mixer  |  tracker strip
- *  Matches the explicit user-requested ordering.
+ *  Position in StandardContent layout: removed from the RIGHT after
+ *  the node-channel-strip (if visible) but BEFORE the
+ *  ContentContainer's bounds are computed.  This leaves the bottom
+ *  strip area free for a future piano-roll editor (which IS time-
+ *  horizontal and belongs there).
  *
  *  Selection policy:
  *   - At construction / on graph attach, picks the first
@@ -40,13 +36,13 @@ class TrackerEditor;
  *     clicking on a tracker clip) bind a specific tracker.
  *   - User can change via the header dropdown.
  *   - Selection persists in the session's UI state alongside the
- *     visibility / height fields. */
-class TrackerStripView : public juce::Component,
-                          private juce::ValueTree::Listener
+ *     visibility / width fields. */
+class TrackerSideDock : public juce::Component,
+                         private juce::ValueTree::Listener
 {
 public:
-    TrackerStripView (Services& services);
-    ~TrackerStripView() override;
+    TrackerSideDock (Services& services);
+    ~TrackerSideDock() override;
 
     /** Bind to a specific TrackerNode by uuid.  No-op if the uuid
      *  doesn't resolve to a TrackerNode in the active graph; in that
@@ -69,9 +65,11 @@ public:
      *  available if the bound one disappeared. */
     void refreshFromGraph();
 
-    /** Drag callbacks for the top-edge resize handle.  Wired to
-     *  StandardContent so the parent owns the height field +
-     *  layout-trigger. */
+    /** Drag callbacks for the left-edge resize handle.  Wired to
+     *  StandardContent so the parent owns the width field +
+     *  layout-trigger.  `deltaPx` is positive when the user is
+     *  dragging RIGHT (shrinking the dock) and negative when
+     *  dragging LEFT (widening it). */
     std::function<void (int /*deltaPx*/)> onResizeDrag;
     std::function<void()>                  onResizeDragEnd;
     std::function<void()>                  onCloseClicked;
@@ -79,16 +77,13 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
 
-    /** Header height (drag handle + title strip).  Constant; the
-     *  TrackerEditor fills the rest. */
-    static constexpr int kHeaderH       = 22;
-    static constexpr int kDragHandleH   = 4;
+    static constexpr int kHeaderH     = 22;
+    static constexpr int kDragHandleW = 4;
 
 private:
     Services& services_;
     juce::Uuid boundId_;
 
-    /* Header components. */
     class DragHandle;
     std::unique_ptr<DragHandle>     dragHandle_;
     juce::ComboBox                  trackerCombo_;
@@ -99,17 +94,9 @@ private:
      * trackereditor full include in.  Rebuilt on each setTracker. */
     std::unique_ptr<juce::Component> editor_;
 
-    /* VT we currently listen to for node add/remove on the active
-     * graph.  Held as a value (juce::ValueTree is ref-counted) so the
-     * detach path in attachToActiveGraph can call removeListener on
-     * the previous VT before replacing it. */
     juce::ValueTree watchedNodes_;
 
     void rebuildEditorForBound();
-
-    /** (Re-)attach as a VT::Listener to the active graph's nodes
-     *  container, detaching from any previously-watched VT.  Idempotent
-     *  -- calling it with the same VT already attached is a no-op. */
     void attachToActiveGraph();
 
     /* ValueTree::Listener -- defer the refresh via callAsync to avoid
@@ -120,7 +107,7 @@ private:
     void valueTreeChildOrderChanged (juce::ValueTree&, int, int) override {}
     void valueTreeParentChanged (juce::ValueTree&) override {}
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TrackerStripView)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TrackerSideDock)
 };
 
 } // namespace element

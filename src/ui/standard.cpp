@@ -21,7 +21,7 @@
 #include "ui/arrangementview.hpp"
 #include "ui/sessionview.hpp"
 #include "ui/controllersview.hpp"
-#include "ui/trackerstripview.hpp"
+#include "ui/trackersidedock.hpp"
 #include "ui/trackerhostview.hpp"
 #include "ui/diskopview.hpp"
 #include "ui/datapathbrowser.hpp"
@@ -582,13 +582,13 @@ StandardContent::StandardContent (Context& ctl_)
 
         setCurrentNode (session()->getActiveGraph());
 
-        /* TrackerStripView holds a ValueTree::Listener pointing at
+        /* TrackerSideDock holds a ValueTree::Listener pointing at
          * the previous session's active-graph nodes container.  After
          * the session swap that VT is stale, so the listener wouldn't
          * fire on the new session's add/remove.  refreshFromGraph()
          * detaches + re-attaches as part of its normal flow. */
-        if (trackerStrip != nullptr)
-            trackerStrip->refreshFromGraph();
+        if (trackerDock != nullptr)
+            trackerDock->refreshFromGraph();
     });
 }
 
@@ -861,19 +861,18 @@ void StandardContent::resizeContent (const Rectangle<int>& area)
         r.removeFromBottom (1);
     }
 
-    /* Tracker strip sits at the very bottom (above _extra if visible,
-     * which it usually isn't simultaneously).  Lives outside
-     * ContentContainer so it naturally falls BELOW the graph mixer
-     * (which is the container's secondary view).  Height is
-     * user-resizable via the strip's top-edge drag handle; the
-     * dragHandle callback updates trackerStripHeight_ + retriggers
-     * this layout. */
-    if (trackerStripVisible_ && trackerStrip != nullptr)
+    /* Tracker side dock sits on the RIGHT edge (full height, above
+     * _extra if visible).  Lives outside ContentContainer so it
+     * doesn't get squeezed by the container's primary/secondary
+     * split.  Width is user-resizable via the dock's left-edge drag
+     * handle; the dragHandle callback updates trackerDockWidth_ +
+     * retriggers this layout. */
+    if (trackerDockVisible_ && trackerDock != nullptr)
     {
-        const int h = juce::jlimit (kTrackerStripMinH, kTrackerStripMaxH,
-                                     trackerStripHeight_);
-        trackerStrip->setBounds (r.removeFromBottom (h));
-        r.removeFromBottom (1);
+        const int w = juce::jlimit (kTrackerDockMinW, kTrackerDockMaxW,
+                                      trackerDockWidth_);
+        trackerDock->setBounds (r.removeFromRight (w));
+        r.removeFromRight (1);
     }
 
     if (nodeStrip && nodeStrip->isVisible())
@@ -1040,8 +1039,8 @@ void StandardContent::saveState (PropertiesFile* props)
 
     auto& mo = container->bottom->bridge->meterBridge();
     props->setValue ("meterBridge", isMeterBridgeVisible());
-    props->setValue ("trackerStrip",       trackerStripVisible_);
-    props->setValue ("trackerStripHeight", trackerStripHeight_);
+    props->setValue ("trackerDock",      trackerDockVisible_);
+    props->setValue ("trackerDockWidth", trackerDockWidth_);
     props->setValue ("meterBridgeSize", mo.meterSize());
     props->setValue ("meterBridgeVisibility", (int) mo.visibility());
 }
@@ -1065,8 +1064,15 @@ void StandardContent::restoreState (PropertiesFile* props)
     bo.setMeterSize (props->getIntValue ("meterBridgeSize", bo.meterSize()));
     bo.setVisibility ((uint32) props->getIntValue ("meterBridgeVisibility", bo.visibility()));
     setMeterBridgeVisible (props->getBoolValue ("meterBridge", isMeterBridgeVisible()));
-    trackerStripHeight_ = props->getIntValue ("trackerStripHeight", trackerStripHeight_);
-    setTrackerStripVisible (props->getBoolValue ("trackerStrip", trackerStripVisible_));
+    /* Honor legacy `trackerStripHeight` / `trackerStrip` keys ONCE
+     * if the new keys aren't present, so old sessions don't lose
+     * their toggle state.  Treat the legacy height as a hint only --
+     * the new dock is width-based, so default to kTrackerDockMinW
+     * range. */
+    if (props->containsKey ("trackerDockWidth"))
+        trackerDockWidth_ = props->getIntValue ("trackerDockWidth", trackerDockWidth_);
+    setTrackerDockVisible (props->getBoolValue ("trackerDock",
+                                                 props->getBoolValue ("trackerStrip", false)));
 
     {
         /* Prefer the new wrapper-managed keys (navExpandedWidth /
@@ -1394,9 +1400,9 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
         }
         case Commands::toggleTrackerStrip: {
             int flags = 0;
-            if (isTrackerStripVisible()) flags |= Info::isTicked;
-            result.setInfo ("Tracker Strip",
-                            "Show / hide the tracker editor at the bottom of the window",
+            if (isTrackerDockVisible()) flags |= Info::isTicked;
+            result.setInfo ("Tracker Dock",
+                            "Show / hide the tracker editor on the right side of the window",
                             "UI", flags);
             result.addDefaultKeypress ('t', ModifierKeys::commandModifier);
             break;
@@ -1506,7 +1512,7 @@ bool StandardContent::perform (const InvocationInfo& info)
             setNodeChannelStripVisible (! isNodeChannelStripVisible());
             break;
         case Commands::toggleTrackerStrip:
-            setTrackerStripVisible (! isTrackerStripVisible());
+            setTrackerDockVisible (! isTrackerDockVisible());
             break;
         case Commands::toggleNavSidebar:
             setNavSidebarCollapsed (! isNavSidebarCollapsed());
@@ -1684,61 +1690,65 @@ void StandardContent::setMeterBridgeVisible (bool vis)
 }
 
 //============================================================================
-// Tracker bottom-attach strip
+// Tracker right-side dock
 
-bool StandardContent::isTrackerStripVisible() const { return trackerStripVisible_; }
-int  StandardContent::getTrackerStripHeight() const { return trackerStripHeight_; }
+bool StandardContent::isTrackerDockVisible() const { return trackerDockVisible_; }
+int  StandardContent::getTrackerDockWidth() const  { return trackerDockWidth_; }
 
-void StandardContent::setTrackerStripHeight (int h)
+void StandardContent::setTrackerDockWidth (int w)
 {
-    h = juce::jlimit (kTrackerStripMinH, kTrackerStripMaxH, h);
-    if (h == trackerStripHeight_) return;
-    trackerStripHeight_ = h;
+    w = juce::jlimit (kTrackerDockMinW, kTrackerDockMaxW, w);
+    if (w == trackerDockWidth_) return;
+    trackerDockWidth_ = w;
     resized();
 }
 
-void StandardContent::setTrackerStripVisible (bool v)
+void StandardContent::setTrackerDockVisible (bool v)
 {
-    if (v == trackerStripVisible_) return;
-    trackerStripVisible_ = v;
+    if (v == trackerDockVisible_) return;
+    trackerDockVisible_ = v;
 
-    if (v && trackerStrip == nullptr)
+    if (v && trackerDock == nullptr)
     {
-        trackerStrip = std::make_unique<TrackerStripView> (services());
-        addChildComponent (trackerStrip.get());
-        trackerStrip->onResizeDrag = [this] (int delta) {
-            setTrackerStripHeight (trackerStripHeight_ + delta);
+        trackerDock = std::make_unique<TrackerSideDock> (services());
+        addChildComponent (trackerDock.get());
+        /* Drag handle delta: positive = user dragged RIGHT (dock
+         * shrinks); negative = user dragged LEFT (dock widens).
+         * Subtract delta from the width to invert into the
+         * shrink/grow convention. */
+        trackerDock->onResizeDrag = [this] (int delta) {
+            setTrackerDockWidth (trackerDockWidth_ - delta);
         };
-        trackerStrip->onResizeDragEnd = [this]() {
-            /* Persist final height on drag end -- writing on every
+        trackerDock->onResizeDragEnd = [this]() {
+            /* Persist final width on drag end -- writing on every
              * mouseDrag frame would thrash session XML. */
             if (auto* props = services().context().settings().getUserSettings())
-                props->setValue ("trackerStripHeight", trackerStripHeight_);
+                props->setValue ("trackerDockWidth", trackerDockWidth_);
         };
-        trackerStrip->onCloseClicked = [this]() {
-            setTrackerStripVisible (false);
+        trackerDock->onCloseClicked = [this]() {
+            setTrackerDockVisible (false);
         };
     }
 
-    if (trackerStrip != nullptr)
-        trackerStrip->setVisible (v);
+    if (trackerDock != nullptr)
+        trackerDock->setVisible (v);
 
     resized();
 }
 
-void StandardContent::showTrackerStripForNode (const juce::Uuid& trackerNodeId,
+void StandardContent::showTrackerDockForNode (const juce::Uuid& trackerNodeId,
                                                 int sequenceIdx)
 {
     /* Implicit show + bind.  Used by ArrangementView's tracker-clip
      * click affordance and by anything else that wants to surface a
-     * specific tracker without forcing the user to toggle the strip
+     * specific tracker without forcing the user to toggle the dock
      * first.  sequenceIdx >= 0 navigates the editor to that pattern
-     * so the strip opens on whichever clip the user actually clicked
+     * so the dock opens on whichever clip the user actually clicked
      * (not pattern 0). */
-    if (! trackerStripVisible_)
-        setTrackerStripVisible (true);
-    if (trackerStrip != nullptr)
-        trackerStrip->setTrackerAndPattern (trackerNodeId, sequenceIdx);
+    if (! trackerDockVisible_)
+        setTrackerDockVisible (true);
+    if (trackerDock != nullptr)
+        trackerDock->setTrackerAndPattern (trackerNodeId, sequenceIdx);
 }
 
 bool StandardContent::isMeterBridgeVisible() const
