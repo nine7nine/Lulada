@@ -29,7 +29,9 @@ public:
                                   Callback callback)
     {
         new SessionPromptDialog (title, message,
-                                  /*includeCancel=*/true, std::move (callback));
+                                  /*includeCancel=*/true,
+                                  "Yes", "No", "Cancel",
+                                  std::move (callback));
     }
 
     static void showYesNo (const juce::String& title,
@@ -37,7 +39,23 @@ public:
                             Callback callback)
     {
         new SessionPromptDialog (title, message,
-                                  /*includeCancel=*/false, std::move (callback));
+                                  /*includeCancel=*/false,
+                                  "Yes", "No", "Cancel",
+                                  std::move (callback));
+    }
+
+    /** Save / Discard / Cancel variant -- matches JUCE
+     *  FileBasedDocument's "Closing document..." prompt, but as a
+     *  native top-level peer like the rest of our session dialogs.
+     *  Result mapping: Yes = Save, No = Discard, Cancel = abort. */
+    static void showSaveDiscardCancel (const juce::String& title,
+                                        const juce::String& message,
+                                        Callback callback)
+    {
+        new SessionPromptDialog (title, message,
+                                  /*includeCancel=*/true,
+                                  "Save", "Discard changes", "Cancel",
+                                  std::move (callback));
     }
 
     void closeButtonPressed() override
@@ -51,6 +69,9 @@ private:
     public:
         ContentPanel (const juce::String& message,
                       bool includeCancel,
+                      const juce::String& yesLabel,
+                      const juce::String& noLabel,
+                      const juce::String& cancelLabel,
                       std::function<void (Result)> onResult)
             : message_ (message), includeCancel_ (includeCancel)
         {
@@ -61,9 +82,9 @@ private:
             if (includeCancel_)
                 addAndMakeVisible (cancelBtn_);
 
-            yesBtn_   .setButtonText ("Yes");
-            noBtn_    .setButtonText ("No");
-            cancelBtn_.setButtonText ("Cancel");
+            yesBtn_   .setButtonText (yesLabel);
+            noBtn_    .setButtonText (noLabel);
+            cancelBtn_.setButtonText (cancelLabel);
 
             yesBtn_   .onClick = [onResult] { onResult (Result::Yes); };
             noBtn_    .onClick = [onResult] { onResult (Result::No); };
@@ -89,16 +110,24 @@ private:
             constexpr int kBtnGap = 8;
             constexpr int kBottomPad = 10;
 
+            /* No button widens for longer labels like "Discard
+             * changes" while Yes / Cancel stay narrow.  Measured via
+             * the LookAndFeel default font; padded so the text isn't
+             * cramped against the button edges. */
+            const int noW = juce::jmax (kBtnW,
+                                          noBtn_.getBestWidthForHeight (kBtnH) + 18);
+
             auto r = getLocalBounds().removeFromBottom (kBtnH + kBottomPad)
                                      .withTrimmedBottom (kBottomPad);
 
-            const int totalBtnW = (includeCancel_ ? 3 : 2) * kBtnW
+            const int totalBtnW = kBtnW + noW
+                                + (includeCancel_ ? kBtnW : 0)
                                 + (includeCancel_ ? 2 : 1) * kBtnGap;
             r = r.withSizeKeepingCentre (totalBtnW, kBtnH);
 
             yesBtn_.setBounds (r.removeFromLeft (kBtnW));
             r.removeFromLeft (kBtnGap);
-            noBtn_.setBounds (r.removeFromLeft (kBtnW));
+            noBtn_.setBounds (r.removeFromLeft (noW));
             if (includeCancel_)
             {
                 r.removeFromLeft (kBtnGap);
@@ -112,9 +141,17 @@ private:
         juce::TextButton yesBtn_, noBtn_, cancelBtn_;
     };
 
+    /* Widen the No button when it carries a longer label like
+     * "Discard changes".  Keep the Yes/Cancel widths fixed so the
+     * row stays balanced. */
+    int          noBtnWidth_  { 76 };
+
     SessionPromptDialog (const juce::String& title,
                           const juce::String& message,
                           bool includeCancel,
+                          const juce::String& yesLabel,
+                          const juce::String& noLabel,
+                          const juce::String& cancelLabel,
                           Callback cb)
         : juce::DocumentWindow (title,
                                  juce::Colour (0xff'1c'1c'1c),
@@ -126,6 +163,7 @@ private:
         setSize (440, 160);
 
         auto* panel = new ContentPanel (message, includeCancel,
+            yesLabel, noLabel, cancelLabel,
             [this] (Result r) { fire (r); });
         setContentOwned (panel, true);
         setResizable (false, false);

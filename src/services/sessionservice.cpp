@@ -119,27 +119,63 @@ void SessionService::openFile (const File& file)
     }
     else if (file.hasFileExtension ("els"))
     {
-        document->saveIfNeededAndUserAgrees();
-        Session::ScopedFrozenLock freeze (*currentSession);
-        Result result = document->loadFrom (file, true);
-
-        if (result.wasOk())
+        /* Common load path -- runs after the (possibly-async) save
+         * prompt resolves.  Captured by value so the lambda survives
+         * past openFile() returning. */
+        auto doLoad = [this, file] ()
         {
-            auto& gui = *sibling<GuiService>();
-            gui.closeAllPluginWindows();
-            refreshOtherControllers();
+            Session::ScopedFrozenLock freeze (*currentSession);
+            Result result = document->loadFrom (file, true);
 
-            if (auto* cc = gui.content())
+            if (result.wasOk())
             {
-                auto ui = currentSession->data().getOrCreateChildWithName (tags::ui, nullptr);
-                cc->applySessionState (ui.getProperty ("content").toString());
-            }
+                auto& gui = *sibling<GuiService>();
+                gui.closeAllPluginWindows();
+                refreshOtherControllers();
 
-            sibling<GuiService>()->stabilizeContent();
-            resetChanges();
+                if (auto* cc = gui.content())
+                {
+                    auto ui = currentSession->data().getOrCreateChildWithName (tags::ui, nullptr);
+                    cc->applySessionState (ui.getProperty ("content").toString());
+                }
+
+                sibling<GuiService>()->stabilizeContent();
+                resetChanges();
+            }
+            jassert (! hasSessionChanged());
+            changeResetter->triggerAsyncUpdate();
+        };
+
+        if (document->hasChangedSinceSaved())
+        {
+            /* Native top-level Save / Discard / Cancel prompt --
+             * replaces juce::FileBasedDocument::saveIfNeededAndUser
+             * Agrees's in-process modal overlay ("Closing
+             * document...") with our SessionPromptDialog. */
+            const juce::String name = document->getDocumentTitle();
+            SessionPromptDialog::showSaveDiscardCancel (
+                "Closing document...",
+                "Do you want to save the changes to \"" + name + "\"?",
+                [this, doLoad] (SessionPromptDialog::Result r)
+                {
+                    if (r == SessionPromptDialog::Result::Yes)
+                    {
+                        document->save (true, true);
+                        doLoad();
+                    }
+                    else if (r == SessionPromptDialog::Result::No)
+                    {
+                        doLoad();
+                    }
+                    /* Cancel -- abort the open entirely. */
+                });
+            /* Skip the post-block triggerAsyncUpdate; the lambda
+             * fires it after the load actually runs. */
+            return;
         }
 
-        jassert (! hasSessionChanged());
+        doLoad();
+        return;
     }
     else
     {
