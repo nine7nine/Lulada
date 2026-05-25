@@ -2137,11 +2137,13 @@ private:
             g.setColour (fill);
             g.fillRoundedRectangle (rect.toFloat(), kCornerSize);
 
-            /* Bitwig-style region title strip: thin band across the
-             * top of the region in a more saturated/darker shade of
-             * the lane tint.  Holds the region label so the waveform
-             * area below stays uncluttered.  Squared-off bottom via
-             * an inner overdraw with the body fill below the band. */
+            /* Region title strip: thin band across the top of the
+             * region in a SUBTLY-tinted dark grey -- not the lane's
+             * full colour.  Border below keeps the full tint, so the
+             * region still reads as that lane's colour at a glance,
+             * but the title strip itself stays quiet so the white
+             * label reads cleanly and several stacked regions don't
+             * compete with hard saturation. */
             constexpr int kTitleH = 13;
             const Rectangle<int> titleRect (rect.getX(), rect.getY(),
                                              rect.getWidth(),
@@ -2150,9 +2152,9 @@ private:
                                             rect.getY() + titleRect.getHeight(),
                                             rect.getWidth(),
                                             juce::jmax (0, rect.getHeight() - titleRect.getHeight()));
-            juce::Colour titleFill = borderTint.withMultipliedBrightness (0.70f)
-                                                .withMultipliedSaturation (1.10f);
-            if (selected) titleFill = titleFill.brighter (0.25f);
+            const juce::Colour titleBase (0xff'14'14'14);
+            juce::Colour titleFill = titleBase.interpolatedWith (borderTint, 0.30f);
+            if (selected) titleFill = titleBase.interpolatedWith (borderTint, 0.55f);
             {
                 /* Clip to the rounded outer rect so the title band's
                  * top corners follow the region's rounding while its
@@ -2266,9 +2268,11 @@ private:
                 labelText = String (barAt) + " " +
                              (r.name.isNotEmpty() ? r.name : String ("Audio"));
 
-            g.setColour (juce::Colours::white.withAlpha (0.92f));
-            g.setFont (monoFont (
-                                          10.0f, juce::Font::bold));
+            /* Plain (not bold) for a quieter read against the
+             * subtly-tinted dark band -- the bold weight was
+             * fighting the border + waveform for visual weight. */
+            g.setColour (juce::Colours::white.withAlpha (0.85f));
+            g.setFont (monoFont (10.0f, juce::Font::plain));
             g.drawText (labelText,
                         titleRect.reduced (5, 0),
                         juce::Justification::centredLeft, true);
