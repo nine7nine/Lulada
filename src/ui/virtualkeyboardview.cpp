@@ -38,6 +38,22 @@ VirtualKeyboardComponent::VirtualKeyboardComponent (MidiKeyboardState& s, Orient
 {
 }
 
+void VirtualKeyboardComponent::drawBlackNote (int /*midiNoteNumber*/,
+                                                Graphics& g,
+                                                Rectangle<float> area,
+                                                bool isDown, bool isOver,
+                                                Colour noteFillColour)
+{
+    /* Flat fill, no JUCE "lit-from-above" inner highlight cap.
+     * Down/over states still composite their overlay colours via
+     * the LookAndFeel ColourIds the host registered. */
+    auto c = noteFillColour;
+    if (isDown) c = c.overlaidWith (findColour (keyDownOverlayColourId));
+    if (isOver) c = c.overlaidWith (findColour (mouseOverKeyOverlayColourId));
+    g.setColour (c);
+    g.fillRect (area);
+}
+
 void VirtualKeyboardComponent::setKeypressOctaveOffset (int offset)
 {
     if (offset < 0)

@@ -4,6 +4,8 @@
 #include <element/ui/simplemeter.hpp>
 #include <element/ui/style.hpp>
 
+#include <juce_audio_utils/juce_audio_utils.h>  /* MidiKeyboardComponent::ColourIds */
+
 #include "ui/buttons.hpp"
 #include "ui/midiblinker.hpp"
 
@@ -302,6 +304,23 @@ LookAndFeel_E1::LookAndFeel_E1()
     setColour (Toolbar::backgroundColourId, Colors::backgroundColor.brighter (0.05f));
     setColour (Toolbar::buttonMouseDownBackgroundColourId, Colors::backgroundColor.brighter (0.1f));
     setColour (Toolbar::buttonMouseOverBackgroundColourId, Colors::backgroundColor.darker (0.046f));
+
+    // MidiKeyboardComponent (virtual keyboard view + any other piano
+    // widget in the app) -- dark theme.  JUCE's LookAndFeel_V4 defaults
+    // are pure white/black; we substitute a medium-dark grey for the
+    // "white" keys with a slight blue tint that matches the LCD
+    // palette, plus a key-down highlight in the same LCD blue used by
+    // the toolbar display + lane indicators.
+    /* whiteNote shade chosen to match the LCD-bezel rim colour
+     * (paintLcdFrame, content.cpp) so the keyboard reads as part of
+     * the same dark-instrument-front family. */
+    setColour (MidiKeyboardComponent::whiteNoteColourId,           Colour (0xff'3a'3a'3a));
+    setColour (MidiKeyboardComponent::blackNoteColourId,           Colour (0xff'00'00'00));
+    setColour (MidiKeyboardComponent::keySeparatorLineColourId,    Colour (0xff'2a'2a'2a));
+    setColour (MidiKeyboardComponent::mouseOverKeyOverlayColourId, Colour (0x80'80'a0'c0));
+    setColour (MidiKeyboardComponent::keyDownOverlayColourId,      Colour (0xc0'5a'be'e5));
+    setColour (MidiKeyboardComponent::textLabelColourId,           Colour (0xff'd0'd0'd0));
+    setColour (MidiKeyboardComponent::shadowColourId,              Colour (0x66'00'00'00));
 
     // Alert Window
     setColour (AlertWindow::backgroundColourId, Colors::backgroundColor);

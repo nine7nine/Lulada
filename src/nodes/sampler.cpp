@@ -2144,9 +2144,11 @@ public:
         /* Natural piano-key colours.  Slot tint is laid on top as a
          * translucent overlay rather than blended into the base, so
          * the white/black distinction reads independently of the slot
-         * mapping. */
-        const Colour grayWhite  { 0xff'9a'9a'9a };   /* light-gray "white" */
-        const Colour grayBlack  { 0xff'14'14'14 };   /* near-black */
+         * mapping.  Matches LookAndFeel_E1's MidiKeyboardComponent
+         * palette so the keymap and the virtual keyboard read at the
+         * same brightness. */
+        const Colour grayWhite  { 0xff'3a'3a'3a };   /* matches LCD bezel rim */
+        const Colour grayBlack  { 0xff'00'00'00 };   /* pure black */
         int whiteIdx = 0;
         for (int n = 0; n < 24; ++n)
         {
