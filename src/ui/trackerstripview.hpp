@@ -41,7 +41,8 @@ class TrackerEditor;
  *   - User can change via the header dropdown.
  *   - Selection persists in the session's UI state alongside the
  *     visibility / height fields. */
-class TrackerStripView : public juce::Component
+class TrackerStripView : public juce::Component,
+                          private juce::ValueTree::Listener
 {
 public:
     TrackerStripView (Services& services);
@@ -98,7 +99,26 @@ private:
      * trackereditor full include in.  Rebuilt on each setTracker. */
     std::unique_ptr<juce::Component> editor_;
 
+    /* VT we currently listen to for node add/remove on the active
+     * graph.  Held as a value (juce::ValueTree is ref-counted) so the
+     * detach path in attachToActiveGraph can call removeListener on
+     * the previous VT before replacing it. */
+    juce::ValueTree watchedNodes_;
+
     void rebuildEditorForBound();
+
+    /** (Re-)attach as a VT::Listener to the active graph's nodes
+     *  container, detaching from any previously-watched VT.  Idempotent
+     *  -- calling it with the same VT already attached is a no-op. */
+    void attachToActiveGraph();
+
+    /* ValueTree::Listener -- defer the refresh via callAsync to avoid
+     * re-entrancy on the VT mutation that triggered us. */
+    void valueTreeChildAdded   (juce::ValueTree&, juce::ValueTree&) override;
+    void valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree&, int) override;
+    void valueTreePropertyChanged (juce::ValueTree&, const juce::Identifier&) override {}
+    void valueTreeChildOrderChanged (juce::ValueTree&, int, int) override {}
+    void valueTreeParentChanged (juce::ValueTree&) override {}
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TrackerStripView)
 };

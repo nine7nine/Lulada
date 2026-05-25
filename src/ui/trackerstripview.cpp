@@ -104,10 +104,59 @@ TrackerStripView::TrackerStripView (Services& services)
     refreshFromGraph();
 }
 
-TrackerStripView::~TrackerStripView() = default;
+TrackerStripView::~TrackerStripView()
+{
+    if (watchedNodes_.isValid())
+        watchedNodes_.removeListener (this);
+}
+
+void TrackerStripView::attachToActiveGraph()
+{
+    /* Replace whatever VT we were listening to with the active graph's
+     * nodes container.  Held-by-value is fine -- juce::ValueTree is
+     * reference-counted; removeListener on a stale handle is harmless
+     * if the underlying tree is already gone. */
+    juce::ValueTree desired;
+    if (auto sess = services_.context().session())
+        desired = sess->getActiveGraph().getNodesValueTree();
+
+    if (desired == watchedNodes_) return;
+
+    if (watchedNodes_.isValid())
+        watchedNodes_.removeListener (this);
+    watchedNodes_ = desired;
+    if (watchedNodes_.isValid())
+        watchedNodes_.addListener (this);
+}
+
+void TrackerStripView::valueTreeChildAdded (juce::ValueTree&, juce::ValueTree&)
+{
+    /* Deferred refresh: the VT mutation that triggered us may not yet
+     * have a corresponding Processor object attached on the Node side
+     * (the engine wires that in a follow-up step), so refreshing
+     * synchronously here can miss the new TrackerNode.  callAsync
+     * lands after the engine's wiring is complete. */
+    juce::Component::SafePointer<TrackerStripView> sp (this);
+    juce::MessageManager::callAsync ([sp]() {
+        if (sp != nullptr) sp->refreshFromGraph();
+    });
+}
+
+void TrackerStripView::valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree&, int)
+{
+    juce::Component::SafePointer<TrackerStripView> sp (this);
+    juce::MessageManager::callAsync ([sp]() {
+        if (sp != nullptr) sp->refreshFromGraph();
+    });
+}
 
 void TrackerStripView::refreshFromGraph()
 {
+    /* Listener re-binds first -- if the session swapped underneath
+     * us, the VT we were listening to is stale and we'd miss the new
+     * graph's add/remove events. */
+    attachToActiveGraph();
+
     /* Re-populate the selector from the current graph.  Preserve the
      * binding if the previously-bound tracker is still present;
      * otherwise bind to the first tracker we find (or unbind if

@@ -551,6 +551,14 @@ StandardContent::StandardContent (Context& ctl_)
         if (prevAcc.isNotEmpty())   setSecondaryView (prevAcc);
 
         setCurrentNode (session()->getActiveGraph());
+
+        /* TrackerStripView holds a ValueTree::Listener pointing at
+         * the previous session's active-graph nodes container.  After
+         * the session swap that VT is stale, so the listener wouldn't
+         * fire on the new session's add/remove.  refreshFromGraph()
+         * detaches + re-attaches as part of its normal flow. */
+        if (trackerStrip != nullptr)
+            trackerStrip->refreshFromGraph();
     });
 }
 
