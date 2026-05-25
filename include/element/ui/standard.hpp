@@ -21,6 +21,7 @@ class ContentContainer;
 class NavigationConcertinaPanel;
 class NodeChannelStripView;
 class VirtualKeyboardView;
+class TrackerStripView;
 
 class StandardContent : public Content,
                         public juce::ApplicationCommandTarget,
@@ -59,6 +60,23 @@ public:
 
     void setMeterBridgeVisible (bool);
     bool isMeterBridgeVisible() const;
+
+    /** Bottom-attach tracker editor strip.  Lives in StandardContent
+     *  (NOT inside ContentContainer) so it sits BELOW the graph
+     *  mixer when both are visible.  Resizable via its top-edge drag
+     *  handle.  See src/ui/trackerstripview.hpp for the layout
+     *  rationale + selection policy. */
+    void setTrackerStripVisible (bool);
+    bool isTrackerStripVisible() const;
+    void setTrackerStripHeight (int);
+    int  getTrackerStripHeight() const;
+    /** Bind the strip to a specific TrackerNode (e.g. clicked from
+     *  an ArrangementView tracker clip) and optionally navigate to a
+     *  specific pattern.  Pass sequenceIdx = -1 to leave the
+     *  tracker's current pattern alone.  Implicitly shows the strip
+     *  if it isn't already visible. */
+    void showTrackerStripForNode (const juce::Uuid& trackerNodeId,
+                                   int sequenceIdx = -1);
 
     void setCurrentNode (const Node& node) override;
 
@@ -100,6 +118,14 @@ private:
     std::unique_ptr<Resizer> bar1;
 
     std::unique_ptr<NodeChannelStripView> nodeStrip;
+
+    /* Bottom-attach tracker editor.  See setTrackerStripVisible /
+     * showTrackerStripForNode docs above for the binding contract. */
+    std::unique_ptr<TrackerStripView> trackerStrip;
+    bool trackerStripVisible_ { false };
+    int  trackerStripHeight_  { 220 };  /* clamped 80..600 at apply time */
+    static constexpr int kTrackerStripMinH = 80;
+    static constexpr int kTrackerStripMaxH = 600;
 
     bool statusBarVisible { true };
     int statusBarSize;

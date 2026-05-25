@@ -20,6 +20,8 @@
 #include "services/timeline/audiolaneadapter.hpp"
 #include "ui/fontcache.hpp"
 #include "ui/lanepalette.hpp"
+#include "ui/viewhelpers.hpp"
+#include <element/ui/standard.hpp>
 
 #include <unordered_map>
 
@@ -795,6 +797,30 @@ public:
         const int laneIdx = (e.y - kRulerH) / kLaneH;
         if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
         const auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+
+        /* Tracker lane: double-click anywhere on a tracker clip
+         * surfaces the bottom-attach tracker strip bound to this
+         * lane's TrackerNode.  Lets the user edit the pattern while
+         * keeping the timeline visible, matching Bitwig / Ableton /
+         * Ardour. */
+        if (runtime.isTrackerLane())
+        {
+            const auto& lane = owner.lanes_.getReference (laneIdx);
+            const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+            for (const auto& r : lane.playlist.regions())
+            {
+                if (! r.containsBeat (beat)) continue;
+                const auto body = regionBodyRect (laneIdx, r);
+                if (! body.contains (e.x, e.y)) continue;
+                if (auto* sc = dynamic_cast<StandardContent*> (
+                        ViewHelpers::findContentComponent (this)))
+                    sc->showTrackerStripForNode (lane.targetNodeUuid,
+                                                  r.sequenceIdx);
+                return;
+            }
+            return;
+        }
+
         if (! runtime.isAudioLane()) return;
 
         const auto& lane = owner.lanes_.getReference (laneIdx);
