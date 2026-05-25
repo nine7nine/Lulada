@@ -235,7 +235,12 @@ AudioClipNode::processBlock (juce::AudioBuffer<float>& buffer,
         {
             const float t = (float) activeSamplesPlayed_
                           / (float) activeFadeInSamples_;
-            blockGain *= juce::jlimit (0.0f, 1.0f, t);
+            /* Power-curve fade.  activeFadeInExp_==1 -> linear (pow is
+             * identity); !=1 bends the slope.  std::pow on the clamped
+             * unit interval is well-behaved (no NaN, no Inf). */
+            const float shaped = std::pow (juce::jlimit (0.0f, 1.0f, t),
+                                           activeFadeInExp_);
+            blockGain *= shaped;
         }
 
         if (activeFadeOutSamples_ > 0 && activeLengthSamples_ > 0)
@@ -246,7 +251,9 @@ AudioClipNode::processBlock (juce::AudioBuffer<float>& buffer,
             {
                 const juce::int64 into = activeSamplesPlayed_ - fadeOutStart;
                 const float t = 1.0f - (float) into / (float) activeFadeOutSamples_;
-                blockGain *= juce::jlimit (0.0f, 1.0f, t);
+                const float shaped = std::pow (juce::jlimit (0.0f, 1.0f, t),
+                                               activeFadeOutExp_);
+                blockGain *= shaped;
             }
         }
 
@@ -316,7 +323,9 @@ AudioClipNode::schedulePlay (juce::Uuid  regionId,
                              double      gainDb,
                              juce::int64 fadeInSamples,
                              juce::int64 fadeOutSamples,
-                             juce::int64 regionLengthSamples)
+                             juce::int64 regionLengthSamples,
+                             float       fadeInCurve,
+                             float       fadeOutCurve)
 {
     auto source = SourceRegistry::get().findAudioFile (sourceId);
     if (source == nullptr)
@@ -354,9 +363,15 @@ AudioClipNode::schedulePlay (juce::Uuid  regionId,
 
     const float gainLinear = (float) juce::Decibels::decibelsToGain (gainDb);
 
+    /* Map curvature scalar (-1..+1) to power-curve exponent.
+     * c==0 -> p==1 (linear), c==+1 -> p==4, c==-1 -> p==0.25. */
+    const float fadeInExp  = std::exp2 (juce::jlimit (-1.0f, 1.0f, fadeInCurve)  * 2.0f);
+    const float fadeOutExp = std::exp2 (juce::jlimit (-1.0f, 1.0f, fadeOutCurve) * 2.0f);
+
     const LaunchReq req {
         regionId, beatTarget, sampleOffset, freshRaw, 1 /*wantPlaying*/, looped,
-        gainLinear, fadeInSamples, fadeOutSamples, regionLengthSamples
+        gainLinear, fadeInSamples, fadeOutSamples, regionLengthSamples,
+        fadeInExp, fadeOutExp
     };
 
     if (sz1 > 0)
@@ -381,7 +396,7 @@ AudioClipNode::scheduleStop (juce::Uuid regionId, double beatTarget) noexcept
 
     const LaunchReq req {
         regionId, beatTarget, 0, nullptr, 0 /*wantPlaying*/, false,
-        1.0f /*unused*/, 0, 0, 0
+        1.0f /*unused*/, 0, 0, 0, 1.0f, 1.0f
     };
 
     if (sz1 > 0)
@@ -465,7 +480,8 @@ AudioClipNode::drainLaunchFifo() noexcept
             r.regionId, r.beatTarget, r.sampleOffset, r.stream,
             r.wantPlaying != 0,
             r.gainLinear, r.fadeInSamples, r.fadeOutSamples,
-            r.regionLengthSamples
+            r.regionLengthSamples,
+            r.fadeInExp, r.fadeOutExp
         });
     };
 
@@ -513,6 +529,8 @@ AudioClipNode::applyPendingForBlock (double blockStartBeat, double blockEndBeat)
             activeGainLinear_     = p.gainLinear;
             activeFadeInSamples_  = p.fadeInSamples;
             activeFadeOutSamples_ = p.fadeOutSamples;
+            activeFadeInExp_      = p.fadeInExp;
+            activeFadeOutExp_     = p.fadeOutExp;
             activeLengthSamples_  = p.regionLengthSamples;
             activeSamplesPlayed_  = 0;
         }
@@ -524,6 +542,8 @@ AudioClipNode::applyPendingForBlock (double blockStartBeat, double blockEndBeat)
             activeGainLinear_     = 1.0f;
             activeFadeInSamples_  = 0;
             activeFadeOutSamples_ = 0;
+            activeFadeInExp_      = 1.0f;
+            activeFadeOutExp_     = 1.0f;
             activeLengthSamples_  = 0;
             activeSamplesPlayed_  = 0;
         }

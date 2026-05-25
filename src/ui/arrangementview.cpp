@@ -483,6 +483,46 @@ public:
                     repaintLane (laneIdx);
                     return;
                 }
+
+                /* Midpoint-handle hit-test runs AFTER the breakpoint
+                 * hit-test so a click on the breakpoint dot itself
+                 * wins (breakpoints sit on top of midpoints when
+                 * they overlap visually).  Only active when the
+                 * region is already selected -- handles aren't drawn
+                 * otherwise. */
+                if (selectedRegion_ == r.id)
+                {
+                    const int segIdx = envSegmentMidHitAt (laneIdx, r, e.x, e.y);
+                    if (segIdx >= 0)
+                    {
+                        if (e.mods.isPopupMenu())
+                        {
+                            /* Right-click on the midpoint = reset to
+                             * defaults (curve reverts to chord, enum
+                             * preset takes over).  No menu -- one
+                             * gesture, no extra clicks. */
+                            auto& laneMut = owner.lanes_.getReference (laneIdx);
+                            if (auto* rmut = laneMut.playlist.findRegion (r.id))
+                            {
+                                if (segIdx < (int) rmut->volumeEnvelope.size())
+                                {
+                                    auto& seg = rmut->volumeEnvelope[(size_t) segIdx];
+                                    seg.curveOffsetT  = 0.5f;
+                                    seg.curveOffsetDb = 0.0f;
+                                    owner.writeLanesToSession();
+                                    repaintLane (laneIdx);
+                                }
+                            }
+                            return;
+                        }
+                        envMidGesture_.laneIdx    = laneIdx;
+                        envMidGesture_.regionId   = r.id;
+                        envMidGesture_.segIndex   = segIdx;
+                        envMidGesture_.dragActive = false;
+                        grabKeyboardFocus();
+                        return;
+                    }
+                }
             }
 
             /* Right-click context menu works in every tool. */
@@ -611,6 +651,43 @@ public:
             const float py = body.getY() + yPad + t * (float) H;
             const float dx = (float) x - px;
             const float dy = (float) y - py;
+            if (dx * dx + dy * dy <= 25.0f) return (int) i;
+        }
+        return -1;
+    }
+
+    /** Hit-test for per-segment midpoint handle.  Returns the index
+     *  of the LEFT breakpoint of the matching segment (i.e. the
+     *  breakpoint whose curveAmount the drag should mutate), or -1.
+     *  5 px radius.  Hold segments excluded -- no handle drawn there. */
+    int envSegmentMidHitAt (int laneIdx, const Region& r, int x, int y) const noexcept
+    {
+        if (r.volumeEnvelope.size() < 2) return -1;
+        const auto body = regionBodyRect (laneIdx, r);
+        constexpr float kTopDb = 6.0f, kBotDb = -24.0f;
+        const int yPad = 3;
+        const int H = juce::jmax (1, body.getHeight() - yPad * 2);
+        for (size_t i = 0; i + 1 < r.volumeEnvelope.size(); ++i)
+        {
+            const auto& a = r.volumeEnvelope[i];
+            const auto& b = r.volumeEnvelope[i + 1];
+            if (a.curve == EnvelopeCurve::Hold) continue;
+
+            /* Pin point coords -- match the paint maths. */
+            const double cot = (double) juce::jlimit (0.25f, 0.75f, a.curveOffsetT);
+            const double pinBeat = a.beatOffset + cot * (b.beatOffset - a.beatOffset);
+            const double chordMidDb = 0.5 * ((double) a.gainDb + (double) b.gainDb);
+            const double pinDb = chordMidDb + (double) a.curveOffsetDb;
+
+            const float mx = body.getX()
+                + (float) (pinBeat / juce::jmax (1e-9, r.lengthBeats))
+                  * (float) body.getWidth();
+            const float ty = juce::jlimit (0.0f, 1.0f,
+                (kTopDb - (float) pinDb) / (kTopDb - kBotDb));
+            const float my = body.getY() + yPad + ty * (float) H;
+
+            const float dx = (float) x - mx;
+            const float dy = (float) y - my;
             if (dx * dx + dy * dy <= 25.0f) return (int) i;
         }
         return -1;
@@ -761,7 +838,8 @@ public:
                 r.gainDb,
                 (juce::int64) (r.fadeInBeats  * secsPerBeat * sessionSR),
                 (juce::int64) (r.fadeOutBeats * secsPerBeat * sessionSR),
-                (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR));
+                (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR),
+                r.fadeInCurve, r.fadeOutCurve);
         }
         runtime.lastDispatchedRegion = r.id;
         runtime.lastDispatchedSeqIdx = r.sequenceIdx;
@@ -791,6 +869,45 @@ public:
             pt->gainDb     = juce::jlimit (-60.0f, 12.0f,
                                             envYToGainDb (e.y, body));
             repaintLane (envGesture_.laneIdx);
+            return;
+        }
+
+        /* Per-segment midpoint-handle drag (2D control point).
+         * Free X+Y placement: convert the current mouse pos to a
+         * (cot, cod) pair via the inverse of the paint mapping.
+         *   cot = (x - segLeftX) / segWidthPx           (clamp 0.25..0.75)
+         *   cod = envYToGainDb(y) - chordMidDb          (no clamp; segment
+         *                                                 gain range is
+         *                                                 already enforced
+         *                                                 by envYToGainDb). */
+        if (envMidGesture_.laneIdx >= 0)
+        {
+            envMidGesture_.dragActive = true;
+            if (envMidGesture_.laneIdx >= owner.lanes_.size()) return;
+            auto& lane = owner.lanes_.getReference (envMidGesture_.laneIdx);
+            auto* r = lane.playlist.findRegion (envMidGesture_.regionId);
+            if (r == nullptr) return;
+            const int seg = envMidGesture_.segIndex;
+            if (seg < 0 || seg + 1 >= (int) r->volumeEnvelope.size()) return;
+
+            auto& a = r->volumeEnvelope[(size_t) seg];
+            const auto& b = r->volumeEnvelope[(size_t) seg + 1];
+
+            const auto body = regionBodyRect (envMidGesture_.laneIdx, *r);
+            /* Segment-local X mapping: project pixel x back to a beat
+             * offset within the segment, then normalise to [0,1]. */
+            const double beat = envXToBeatOffset (e.x, body, *r);
+            const double span = juce::jmax (1e-9, b.beatOffset - a.beatOffset);
+            const double cot  = juce::jlimit (0.25, 0.75,
+                                              (beat - a.beatOffset) / span);
+
+            const float  pinDb     = envYToGainDb (e.y, body);
+            const double chordMidDb = 0.5 * ((double) a.gainDb + (double) b.gainDb);
+
+            a.curveOffsetT  = (float) cot;
+            a.curveOffsetDb = (float) ((double) pinDb - chordMidDb);
+
+            repaintLane (envMidGesture_.laneIdx);
             return;
         }
 
@@ -877,6 +994,20 @@ public:
             return;
         }
 
+        if (envMidGesture_.laneIdx >= 0)
+        {
+            if (envMidGesture_.dragActive
+                && envMidGesture_.laneIdx < owner.lanes_.size())
+            {
+                /* Persist the new curveAmount.  No sortEnvelope needed
+                 * (we didn't touch beatOffsets). */
+                owner.writeLanesToSession();
+                repaintLane (envMidGesture_.laneIdx);
+            }
+            envMidGesture_ = EnvMidGesture {};
+            return;
+        }
+
         /* Finish range drag (lane strip OR ruler).  Empty range
          * (start == end) collapses to no-range; non-empty range
          * stays armed for loop / future delete-in-range. */
@@ -931,7 +1062,8 @@ public:
                     r->gainDb,
                     (juce::int64) (r->fadeInBeats  * secsPerBeat * sessionSR),
                     (juce::int64) (r->fadeOutBeats * secsPerBeat * sessionSR),
-                    (juce::int64) (r->lengthBeats  * secsPerBeat * sessionSR));
+                    (juce::int64) (r->lengthBeats  * secsPerBeat * sessionSR),
+                    r->fadeInCurve, r->fadeOutCurve);
             }
             runtime.lastDispatchedRegion = r->id;
             runtime.lastDispatchedSeqIdx = r->sequenceIdx;
@@ -1471,7 +1603,9 @@ private:
 
         auto pushSegment = [&] (double beatA, float dbA,
                                  double beatB, float dbB,
-                                 EnvelopeCurve curve, bool first)
+                                 EnvelopeCurve curve,
+                                 float curveOffsetT, float curveOffsetDb,
+                                 bool first)
         {
             const float xA = beatToX (beatA);
             const float yA = gainToY (dbA);
@@ -1484,6 +1618,7 @@ private:
             }
             if (curve == EnvelopeCurve::Hold)
             {
+                /* Hold stays a step; offsets ignored. */
                 const float xB = beatToX (beatB);
                 stroke.lineTo (xB, yA);
                 stroke.lineTo (xB, gainToY (dbB));
@@ -1491,7 +1626,10 @@ private:
                 shadePoly.lineTo (xB, gainToY (dbB));
                 return;
             }
-            if (curve == EnvelopeCurve::Linear)
+            /* Default Bezier (cot=0.5, cod=0) with enum=Linear is just
+             * a fast straight line; skip subdivision. */
+            const bool useBezier = (curveOffsetT != 0.5f) || (curveOffsetDb != 0.0f);
+            if (! useBezier && curve == EnvelopeCurve::Linear)
             {
                 const float xB = beatToX (beatB);
                 const float yB = gainToY (dbB);
@@ -1499,17 +1637,40 @@ private:
                 shadePoly.lineTo (xB, yB);
                 return;
             }
+            /* Quadratic Bezier endpoints A=(0,dbA), B=(1,dbB); control
+             * point (cx, cy) derived so the curve passes through
+             * (curveOffsetT, chordMidDb + curveOffsetDb) at u=0.5. */
+            const double cot = (double) juce::jlimit (0.25f, 0.75f, curveOffsetT);
+            const double cx  = 2.0 * cot - 0.5;
+            const double chordMidDb = 0.5 * ((double) dbA + (double) dbB);
+            const double pinDb = chordMidDb + (double) curveOffsetDb;
+            const double cy  = 2.0 * pinDb - chordMidDb;
             for (int k = 1; k <= kSubdiv; ++k)
             {
-                const double t = (double) k / (double) kSubdiv;
-                double shaped = t;
-                if (curve == EnvelopeCurve::Exponential) shaped = t * t;
-                if (curve == EnvelopeCurve::Smooth)
-                    shaped = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * t);
-                const double beat = beatA + t * (beatB - beatA);
-                const double db   = dbA + shaped * (dbB - dbA);
+                double xLocal, yLocal;
+                if (useBezier)
+                {
+                    const double u = (double) k / (double) kSubdiv;
+                    const double oneMinusU = 1.0 - u;
+                    xLocal = 2.0 * oneMinusU * u * cx + u * u;
+                    yLocal = oneMinusU * oneMinusU * (double) dbA
+                           + 2.0 * oneMinusU * u * cy
+                           + u * u * (double) dbB;
+                }
+                else
+                {
+                    const double t = (double) k / (double) kSubdiv;
+                    double shaped = t;
+                    if (curve == EnvelopeCurve::Exponential)
+                        shaped = t * t;
+                    else if (curve == EnvelopeCurve::Smooth)
+                        shaped = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * t);
+                    xLocal = t;
+                    yLocal = (double) dbA + shaped * ((double) dbB - (double) dbA);
+                }
+                const double beat = beatA + xLocal * (beatB - beatA);
                 const float xK = beatToX (beat);
-                const float yK = gainToY ((float) db);
+                const float yK = gainToY ((float) yLocal);
                 stroke.lineTo (xK, yK);
                 shadePoly.lineTo (xK, yK);
             }
@@ -1538,7 +1699,8 @@ private:
                 const auto& b = r.volumeEnvelope[i + 1];
                 pushSegment (a.beatOffset, a.gainDb,
                               b.beatOffset, b.gainDb,
-                              a.curve, i == 0);
+                              a.curve, a.curveOffsetT, a.curveOffsetDb,
+                              i == 0);
             }
             /* Close the shading polygon: traverse along the top edge
              * back to the starting X. */
@@ -1570,6 +1732,41 @@ private:
             {
                 g.setColour (juce::Colours::black);
                 g.drawEllipse (x - dotR, y - dotR, dotR * 2, dotR * 2, 1.0f);
+            }
+        }
+
+        /* Per-segment midpoint handle.  Only drawn when the region is
+         * selected (avoids visual clutter on every clip in the lane).
+         * Position: x = geometric midpoint of beatA..beatB; y = the
+         * curve's actual y at that x, i.e. it tracks the curve --
+         * drag perpendicular to the segment's chord to bend.  Hold
+         * segments get no handle (step function isn't bendable). */
+        if (selected && r.volumeEnvelope.size() >= 2)
+        {
+            const float midR = 2.5f;
+            for (size_t i = 0; i + 1 < r.volumeEnvelope.size(); ++i)
+            {
+                const auto& a = r.volumeEnvelope[i];
+                const auto& b = r.volumeEnvelope[i + 1];
+                if (a.curve == EnvelopeCurve::Hold) continue;
+
+                /* Handle pin point in segment-local coords.  For
+                 * default (cot=0.5, cod=0) this is the geometric
+                 * midpoint of the chord; non-default positions move
+                 * the bend toward the dragged pin. */
+                const double cot = (double) juce::jlimit (0.25f, 0.75f, a.curveOffsetT);
+                const double chordMidDb = 0.5 * ((double) a.gainDb + (double) b.gainDb);
+                const double pinBeat = a.beatOffset + cot * (b.beatOffset - a.beatOffset);
+                const double pinDb   = chordMidDb + (double) a.curveOffsetDb;
+                const float  mx      = beatToX (pinBeat);
+                const float  my      = gainToY ((float) pinDb);
+
+                /* Two-tone fill so it's visually distinct from the
+                 * solid breakpoint dots: hollow centre, coloured ring. */
+                g.setColour (juce::Colours::black);
+                g.fillEllipse (mx - midR, my - midR, midR * 2, midR * 2);
+                g.setColour (lineCol);
+                g.drawEllipse (mx - midR, my - midR, midR * 2, midR * 2, 1.25f);
             }
         }
     }
@@ -2151,6 +2348,23 @@ private:
         bool       dragActive = false;
     };
     EnvGesture envGesture_;
+
+    /** Live drag of a per-segment midpoint handle.  Bends the segment
+     *  between two breakpoints into a power curve.  Distinct gesture
+     *  type so a midpoint drag doesn't also move the surrounding
+     *  breakpoints.  segIndex is the index of the LEFT breakpoint of
+     *  the segment (i.e. the breakpoint whose curve+curveAmount
+     *  fields drive the segment's shape). */
+    struct EnvMidGesture {
+        int        laneIdx        = -1;
+        juce::Uuid regionId;
+        int        segIndex       = -1;
+        bool       dragActive     = false;
+        /* Free 2D drag: convert the current mouse position to (cot, cod)
+         * each frame by inverting the same mapping the paint maths uses.
+         * No baseline / delta state needed -- absolute placement. */
+    };
+    EnvMidGesture envMidGesture_;
 
     /* Active tool + loop-range state.  See the comment block on the
      * Tool enum declaration for the per-tool gesture mapping. */
@@ -3336,7 +3550,8 @@ void ArrangementView::dispatchAtBeat (double beat)
                 sampleOffset,
                 active->looped,
                 active->gainDb,
-                fadeInSamples, fadeOutSamples, regionLenSamples);
+                fadeInSamples, fadeOutSamples, regionLenSamples,
+                active->fadeInCurve, active->fadeOutCurve);
         }
 
         runtime.lastDispatchedRegion = active->id;
@@ -3513,7 +3728,8 @@ bool ArrangementView::importAudioFileToLane (const juce::File& file,
             r.id, r.sourceId, -1.0, 0, r.looped, r.gainDb,
             (juce::int64) (r.fadeInBeats  * secsPerBeat * sessionSR),
             (juce::int64) (r.fadeOutBeats * secsPerBeat * sessionSR),
-            (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR));
+            (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR),
+            r.fadeInCurve, r.fadeOutCurve);
     }
 
     writeLanesToSession();
