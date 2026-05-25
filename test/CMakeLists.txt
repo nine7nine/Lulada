@@ -27,6 +27,7 @@ add_test(NAME "AtomicValueTests" COMMAND test_element --run_test=AtomicValueTest
 add_test(NAME "AtomicLockTests" COMMAND test_element --run_test=AtomicLockTests)
 add_test(NAME "AudioRoutingTests" COMMAND test_element --run_test=AudioRoutingTests)
 add_test(NAME "AutomationCurveTests" COMMAND test_element --run_test=AutomationCurveTests)
+add_test(NAME "AutomationTargetTests" COMMAND test_element --run_test=AutomationTargetTests)
 add_test(NAME "BytesTest" COMMAND test_element --run_test=BytesTest)
 add_test(NAME "JuceIntegrationTests" COMMAND test_element --run_test=JuceIntegrationTests)
 add_test(NAME "DataPathTests" COMMAND test_element --run_test=DataPathTests)
