@@ -5,9 +5,22 @@
 
 #include "dsp/automation/curve.hpp"
 #include "dsp/automation/parameter_change_tracker.hpp"
+#include "dsp/automation/automation_point.hpp"
+#include "dsp/automation/automation_region.hpp"
+#include "dsp/automation/automation_track.hpp"
 
+#include <element/juce/core.hpp>
+
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <thread>
 
+using element::dsp::automation::AutomationMode;
+using element::dsp::automation::AutomationPoint;
+using element::dsp::automation::AutomationRecordMode;
+using element::dsp::automation::AutomationRegion;
+using element::dsp::automation::AutomationTrack;
 using element::dsp::automation::CurveAlgorithm;
 using element::dsp::automation::CurveOptions;
 using element::dsp::automation::evaluate;
@@ -199,5 +212,322 @@ BOOST_AUTO_TEST_CASE (finalize_block_sets_changed_when_modulated_differs)
 }
 
 BOOST_AUTO_TEST_SUITE_END()  /* ParameterChangeTrackerTests */
+
+/* ---------- AutomationRegion sampling ---------- */
+
+BOOST_AUTO_TEST_SUITE (AutomationRegionTests)
+
+BOOST_AUTO_TEST_CASE (empty_region_samples_neutral)
+{
+    AutomationRegion r;
+    BOOST_CHECK (nearly (r.sampleAtBeats (0.0),  0.5));
+    BOOST_CHECK (nearly (r.sampleAtBeats (4.2),  0.5));
+}
+
+BOOST_AUTO_TEST_CASE (single_point_region_returns_constant)
+{
+    AutomationRegion r;
+    AutomationRegion::PointList pts { { 0.0, 0.42, {} } };
+    r.setPoints (pts);
+    BOOST_CHECK (nearly (r.sampleAtBeats (0.0),  0.42));
+    BOOST_CHECK (nearly (r.sampleAtBeats (5.0),  0.42));
+}
+
+BOOST_AUTO_TEST_CASE (linear_segment_interpolates)
+{
+    AutomationRegion r;
+    AutomationRegion::PointList pts {
+        { 0.0, 0.0, { CurveAlgorithm::Linear, 0.0 } },
+        { 4.0, 1.0, { CurveAlgorithm::Linear, 0.0 } }
+    };
+    r.setPoints (pts);
+    BOOST_CHECK (nearly (r.sampleAtBeats (0.0), 0.0));
+    BOOST_CHECK (nearly (r.sampleAtBeats (1.0), 0.25));
+    BOOST_CHECK (nearly (r.sampleAtBeats (2.0), 0.5));
+    BOOST_CHECK (nearly (r.sampleAtBeats (3.0), 0.75));
+    BOOST_CHECK (nearly (r.sampleAtBeats (4.0), 1.0));
+}
+
+BOOST_AUTO_TEST_CASE (linear_segment_descending_reflects)
+{
+    AutomationRegion r;
+    AutomationRegion::PointList pts {
+        { 0.0, 0.8, { CurveAlgorithm::Linear, 0.0 } },
+        { 2.0, 0.2, { CurveAlgorithm::Linear, 0.0 } }
+    };
+    r.setPoints (pts);
+    BOOST_CHECK (nearly (r.sampleAtBeats (1.0), 0.5));
+}
+
+BOOST_AUTO_TEST_CASE (out_of_range_clamps_to_endpoints)
+{
+    AutomationRegion r;
+    AutomationRegion::PointList pts {
+        { 1.0, 0.2, {} },
+        { 3.0, 0.8, {} }
+    };
+    r.setPoints (pts);
+    BOOST_CHECK (nearly (r.sampleAtBeats (0.0), 0.2));   /* before first */
+    BOOST_CHECK (nearly (r.sampleAtBeats (5.0), 0.8));   /* after last */
+}
+
+BOOST_AUTO_TEST_CASE (each_curve_algo_endpoint_pins)
+{
+    /* For every algo, the interpolated value at t=0 must equal the
+     * from-point value and at t=1 must equal the to-point value. */
+    for (auto algo : { CurveAlgorithm::Linear,
+                        CurveAlgorithm::Exponent,
+                        CurveAlgorithm::SuperEllipse,
+                        CurveAlgorithm::Vital,
+                        CurveAlgorithm::Logarithmic,
+                        CurveAlgorithm::Pulse })
+    {
+        AutomationRegion r;
+        AutomationRegion::PointList pts {
+            { 0.0, 0.3, { algo, 0.5 } },
+            { 2.0, 0.7, { algo, 0.5 } }
+        };
+        r.setPoints (pts);
+        BOOST_CHECK (nearly (r.sampleAtBeats (0.0), 0.3, 1e-6));
+        BOOST_CHECK (nearly (r.sampleAtBeats (2.0), 0.7, 1e-6));
+    }
+}
+
+BOOST_AUTO_TEST_CASE (setpoints_sorts_unordered_input)
+{
+    AutomationRegion r;
+    AutomationRegion::PointList pts {
+        { 4.0, 1.0, {} },
+        { 0.0, 0.0, {} },
+        { 2.0, 0.5, {} }
+    };
+    r.setPoints (pts);
+    /* Linear interp must work correctly even though input was
+     * shuffled.  If sort failed, sampleAtBeats(2.0) wouldn't be 0.5. */
+    BOOST_CHECK (nearly (r.sampleAtBeats (2.0), 0.5));
+}
+
+BOOST_AUTO_TEST_CASE (cow_snapshot_swap_is_visible_atomically)
+{
+    /* Smoke test for the leaked-ptr-trash-bin + epoch-gated reclaim
+     * pattern.  The UI side publishes a new snapshot; the audio side
+     * -- a separate thread simulating the render callback -- bumps
+     * the audio epoch + samples in a tight loop and sees ONE coherent
+     * value, never a torn read.  Can't TSan-prove race-freedom from
+     * inside the test but can confirm the published value materialises
+     * atomically AND no in-flight reader observes a freed pointer. */
+    AutomationRegion r;
+    AutomationRegion::PointList initial { { 0.0, 0.25, {} } };
+    r.setPoints (initial);
+
+    std::atomic<bool> done { false };
+    std::atomic<int>  seenA { 0 };
+    std::atomic<int>  seenB { 0 };
+
+    std::thread reader ([&] ()
+    {
+        while (! done.load (std::memory_order_acquire))
+        {
+            r.advanceAudioEpoch();           /* per-block epoch tick */
+            const double v = r.sampleAtBeats (0.0);
+            if (nearly (v, 0.25)) seenA.fetch_add (1, std::memory_order_relaxed);
+            else if (nearly (v, 0.75)) seenB.fetch_add (1, std::memory_order_relaxed);
+            else BOOST_FAIL ("torn snapshot read: " << v);
+        }
+    });
+
+    /* UI thread: publish + sweep concurrent with the reader.  The
+     * epoch gate must keep sweepTrash() from reclaiming any snapshot
+     * the reader is currently using. */
+    for (int i = 0; i < 1000; ++i)
+    {
+        AutomationRegion::PointList next { { 0.0, (i & 1) ? 0.75 : 0.25, {} } };
+        r.setPoints (next);
+        if ((i % 16) == 0)
+            r.sweepTrash();
+        std::this_thread::sleep_for (std::chrono::microseconds (10));
+    }
+    done.store (true, std::memory_order_release);
+    reader.join();
+
+    BOOST_CHECK_GT (seenA.load() + seenB.load(), 0);
+
+    /* Final sweep -- audio thread is gone, all trash must be safely
+     * reclaimable now. */
+    r.advanceAudioEpoch();
+    r.sweepTrash();
+}
+
+BOOST_AUTO_TEST_CASE (region_xml_round_trip)
+{
+    AutomationRegion r;
+    r.id = juce::Uuid();
+    r.positionBeats = 8.0;
+    r.lengthBeats   = 4.0;
+    r.looped        = true;
+    AutomationRegion::PointList pts {
+        { 0.0, 0.1, { CurveAlgorithm::Linear, 0.0 } },
+        { 2.0, 0.9, { CurveAlgorithm::SuperEllipse, -0.4 } },
+        { 4.0, 0.5, { CurveAlgorithm::Exponent, 0.3 } }
+    };
+    r.setPoints (pts);
+
+    const auto vt = r.toValueTree();
+    auto restored = AutomationRegion::fromValueTree (vt);
+    BOOST_REQUIRE (restored != nullptr);
+
+    BOOST_CHECK (restored->id == r.id);
+    BOOST_CHECK_EQUAL (restored->positionBeats, r.positionBeats);
+    BOOST_CHECK_EQUAL (restored->lengthBeats,   r.lengthBeats);
+    BOOST_CHECK (restored->looped);
+
+    /* Sampling parity: the restored region must produce the same
+     * values at the same beat offsets. */
+    for (double t : { 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0 })
+        BOOST_CHECK (nearly (restored->sampleAtBeats (t), r.sampleAtBeats (t), 1e-9));
+}
+
+BOOST_AUTO_TEST_SUITE_END()  /* AutomationRegionTests */
+
+/* ---------- AutomationTrack region resolution ---------- */
+
+BOOST_AUTO_TEST_SUITE (AutomationTrackTests)
+
+BOOST_AUTO_TEST_CASE (empty_track_returns_no_active_region)
+{
+    AutomationTrack t;
+    BOOST_CHECK (t.findActiveRegion (0.0) == nullptr);
+    BOOST_CHECK (t.findActiveRegion (100.0) == nullptr);
+}
+
+BOOST_AUTO_TEST_CASE (single_region_resolution)
+{
+    AutomationTrack t;
+    auto r = std::make_unique<AutomationRegion>();
+    r->id = juce::Uuid();
+    r->positionBeats = 4.0;
+    r->lengthBeats   = 4.0;
+    auto* raw = r.get();
+    t.addRegion (std::move (r));
+
+    BOOST_CHECK (t.findActiveRegion (3.999) == nullptr);
+    BOOST_CHECK (t.findActiveRegion (4.0)   == raw);
+    BOOST_CHECK (t.findActiveRegion (6.0)   == raw);
+    BOOST_CHECK (t.findActiveRegion (8.0)   == nullptr);  /* end-exclusive */
+}
+
+BOOST_AUTO_TEST_CASE (multi_region_binary_search_with_cache)
+{
+    AutomationTrack t;
+    AutomationRegion* a = nullptr;
+    AutomationRegion* b = nullptr;
+    AutomationRegion* c = nullptr;
+
+    {
+        auto r = std::make_unique<AutomationRegion>();
+        r->positionBeats =  0.0; r->lengthBeats = 4.0;
+        a = r.get();
+        t.addRegion (std::move (r));
+    }
+    {
+        auto r = std::make_unique<AutomationRegion>();
+        r->positionBeats =  8.0; r->lengthBeats = 4.0;
+        b = r.get();
+        t.addRegion (std::move (r));
+    }
+    {
+        auto r = std::make_unique<AutomationRegion>();
+        r->positionBeats = 16.0; r->lengthBeats = 4.0;
+        c = r.get();
+        t.addRegion (std::move (r));
+    }
+
+    BOOST_CHECK (t.findActiveRegion ( 2.0) == a);
+    BOOST_CHECK (t.findActiveRegion ( 5.0) == nullptr);   /* gap */
+    BOOST_CHECK (t.findActiveRegion (10.0) == b);
+    BOOST_CHECK (t.findActiveRegion (12.0) == nullptr);   /* end-exclusive */
+    BOOST_CHECK (t.findActiveRegion (18.0) == c);
+
+    /* Hit cache: repeated calls in the same region must reuse the
+     * cached pointer.  We can't observe this directly without a
+     * counter, but the call must continue returning the correct
+     * region without crashing. */
+    for (int i = 0; i < 100; ++i)
+        BOOST_CHECK (t.findActiveRegion (18.0) == c);
+}
+
+BOOST_AUTO_TEST_CASE (remove_region_clears_cache)
+{
+    AutomationTrack t;
+    auto r = std::make_unique<AutomationRegion>();
+    r->id = juce::Uuid();
+    r->positionBeats = 0.0;
+    r->lengthBeats   = 4.0;
+    const auto id = r->id;
+    auto* raw = r.get();
+    t.addRegion (std::move (r));
+
+    BOOST_CHECK (t.findActiveRegion (1.0) == raw);
+    t.removeRegion (id);
+    BOOST_CHECK (t.findActiveRegion (1.0) == nullptr);
+    t.sweepTrash();   /* reclaims displaced snapshot + the region */
+}
+
+BOOST_AUTO_TEST_CASE (mode_atomic_round_trip)
+{
+    AutomationTrack t;
+    BOOST_CHECK (t.getMode() == AutomationMode::Off);
+    t.setMode (AutomationMode::Read);
+    BOOST_CHECK (t.getMode() == AutomationMode::Read);
+    t.setMode (AutomationMode::Record);
+    BOOST_CHECK (t.getMode() == AutomationMode::Record);
+    t.setMode (AutomationMode::Off);
+    BOOST_CHECK (t.getMode() == AutomationMode::Off);
+}
+
+BOOST_AUTO_TEST_CASE (track_xml_round_trip_internal_target)
+{
+    AutomationTrack t;
+    t.id = juce::Uuid();
+    t.targetKey.nodeId  = juce::Uuid();
+    t.targetKey.paramId = "volume";
+    t.setMode (AutomationMode::Read);
+    t.setRecordMode (AutomationRecordMode::Latch);
+
+    auto r = std::make_unique<AutomationRegion>();
+    r->id = juce::Uuid();
+    r->positionBeats = 0.0;
+    r->lengthBeats   = 4.0;
+    AutomationRegion::PointList pts { { 0.0, 0.0, {} }, { 4.0, 1.0, {} } };
+    r->setPoints (pts);
+    t.addRegion (std::move (r));
+
+    const auto vt = t.toValueTree();
+    auto restored = AutomationTrack::fromValueTree (vt);
+    BOOST_REQUIRE (restored != nullptr);
+    BOOST_CHECK (restored->id == t.id);
+    BOOST_CHECK (restored->targetKey == t.targetKey);
+    BOOST_CHECK (restored->getMode() == AutomationMode::Read);
+    BOOST_CHECK (restored->getRecordMode() == AutomationRecordMode::Latch);
+    BOOST_CHECK (restored->findActiveRegion (2.0) != nullptr);
+}
+
+BOOST_AUTO_TEST_CASE (track_xml_round_trip_midi_target)
+{
+    AutomationTrack t;
+    t.id = juce::Uuid();
+    t.targetKey.midiCcChannel = 3;
+    t.targetKey.midiCcNumber  = 74;
+    t.setMode (AutomationMode::Read);
+
+    const auto vt = t.toValueTree();
+    auto restored = AutomationTrack::fromValueTree (vt);
+    BOOST_REQUIRE (restored != nullptr);
+    BOOST_CHECK (restored->targetKey.isMidi());
+    BOOST_CHECK_EQUAL (restored->targetKey.midiCcChannel, 3);
+    BOOST_CHECK_EQUAL (restored->targetKey.midiCcNumber,  74);
+}
+
+BOOST_AUTO_TEST_SUITE_END()  /* AutomationTrackTests */
 
 BOOST_AUTO_TEST_SUITE_END()  /* AutomationCurveTests */

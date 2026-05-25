@@ -25,9 +25,9 @@ target_include_directories(element
 )
 
 # Re-glob marker: bump this file's mtime to force CMake to re-scan
-# after adding new sources under src/.  Updated 2026-05-23 for the
-# audio-lane support phase (audiolaneadapter cpp + arrangementtracksservice
-# cpp + AudioClipNode record path).
+# after adding new sources under src/.  Updated 2026-05-25 for the
+# automation engine Phase 1 (dsp/automation/automation_region.cpp +
+# automation_track.cpp).
 file(GLOB_RECURSE ELEMENT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
