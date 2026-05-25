@@ -12,6 +12,8 @@
 #include <element/tags.hpp>
 #include <element/ui.hpp>
 #include <element/ui/style.hpp>
+#include <element/ui/standard.hpp>
+#include "ui/viewhelpers.hpp"
 
 #include "nodes/tracker.hpp"
 #include "ui/fontcache.hpp"
@@ -1343,7 +1345,7 @@ void SessionView::mouseDown (const MouseEvent& e)
     {
         if (auto* clip = findClip (row, col))
         {
-            openPatternEditor (*clip);
+            openTrackerDockForClip (*clip);
             return;
         }
     }
@@ -1522,7 +1524,12 @@ void SessionView::mouseDoubleClick (const MouseEvent& e)
             if (! playButtonBounds (row, col).contains (e.getPosition())
              && ! editButtonBounds (row, col).contains (e.getPosition()))
             {
-                openClipView (*clip);
+                /* Default double-click action: open the clip in the
+                 * tracker side dock (matches edit-button + graph-
+                 * block + arrangement-clip double-click affordances).
+                 * Clip-properties / floating popup variants live in
+                 * the right-click context menu. */
+                openTrackerDockForClip (*clip);
                 return;
             }
         }
@@ -3025,6 +3032,28 @@ void SessionView::openSceneView (int sceneRow)
     auto* win = new SceneViewWindow (content,
                                      "Scene " + juce::String (sceneRow + 1));
     juce::ignoreUnused (win);   // self-deletes on close
+}
+
+void SessionView::openTrackerDockForClip (SessionClip& clip)
+{
+    /* Route to the right-side TrackerSideDock + jump to the clip's
+     * pattern.  Used by single-click on the clip's edit button and
+     * by double-click on the clip body.  The floating
+     * TrackerPatternWindow (openPatternEditor) is reserved for an
+     * explicit "open in window" action that we may add to the
+     * right-click menu later. */
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto graph = sess->getActiveGraph();
+    if (! graph.isValid()) return;
+    Node n = graph.getNodeById (clip.trackerNodeId);
+    if (! n.isValid()) return;
+    if (dynamic_cast<TrackerNode*> (n.getObject()) == nullptr) return;
+
+    if (auto* sc = dynamic_cast<StandardContent*> (
+            ViewHelpers::findContentComponent (this)))
+        sc->showTrackerDockForNode (n.getUuid(), clip.sequenceIdx);
 }
 
 void SessionView::openPatternEditor (SessionClip& clip)
