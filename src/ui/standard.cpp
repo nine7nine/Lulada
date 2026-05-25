@@ -21,6 +21,7 @@
 #include "ui/arrangementview.hpp"
 #include "ui/sessionview.hpp"
 #include "ui/controllersview.hpp"
+#include "ui/trackerstripview.hpp"
 #include "ui/trackerhostview.hpp"
 #include "ui/diskopview.hpp"
 #include "ui/datapathbrowser.hpp"
@@ -493,7 +494,12 @@ StandardContent::StandardContent (Context& ctl_)
     nav->updateContent();
 
     toolBarVisible = true;
-    toolBarSize = 32;
+    /* Taller toolbar -- absorbs the vertical strip the menu bar
+     * currently uses (~24 px) PLUS extra room so the LCD-style sub-
+     * labels (FILE / PLUG / PREF / PLAY / STOP / REC / REW / GRAPH /
+     * ARR / TRK / SESS / PATCH) sit comfortably under each icon
+     * inside the cluster bezels.  Menu removal is a follow-up. */
+    toolBarSize = 96;
     statusBarVisible = true;
     statusBarSize = 22;
 
@@ -545,6 +551,14 @@ StandardContent::StandardContent (Context& ctl_)
         if (prevAcc.isNotEmpty())   setSecondaryView (prevAcc);
 
         setCurrentNode (session()->getActiveGraph());
+
+        /* TrackerStripView holds a ValueTree::Listener pointing at
+         * the previous session's active-graph nodes container.  After
+         * the session swap that VT is stale, so the listener wouldn't
+         * fire on the new session's add/remove.  refreshFromGraph()
+         * detaches + re-attaches as part of its normal flow. */
+        if (trackerStrip != nullptr)
+            trackerStrip->refreshFromGraph();
     });
 }
 
@@ -799,6 +813,21 @@ void StandardContent::resizeContent (const Rectangle<int>& area)
         r.removeFromBottom (1);
     }
 
+    /* Tracker strip sits at the very bottom (above _extra if visible,
+     * which it usually isn't simultaneously).  Lives outside
+     * ContentContainer so it naturally falls BELOW the graph mixer
+     * (which is the container's secondary view).  Height is
+     * user-resizable via the strip's top-edge drag handle; the
+     * dragHandle callback updates trackerStripHeight_ + retriggers
+     * this layout. */
+    if (trackerStripVisible_ && trackerStrip != nullptr)
+    {
+        const int h = juce::jlimit (kTrackerStripMinH, kTrackerStripMaxH,
+                                     trackerStripHeight_);
+        trackerStrip->setBounds (r.removeFromBottom (h));
+        r.removeFromBottom (1);
+    }
+
     if (nodeStrip && nodeStrip->isVisible())
         nodeStrip->setBounds (r.removeFromRight (nodeStripSize));
 
@@ -963,6 +992,8 @@ void StandardContent::saveState (PropertiesFile* props)
 
     auto& mo = container->bottom->bridge->meterBridge();
     props->setValue ("meterBridge", isMeterBridgeVisible());
+    props->setValue ("trackerStrip",       trackerStripVisible_);
+    props->setValue ("trackerStripHeight", trackerStripHeight_);
     props->setValue ("meterBridgeSize", mo.meterSize());
     props->setValue ("meterBridgeVisibility", (int) mo.visibility());
 }
@@ -986,6 +1017,8 @@ void StandardContent::restoreState (PropertiesFile* props)
     bo.setMeterSize (props->getIntValue ("meterBridgeSize", bo.meterSize()));
     bo.setVisibility ((uint32) props->getIntValue ("meterBridgeVisibility", bo.visibility()));
     setMeterBridgeVisible (props->getBoolValue ("meterBridge", isMeterBridgeVisible()));
+    trackerStripHeight_ = props->getIntValue ("trackerStripHeight", trackerStripHeight_);
+    setTrackerStripVisible (props->getBoolValue ("trackerStrip", trackerStripVisible_));
 
     {
         auto ns = props->getIntValue ("standardNavSize", getNavSize());
@@ -1130,6 +1163,7 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::toggleVirtualKeyboard,
         Commands::toggleMeterBridge,
         Commands::toggleChannelStrip,
+        Commands::toggleTrackerStrip,
         Commands::showLastContentView,
         Commands::rotateContentView,
         Commands::selectAll
@@ -1270,6 +1304,15 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
             result.setInfo ("Channel Strip", "Toggles the global channel strip", "UI", flags);
             break;
         }
+        case Commands::toggleTrackerStrip: {
+            int flags = 0;
+            if (isTrackerStripVisible()) flags |= Info::isTicked;
+            result.setInfo ("Tracker Strip",
+                            "Show / hide the tracker editor at the bottom of the window",
+                            "UI", flags);
+            result.addDefaultKeypress ('t', ModifierKeys::commandModifier);
+            break;
+        }
         case Commands::showLastContentView: {
             result.setInfo ("Last View", "Shows the last shown View", "UI", 0);
             break;
@@ -1361,6 +1404,9 @@ bool StandardContent::perform (const InvocationInfo& info)
             break;
         case Commands::toggleChannelStrip:
             setNodeChannelStripVisible (! isNodeChannelStripVisible());
+            break;
+        case Commands::toggleTrackerStrip:
+            setTrackerStripVisible (! isTrackerStripVisible());
             break;
         case Commands::showLastContentView:
             backMainView();
@@ -1532,6 +1578,64 @@ void StandardContent::setMeterBridgeVisible (bool vis)
     container->bottom->bridge->setVisible (vis);
     container->bottom->resized();
     container->resized();
+}
+
+//============================================================================
+// Tracker bottom-attach strip
+
+bool StandardContent::isTrackerStripVisible() const { return trackerStripVisible_; }
+int  StandardContent::getTrackerStripHeight() const { return trackerStripHeight_; }
+
+void StandardContent::setTrackerStripHeight (int h)
+{
+    h = juce::jlimit (kTrackerStripMinH, kTrackerStripMaxH, h);
+    if (h == trackerStripHeight_) return;
+    trackerStripHeight_ = h;
+    resized();
+}
+
+void StandardContent::setTrackerStripVisible (bool v)
+{
+    if (v == trackerStripVisible_) return;
+    trackerStripVisible_ = v;
+
+    if (v && trackerStrip == nullptr)
+    {
+        trackerStrip = std::make_unique<TrackerStripView> (services());
+        addChildComponent (trackerStrip.get());
+        trackerStrip->onResizeDrag = [this] (int delta) {
+            setTrackerStripHeight (trackerStripHeight_ + delta);
+        };
+        trackerStrip->onResizeDragEnd = [this]() {
+            /* Persist final height on drag end -- writing on every
+             * mouseDrag frame would thrash session XML. */
+            if (auto* props = services().context().settings().getUserSettings())
+                props->setValue ("trackerStripHeight", trackerStripHeight_);
+        };
+        trackerStrip->onCloseClicked = [this]() {
+            setTrackerStripVisible (false);
+        };
+    }
+
+    if (trackerStrip != nullptr)
+        trackerStrip->setVisible (v);
+
+    resized();
+}
+
+void StandardContent::showTrackerStripForNode (const juce::Uuid& trackerNodeId,
+                                                int sequenceIdx)
+{
+    /* Implicit show + bind.  Used by ArrangementView's tracker-clip
+     * click affordance and by anything else that wants to surface a
+     * specific tracker without forcing the user to toggle the strip
+     * first.  sequenceIdx >= 0 navigates the editor to that pattern
+     * so the strip opens on whichever clip the user actually clicked
+     * (not pattern 0). */
+    if (! trackerStripVisible_)
+        setTrackerStripVisible (true);
+    if (trackerStrip != nullptr)
+        trackerStrip->setTrackerAndPattern (trackerNodeId, sequenceIdx);
 }
 
 bool StandardContent::isMeterBridgeVisible() const

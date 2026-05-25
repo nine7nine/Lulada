@@ -20,12 +20,9 @@ public:
         File,
         Edit,
         View,
-        Options,
-        Window,
 #if JUCE_DEBUG
         DebugItem,
 #endif
-        Help,
         NumMenus
     };
 

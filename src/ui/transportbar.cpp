@@ -98,6 +98,15 @@ TransportBar::TransportBar()
     addAndMakeVisible (subLabel.get());
     subLabel->setName ("subLabel");
 
+    /* LCD sub-labels under each transport button.  Visible by default;
+     * showPositionLabels mode (legacy bar/beat/sub layout) hides them
+     * since vertical space is already consumed by the position
+     * read-outs. */
+    addAndMakeVisible (playLbl_);
+    addAndMakeVisible (stopLbl_);
+    addAndMakeVisible (recordLbl_);
+    addAndMakeVisible (toZeroLbl_);
+
     setBeatTime (0.f);
     /* Default size sized for tempoBarHeight (26 in the main toolbar)
      * — the parent Toolbar will resize us with the real height, but
@@ -176,11 +185,28 @@ void TransportBar::resized()
     /* Children inset by kFramePad on every side so the LCD frame
      * painted in paint() stays visible around them.  Each button is
      * a square with a 4-px gap between siblings. */
-    constexpr int kFramePad = 5;
+    constexpr int kFramePad     = 5;
+    constexpr int kSublabelH    = 13;
+    constexpr int kSublabelGap  = 3;
     const int outerH = getHeight();
-    const int h = juce::jmax (16, outerH - kFramePad * 2);
-    const int labelW = juce::jmax (24, juce::roundToInt (h * 1.6f));
-    const int btnW   = h;
+    const int innerH = juce::jmax (16, outerH - kFramePad * 2);
+
+    /* Sublabels visible only in the buttons-only mode (the Content::
+     * Toolbar configuration).  In showPositionLabels mode we keep the
+     * legacy full-height buttons; there isn't room for labels there.
+     * No upper cap on btnH -- main clusters scale with the toolbar. */
+    const bool useSublabels = ! showPositionLabels_;
+    const int  btnH = useSublabels
+        ? juce::jmax (16, innerH - kSublabelH - kSublabelGap)
+        : innerH;
+    const int  btnW = btnH;
+    /* Centre the icon+label stack vertically so the cluster looks
+     * balanced inside the taller frame. */
+    const int  stackH = useSublabels ? btnH + kSublabelGap + kSublabelH : btnH;
+    const int  stackY = kFramePad + juce::jmax (0, (innerH - stackH) / 2);
+    const int  lblY  = stackY + btnH + kSublabelGap;
+
+    const int labelW = juce::jmax (24, juce::roundToInt (innerH * 1.6f));
     constexpr int gap = 4;
     constexpr int groupGap = 10;
 
@@ -188,15 +214,29 @@ void TransportBar::resized()
     const int y = kFramePad;
     if (showPositionLabels_)
     {
-        barLabel->setBounds  (x, y, labelW, h); x += labelW + 2;
-        beatLabel->setBounds (x, y, labelW, h); x += labelW + 2;
-        subLabel->setBounds  (x, y, labelW, h); x += labelW + groupGap;
+        barLabel->setBounds  (x, y, labelW, innerH); x += labelW + 2;
+        beatLabel->setBounds (x, y, labelW, innerH); x += labelW + 2;
+        subLabel->setBounds  (x, y, labelW, innerH); x += labelW + groupGap;
     }
 
-    play->setBounds   (x, y, btnW, h); x += btnW + gap;
-    stop->setBounds   (x, y, btnW, h); x += btnW + gap;
-    record->setBounds (x, y, btnW, h); x += btnW + gap;
-    toZero->setBounds (x, y, btnW, h);
+    auto place = [&] (juce::Button* b, LcdSublabel& lbl)
+    {
+        b->setBounds (x, stackY, btnW, btnH);
+        if (useSublabels)
+        {
+            lbl.setVisible (true);
+            lbl.setBounds (x, lblY, btnW, kSublabelH);
+        }
+        else
+        {
+            lbl.setVisible (false);
+        }
+        x += btnW + gap;
+    };
+    place (play.get(),   playLbl_);
+    place (stop.get(),   stopLbl_);
+    place (record.get(), recordLbl_);
+    place (toZero.get(), toZeroLbl_);
 }
 
 void TransportBar::setShowPositionLabels (bool show)

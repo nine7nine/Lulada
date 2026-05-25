@@ -125,7 +125,9 @@ public:
                        double      gainDb = 0.0,
                        juce::int64 fadeInSamples  = 0,
                        juce::int64 fadeOutSamples = 0,
-                       juce::int64 regionLengthSamples = 0);
+                       juce::int64 regionLengthSamples = 0,
+                       float       fadeInCurve  = 0.0f,
+                       float       fadeOutCurve = 0.0f);
 
     void scheduleStop (juce::Uuid regionId, double beatTarget) noexcept;
 
@@ -243,6 +245,12 @@ private:
     juce::int64 activeFadeOutSamples_   { 0 };
     juce::int64 activeLengthSamples_    { 0 };
     juce::int64 activeSamplesPlayed_    { 0 };
+    /* Power-curve exponents derived from the region's fadeInCurve /
+     * fadeOutCurve scalars (p = exp2(curve * 2)).  Latched alongside
+     * the fade-length fields at PendingAction commit time so the
+     * audio thread never reads from the Region directly. */
+    float       activeFadeInExp_        { 1.0f };
+    float       activeFadeOutExp_       { 1.0f };
 
     /* Live gain override -- see setLiveGain.  NaN sentinel means
      * "no override; use activeGainLinear_".  std::atomic<float> on
@@ -295,6 +303,8 @@ private:
         juce::int64  fadeInSamples;
         juce::int64  fadeOutSamples;
         juce::int64  regionLengthSamples;
+        float        fadeInExp;             /* exp2(curve*2), 1.0 = linear */
+        float        fadeOutExp;
     };
 
     static constexpr int kLaunchFifoSize = 64;
@@ -312,6 +322,8 @@ private:
         juce::int64  fadeInSamples;
         juce::int64  fadeOutSamples;
         juce::int64  regionLengthSamples;
+        float        fadeInExp;
+        float        fadeOutExp;
     };
 
     juce::Array<PendingAction> pendingActions_;

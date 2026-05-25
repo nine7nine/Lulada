@@ -21,6 +21,8 @@ const juce::Identifier kLenAttr       ("len");
 const juce::Identifier kGainAttr      ("gainDb");
 const juce::Identifier kFadeInAttr    ("fadeIn");
 const juce::Identifier kFadeOutAttr   ("fadeOut");
+const juce::Identifier kFadeInCurveAttr  ("fadeInC");
+const juce::Identifier kFadeOutCurveAttr ("fadeOutC");
 const juce::Identifier kLoopedAttr    ("loop");
 const juce::Identifier kColourAttr    ("colour");
 const juce::Identifier kNameAttr      ("name");
@@ -33,6 +35,8 @@ const juce::Identifier kEnvPtIdAttr   ("id");
 const juce::Identifier kEnvPtBeatAttr ("b");
 const juce::Identifier kEnvPtGainAttr ("g");
 const juce::Identifier kEnvPtCurveAttr ("c");
+const juce::Identifier kEnvPtCurveOffsetTAttr ("cot");    /* Bezier handle X in [0.25, 0.75] */
+const juce::Identifier kEnvPtCurveOffsetDbAttr ("cod");   /* Bezier handle Y as dB offset from chord midpoint */
 } // namespace
 
 float Region::gainAtBeatOffset (double localBeat) const noexcept
@@ -59,6 +63,51 @@ float Region::gainAtBeatOffset (double localBeat) const noexcept
         const double span = juce::jmax (1e-9, b.beatOffset - a.beatOffset);
         const double t    = juce::jlimit (0.0, 1.0,
                                             (localBeat - a.beatOffset) / span);
+        /* Non-default Bezier handle overrides the enum preset with a
+         * quadratic Bezier passing through (curveOffsetT,
+         * chordMidDb + curveOffsetDb) at Bezier-parameter u=0.5.
+         * Endpoints are A=(0, dbA) and B=(1, dbB) in segment-local
+         * coords.  Hold stays a step regardless (you don't bend
+         * a step function). */
+        if (a.curve != EnvelopeCurve::Hold
+            && (a.curveOffsetT != 0.5f || a.curveOffsetDb != 0.0f))
+        {
+            const double cot = (double) juce::jlimit (0.25f, 0.75f, a.curveOffsetT);
+            const double cx  = 2.0 * cot - 0.5;                   /* control point X */
+            const double chordMidDb = 0.5 * ((double) a.gainDb + (double) b.gainDb);
+            const double pinDb = chordMidDb + (double) a.curveOffsetDb;
+            const double cy  = 2.0 * pinDb - chordMidDb;          /* control point Y in dB */
+            /* Solve x(u) = u^2*(1-2cx) + 2cx*u = t for u in [0,1].
+             *  - cx == 0.5 -> linear in x, u = t.
+             *  - else      -> quadratic; positive-root branch picks the
+             *                 monotone-increasing solution on [0,1]. */
+            double u;
+            if (std::abs (cx - 0.5) < 1.0e-9)
+            {
+                u = t;
+            }
+            else
+            {
+                const double aQ = 1.0 - 2.0 * cx;
+                const double bQ = 2.0 * cx;
+                const double cQ = -t;
+                const double disc = bQ * bQ - 4.0 * aQ * cQ;
+                const double sq   = disc > 0.0 ? std::sqrt (disc) : 0.0;
+                u = (-bQ + sq) / (2.0 * aQ);
+                /* Numerical fallback: if the chosen root falls out of
+                 * [0,1] (can happen at u=0/1 boundaries), try the
+                 * other root. */
+                if (! (u >= 0.0 && u <= 1.0))
+                    u = (-bQ - sq) / (2.0 * aQ);
+                u = juce::jlimit (0.0, 1.0, u);
+            }
+            const double oneMinusU = 1.0 - u;
+            const double y = oneMinusU * oneMinusU * (double) a.gainDb
+                           + 2.0 * oneMinusU * u   * cy
+                           + u * u                 * (double) b.gainDb;
+            return (float) y;
+        }
+
         double shaped = t;
         switch (a.curve)
         {
@@ -94,6 +143,8 @@ juce::ValueTree Region::toValueTree() const
     if (gainDb       != 0.0)         v.setProperty (kGainAttr,    gainDb,               nullptr);
     if (fadeInBeats  != 0.0)         v.setProperty (kFadeInAttr,  fadeInBeats,          nullptr);
     if (fadeOutBeats != 0.0)         v.setProperty (kFadeOutAttr, fadeOutBeats,         nullptr);
+    if (fadeInCurve  != 0.0f)        v.setProperty (kFadeInCurveAttr,  (double) fadeInCurve,  nullptr);
+    if (fadeOutCurve != 0.0f)        v.setProperty (kFadeOutCurveAttr, (double) fadeOutCurve, nullptr);
     if (looped)                       v.setProperty (kLoopedAttr,  true,                 nullptr);
     /* Colour stored as ARGB hex string; only emit when set to a
      * non-default tint (every Region has a colour at construction,
@@ -114,6 +165,10 @@ juce::ValueTree Region::toValueTree() const
             pNode.setProperty (kEnvPtBeatAttr, pt.beatOffset,          nullptr);
             pNode.setProperty (kEnvPtGainAttr, (double) pt.gainDb,     nullptr);
             pNode.setProperty (kEnvPtCurveAttr, (int) pt.curve,        nullptr);
+            if (pt.curveOffsetT != 0.5f)
+                pNode.setProperty (kEnvPtCurveOffsetTAttr,  (double) pt.curveOffsetT,  nullptr);
+            if (pt.curveOffsetDb != 0.0f)
+                pNode.setProperty (kEnvPtCurveOffsetDbAttr, (double) pt.curveOffsetDb, nullptr);
             envNode.appendChild (pNode, nullptr);
         }
         v.appendChild (envNode, nullptr);
@@ -136,6 +191,8 @@ Region Region::fromValueTree (const juce::ValueTree& v)
     r.gainDb        = (double) v.getProperty (kGainAttr,    0.0);
     r.fadeInBeats   = (double) v.getProperty (kFadeInAttr,  0.0);
     r.fadeOutBeats  = (double) v.getProperty (kFadeOutAttr, 0.0);
+    r.fadeInCurve   = (float)  (double) v.getProperty (kFadeInCurveAttr,  0.0);
+    r.fadeOutCurve  = (float)  (double) v.getProperty (kFadeOutCurveAttr, 0.0);
     r.looped        = (bool)   v.getProperty (kLoopedAttr,  false);
     {
         const juce::String s = v.getProperty (kColourAttr).toString();
@@ -159,7 +216,9 @@ Region Region::fromValueTree (const juce::ValueTree& v)
             pt.id         = idStr.isNotEmpty() ? juce::Uuid (idStr) : juce::Uuid();
             pt.beatOffset = (double) p.getProperty (kEnvPtBeatAttr, 0.0);
             pt.gainDb     = (float)  (double) p.getProperty (kEnvPtGainAttr, 0.0);
-            pt.curve      = (EnvelopeCurve) (int) p.getProperty (kEnvPtCurveAttr, 0);
+            pt.curve         = (EnvelopeCurve) (int) p.getProperty (kEnvPtCurveAttr, 0);
+            pt.curveOffsetT  = (float) (double) p.getProperty (kEnvPtCurveOffsetTAttr,  0.5);
+            pt.curveOffsetDb = (float) (double) p.getProperty (kEnvPtCurveOffsetDbAttr, 0.0);
             r.volumeEnvelope.push_back (pt);
         }
         r.sortEnvelope();

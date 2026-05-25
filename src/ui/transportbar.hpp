@@ -5,6 +5,7 @@
 
 #include "ElementApp.h"
 #include "ui/buttons.hpp"
+#include "ui/lcdsublabel.hpp"
 #include <element/audioengine.hpp>
 #include <element/session.hpp>
 
@@ -44,6 +45,15 @@ private:
     std::unique_ptr<juce::Button> play, stop, record, toZero;
     std::unique_ptr<DragableIntLabel> barLabel, beatLabel, subLabel;
     bool showPositionLabels_ { true };
+
+    /* LCD-style sub-labels under each transport button.  Match the
+     * left-cluster pattern in Content::Toolbar -- decorative for now,
+     * will become spill-over menu triggers when the legacy menubar
+     * is removed. */
+    LcdSublabel playLbl_   { "PLAY" };
+    LcdSublabel stopLbl_   { "STOP" };
+    LcdSublabel recordLbl_ { "REC"  };
+    LcdSublabel toZeroLbl_ { "REW"  };
 
     friend class BarLabel;
     friend class Timer;

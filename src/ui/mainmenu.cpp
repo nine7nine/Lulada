@@ -59,12 +59,9 @@ StringArray MainMenu::getMenuBarNames()
         "File",
         "Edit",
         "View",
-        "Options",
-        "Window",
 #if JUCE_DEBUG
         "Debug",
 #endif
-        "Help",
         nullptr
     };
 
@@ -82,12 +79,6 @@ PopupMenu MainMenu::getMenuForIndex (int index, const String& name)
         buildEditMenu (menu);
     else if (name == "View")
         buildViewMenu (menu);
-    else if (name == "Window")
-        buildWindowMenu (menu);
-    else if (name == "Options")
-        buildOptionsMenu (menu);
-    else if (name == "Help")
-        buildHelpMenu (menu);
 #if JUCE_DEBUG
     else if (name == "Debug")
         buildDebugMenu (menu);
@@ -105,60 +96,6 @@ void MainMenu::menuItemSelected (int index, int menu)
 {
     auto session = world.session();
     auto engine = world.audio();
-
-    if (index == 6000 && menu == Help)
-    {
-        URL (ELEMENT_URL_MANUAL_HOME).launchInDefaultBrowser();
-    }
-    else if (index == 6001 && menu == Help)
-    {
-#ifdef ELEMENT_URL_API_LUA_EL
-        URL (ELEMENT_URL_API_LUA_EL).launchInDefaultBrowser();
-#endif
-    }
-    else if (index == 6002 && menu == Help)
-    {
-        URL (ELEMENT_URL_DISCUSSIONS).launchInDefaultBrowser();
-    }
-    else if (index == 7000 && menu == Help)
-    {
-        URL (ELEMENT_URL_BUG_TRACKER).launchInDefaultBrowser();
-    }
-    else if (index == 7001)
-    {
-        URL (ELEMENT_URL_DONATE).launchInDefaultBrowser();
-    }
-    else if (index == 7002)
-    {
-        auto dir = DataPath::defaultSettingsFile().getParentDirectory();
-        dir = dir.getChildFile ("log");
-        Logger::writeToLog (String ("opening log folder ") + dir.getFullPathName());
-        dir.startAsProcess();
-    }
-    else if (index == 7003)
-    {
-        URL (ELEMENT_URL_CHANGELOG).launchInDefaultBrowser();
-    }
-
-    else if (index == 2000 && menu == Window)
-    {
-        ViewHelpers::closePluginWindows (&owner, false);
-    }
-
-    if (menu == Options)
-    {
-        world.settings().performMenuResult (world, index);
-        owner.refreshMenu();
-    }
-
-    if (menu == Window)
-    {
-        if (index >= 100000)
-        {
-            // if (auto* const cc = dynamic_cast<WorkspacesContentComponent*> (content()))
-            //     cc->handleWorkspaceMenuResult (index);
-        }
-    }
 
 #if JUCE_DEBUG
     if (index == 1000)

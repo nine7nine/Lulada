@@ -14,6 +14,7 @@
 #include <element/ui/style.hpp>
 
 #include "ui/fontcache.hpp"
+#include "ui/lcdsublabel.hpp"
 
 #include "services/mappingservice.hpp"
 #include "services/sessionservice.hpp"
@@ -42,7 +43,9 @@ static void paintLcdFrame (juce::Graphics& g, juce::Rectangle<int> r,
     const auto frect = r.toFloat();
     g.setColour (juce::Colour (0xff'05'05'05));
     g.fillRoundedRectangle (frect, cornerSize);
-    g.setColour (juce::Colour (0xff'5a'5a'5a));
+    /* Rim colour matches MainDisplayPanel's bezel (0xff3a3a3a) so
+     * every cluster reads as the same material as the central LCD. */
+    g.setColour (juce::Colour (0xff'3a'3a'3a));
     g.drawRoundedRectangle (frect.reduced (0.5f), cornerSize, 1.0f);
 
     const auto inner = frect.reduced (3.0f);
@@ -433,6 +436,12 @@ public:
         setActiveFromTint (sessionBtn, juce::Colour::fromRGB ( 80, 200, 170));
         setActiveFromTint (patchBtn,   juce::Colour::fromRGB ( 80, 160, 200));
 
+        addAndMakeVisible (graphLbl_);
+        addAndMakeVisible (arrLbl_);
+        addAndMakeVisible (trkLbl_);
+        addAndMakeVisible (sessionLbl_);
+        addAndMakeVisible (patchLbl_);
+
         startTimer (150);
     }
 
@@ -443,23 +452,37 @@ public:
 
     void resized() override
     {
-        constexpr int kFramePad = 5;
-        constexpr int kGap = 4;
+        constexpr int kFramePad   = 5;
+        constexpr int kGap        = 4;
+        constexpr int kSublabelH  = 13;
+        constexpr int kSublabelGap = 3;
+        /* No cap on btnH -- main clusters scale with the toolbar so
+         * the labeled buttons keep dominant visual weight. */
         const int n = 5;
         auto r = getLocalBounds().reduced (kFramePad, kFramePad);
-        const int total = r.getWidth();
-        const int w = (total - kGap * (n - 1)) / n;
+        const int total  = r.getWidth();
+        const int w      = (total - kGap * (n - 1)) / n;
+        const int btnH   = juce::jmax (16, r.getHeight() - kSublabelH - kSublabelGap);
+        /* Vertical-centre the icon+label stack inside the frame. */
+        const int stackH = btnH + kSublabelGap + kSublabelH;
+        const int btnY   = r.getY() + juce::jmax (0, (r.getHeight() - stackH) / 2);
+        const int lblY   = btnY + btnH + kSublabelGap;
 
-        auto place = [&] (BlockToolButton& b)
+        int x = r.getX();
+        auto place = [&] (BlockToolButton& b, LcdSublabel& lbl)
         {
-            b.setBounds (r.removeFromLeft (w));
-            if (! r.isEmpty()) r.removeFromLeft (kGap);
+            b.setBounds  (x, btnY, w, btnH);
+            lbl.setBounds (x, lblY, w, kSublabelH);
+            x += w + kGap;
         };
-        place (graphBtn);
-        place (arrBtn);
-        place (trkBtn);
-        place (sessionBtn);
-        patchBtn.setBounds (r);
+        place (graphBtn,   graphLbl_);
+        place (arrBtn,     arrLbl_);
+        place (trkBtn,     trkLbl_);
+        place (sessionBtn, sessionLbl_);
+        /* Last button absorbs any rounding slack in the remainder. */
+        const int lastW = r.getRight() - x;
+        patchBtn  .setBounds (x, btnY, lastW, btnH);
+        patchLbl_ .setBounds (x, lblY, lastW, kSublabelH);
     }
 
 private:
@@ -487,6 +510,12 @@ private:
     }
 
     BlockToolButton graphBtn, arrBtn, trkBtn, sessionBtn, patchBtn;
+
+    LcdSublabel graphLbl_   { "GRAPH" };
+    LcdSublabel arrLbl_     { "ARR" };
+    LcdSublabel trkLbl_     { "TRK" };
+    LcdSublabel sessionLbl_ { "SESS" };
+    LcdSublabel patchLbl_   { "PATCH" };
 };
 
 class Content::Toolbar : public Component,
@@ -556,6 +585,10 @@ public:
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::showPluginManager, true); });
         wireBtn (prefsBtn_,     "Preferences...",  &ui::iconCog,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::showPreferences, true); });
+
+        addAndMakeVisible (diskOpLbl_);
+        addAndMakeVisible (pluginMgrLbl_);
+        addAndMakeVisible (prefsLbl_);
         wireBtn (graphMixBtn_,  "Graph Mixer",      &ui::iconMixer,
                   [this]() { ViewHelpers::invokeDirectly (this, Commands::showGraphMixer, true); });
         wireBtn (vKbdBtn_,      "Virtual keyboard", &ui::iconKeyboard,
@@ -651,35 +684,60 @@ public:
          * menu + midi blinker right-aligned. */
         Rectangle<int> r = getLocalBounds();
         const int H = r.getHeight();
-        /* Tightened external padding (was 7 -> now 3) so the LCD-
-         * framed clusters get more vertical real estate.  Frame is
-         * what gives them breathing room now, not bar-edge padding. */
-        constexpr int kInnerPadY = 3;
+        /* Vertical breathing room top + bottom so the cluster bezels
+         * never clip into the window-decoration / content boundary
+         * above or below. */
+        constexpr int kInnerPadY = 6;
         const int innerPad = kInnerPadY;
         const int rowH = juce::jmax (20, H - innerPad * 2);
 
         constexpr int kSidePad   = 8;
-        constexpr int kGap       = 14;
+        constexpr int kGap       = 8;     /* tighter between-cluster gap */
         constexpr int kIconGap   = 4;
         constexpr int kFramePad  = 5;
-        constexpr int kDisplayW  = 380;
-        /* Icon buttons fit inside the LCD frame; their square size
-         * is the row height minus the frame's top+bottom padding. */
-        const int kIconBtnW = juce::jmax (16, rowH - kFramePad * 2);
+        /* Wider central LCD now that the toolbar is taller -- gives
+         * the BPM / position read-outs more breathing room so the
+         * faceplate feels proportional to the cluster bezels around
+         * it. */
+        constexpr int kDisplayW  = 460;
+        /* Sublabel block size -- shared with TransportBar +
+         * ViewSelectorBar so every labeled cluster computes its icon
+         * size the same way. */
+        constexpr int kSublabelH    = 13;
+        constexpr int kSublabelGap  = 3;
+        /* Icon size for ALL main clusters: derived from rowH so the
+         * icon + sublabel stack fills the bezel.  No cap -- the
+         * labeled clusters scale up with the toolbar so they keep
+         * dominant visual weight. */
+        const int kMainIconBtnW = juce::jmax (16, rowH - kFramePad * 2 - kSublabelH - kSublabelGap);
+        /* Trailing tools cluster stays fixed-smaller (no labels).
+         * Always less than main so the labeled clusters read as
+         * primary. */
+        constexpr int kTrailingBtnW = 40;
 
         r.reduce (kSidePad, 0);
         const int top = r.getY() + innerPad;
 
         /* ---- LEFT cluster: Disk Op + Plugin Manager + Preferences
                 inside their LCD frame.  Cluster outer width =
-                kFramePad + 3*btn + 2*gap + kFramePad. */
-        const int leftClusterW = kFramePad * 2 + kIconBtnW * 3 + kIconGap * 2;
+                kFramePad + 3*btn + 2*gap + kFramePad.  Reuses the
+                outer-scope kSublabelH / kSublabelGap so all clusters
+                share one sublabel block size. */
+        const int leftClusterW = kFramePad * 2 + kMainIconBtnW * 3 + kIconGap * 2;
         leftClusterRect_ = Rectangle<int> (r.getX(), top, leftClusterW, rowH);
-        const int leftBtnY = top + kFramePad;
+        /* Vertically centre the icon+label stack inside the frame. */
+        const int stackH    = kMainIconBtnW + kSublabelGap + kSublabelH;
+        const int leftBtnY  = top + (rowH - stackH) / 2;
+        const int leftLblY  = leftBtnY + kMainIconBtnW + kSublabelGap;
         int lx = r.getX() + kFramePad;
-        diskOpBtn_   .setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW); lx += kIconBtnW + kIconGap;
-        pluginMgrBtn_.setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW); lx += kIconBtnW + kIconGap;
-        prefsBtn_    .setBounds (lx, leftBtnY, kIconBtnW, kIconBtnW);
+        diskOpBtn_   .setBounds (lx, leftBtnY, kMainIconBtnW, kMainIconBtnW);
+        diskOpLbl_   .setBounds (lx, leftLblY, kMainIconBtnW, kSublabelH);
+        lx += kMainIconBtnW + kIconGap;
+        pluginMgrBtn_.setBounds (lx, leftBtnY, kMainIconBtnW, kMainIconBtnW);
+        pluginMgrLbl_.setBounds (lx, leftLblY, kMainIconBtnW, kSublabelH);
+        lx += kMainIconBtnW + kIconGap;
+        prefsBtn_    .setBounds (lx, leftBtnY, kMainIconBtnW, kMainIconBtnW);
+        prefsLbl_    .setBounds (lx, leftLblY, kMainIconBtnW, kSublabelH);
         r.removeFromLeft (leftClusterW + kGap);
 
         /* ---- Transport (Play / Stop / Record / SeekZero) ---- */
@@ -705,24 +763,26 @@ public:
         if (viewSelector.isVisible())
         {
             /* 5 view buttons: Graph / Arr / Tracker / Session / Patch. */
-            const int vsW = kFramePad * 2 + kIconBtnW * 5 + kIconGap * 4;
+            const int vsW = kFramePad * 2 + kMainIconBtnW * 5 + kIconGap * 4;
             viewSelector.setBounds (r.getX(), top, vsW, rowH);
             r.removeFromLeft (vsW + kGap);
         }
 
-        /* ---- Trailing tools cluster (15 % smaller buttons):
-                Graph Mixer | VKbd | Undo | Redo. */
-        const int smallBtnW = juce::jmax (12, (int) std::lround (kIconBtnW * 0.85));
-        const int smallClusterH = smallBtnW + kFramePad * 2;
-        const int smallClusterW = kFramePad * 2 + smallBtnW * 4 + kIconGap * 3;
+        /* ---- Trailing tools cluster:
+                Graph Mixer | VKbd | Undo | Redo.  Kept intentionally
+                smaller than the labeled main clusters so they read as
+                secondary tools.  Fixed-size buttons (not rowH-derived)
+                so they don't grow with the taller toolbar. */
+        const int smallClusterH = kTrailingBtnW + kFramePad * 2;
+        const int smallClusterW = kFramePad * 2 + kTrailingBtnW * 4 + kIconGap * 3;
         const int smallTop = top + (rowH - smallClusterH) / 2;
         postXportRect_ = Rectangle<int> (r.getX(), smallTop, smallClusterW, smallClusterH);
         const int smallBtnY = smallTop + kFramePad;
         int px = r.getX() + kFramePad;
-        graphMixBtn_.setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        vKbdBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        undoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW); px += smallBtnW + kIconGap;
-        redoBtn_    .setBounds (px, smallBtnY, smallBtnW, smallBtnW);
+        graphMixBtn_.setBounds (px, smallBtnY, kTrailingBtnW, kTrailingBtnW); px += kTrailingBtnW + kIconGap;
+        vKbdBtn_    .setBounds (px, smallBtnY, kTrailingBtnW, kTrailingBtnW); px += kTrailingBtnW + kIconGap;
+        undoBtn_    .setBounds (px, smallBtnY, kTrailingBtnW, kTrailingBtnW); px += kTrailingBtnW + kIconGap;
+        redoBtn_    .setBounds (px, smallBtnY, kTrailingBtnW, kTrailingBtnW);
         r.removeFromLeft (smallClusterW + kGap);
 
         /* pluginMenu + mapButton stay on the far right (only visible
@@ -832,6 +892,14 @@ private:
     BlockToolButton vKbdBtn_      { "" };
     BlockToolButton undoBtn_      { "" };
     BlockToolButton redoBtn_      { "" };
+
+    /* LCD-style sub-labels live in ui/lcdsublabel.hpp -- shared with
+     * TransportBar + ViewSelectorBar so all three clusters share one
+     * visual treatment.  Will become drop-down menu triggers (spill-
+     * over from the soon-to-be-removed top menubar) in a follow-up. */
+    LcdSublabel diskOpLbl_    { "FILE" };
+    LcdSublabel pluginMgrLbl_ { "PLUG" };
+    LcdSublabel prefsLbl_     { "PREF" };
 
     /* LCD-frame bounds captured in resized(), painted in paint(). */
     Rectangle<int> leftClusterRect_;
@@ -1004,10 +1072,13 @@ Content::Content (Context& ctx)
     addAndMakeVisible (toolBar.get());
     toolBar->setSession (context().session());
     toolBarVisible = true;
-    /* Thicker bar to fit the secondary Bitwig-style row beneath the
-     * primary tempo / transport row.  32 -> 60 = +28 px; the two-row
-     * layout in Content::Toolbar::resized() splits it ~50/50. */
-    toolBarSize = 60;
+    /* Taller bar -- absorbs the menubar's vertical strip plus
+     * additional headroom so the labeled main clusters (FILE/PLUG/
+     * PREF, PLAY/STOP/REC/REW, GRAPH/ARR/TRK/SESS/PATCH) scale up to
+     * comfortable icon sizes with the LCD sublabel beneath each
+     * icon.  Trailing cluster (Mixer/VKbd/Undo/Redo) stays at a
+     * fixed smaller size since it has no labels. */
+    toolBarSize = 84;
 
     const Node node (context().session()->getCurrentGraph());
     setCurrentNode (node);

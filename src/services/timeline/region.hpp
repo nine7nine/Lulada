@@ -34,6 +34,27 @@ struct EnvelopePoint
     double        beatOffset { 0.0 };
     float         gainDb     { 0.0f };
     EnvelopeCurve curve      { EnvelopeCurve::Linear };
+    /** 2D control-point Bezier handle for the segment between THIS
+     *  point and the next-by-beatOffset.
+     *
+     *  curveOffsetT  -- normalised X within the segment in [0.25, 0.75]
+     *                   (clamped at the UI layer; outside that range
+     *                   the quadratic Bezier's x(u) is non-monotonic
+     *                   and the curve loops back on itself).
+     *  curveOffsetDb -- dB shift from the chord midpoint.  0 = handle
+     *                   sits on the straight chord, no bend.  Positive
+     *                   raises the handle above the chord, negative
+     *                   lowers it.
+     *
+     *  Defaults (0.5, 0) = handle at geometric midpoint on the chord
+     *  = linear.  Non-default = curve bent into a quadratic Bezier
+     *  passing through (curveOffsetT, chordMidDb + curveOffsetDb) at
+     *  Bezier-parameter u=0.5.  Hold ignores both (step regardless).
+     *
+     *  Sparse-write: stored as `cot` / `cod` XML attrs; only emitted
+     *  when non-default. */
+    float         curveOffsetT  { 0.5f };
+    float         curveOffsetDb { 0.0f };
 };
 
 /** Pure-data Region.  A thin metadata wrapper pointing at a Source by
@@ -74,6 +95,14 @@ struct Region
     double        gainDb        { 0.0 };
     double        fadeInBeats   { 0.0 };
     double        fadeOutBeats  { 0.0 };
+    /** Fade curvature in [-1, +1].  0 = linear (current default).
+     *  Positive  = concave-up  (slow start, fast finish; "exponential").
+     *  Negative  = concave-down (fast start, slow finish; "logarithmic").
+     *  Mapped to a power-curve exponent at evaluation time via
+     *  p = exp2(curve * 2.0), so c==+1 -> p==4, c==-1 -> p==0.25.
+     *  Sparse-write: only persisted when != 0.0. */
+    float         fadeInCurve   { 0.0f };
+    float         fadeOutCurve  { 0.0f };
     bool          looped        { false };
     juce::Colour  colour        { 0xff'4a'7a'b5 };
     juce::String  name;

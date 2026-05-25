@@ -1654,6 +1654,25 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
 
 void SessionView::bangClip (SessionClip& clip)
 {
+    /* Sketch Mode -- match bangScene: a single-clip click when the
+     * transport is stopped auto-starts it so the clip actually
+     * fires AND subsequent clip launches quantise to the next bar
+     * (Ableton / Bitwig convention).  Without this, the very first
+     * click on a stopped transport fired immediately (targetBeat
+     * stayed -1.0) AND left the transport stopped, so every
+     * follow-up clip also fired immediately -- the
+     * "triggers on the spot, feels buggy" symptom.  After this
+     * starts the transport, immediately re-evaluate `transportPlaying`
+     * below so this same click already aligns to the next bar
+     * instead of the first being immediate and only subsequent
+     * clicks quantising. */
+    if (monitor_ != nullptr && ! monitor_->playing.get())
+    {
+        if (services_ != nullptr)
+            if (auto* eng = services_->context().audio().get())
+                eng->setPlaying (true);
+    }
+
     const bool transportPlaying = (monitor_ != nullptr && monitor_->playing.get());
     const double targetBeat = transportPlaying
         ? computeTargetBeat (currentTransportBeat(), clip.launchQuant)

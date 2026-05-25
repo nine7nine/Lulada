@@ -740,6 +740,7 @@ void GuiService::getAllCommands (Array<CommandID>& ids)
                     Commands::showAllPluginWindows,
                     Commands::hideAllPluginWindows,
                     Commands::toggleUserInterface,
+                    Commands::toggleMainMenu,
                     //======================================================================
                     Commands::sessionOpen,
                     Commands::sessionClose,
@@ -806,6 +807,14 @@ void GuiService::getCommandInfo (CommandID commandID, ApplicationCommandInfo& re
             break;
         case Commands::toggleUserInterface:
             result.setInfo ("Show UI", "Show the main UI", "UI", 0);
+            break;
+        case Commands::toggleMainMenu:
+            /* Ctrl+M toggles the top menubar visibility -- the new
+             * LCD-labeled toolbar is meant to replace it eventually,
+             * but until full menu migration lands the toggle lets the
+             * user reclaim the vertical strip on demand. */
+            result.setInfo ("Toggle Menu Bar", "Show or hide the top menu bar", "UI", 0);
+            result.addDefaultKeypress ('m', ModifierKeys::commandModifier);
             break;
         //======================================================================
         case Commands::sessionOpen:
@@ -972,6 +981,11 @@ bool GuiService::perform (const InvocationInfo& info)
         }
         case Commands::hideAllPluginWindows: {
             closeAllPluginWindows (false);
+            break;
+        }
+        case Commands::toggleMainMenu: {
+            if (auto* const window = mainWindow.get())
+                window->toggleMenuBar();
             break;
         }
         case Commands::toggleUserInterface: {

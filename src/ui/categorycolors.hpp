@@ -153,4 +153,42 @@ inline juce::Colour colorForNode (const Node& node)
     return colorForCategoryOrFormat (category, node.getFormat().toString());
 }
 
+/** Per-node tint that prefers an Arrangement Lane binding's `colour`
+ *  when the node is the target of any lane (Lane.targetNodeUuid ==
+ *  node.getUuid()).  Falls back to `colorForNode` when no lane points
+ *  here.  Lets audio-clip mixer strips inherit the lane colour the
+ *  user picks in ArrangementView, matching Bitwig / Ableton.
+ *
+ *  `sessionRoot` is the session's root ValueTree (typically obtained
+ *  via `ViewHelpers::getSession(this)->data()` at the call site).
+ *  Pass an invalid VT to short-circuit to category-only colour. */
+inline juce::Colour colorForNodeWithLane (const Node& node,
+                                          const juce::ValueTree& sessionRoot)
+{
+    if (sessionRoot.isValid() && node.isValid())
+    {
+        const auto arrangement = sessionRoot.getChildWithName (tags::arrangement);
+        if (arrangement.isValid())
+        {
+            const auto lanes = arrangement.getChildWithName ("lanes");
+            if (lanes.isValid())
+            {
+                const auto target = node.getUuid().toString();
+                for (int i = 0; i < lanes.getNumChildren(); ++i)
+                {
+                    const auto lane = lanes.getChild (i);
+                    if (lane.getProperty ("targetNodeUuid").toString() == target)
+                    {
+                        const auto s = lane.getProperty ("colour").toString();
+                        if (s.isNotEmpty())
+                            return juce::Colour::fromString (s);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return colorForNode (node);
+}
+
 } // namespace element
