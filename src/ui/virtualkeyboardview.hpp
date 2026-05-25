@@ -18,6 +18,16 @@ public:
 
     bool keyPressed (const KeyPress&) override;
 
+    /** Override JUCE's default drawBlackNote which paints a
+     *  `c.brighter()` highlight cap across the upper 7/8 of every
+     *  black key.  That cap reads as grey-on-grey under the dark
+     *  palette (since brightening pure black still yields a dark
+     *  grey).  We just fill the whole black-key rect flat instead. */
+    void drawBlackNote (int midiNoteNumber, Graphics&,
+                         Rectangle<float> area,
+                         bool isDown, bool isOver,
+                         Colour noteFillColour) override;
+
 private:
     int keypressOctaveOffset = 6;
 };

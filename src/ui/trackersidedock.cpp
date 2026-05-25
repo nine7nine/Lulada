@@ -1,7 +1,7 @@
 // Copyright 2026 Element-NSPA <johnstonljordan@gmail.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "ui/trackerstripview.hpp"
+#include "ui/trackersidedock.hpp"
 #include "nodes/tracker.hpp"
 #include "nodes/trackereditor.hpp"
 #include "ui/fontcache.hpp"
@@ -13,56 +13,60 @@
 
 namespace element {
 
-/* Top-edge drag handle.  Vertical-only resize -- forwards the pixel
- * delta to the strip's onResizeDrag callback so StandardContent
- * owns the height field + layout invalidation. */
-class TrackerStripView::DragHandle : public juce::Component
+/* Left-edge drag handle.  Horizontal-only resize -- forwards the
+ * pixel delta to the dock's onResizeDrag callback so StandardContent
+ * owns the width field + layout invalidation. */
+class TrackerSideDock::DragHandle : public juce::Component
 {
 public:
-    DragHandle (TrackerStripView& s) : strip_ (s)
+    DragHandle (TrackerSideDock& d) : dock_ (d)
     {
-        setMouseCursor (juce::MouseCursor::UpDownResizeCursor);
+        setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
     }
 
     void paint (juce::Graphics& g) override
     {
-        /* Match the SmartLayoutResizeBar visual cue: faint horizontal
-         * line + 3 centred dots so the user spots the affordance. */
+        /* Match the SmartLayoutResizeBar visual cue, rotated for the
+         * vertical orientation: faint vertical line + 3 stacked dots
+         * so the user spots the affordance. */
         g.fillAll (juce::Colour (0xff'1a'1a'1a));
         g.setColour (juce::Colour (0xff'3a'3a'3a));
-        g.drawHorizontalLine (getHeight() / 2,
-                              0.0f, (float) getWidth());
+        g.drawVerticalLine (getWidth() / 2,
+                              0.0f, (float) getHeight());
         g.setColour (juce::Colour (0xff'5a'5a'5a));
         const int cx = getWidth() / 2;
         const int cy = getHeight() / 2;
         for (int i = -1; i <= 1; ++i)
-            g.fillEllipse ((float) (cx + i * 8) - 1.0f,
-                            (float) cy - 1.0f, 2.0f, 2.0f);
+            g.fillEllipse ((float) cx - 1.0f,
+                            (float) (cy + i * 8) - 1.0f, 2.0f, 2.0f);
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
-        dragStartY_ = e.getScreenY();
+        dragStartX_ = e.getScreenX();
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
-        const int dy = dragStartY_ - e.getScreenY();
-        dragStartY_ = e.getScreenY();
-        if (strip_.onResizeDrag) strip_.onResizeDrag (dy);
+        /* Positive delta = user dragging RIGHT (dock shrinks).
+         * Negative delta = user dragging LEFT (dock widens).
+         * StandardContent inverts this for its width state. */
+        const int dx = e.getScreenX() - dragStartX_;
+        dragStartX_ = e.getScreenX();
+        if (dock_.onResizeDrag) dock_.onResizeDrag (dx);
     }
 
     void mouseUp (const juce::MouseEvent&) override
     {
-        if (strip_.onResizeDragEnd) strip_.onResizeDragEnd();
+        if (dock_.onResizeDragEnd) dock_.onResizeDragEnd();
     }
 
 private:
-    TrackerStripView& strip_;
-    int dragStartY_ { 0 };
+    TrackerSideDock& dock_;
+    int dragStartX_ { 0 };
 };
 
-TrackerStripView::TrackerStripView (Services& services)
+TrackerSideDock::TrackerSideDock (Services& services)
     : services_ (services)
 {
     dragHandle_ = std::make_unique<DragHandle> (*this);
@@ -74,10 +78,6 @@ TrackerStripView::TrackerStripView (Services& services)
         const int idx = trackerCombo_.getSelectedItemIndex();
         if (idx < 0) return;
         const auto uuidStr = trackerCombo_.getItemText (idx);
-        /* ItemText holds the node name; we keep ItemID == hash of
-         * uuid for resolution.  ComboBox doesn't store strings as
-         * uuid directly, so we walk the graph to match the display
-         * name back to a node (cheap: graphs are small). */
         if (auto sess = services_.context().session())
         {
             const auto g = sess->getActiveGraph();
@@ -96,7 +96,7 @@ TrackerStripView::TrackerStripView (Services& services)
     };
 
     addAndMakeVisible (closeBtn_);
-    closeBtn_.setTooltip ("Hide tracker strip");
+    closeBtn_.setTooltip ("Hide tracker dock");
     closeBtn_.onClick = [this]() {
         if (onCloseClicked) onCloseClicked();
     };
@@ -104,18 +104,14 @@ TrackerStripView::TrackerStripView (Services& services)
     refreshFromGraph();
 }
 
-TrackerStripView::~TrackerStripView()
+TrackerSideDock::~TrackerSideDock()
 {
     if (watchedNodes_.isValid())
         watchedNodes_.removeListener (this);
 }
 
-void TrackerStripView::attachToActiveGraph()
+void TrackerSideDock::attachToActiveGraph()
 {
-    /* Replace whatever VT we were listening to with the active graph's
-     * nodes container.  Held-by-value is fine -- juce::ValueTree is
-     * reference-counted; removeListener on a stale handle is harmless
-     * if the underlying tree is already gone. */
     juce::ValueTree desired;
     if (auto sess = services_.context().session())
         desired = sess->getActiveGraph().getNodesValueTree();
@@ -129,38 +125,26 @@ void TrackerStripView::attachToActiveGraph()
         watchedNodes_.addListener (this);
 }
 
-void TrackerStripView::valueTreeChildAdded (juce::ValueTree&, juce::ValueTree&)
+void TrackerSideDock::valueTreeChildAdded (juce::ValueTree&, juce::ValueTree&)
 {
-    /* Deferred refresh: the VT mutation that triggered us may not yet
-     * have a corresponding Processor object attached on the Node side
-     * (the engine wires that in a follow-up step), so refreshing
-     * synchronously here can miss the new TrackerNode.  callAsync
-     * lands after the engine's wiring is complete. */
-    juce::Component::SafePointer<TrackerStripView> sp (this);
+    juce::Component::SafePointer<TrackerSideDock> sp (this);
     juce::MessageManager::callAsync ([sp]() {
         if (sp != nullptr) sp->refreshFromGraph();
     });
 }
 
-void TrackerStripView::valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree&, int)
+void TrackerSideDock::valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree&, int)
 {
-    juce::Component::SafePointer<TrackerStripView> sp (this);
+    juce::Component::SafePointer<TrackerSideDock> sp (this);
     juce::MessageManager::callAsync ([sp]() {
         if (sp != nullptr) sp->refreshFromGraph();
     });
 }
 
-void TrackerStripView::refreshFromGraph()
+void TrackerSideDock::refreshFromGraph()
 {
-    /* Listener re-binds first -- if the session swapped underneath
-     * us, the VT we were listening to is stale and we'd miss the new
-     * graph's add/remove events. */
     attachToActiveGraph();
 
-    /* Re-populate the selector from the current graph.  Preserve the
-     * binding if the previously-bound tracker is still present;
-     * otherwise bind to the first tracker we find (or unbind if
-     * none). */
     trackerCombo_.clear (juce::dontSendNotification);
 
     auto sess = services_.context().session();
@@ -192,7 +176,6 @@ void TrackerStripView::refreshFromGraph()
     if (! boundStillPresent)
         boundId_ = firstTrackerId;
 
-    /* Select the matching combo entry. */
     if (! boundId_.isNull())
     {
         for (int i = 0; i < g.getNumNodes(); ++i)
@@ -200,11 +183,6 @@ void TrackerStripView::refreshFromGraph()
             const auto n = g.getNode (i);
             if (n.getUuid() == boundId_)
             {
-                trackerCombo_.setSelectedItemIndex (
-                    trackerCombo_.indexOfItemId (-1) /* unused */, juce::dontSendNotification);
-                /* indexOfItemId is awkward here because ComboBox item
-                 * IDs are 1-based and we used getNumItems+1 to assign;
-                 * walk the items directly instead. */
                 for (int k = 0; k < trackerCombo_.getNumItems(); ++k)
                 {
                     if (trackerCombo_.getItemText (k) == n.getDisplayName())
@@ -221,7 +199,7 @@ void TrackerStripView::refreshFromGraph()
     rebuildEditorForBound();
 }
 
-void TrackerStripView::setTracker (const juce::Uuid& nodeId)
+void TrackerSideDock::setTracker (const juce::Uuid& nodeId)
 {
     if (nodeId == boundId_) return;
 
@@ -229,7 +207,6 @@ void TrackerStripView::setTracker (const juce::Uuid& nodeId)
     if (sess == nullptr) return;
     const auto g = sess->getActiveGraph();
 
-    /* Verify the uuid resolves to a TrackerNode in the graph. */
     Node match;
     for (int i = 0; i < g.getNumNodes(); ++i)
     {
@@ -247,7 +224,6 @@ void TrackerStripView::setTracker (const juce::Uuid& nodeId)
     boundId_ = nodeId;
     rebuildEditorForBound();
 
-    /* Sync the combo selection without re-firing onChange. */
     for (int k = 0; k < trackerCombo_.getNumItems(); ++k)
     {
         if (trackerCombo_.getItemText (k) == match.getDisplayName())
@@ -258,16 +234,12 @@ void TrackerStripView::setTracker (const juce::Uuid& nodeId)
     }
 }
 
-void TrackerStripView::setTrackerAndPattern (const juce::Uuid& nodeId, int sequenceIdx)
+void TrackerSideDock::setTrackerAndPattern (const juce::Uuid& nodeId, int sequenceIdx)
 {
     setTracker (nodeId);
     if (sequenceIdx < 0) return;
     if (auto* ed = dynamic_cast<TrackerEditor*> (editor_.get()))
     {
-        /* TrackerEditor only exposes relative switchPattern (delta).
-         * Walk by the difference between the requested index and the
-         * editor's current index.  Mirrors the same idiom the
-         * pattern-jump dialog uses internally (trackereditor.cpp). */
         const int cur  = ed->getPatternIndex();
         const int n    = ed->getPatternCount();
         if (n <= 0) return;
@@ -276,7 +248,7 @@ void TrackerStripView::setTrackerAndPattern (const juce::Uuid& nodeId, int seque
     }
 }
 
-void TrackerStripView::rebuildEditorForBound()
+void TrackerSideDock::rebuildEditorForBound()
 {
     if (editor_ != nullptr)
     {
@@ -297,27 +269,24 @@ void TrackerStripView::rebuildEditorForBound()
     }
     if (! match.isValid()) return;
 
-    /* TrackerEditor's ctor takes a Node by const ref.  We own the
-     * resulting Component via unique_ptr<Component>. */
     auto ed = std::make_unique<TrackerEditor> (match);
     addAndMakeVisible (ed.get());
     editor_ = std::move (ed);
     resized();
 }
 
-void TrackerStripView::paint (juce::Graphics& g)
+void TrackerSideDock::paint (juce::Graphics& g)
 {
-    /* Header strip background -- matte black to read as a faceplate
-     * separate from the main content above.  TrackerEditor paints
-     * its own body. */
+    /* Header strip background -- matte black faceplate behind the
+     * combo + close button.  TrackerEditor paints its own body. */
     g.setColour (juce::Colour (0xff'0c'0c'0c));
-    g.fillRect (0, 0, getWidth(), kDragHandleH + kHeaderH);
+    g.fillRect (kDragHandleW, 0, getWidth() - kDragHandleW, kHeaderH);
 }
 
-void TrackerStripView::resized()
+void TrackerSideDock::resized()
 {
     auto r = getLocalBounds();
-    dragHandle_->setBounds (r.removeFromTop (kDragHandleH));
+    dragHandle_->setBounds (r.removeFromLeft (kDragHandleW));
 
     auto header = r.removeFromTop (kHeaderH);
     closeBtn_   .setBounds (header.removeFromRight (kHeaderH).reduced (3));

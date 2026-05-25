@@ -21,7 +21,7 @@
 #include "ui/arrangementview.hpp"
 #include "ui/sessionview.hpp"
 #include "ui/controllersview.hpp"
-#include "ui/trackerstripview.hpp"
+#include "ui/trackersidedock.hpp"
 #include "ui/trackerhostview.hpp"
 #include "ui/diskopview.hpp"
 #include "ui/datapathbrowser.hpp"
@@ -32,6 +32,7 @@
 #include "ui/luaconsoleview.hpp"
 #include "ui/mainmenu.hpp"
 #include "ui/navigationview.hpp"
+#include "ui/navigationsidebar.hpp"
 #include "ui/nodechannelstripview.hpp"
 #include "ui/pluginspanelview.hpp"
 #include "ui/sessiontreepanel.hpp"
@@ -489,9 +490,35 @@ StandardContent::StandardContent (Context& ctl_)
     addAndMakeVisible (container.get());
     bar1 = std::make_unique<Resizer> (*this, &layout, 1, true);
     addAndMakeVisible (bar1.get());
-    nav = std::make_unique<NavigationConcertinaPanel> (ctl_);
+    nav = std::make_unique<NavigationSidebar> (ctl_);
     addAndMakeVisible (nav.get());
     nav->updateContent();
+    nav->onLayoutInvalidated = [this]() {
+        /* Sidebar's collapse state changed (header chevron, icon
+         * click, or Ctrl+B).  Re-derive the StretchableLayoutManager
+         * column rules from the sidebar's desired width so both the
+         * resizer min/max + the laid-out width follow.  Without this
+         * the layout manager stays locked at the previous state's
+         * column width and either:
+         *   (a) collapsed -> icon strip appears in a 304px column
+         *       with the panel content hidden, or
+         *   (b) expanded -> concertina is squeezed into the 52px
+         *       collapsed column. */
+        if (! nav) return;
+        if (nav->isCollapsed())
+        {
+            const int w = NavigationSidebar::kCollapsedW;
+            layout.setItemLayout (0, w, w, w);
+            nav->setSize (w, nav->getHeight());
+        }
+        else
+        {
+            const int w = nav->getExpandedWidth();
+            layout.setItemLayout (0, w, w, w);
+            nav->setSize (w, nav->getHeight());
+        }
+        resized();
+    };
 
     toolBarVisible = true;
     /* Taller toolbar -- absorbs the vertical strip the menu bar
@@ -508,11 +535,14 @@ StandardContent::StandardContent (Context& ctl_)
     setMainView (EL_VIEW_GRAPH_EDITOR);
 
     nav->setSize (304, getHeight());
+    nav->setExpandedWidth (304);
     resizerMouseUp();
-    if (auto gp = nav->findPanel<GraphSettingsView>())
-        nav->expandPanelFully (gp, false);
-    if (auto stp = nav->findPanel<SessionTreePanel>())
-        nav->setPanelSize (stp, 200, false);
+    /* Don't call expandPanelFully / setPanelSize on the concertina
+     * here -- in the new VS-Code-style model the concertina is just
+     * a panel registry, not a rendered accordion.  Its internal
+     * layout machinery operates on panels we've reparented away,
+     * which crashes.  Section selection is driven by
+     * setActiveSection() instead. */
 
     resized();
 
@@ -552,13 +582,13 @@ StandardContent::StandardContent (Context& ctl_)
 
         setCurrentNode (session()->getActiveGraph());
 
-        /* TrackerStripView holds a ValueTree::Listener pointing at
+        /* TrackerSideDock holds a ValueTree::Listener pointing at
          * the previous session's active-graph nodes container.  After
          * the session swap that VT is stale, so the listener wouldn't
          * fire on the new session's add/remove.  refreshFromGraph()
          * detaches + re-attaches as part of its normal flow. */
-        if (trackerStrip != nullptr)
-            trackerStrip->refreshFromGraph();
+        if (trackerDock != nullptr)
+            trackerDock->refreshFromGraph();
     });
 }
 
@@ -602,6 +632,24 @@ String StandardContent::getAccessoryViewName() const
 int StandardContent::getNavSize()
 {
     return nav != nullptr ? nav->getWidth() : 220;
+}
+
+NavigationConcertinaPanel* StandardContent::getNavigationConcertinaPanel() const
+{
+    return nav != nullptr ? nav->concertina() : nullptr;
+}
+
+void StandardContent::setNavSidebarCollapsed (bool c)
+{
+    if (nav == nullptr) return;
+    /* setCollapsed fires onLayoutInvalidated which centralises the
+     * layout-rule update + parent resize -- nothing else to do here. */
+    nav->setCollapsed (c);
+}
+
+bool StandardContent::isNavSidebarCollapsed() const
+{
+    return nav != nullptr && nav->isCollapsed();
 }
 
 ContentView* StandardContent::lookupOrCreateMainView (const String& name)
@@ -813,19 +861,18 @@ void StandardContent::resizeContent (const Rectangle<int>& area)
         r.removeFromBottom (1);
     }
 
-    /* Tracker strip sits at the very bottom (above _extra if visible,
-     * which it usually isn't simultaneously).  Lives outside
-     * ContentContainer so it naturally falls BELOW the graph mixer
-     * (which is the container's secondary view).  Height is
-     * user-resizable via the strip's top-edge drag handle; the
-     * dragHandle callback updates trackerStripHeight_ + retriggers
-     * this layout. */
-    if (trackerStripVisible_ && trackerStrip != nullptr)
+    /* Tracker side dock sits on the RIGHT edge (full height, above
+     * _extra if visible).  Lives outside ContentContainer so it
+     * doesn't get squeezed by the container's primary/secondary
+     * split.  Width is user-resizable via the dock's left-edge drag
+     * handle; the dragHandle callback updates trackerDockWidth_ +
+     * retriggers this layout. */
+    if (trackerDockVisible_ && trackerDock != nullptr)
     {
-        const int h = juce::jlimit (kTrackerStripMinH, kTrackerStripMaxH,
-                                     trackerStripHeight_);
-        trackerStrip->setBounds (r.removeFromBottom (h));
-        r.removeFromBottom (1);
+        const int w = juce::jlimit (kTrackerDockMinW, kTrackerDockMaxW,
+                                      trackerDockWidth_);
+        trackerDock->setBounds (r.removeFromRight (w));
+        r.removeFromRight (1);
     }
 
     if (nodeStrip && nodeStrip->isVisible())
@@ -992,8 +1039,8 @@ void StandardContent::saveState (PropertiesFile* props)
 
     auto& mo = container->bottom->bridge->meterBridge();
     props->setValue ("meterBridge", isMeterBridgeVisible());
-    props->setValue ("trackerStrip",       trackerStripVisible_);
-    props->setValue ("trackerStripHeight", trackerStripHeight_);
+    props->setValue ("trackerDock",      trackerDockVisible_);
+    props->setValue ("trackerDockWidth", trackerDockWidth_);
     props->setValue ("meterBridgeSize", mo.meterSize());
     props->setValue ("meterBridgeVisibility", (int) mo.visibility());
 }
@@ -1017,13 +1064,36 @@ void StandardContent::restoreState (PropertiesFile* props)
     bo.setMeterSize (props->getIntValue ("meterBridgeSize", bo.meterSize()));
     bo.setVisibility ((uint32) props->getIntValue ("meterBridgeVisibility", bo.visibility()));
     setMeterBridgeVisible (props->getBoolValue ("meterBridge", isMeterBridgeVisible()));
-    trackerStripHeight_ = props->getIntValue ("trackerStripHeight", trackerStripHeight_);
-    setTrackerStripVisible (props->getBoolValue ("trackerStrip", trackerStripVisible_));
+    /* Honor legacy `trackerStripHeight` / `trackerStrip` keys ONCE
+     * if the new keys aren't present, so old sessions don't lose
+     * their toggle state.  Treat the legacy height as a hint only --
+     * the new dock is width-based, so default to kTrackerDockMinW
+     * range. */
+    if (props->containsKey ("trackerDockWidth"))
+        trackerDockWidth_ = props->getIntValue ("trackerDockWidth", trackerDockWidth_);
+    setTrackerDockVisible (props->getBoolValue ("trackerDock",
+                                                 props->getBoolValue ("trackerStrip", false)));
 
     {
-        auto ns = props->getIntValue ("standardNavSize", getNavSize());
+        /* Prefer the new wrapper-managed keys (navExpandedWidth /
+         * navCollapsed restored in NavigationSidebar::restoreState)
+         * over the legacy standardNavSize.  If the user came from an
+         * older session the wrapper falls back to its default 304;
+         * we then honour the legacy key so they don't lose their
+         * tuned width. */
         if (nav)
-            nav->setSize (ns, nav->getHeight());
+        {
+            if (! props->containsKey ("navExpandedWidth")
+                && props->containsKey ("standardNavSize"))
+            {
+                nav->setExpandedWidth (props->getIntValue ("standardNavSize",
+                                                            nav->getExpandedWidth()));
+            }
+            const int w = nav->isCollapsed()
+                            ? NavigationSidebar::kCollapsedW
+                            : nav->getExpandedWidth();
+            nav->setSize (w, nav->getHeight());
+        }
         resizerMouseUp();
     }
 
@@ -1050,7 +1120,20 @@ void StandardContent::setCurrentNode (const Node& node)
 
 void StandardContent::updateLayout()
 {
-    layout.setItemLayout (0, EL_NAV_MIN_WIDTH, EL_NAV_MAX_WIDTH, nav->getWidth());
+    if (nav && nav->isCollapsed())
+    {
+        /* Collapsed: lock the column to a fixed icon-strip width.
+         * Equal min/max prevents the resizer from dragging it.
+         * Resizer itself becomes a visual no-op (still painted, but
+         * any drag is clamped to the fixed width). */
+        const int w = NavigationSidebar::kCollapsedW;
+        layout.setItemLayout (0, w, w, w);
+    }
+    else
+    {
+        layout.setItemLayout (0, EL_NAV_MIN_WIDTH, EL_NAV_MAX_WIDTH,
+                                nav ? nav->getWidth() : 304);
+    }
     layout.setItemLayout (1, 2, 2, 2);
     layout.setItemLayout (2, 100, -1, 400);
 }
@@ -1062,7 +1145,17 @@ void StandardContent::resizerMouseDown()
 
 void StandardContent::resizerMouseUp()
 {
-    layout.setItemLayout (0, nav->getWidth(), nav->getWidth(), nav->getWidth());
+    if (nav && nav->isCollapsed())
+    {
+        const int w = NavigationSidebar::kCollapsedW;
+        layout.setItemLayout (0, w, w, w);
+    }
+    else
+    {
+        const int w = nav ? nav->getWidth() : 304;
+        layout.setItemLayout (0, w, w, w);
+        if (nav) nav->setExpandedWidth (w);
+    }
     layout.setItemLayout (1, 2, 2, 2);
     layout.setItemLayout (2, 100, -1, 400);
     resized();
@@ -1164,6 +1257,7 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::toggleMeterBridge,
         Commands::toggleChannelStrip,
         Commands::toggleTrackerStrip,
+        Commands::toggleNavSidebar,
         Commands::showLastContentView,
         Commands::rotateContentView,
         Commands::selectAll
@@ -1306,11 +1400,23 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
         }
         case Commands::toggleTrackerStrip: {
             int flags = 0;
-            if (isTrackerStripVisible()) flags |= Info::isTicked;
-            result.setInfo ("Tracker Strip",
-                            "Show / hide the tracker editor at the bottom of the window",
+            if (isTrackerDockVisible()) flags |= Info::isTicked;
+            result.setInfo ("Tracker Dock",
+                            "Show / hide the tracker editor on the right side of the window",
                             "UI", flags);
             result.addDefaultKeypress ('t', ModifierKeys::commandModifier);
+            break;
+        }
+        case Commands::toggleNavSidebar: {
+            int flags = 0;
+            /* Tick when the sidebar is EXPANDED -- the menu item then
+             * reads as "Sidebar is on", matching the way Channel Strip
+             * / Meter Bridge ticks when their feature is visible. */
+            if (! isNavSidebarCollapsed()) flags |= Info::isTicked;
+            result.setInfo ("Sidebar",
+                            "Collapse / expand the left navigation sidebar",
+                            "UI", flags);
+            result.addDefaultKeypress ('b', ModifierKeys::commandModifier);
             break;
         }
         case Commands::showLastContentView: {
@@ -1406,7 +1512,10 @@ bool StandardContent::perform (const InvocationInfo& info)
             setNodeChannelStripVisible (! isNodeChannelStripVisible());
             break;
         case Commands::toggleTrackerStrip:
-            setTrackerStripVisible (! isTrackerStripVisible());
+            setTrackerDockVisible (! isTrackerDockVisible());
+            break;
+        case Commands::toggleNavSidebar:
+            setNavSidebarCollapsed (! isNavSidebarCollapsed());
             break;
         case Commands::showLastContentView:
             backMainView();
@@ -1581,61 +1690,65 @@ void StandardContent::setMeterBridgeVisible (bool vis)
 }
 
 //============================================================================
-// Tracker bottom-attach strip
+// Tracker right-side dock
 
-bool StandardContent::isTrackerStripVisible() const { return trackerStripVisible_; }
-int  StandardContent::getTrackerStripHeight() const { return trackerStripHeight_; }
+bool StandardContent::isTrackerDockVisible() const { return trackerDockVisible_; }
+int  StandardContent::getTrackerDockWidth() const  { return trackerDockWidth_; }
 
-void StandardContent::setTrackerStripHeight (int h)
+void StandardContent::setTrackerDockWidth (int w)
 {
-    h = juce::jlimit (kTrackerStripMinH, kTrackerStripMaxH, h);
-    if (h == trackerStripHeight_) return;
-    trackerStripHeight_ = h;
+    w = juce::jlimit (kTrackerDockMinW, kTrackerDockMaxW, w);
+    if (w == trackerDockWidth_) return;
+    trackerDockWidth_ = w;
     resized();
 }
 
-void StandardContent::setTrackerStripVisible (bool v)
+void StandardContent::setTrackerDockVisible (bool v)
 {
-    if (v == trackerStripVisible_) return;
-    trackerStripVisible_ = v;
+    if (v == trackerDockVisible_) return;
+    trackerDockVisible_ = v;
 
-    if (v && trackerStrip == nullptr)
+    if (v && trackerDock == nullptr)
     {
-        trackerStrip = std::make_unique<TrackerStripView> (services());
-        addChildComponent (trackerStrip.get());
-        trackerStrip->onResizeDrag = [this] (int delta) {
-            setTrackerStripHeight (trackerStripHeight_ + delta);
+        trackerDock = std::make_unique<TrackerSideDock> (services());
+        addChildComponent (trackerDock.get());
+        /* Drag handle delta: positive = user dragged RIGHT (dock
+         * shrinks); negative = user dragged LEFT (dock widens).
+         * Subtract delta from the width to invert into the
+         * shrink/grow convention. */
+        trackerDock->onResizeDrag = [this] (int delta) {
+            setTrackerDockWidth (trackerDockWidth_ - delta);
         };
-        trackerStrip->onResizeDragEnd = [this]() {
-            /* Persist final height on drag end -- writing on every
+        trackerDock->onResizeDragEnd = [this]() {
+            /* Persist final width on drag end -- writing on every
              * mouseDrag frame would thrash session XML. */
             if (auto* props = services().context().settings().getUserSettings())
-                props->setValue ("trackerStripHeight", trackerStripHeight_);
+                props->setValue ("trackerDockWidth", trackerDockWidth_);
         };
-        trackerStrip->onCloseClicked = [this]() {
-            setTrackerStripVisible (false);
+        trackerDock->onCloseClicked = [this]() {
+            setTrackerDockVisible (false);
         };
     }
 
-    if (trackerStrip != nullptr)
-        trackerStrip->setVisible (v);
+    if (trackerDock != nullptr)
+        trackerDock->setVisible (v);
 
     resized();
 }
 
-void StandardContent::showTrackerStripForNode (const juce::Uuid& trackerNodeId,
+void StandardContent::showTrackerDockForNode (const juce::Uuid& trackerNodeId,
                                                 int sequenceIdx)
 {
     /* Implicit show + bind.  Used by ArrangementView's tracker-clip
      * click affordance and by anything else that wants to surface a
-     * specific tracker without forcing the user to toggle the strip
+     * specific tracker without forcing the user to toggle the dock
      * first.  sequenceIdx >= 0 navigates the editor to that pattern
-     * so the strip opens on whichever clip the user actually clicked
+     * so the dock opens on whichever clip the user actually clicked
      * (not pattern 0). */
-    if (! trackerStripVisible_)
-        setTrackerStripVisible (true);
-    if (trackerStrip != nullptr)
-        trackerStrip->setTrackerAndPattern (trackerNodeId, sequenceIdx);
+    if (! trackerDockVisible_)
+        setTrackerDockVisible (true);
+    if (trackerDock != nullptr)
+        trackerDock->setTrackerAndPattern (trackerNodeId, sequenceIdx);
 }
 
 bool StandardContent::isMeterBridgeVisible() const

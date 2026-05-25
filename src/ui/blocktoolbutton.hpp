@@ -58,6 +58,30 @@ public:
      *  + no halo. */
     void setTint (juce::Colour c) { tint_ = c; repaint(); }
 
+    /** Switch the body fill from the default vertical-gradient style
+     *  to a flat LCD-recessed style (matches LcdSublabel + the LCD
+     *  cluster bezels).  Used by the navigation sidebar's icon
+     *  column so its buttons share the "instrument-front" palette
+     *  with the rest of the toolbar but read as a quieter cluster.
+     *  Top highlight line + inner dark ring are also suppressed in
+     *  LCD mode. */
+    void setLcdBody (bool lcd) { lcdBody_ = lcd; repaint(); }
+
+    /** Open the RIGHT edge of the LCD body so the button reads as a
+     *  "tab" bridged into adjacent content.  In open mode the right
+     *  corners stay square + the right border line is omitted; the
+     *  left side keeps its rounded corners.  Only applied in LCD
+     *  mode; no-op when the gradient-body style is in effect. */
+    void setOpenRightEdge (bool open) { openRightEdge_ = open; repaint(); }
+
+    /** Suppress the button's own body + border painting -- only the
+     *  icon glyph + hover/press overlay is drawn.  Used by the
+     *  navigation sidebar to paint the active icon's body as part of
+     *  a larger unified shape (icon + bridge + panel) from the
+     *  PARENT component, eliminating subpixel-alignment seams that
+     *  separate stroked paths can't fully hide. */
+    void setPaintShellOnly (bool shellOnly) { paintShellOnly_ = shellOnly; repaint(); }
+
     void paintButton (juce::Graphics& g, bool isOver, bool isDown) override
     {
         const float cornerSize = 3.0f;
@@ -81,30 +105,92 @@ public:
         auto box = getLocalBounds().reduced (1);
         const auto frect = box.toFloat();
 
-        /* Subtle vertical gradient on the body -- top edge a hair
-         * brighter than the bottom so the button reads as having
-         * depth.  Matches the tracker EDIT / FOLLOW button family. */
-        juce::ColourGradient bodyGrad (bodyCol.brighter (0.12f),
-                                         frect.getX(), frect.getY(),
-                                         bodyCol.darker (0.18f),
-                                         frect.getX(), frect.getBottom(),
-                                         false);
-        g.setGradientFill (bodyGrad);
-        g.fillRoundedRectangle (frect, cornerSize);
+        if (paintShellOnly_)
+        {
+            /* Skip body + border entirely -- the parent component
+             * paints the body as part of a larger unified shape.
+             * Fall through to icon/label + hover overlay. */
+        }
+        else if (lcdBody_)
+        {
+            /* LCD-recessed body: flat dark fill, no gradient, no top
+             * highlight, no inner ring.  Matches LcdSublabel +
+             * paintLcdFrame's interior so the buttons read as part of
+             * the same LCD instrument-front family. */
+            const auto lcdFill = active
+                ? juce::Colour (0xff'12'17'1c)
+                : juce::Colour (0xff'0c'10'14);
 
-        /* Top 1-px highlight line for an even subtler "lit from
-         * above" depth cue. */
-        g.setColour (juce::Colours::white.withAlpha (0.06f));
-        g.drawLine (frect.getX() + 1.5f, frect.getY() + 1.0f,
-                    frect.getRight() - 1.5f, frect.getY() + 1.0f, 1.0f);
+            if (openRightEdge_)
+            {
+                /* Tab-style: rounded on the left, SQUARE + OPEN on
+                 * the right.  Right border line is omitted so the
+                 * button visually bridges to adjacent content (used
+                 * by the navigation sidebar's active section icon). */
+                juce::Path bodyPath;
+                bodyPath.addRoundedRectangle (
+                    frect.getX(), frect.getY(),
+                    frect.getWidth(), frect.getHeight(),
+                    cornerSize, cornerSize,
+                    /*topLeft*/    true,
+                    /*topRight*/   false,
+                    /*bottomLeft*/ true,
+                    /*bottomRight*/false);
+                g.setColour (lcdFill);
+                g.fillPath (bodyPath);
 
-        /* Outer border + inner dark ring (graph-block aesthetic). */
-        g.setColour (borderCol);
-        g.drawRoundedRectangle (frect, cornerSize, 1.2f);
-        g.setColour (juce::Colours::black.withAlpha (0.55f));
-        g.drawRoundedRectangle (frect.reduced (1.2f, 1.2f),
-                                juce::jmax (0.5f, cornerSize - 1.2f),
-                                1.0f);
+                /* Border: top + left + bottom, NO right.  Drawn as
+                 * a single open path for crisp 90-degree joins. */
+                const float L = frect.getX();
+                const float R = frect.getRight();
+                const float T = frect.getY();
+                const float B = frect.getBottom();
+                const float r = cornerSize;
+                juce::Path border;
+                border.startNewSubPath (R, T);
+                border.lineTo (L + r, T);
+                border.cubicTo (L, T,  L, T,  L, T + r);
+                border.lineTo (L, B - r);
+                border.cubicTo (L, B,  L, B,  L + r, B);
+                border.lineTo (R, B);
+                g.setColour (borderCol);
+                g.strokePath (border, juce::PathStrokeType (1.2f));
+            }
+            else
+            {
+                g.setColour (lcdFill);
+                g.fillRoundedRectangle (frect, cornerSize);
+                g.setColour (borderCol);
+                g.drawRoundedRectangle (frect, cornerSize, 1.2f);
+            }
+        }
+        else
+        {
+            /* Subtle vertical gradient on the body -- top edge a hair
+             * brighter than the bottom so the button reads as having
+             * depth.  Matches the tracker EDIT / FOLLOW button family. */
+            juce::ColourGradient bodyGrad (bodyCol.brighter (0.12f),
+                                             frect.getX(), frect.getY(),
+                                             bodyCol.darker (0.18f),
+                                             frect.getX(), frect.getBottom(),
+                                             false);
+            g.setGradientFill (bodyGrad);
+            g.fillRoundedRectangle (frect, cornerSize);
+
+            /* Top 1-px highlight line for an even subtler "lit from
+             * above" depth cue. */
+            g.setColour (juce::Colours::white.withAlpha (0.06f));
+            g.drawLine (frect.getX() + 1.5f, frect.getY() + 1.0f,
+                        frect.getRight() - 1.5f, frect.getY() + 1.0f, 1.0f);
+
+            /* Outer border + inner dark ring (graph-block aesthetic). */
+            g.setColour (borderCol);
+            g.drawRoundedRectangle (frect, cornerSize, 1.2f);
+            g.setColour (juce::Colours::black.withAlpha (0.55f));
+            g.drawRoundedRectangle (frect.reduced (1.2f, 1.2f),
+                                    juce::jmax (0.5f, cornerSize - 1.2f),
+                                    1.0f);
+        }
 
         const auto isLightTint = active && hasActiveTint
                                 && activeTint_.getPerceivedBrightness() > 0.55f;
@@ -194,6 +280,9 @@ private:
     juce::Colour tint_;
     juce::Colour activeTint_;
     IconDrawer   iconDrawer_;
+    bool         lcdBody_ { false };
+    bool         openRightEdge_ { false };
+    bool         paintShellOnly_ { false };
 };
 
 } // namespace element

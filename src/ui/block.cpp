@@ -18,6 +18,8 @@
 #include "ui/viewhelpers.hpp"
 #include "ui/block.hpp"
 #include "ui/blockutils.hpp"
+#include <element/ui/standard.hpp>
+#include "nodes/tracker.hpp"
 
 #include "scopedflag.hpp"
 #include "ui/categorycolors.hpp"
@@ -744,6 +746,24 @@ void BlockComponent::mouseUp (const MouseEvent& e)
     if (panel)
         panel->selectedNodes.addToSelectionOnMouseUp (node.getNodeId(), e.mods, dragging, selectionMouseDownResult);
 
+    if (e.mouseWasClicked() && e.getNumberOfClicks() == 1
+        && dynamic_cast<TrackerNode*> (node.getObject()) != nullptr)
+    {
+        /* Selection-follow: clicking a TrackerNode while the side
+         * dock is already visible re-targets it to that tracker.
+         * Doesn't auto-OPEN the dock -- that's reserved for
+         * double-click + the ArrangementView / SessionView clip
+         * affordances.  Keeps "which tracker is selected" + "which
+         * tracker is visible in the dock" in sync without forcing
+         * the dock onto users who haven't asked for it. */
+        if (auto* sc = dynamic_cast<StandardContent*> (
+                ViewHelpers::findContentComponent (this)))
+        {
+            if (sc->isTrackerDockVisible())
+                sc->showTrackerDockForNode (node.getUuid(), -1);
+        }
+    }
+
     if (e.mouseWasClicked() && e.getNumberOfClicks() == 2)
         makeEditorActive();
 }
@@ -763,6 +783,17 @@ void BlockComponent::makeEditorActive()
         // TODO: this can cause a crash, do it async
         if (auto* cc = ViewHelpers::findContentComponent (this))
             cc->setCurrentNode (node);
+    }
+    else if (dynamic_cast<TrackerNode*> (node.getObject()) != nullptr)
+    {
+        /* Tracker blocks route to the right-side TrackerSideDock
+         * instead of a floating PluginWindow.  Matches the same
+         * affordance ArrangementView + SessionView use, so trackers
+         * have one canonical edit surface no matter where the user
+         * double-clicks into them. */
+        if (auto* sc = dynamic_cast<StandardContent*> (
+                ViewHelpers::findContentComponent (this)))
+            sc->showTrackerDockForNode (node.getUuid(), -1);
     }
     else if (node.hasProperty (tags::missing))
     {

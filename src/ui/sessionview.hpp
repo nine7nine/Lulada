@@ -151,6 +151,7 @@ private:
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
     void deleteClip (SessionClip&);
     void openPatternEditor (SessionClip&);  // popup tracker editor at clip's seqIdx
+    void openTrackerDockForClip (SessionClip&);  // surface clip in the right-side TrackerSideDock
 
     void addScene();                  // append at end
     void insertScene (int beforeRow);

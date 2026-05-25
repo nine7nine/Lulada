@@ -49,6 +49,7 @@ public:
         toggleMeterBridge,
         toggleMainMenu,
         toggleTrackerStrip,
+        toggleNavSidebar,
 
         sessionClose = 0x0300,
         sessionOpen,
@@ -134,6 +135,7 @@ public:
             showDiskOp,
             toggleMainMenu,
             toggleTrackerStrip,
+            toggleNavSidebar,
 
             sessionClose,
             sessionOpen,
@@ -256,6 +258,9 @@ public:
             case Commands::toggleTrackerStrip:
                 return "toggleTrackerStrip";
                 break;
+            case Commands::toggleNavSidebar:
+                return "toggleNavSidebar";
+                break;
             case Commands::panic:
                 return "panic";
                 break;
@@ -338,6 +343,8 @@ public:
             return Commands::toggleMainMenu;
         if (str == "toggleTrackerStrip")
             return Commands::toggleTrackerStrip;
+        if (str == "toggleNavSidebar")
+            return Commands::toggleNavSidebar;
 
         if (str == "panic")
             return Commands::panic;

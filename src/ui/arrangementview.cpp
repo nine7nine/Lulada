@@ -814,8 +814,8 @@ public:
                 if (! body.contains (e.x, e.y)) continue;
                 if (auto* sc = dynamic_cast<StandardContent*> (
                         ViewHelpers::findContentComponent (this)))
-                    sc->showTrackerStripForNode (lane.targetNodeUuid,
-                                                  r.sequenceIdx);
+                    sc->showTrackerDockForNode (lane.targetNodeUuid,
+                                                 r.sequenceIdx);
                 return;
             }
             return;
@@ -1294,7 +1294,21 @@ public:
 
     /** Zoom out until the longest region's end fits inside the visible
      *  viewport width.  Scrolls back to x=0 (overview).  No-op if
-     *  there are no regions or the visible width is non-positive. */
+     *  there are no regions or the visible width is non-positive.
+     *
+     *  Width source = viewport.getMaximumVisibleWidth() (the
+     *  viewport's inner width minus the vertical scrollbar when
+     *  shown).  Earlier versions used viewport.getViewArea().getWidth()
+     *  which JUCE clamps to `min(contentWidth - scrollX, viewportInnerWidth)`
+     *  -- when content is narrower than the viewport that returned
+     *  the CONTENT width, making fit a no-op or, with the +4 beat
+     *  padding feedback loop, an incremental crawl over many clicks.
+     *
+     *  Padding compensation: resizeForLanes pads the body to
+     *  (maxBeats + kFitPaddingBeats) * pxPerBeat.  zoomToFit divides
+     *  by the SAME padded count so a single click lands an exact
+     *  fit; without compensation the body is ~kFitPaddingBeats *
+     *  pxPerBeat short of the viewport every time. */
     void zoomToFit()
     {
         double maxEndBeats = 0.0;
@@ -1303,21 +1317,23 @@ public:
                 maxEndBeats = juce::jmax (maxEndBeats, r.endBeats());
         if (maxEndBeats <= 0.0) return;
 
-        const auto viewArea = owner.viewport_.getViewArea();
-        const int availPx = viewArea.getWidth() - kLabelW - 8;
+        const int viewportInnerW = owner.viewport_.getMaximumVisibleWidth();
+        const int availPx = viewportInnerW - kLabelW - 8;
         if (availPx <= 0) return;
 
+        const double fitBeats = maxEndBeats + (double) kFitPaddingBeats;
         const int newPxPerBeat = juce::jlimit (kPxPerBeatMin, kPxPerBeatMax,
-            (int) std::floor ((double) availPx / maxEndBeats));
+            (int) std::floor ((double) availPx / fitBeats));
+
         if (newPxPerBeat == kPxPerBeat)
         {
-            owner.viewport_.setViewPosition (0, viewArea.getY());
+            owner.viewport_.setViewPosition (0, owner.viewport_.getViewPositionY());
             owner.writeViewStateToSession();
             return;
         }
         kPxPerBeat = newPxPerBeat;
         resizeForLanes();
-        owner.viewport_.setViewPosition (0, viewArea.getY());
+        owner.viewport_.setViewPosition (0, owner.viewport_.getViewPositionY());
         owner.writeViewStateToSession();
     }
 
@@ -1329,7 +1345,7 @@ public:
         /* Floor + per-lane padding tuned to keep the strip flush with
          * content.  Floor of 16 beats = 4 bars at 4/4 -- enough empty
          * timeline to be a drop target on a fresh session, no further.
-         * Padding of +4 beats past the last region = ~1 bar buffer to
+         * kFitPaddingBeats past the last region = ~1 bar buffer to
          * make trailing drag-resize feel snappy without leaving a
          * sea of empty area past the content.  Was 32 + 8 which left
          * 8 bars of wasted scroll area on session open. */
@@ -1339,7 +1355,7 @@ public:
             double end = 0.0;
             for (const auto& r : l.playlist.regions())
                 end = juce::jmax (end, r.endBeats());
-            const int needed = (int) end + 4;
+            const int needed = (int) end + kFitPaddingBeats;
             if (needed > maxBeats) maxBeats = needed;
         }
         const int w = kLabelW + maxBeats * kPxPerBeat;
@@ -1388,6 +1404,11 @@ public:
     int kPxPerBeat = 24;
     static constexpr int kPxPerBeatMin = 4;
     static constexpr int kPxPerBeatMax = 256;
+    /* Trailing empty-bar padding past the last region.  resizeForLanes
+     * sizes the body to (maxBeats + kFitPaddingBeats) * kPxPerBeat so
+     * the user has a snappy drag-resize target.  zoomToFit divides by
+     * the same padded count so a single click lands an exact fit. */
+    static constexpr int kFitPaddingBeats = 4;
     static constexpr int kRulerH         = 24;   /* bars:beats ruler row */
     static constexpr int kEdgeHandlePx   = 6;    /* width of right-edge resize handle */
     static constexpr int kDragThresholdPx = 4;   /* pixels before mouseDown -> drag */
@@ -2116,11 +2137,13 @@ private:
             g.setColour (fill);
             g.fillRoundedRectangle (rect.toFloat(), kCornerSize);
 
-            /* Bitwig-style region title strip: thin band across the
-             * top of the region in a more saturated/darker shade of
-             * the lane tint.  Holds the region label so the waveform
-             * area below stays uncluttered.  Squared-off bottom via
-             * an inner overdraw with the body fill below the band. */
+            /* Region title strip: thin band across the top of the
+             * region in a SUBTLY-tinted dark grey -- not the lane's
+             * full colour.  Border below keeps the full tint, so the
+             * region still reads as that lane's colour at a glance,
+             * but the title strip itself stays quiet so the white
+             * label reads cleanly and several stacked regions don't
+             * compete with hard saturation. */
             constexpr int kTitleH = 13;
             const Rectangle<int> titleRect (rect.getX(), rect.getY(),
                                              rect.getWidth(),
@@ -2129,9 +2152,9 @@ private:
                                             rect.getY() + titleRect.getHeight(),
                                             rect.getWidth(),
                                             juce::jmax (0, rect.getHeight() - titleRect.getHeight()));
-            juce::Colour titleFill = borderTint.withMultipliedBrightness (0.70f)
-                                                .withMultipliedSaturation (1.10f);
-            if (selected) titleFill = titleFill.brighter (0.25f);
+            const juce::Colour titleBase (0xff'14'14'14);
+            juce::Colour titleFill = titleBase.interpolatedWith (borderTint, 0.30f);
+            if (selected) titleFill = titleBase.interpolatedWith (borderTint, 0.55f);
             {
                 /* Clip to the rounded outer rect so the title band's
                  * top corners follow the region's rounding while its
@@ -2245,9 +2268,11 @@ private:
                 labelText = String (barAt) + " " +
                              (r.name.isNotEmpty() ? r.name : String ("Audio"));
 
-            g.setColour (juce::Colours::white.withAlpha (0.92f));
-            g.setFont (monoFont (
-                                          10.0f, juce::Font::bold));
+            /* Plain (not bold) for a quieter read against the
+             * subtly-tinted dark band -- the bold weight was
+             * fighting the border + waveform for visual weight. */
+            g.setColour (juce::Colours::white.withAlpha (0.85f));
+            g.setFont (monoFont (10.0f, juce::Font::plain));
             g.drawText (labelText,
                         titleRect.reduced (5, 0),
                         juce::Justification::centredLeft, true);
@@ -2713,12 +2738,19 @@ void ArrangementView::didBecomeActive()
      * so viewport_ has zero dimensions at this point and an immediate
      * setViewPosition would clamp to (0, 0).  callAsync defers past
      * resized() so loadViewStateFromSession (scroll only) applies
-     * against the real viewport area. */
+     * against the real viewport area.  After scroll restore we also
+     * try an auto-fit-to-content -- no-op when the session has a
+     * saved pxPerBeat, otherwise fits a fresh-load arrangement into
+     * the visible viewport instead of leaving it at the default
+     * (overflowing) kPxPerBeat = 24. */
     juce::Component::SafePointer<ArrangementView> self (this);
     juce::MessageManager::callAsync ([self]()
     {
         if (auto* v = self.getComponent())
+        {
             v->loadViewStateFromSession();
+            v->maybeAutoFitOnLoad();
+        }
     });
 }
 
@@ -3417,6 +3449,52 @@ void ArrangementView::loadZoomFromSession()
     body_->kLaneH = juce::jlimit (Body::kLaneHMin, Body::kLaneHMax,
         (int) vs.getProperty ("laneH", body_->kLaneH));
     body_->resizeForLanes();
+}
+
+bool ArrangementView::sessionHasSavedZoom() const
+{
+    if (services_ == nullptr) return false;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return false;
+    auto tree = sess->data().getChildWithName (tags::arrangement);
+    if (! tree.isValid()) return false;
+    auto vs = tree.getChildWithName ("viewState");
+    if (! vs.isValid()) return false;
+    return vs.hasProperty ("pxPerBeat");
+}
+
+void ArrangementView::maybeAutoFitOnLoad()
+{
+    if (body_ == nullptr) return;
+
+    double maxEndBeats = 0.0;
+    for (const auto& l : lanes_)
+        for (const auto& r : l.playlist.regions())
+            maxEndBeats = juce::jmax (maxEndBeats, r.endBeats());
+    if (maxEndBeats <= 0.0) return;
+
+    /* Two trigger conditions for auto-fit:
+     *   1. No saved zoom at all (fresh session, never been fit).
+     *   2. Saved zoom but content OVERFLOWS the viewport (the saved
+     *      value is stale -- e.g. user added regions since last
+     *      save, or the window is narrower than when it was saved,
+     *      OR the saved value was wrong because the old buggy
+     *      zoomToFit chronically undershot).
+     * When the saved zoom DOES fit, leave it alone -- the user
+     * picked it deliberately. */
+    const bool hasSaved = sessionHasSavedZoom();
+    bool overflows = false;
+    if (hasSaved)
+    {
+        const int contentW = Body::kLabelW
+                              + (int) (maxEndBeats + (double) Body::kFitPaddingBeats)
+                                * body_->kPxPerBeat;
+        const int viewW = viewport_.getMaximumVisibleWidth();
+        overflows = contentW > viewW;
+    }
+
+    if (! hasSaved || overflows)
+        body_->zoomToFit();
 }
 
 void ArrangementView::loadViewStateFromSession()

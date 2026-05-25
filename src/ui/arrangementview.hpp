@@ -190,6 +190,19 @@ private:
     void loadViewStateFromSession();
     void writeViewStateToSession();
 
+    /** True if the session's arrangement viewState VT already has a
+     *  saved pxPerBeat property.  Used to gate auto-fit-on-load: if
+     *  the user has previously set/saved a zoom, we restore it; if
+     *  not, we fit-to-content on first paint instead of defaulting
+     *  to the unfitted kPxPerBeat = 24. */
+    bool sessionHasSavedZoom() const;
+
+    /** Called after lanes + viewport are fully laid out on first
+     *  load.  Triggers zoomToFit() when the session has no saved
+     *  zoom AND the arrangement has content; otherwise no-op so the
+     *  saved zoom from loadZoomFromSession sticks. */
+    void maybeAutoFitOnLoad();
+
     /** AsyncUpdater target -- coalesces N stabilizeContent + N
      *  ValueTree-listener triggers in one event-loop tick into one
      *  attachToActiveGraph + rescanLaneTargets pass on the next.

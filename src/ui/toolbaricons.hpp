@@ -225,6 +225,86 @@ inline void iconSession (juce::Graphics& g, juce::Rectangle<float> b, juce::Colo
     g.fillRoundedRectangle (box.getRight() - cellW,    box.getBottom() - cellH,    cellW, cellH, 1.0f);
 }
 
+inline void iconNodeBlock (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+{
+    /* Single graph-block silhouette with 2 input + 2 output ports.
+     * Visual cue for "Node properties / selected node". */
+    const auto box = b.reduced (b.getWidth() * 0.20f, b.getHeight() * 0.18f);
+    g.setColour (fg);
+    g.drawRoundedRectangle (box, 1.6f, 1.3f);
+    /* Ports: 2 dots on top edge, 2 on bottom. */
+    const float portR = juce::jmin (box.getWidth(), box.getHeight()) * 0.07f;
+    const float x1 = box.getX() + box.getWidth() * 0.30f;
+    const float x2 = box.getX() + box.getWidth() * 0.70f;
+    g.fillEllipse (x1 - portR, box.getY() - portR, portR * 2.0f, portR * 2.0f);
+    g.fillEllipse (x2 - portR, box.getY() - portR, portR * 2.0f, portR * 2.0f);
+    g.fillEllipse (x1 - portR, box.getBottom() - portR, portR * 2.0f, portR * 2.0f);
+    g.fillEllipse (x2 - portR, box.getBottom() - portR, portR * 2.0f, portR * 2.0f);
+}
+
+inline void iconNavToggle (juce::Graphics& g, juce::Rectangle<float> b,
+                            juce::Colour fg, bool sidebarExpanded)
+{
+    /* "Sidebar toggle" affordance.  Outer rounded rectangle (the
+     * whole window/content area) + a darker filled column on the
+     * LEFT representing the sidebar.  When the sidebar is currently
+     * expanded, the column is wide (~35%); when collapsed, narrow
+     * (~18%) so the icon visually communicates the upcoming state
+     * change.  Three horizontal "row" lines on the right hint at the
+     * panel content remaining visible. */
+    const auto box = b.reduced (b.getWidth() * 0.10f, b.getHeight() * 0.14f);
+
+    g.setColour (fg);
+    g.drawRoundedRectangle (box, 1.6f, 1.4f);
+
+    /* Sidebar column: filled solid in the same fg so the cue reads
+     * at small sizes.  Width swings between collapsed/expanded
+     * presentation -- the value the user is ABOUT to collapse INTO
+     * is what the icon depicts (matches the platform convention of
+     * "icon shows result"). */
+    const float colFrac = sidebarExpanded ? 0.28f : 0.46f;
+    const float colW    = box.getWidth() * colFrac;
+    const auto col      = juce::Rectangle<float> (box.getX(), box.getY(),
+                                                    colW, box.getHeight()).reduced (1.2f);
+    g.fillRect (col);
+
+    /* Content "rows" on the right side of the divider -- three
+     * short horizontal lines, evenly spaced. */
+    const float rightX  = box.getX() + colW + 2.0f;
+    const float rightW  = (box.getRight() - rightX) - 3.0f;
+    if (rightW > 4.0f)
+    {
+        const float rowH = box.getHeight() / 6.0f;
+        for (int i = 0; i < 3; ++i)
+        {
+            const float y = box.getY() + rowH * (1.0f + (float) i * 1.5f);
+            g.drawLine (rightX + 1.0f, y, rightX + rightW * 0.85f, y, 1.2f);
+        }
+    }
+}
+
+inline void iconKnobs (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+{
+    /* Three vertical slider tracks with caps at varying heights --
+     * "node editor" cue.  Mirrors a synth front-panel slider bank. */
+    const auto box = b.reduced (b.getWidth() * 0.16f, b.getHeight() * 0.14f);
+    const float trackW = juce::jmax (1.4f, box.getWidth() * 0.06f);
+    const float capW   = juce::jmax (3.0f, box.getWidth() * 0.18f);
+    const float capH   = juce::jmax (2.5f, box.getHeight() * 0.10f);
+    const float colGap = box.getWidth() / 3.0f;
+    const float caps[3] = { 0.30f, 0.65f, 0.45f }; /* fraction down from top */
+    g.setColour (fg);
+    for (int i = 0; i < 3; ++i)
+    {
+        const float cx = box.getX() + colGap * (i + 0.5f);
+        /* Track */
+        g.fillRect (cx - trackW * 0.5f, box.getY(), trackW, box.getHeight());
+        /* Cap */
+        const float capY = box.getY() + (box.getHeight() - capH) * caps[i];
+        g.fillRoundedRectangle (cx - capW * 0.5f, capY, capW, capH, 1.0f);
+    }
+}
+
 inline void iconDisk (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
 {
     /* Floppy disk: outer rect, top notch (label) + inner shutter. */
