@@ -11,6 +11,7 @@
 #include "ui/categorycolors.hpp"
 #include "ui/channelstrip.hpp"
 #include "ui/fontcache.hpp"
+#include "ui/viewhelpers.hpp"
 #include "services/sessionservice.hpp"
 
 namespace element {
@@ -209,7 +210,15 @@ public:
          * Same idiom across the four primary views. */
         const juce::Colour kGutterColour     { 0xff'14'14'14 };
         const juce::Colour kRowDividerColour { 0xff'22'22'22 };
-        const juce::Colour tint = colorForNode (node);
+        /* Prefer the Arrangement Lane colour when the node is bound
+         * to a lane (Bitwig / Ableton track-colour convention).  Falls
+         * back to category / format colour when no lane binding exists
+         * (graph-only nodes like the synth pseudo-nodes, plugins not
+         * placed in an arrangement lane, etc.). */
+        juce::ValueTree sessionRoot;
+        if (auto sess = ViewHelpers::getSession (this))
+            sessionRoot = sess->data();
+        const juce::Colour tint = colorForNodeWithLane (node, sessionRoot);
 
         const auto bounds = getLocalBounds();
         constexpr int kNameBandH = 22;

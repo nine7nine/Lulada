@@ -493,7 +493,12 @@ StandardContent::StandardContent (Context& ctl_)
     nav->updateContent();
 
     toolBarVisible = true;
-    toolBarSize = 32;
+    /* Taller toolbar -- absorbs the vertical strip the menu bar
+     * currently uses (~24 px) PLUS extra room so the LCD-style sub-
+     * labels (FILE / PLUG / PREF / PLAY / STOP / REC / REW / GRAPH /
+     * ARR / TRK / SESS / PATCH) sit comfortably under each icon
+     * inside the cluster bezels.  Menu removal is a follow-up. */
+    toolBarSize = 96;
     statusBarVisible = true;
     statusBarSize = 22;
 

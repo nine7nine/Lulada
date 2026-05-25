@@ -45,6 +45,17 @@ MainWindow::MainWindow (Context& g)
     openGLContext.attachTo (*this);
 }
 
+void MainWindow::toggleMenuBar()
+{
+    if (mainMenu == nullptr) return;
+    /* DocumentWindow tracks the current model via getMenuBarComponent;
+     * NULL when hidden, non-null when shown.  Toggle accordingly. */
+    if (getMenuBarComponent() != nullptr)
+        setMenuBar (nullptr);
+    else
+        setMenuBar (mainMenu.get());
+}
+
 MainWindow::~MainWindow()
 {
     openGLContext.detach();

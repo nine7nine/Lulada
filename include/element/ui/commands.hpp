@@ -47,6 +47,7 @@ public:
         showSessionView,
         showDiskOp,
         toggleMeterBridge,
+        toggleMainMenu,
 
         sessionClose = 0x0300,
         sessionOpen,
@@ -130,6 +131,7 @@ public:
             showTrackerHost,
             showSessionView,
             showDiskOp,
+            toggleMainMenu,
 
             sessionClose,
             sessionOpen,
@@ -246,6 +248,9 @@ public:
             case Commands::showDiskOp:
                 return "showDiskOp";
                 break;
+            case Commands::toggleMainMenu:
+                return "toggleMainMenu";
+                break;
             case Commands::panic:
                 return "panic";
                 break;
@@ -324,6 +329,8 @@ public:
             return Commands::showSessionView;
         if (str == "showDiskOp")
             return Commands::showDiskOp;
+        if (str == "toggleMainMenu")
+            return Commands::toggleMainMenu;
 
         if (str == "panic")
             return Commands::panic;

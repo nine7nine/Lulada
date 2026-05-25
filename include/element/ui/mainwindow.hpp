@@ -31,6 +31,12 @@ public:
     void activeWindowStatusChanged() override;
     void refreshName();
 
+    /** Show / hide the top menu bar.  Bound to Commands::toggleMainMenu
+     *  (default Ctrl+M).  Toggling off frees the top vertical strip
+     *  for the new LCD-labeled toolbar; toggling on restores the
+     *  legacy File / Edit / View menus. */
+    void toggleMenuBar();
+
 private:
     friend class GuiService;
 
