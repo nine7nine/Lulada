@@ -19,6 +19,7 @@ class MeterBridgeView;
 class GuiService;
 class ContentContainer;
 class NavigationConcertinaPanel;
+class NavigationSidebar;
 class NodeChannelStripView;
 class VirtualKeyboardView;
 class TrackerStripView;
@@ -34,7 +35,13 @@ public:
 
     void resizeContent (const juce::Rectangle<int>& area) override;
 
-    NavigationConcertinaPanel* getNavigationConcertinaPanel() const { return nav.get(); }
+    NavigationConcertinaPanel* getNavigationConcertinaPanel() const;
+    NavigationSidebar*         getNavigationSidebar()         const { return nav.get(); }
+
+    /** Toggle the sidebar between collapsed (icon strip) and expanded
+     *  (concertina) modes.  Bound to Ctrl+B via Commands::toggleNavSidebar. */
+    void setNavSidebarCollapsed (bool);
+    bool isNavSidebarCollapsed() const;
 
     void setMainView (const juce::String& name);
     void setSecondaryView (const juce::String& name);
@@ -109,7 +116,7 @@ protected:
     virtual ContentView* createContentView (const juce::String&) { return nullptr; }
 
 private:
-    std::unique_ptr<NavigationConcertinaPanel> nav;
+    std::unique_ptr<NavigationSidebar> nav;
     friend class ContentContainer;
     std::unique_ptr<ContentContainer> container;
     juce::StretchableLayoutManager layout;

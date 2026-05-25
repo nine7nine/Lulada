@@ -32,6 +32,7 @@
 #include "ui/luaconsoleview.hpp"
 #include "ui/mainmenu.hpp"
 #include "ui/navigationview.hpp"
+#include "ui/navigationsidebar.hpp"
 #include "ui/nodechannelstripview.hpp"
 #include "ui/pluginspanelview.hpp"
 #include "ui/sessiontreepanel.hpp"
@@ -489,9 +490,35 @@ StandardContent::StandardContent (Context& ctl_)
     addAndMakeVisible (container.get());
     bar1 = std::make_unique<Resizer> (*this, &layout, 1, true);
     addAndMakeVisible (bar1.get());
-    nav = std::make_unique<NavigationConcertinaPanel> (ctl_);
+    nav = std::make_unique<NavigationSidebar> (ctl_);
     addAndMakeVisible (nav.get());
     nav->updateContent();
+    nav->onLayoutInvalidated = [this]() {
+        /* Sidebar's collapse state changed (header chevron, icon
+         * click, or Ctrl+B).  Re-derive the StretchableLayoutManager
+         * column rules from the sidebar's desired width so both the
+         * resizer min/max + the laid-out width follow.  Without this
+         * the layout manager stays locked at the previous state's
+         * column width and either:
+         *   (a) collapsed -> icon strip appears in a 304px column
+         *       with the panel content hidden, or
+         *   (b) expanded -> concertina is squeezed into the 52px
+         *       collapsed column. */
+        if (! nav) return;
+        if (nav->isCollapsed())
+        {
+            const int w = NavigationSidebar::kCollapsedW;
+            layout.setItemLayout (0, w, w, w);
+            nav->setSize (w, nav->getHeight());
+        }
+        else
+        {
+            const int w = nav->getExpandedWidth();
+            layout.setItemLayout (0, w, w, w);
+            nav->setSize (w, nav->getHeight());
+        }
+        resized();
+    };
 
     toolBarVisible = true;
     /* Taller toolbar -- absorbs the vertical strip the menu bar
@@ -508,11 +535,14 @@ StandardContent::StandardContent (Context& ctl_)
     setMainView (EL_VIEW_GRAPH_EDITOR);
 
     nav->setSize (304, getHeight());
+    nav->setExpandedWidth (304);
     resizerMouseUp();
-    if (auto gp = nav->findPanel<GraphSettingsView>())
-        nav->expandPanelFully (gp, false);
-    if (auto stp = nav->findPanel<SessionTreePanel>())
-        nav->setPanelSize (stp, 200, false);
+    /* Don't call expandPanelFully / setPanelSize on the concertina
+     * here -- in the new VS-Code-style model the concertina is just
+     * a panel registry, not a rendered accordion.  Its internal
+     * layout machinery operates on panels we've reparented away,
+     * which crashes.  Section selection is driven by
+     * setActiveSection() instead. */
 
     resized();
 
@@ -602,6 +632,24 @@ String StandardContent::getAccessoryViewName() const
 int StandardContent::getNavSize()
 {
     return nav != nullptr ? nav->getWidth() : 220;
+}
+
+NavigationConcertinaPanel* StandardContent::getNavigationConcertinaPanel() const
+{
+    return nav != nullptr ? nav->concertina() : nullptr;
+}
+
+void StandardContent::setNavSidebarCollapsed (bool c)
+{
+    if (nav == nullptr) return;
+    /* setCollapsed fires onLayoutInvalidated which centralises the
+     * layout-rule update + parent resize -- nothing else to do here. */
+    nav->setCollapsed (c);
+}
+
+bool StandardContent::isNavSidebarCollapsed() const
+{
+    return nav != nullptr && nav->isCollapsed();
 }
 
 ContentView* StandardContent::lookupOrCreateMainView (const String& name)
@@ -1021,9 +1069,25 @@ void StandardContent::restoreState (PropertiesFile* props)
     setTrackerStripVisible (props->getBoolValue ("trackerStrip", trackerStripVisible_));
 
     {
-        auto ns = props->getIntValue ("standardNavSize", getNavSize());
+        /* Prefer the new wrapper-managed keys (navExpandedWidth /
+         * navCollapsed restored in NavigationSidebar::restoreState)
+         * over the legacy standardNavSize.  If the user came from an
+         * older session the wrapper falls back to its default 304;
+         * we then honour the legacy key so they don't lose their
+         * tuned width. */
         if (nav)
-            nav->setSize (ns, nav->getHeight());
+        {
+            if (! props->containsKey ("navExpandedWidth")
+                && props->containsKey ("standardNavSize"))
+            {
+                nav->setExpandedWidth (props->getIntValue ("standardNavSize",
+                                                            nav->getExpandedWidth()));
+            }
+            const int w = nav->isCollapsed()
+                            ? NavigationSidebar::kCollapsedW
+                            : nav->getExpandedWidth();
+            nav->setSize (w, nav->getHeight());
+        }
         resizerMouseUp();
     }
 
@@ -1050,7 +1114,20 @@ void StandardContent::setCurrentNode (const Node& node)
 
 void StandardContent::updateLayout()
 {
-    layout.setItemLayout (0, EL_NAV_MIN_WIDTH, EL_NAV_MAX_WIDTH, nav->getWidth());
+    if (nav && nav->isCollapsed())
+    {
+        /* Collapsed: lock the column to a fixed icon-strip width.
+         * Equal min/max prevents the resizer from dragging it.
+         * Resizer itself becomes a visual no-op (still painted, but
+         * any drag is clamped to the fixed width). */
+        const int w = NavigationSidebar::kCollapsedW;
+        layout.setItemLayout (0, w, w, w);
+    }
+    else
+    {
+        layout.setItemLayout (0, EL_NAV_MIN_WIDTH, EL_NAV_MAX_WIDTH,
+                                nav ? nav->getWidth() : 304);
+    }
     layout.setItemLayout (1, 2, 2, 2);
     layout.setItemLayout (2, 100, -1, 400);
 }
@@ -1062,7 +1139,17 @@ void StandardContent::resizerMouseDown()
 
 void StandardContent::resizerMouseUp()
 {
-    layout.setItemLayout (0, nav->getWidth(), nav->getWidth(), nav->getWidth());
+    if (nav && nav->isCollapsed())
+    {
+        const int w = NavigationSidebar::kCollapsedW;
+        layout.setItemLayout (0, w, w, w);
+    }
+    else
+    {
+        const int w = nav ? nav->getWidth() : 304;
+        layout.setItemLayout (0, w, w, w);
+        if (nav) nav->setExpandedWidth (w);
+    }
     layout.setItemLayout (1, 2, 2, 2);
     layout.setItemLayout (2, 100, -1, 400);
     resized();
@@ -1164,6 +1251,7 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::toggleMeterBridge,
         Commands::toggleChannelStrip,
         Commands::toggleTrackerStrip,
+        Commands::toggleNavSidebar,
         Commands::showLastContentView,
         Commands::rotateContentView,
         Commands::selectAll
@@ -1313,6 +1401,18 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
             result.addDefaultKeypress ('t', ModifierKeys::commandModifier);
             break;
         }
+        case Commands::toggleNavSidebar: {
+            int flags = 0;
+            /* Tick when the sidebar is EXPANDED -- the menu item then
+             * reads as "Sidebar is on", matching the way Channel Strip
+             * / Meter Bridge ticks when their feature is visible. */
+            if (! isNavSidebarCollapsed()) flags |= Info::isTicked;
+            result.setInfo ("Sidebar",
+                            "Collapse / expand the left navigation sidebar",
+                            "UI", flags);
+            result.addDefaultKeypress ('b', ModifierKeys::commandModifier);
+            break;
+        }
         case Commands::showLastContentView: {
             result.setInfo ("Last View", "Shows the last shown View", "UI", 0);
             break;
@@ -1407,6 +1507,9 @@ bool StandardContent::perform (const InvocationInfo& info)
             break;
         case Commands::toggleTrackerStrip:
             setTrackerStripVisible (! isTrackerStripVisible());
+            break;
+        case Commands::toggleNavSidebar:
+            setNavSidebarCollapsed (! isNavSidebarCollapsed());
             break;
         case Commands::showLastContentView:
             backMainView();
