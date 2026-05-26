@@ -31,6 +31,7 @@ add_test(NAME "AutomationTargetTests" COMMAND test_element --run_test=Automation
 add_test(NAME "AutomationEngineTests" COMMAND test_element --run_test=AutomationEngineTests)
 add_test(NAME "MidiNoteRegionTests" COMMAND test_element --run_test=MidiNoteRegionTests)
 add_test(NAME "MidiSourceTests" COMMAND test_element --run_test=MidiSourceTests)
+add_test(NAME "MidiLaneTests" COMMAND test_element --run_test=MidiLaneTests)
 add_test(NAME "BytesTest" COMMAND test_element --run_test=BytesTest)
 add_test(NAME "JuceIntegrationTests" COMMAND test_element --run_test=JuceIntegrationTests)
 add_test(NAME "DataPathTests" COMMAND test_element --run_test=DataPathTests)

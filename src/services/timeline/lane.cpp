@@ -8,6 +8,7 @@ namespace element {
 namespace {
 const juce::Identifier kIdAttr        ("id");
 const juce::Identifier kNameAttr      ("name");
+const juce::Identifier kKindAttr      ("kind");
 const juce::Identifier kColourAttr    ("colour");
 const juce::Identifier kHeightAttr    ("heightPx");
 const juce::Identifier kMutedAttr     ("muted");
@@ -21,6 +22,9 @@ juce::ValueTree Lane::toValueTree() const
     juce::ValueTree v ("lane");
     v.setProperty (kIdAttr,     id.toString(),             nullptr);
     if (name.isNotEmpty())  v.setProperty (kNameAttr,   name,                 nullptr);
+    /* Sparse-write: Kind::Audio is the default, only emit attr when
+     * MIDI.  Keeps existing sessions byte-identical on round-trip. */
+    if (kind != Kind::Audio) v.setProperty (kKindAttr, (int) kind, nullptr);
     v.setProperty (kColourAttr, colour.toString(),         nullptr);
     if (heightPx != 60)     v.setProperty (kHeightAttr, heightPx,             nullptr);
     if (muted)              v.setProperty (kMutedAttr,  true,                 nullptr);
@@ -39,6 +43,10 @@ Lane Lane::fromValueTree (const juce::ValueTree& v)
 
     l.id             = juce::Uuid (v.getProperty (kIdAttr).toString());
     l.name           = v.getProperty (kNameAttr,   juce::String()).toString();
+    {
+        const int k = (int) v.getProperty (kKindAttr, (int) Kind::Audio);
+        l.kind = (k == (int) Kind::Midi) ? Kind::Midi : Kind::Audio;
+    }
     {
         const juce::String s = v.getProperty (kColourAttr).toString();
         if (s.isNotEmpty()) l.colour = juce::Colour::fromString (s);

@@ -16,6 +16,31 @@ Playlist::Playlist()
 {
 }
 
+Playlist::Playlist (const Playlist& other)
+    : id_       (other.id_),
+      regions_  (other.regions_)
+{
+    /* MidiNoteRegion is non-copyable; clone each one.  The cloned
+     * vector keeps the same beat-sort order as the source. */
+    midiRegions_.reserve (other.midiRegions_.size());
+    for (const auto& m : other.midiRegions_)
+        if (m != nullptr)
+            midiRegions_.push_back (m->clone());
+}
+
+Playlist& Playlist::operator= (const Playlist& other)
+{
+    if (this == &other) return *this;
+    id_      = other.id_;
+    regions_ = other.regions_;
+    midiRegions_.clear();
+    midiRegions_.reserve (other.midiRegions_.size());
+    for (const auto& m : other.midiRegions_)
+        if (m != nullptr)
+            midiRegions_.push_back (m->clone());
+    return *this;
+}
+
 bool Playlist::addRegion (Region r)
 {
     if (r.lengthBeats < 0.0)  return false;
@@ -147,12 +172,71 @@ void Playlist::rebuildOrder() noexcept
                });
 }
 
+//==============================================================================
+// MIDI region operations.  Parallel to the audio/tracker region API; the
+// storage shape is std::vector<unique_ptr<MidiNoteRegion>> because
+// MidiNoteRegion is non-copyable.
+
+bool Playlist::addMidiRegion (std::unique_ptr<MidiNoteRegion> r)
+{
+    if (r == nullptr)                return false;
+    if (r->lengthBeats < 0.0)        return false;
+
+    midiRegions_.push_back (std::move (r));
+    rebuildMidiOrder();
+    return true;
+}
+
+bool Playlist::removeMidiRegion (juce::Uuid regionId)
+{
+    const auto before = midiRegions_.size();
+    midiRegions_.erase (
+        std::remove_if (midiRegions_.begin(), midiRegions_.end(),
+                        [regionId] (const std::unique_ptr<MidiNoteRegion>& m)
+                        {
+                            return m != nullptr && m->id == regionId;
+                        }),
+        midiRegions_.end());
+    return midiRegions_.size() != before;
+}
+
+MidiNoteRegion* Playlist::findMidiRegion (juce::Uuid regionId) noexcept
+{
+    for (auto& m : midiRegions_)
+        if (m != nullptr && m->id == regionId)
+            return m.get();
+    return nullptr;
+}
+
+const MidiNoteRegion* Playlist::findMidiRegion (juce::Uuid regionId) const noexcept
+{
+    for (const auto& m : midiRegions_)
+        if (m != nullptr && m->id == regionId)
+            return m.get();
+    return nullptr;
+}
+
+void Playlist::rebuildMidiOrder() noexcept
+{
+    std::sort (midiRegions_.begin(), midiRegions_.end(),
+               [] (const std::unique_ptr<MidiNoteRegion>& a,
+                   const std::unique_ptr<MidiNoteRegion>& b)
+               {
+                   if (a == nullptr) return false;
+                   if (b == nullptr) return true;
+                   return a->positionBeats < b->positionBeats;
+               });
+}
+
 juce::ValueTree Playlist::toValueTree() const
 {
     juce::ValueTree v ("playlist");
     v.setProperty (kIdAttr, id_.toString(), nullptr);
     for (const auto& r : regions_)
         v.appendChild (r.toValueTree(), nullptr);
+    for (const auto& m : midiRegions_)
+        if (m != nullptr)
+            v.appendChild (m->toValueTree(), nullptr);
     return v;
 }
 
@@ -168,10 +252,19 @@ Playlist Playlist::fromValueTree (const juce::ValueTree& v)
     for (int i = 0; i < v.getNumChildren(); ++i)
     {
         const auto child = v.getChild (i);
-        if (child.getType() != juce::Identifier ("region")) continue;
-        p.regions_.push_back (Region::fromValueTree (child));
+        if (child.getType() == juce::Identifier ("region"))
+        {
+            p.regions_.push_back (Region::fromValueTree (child));
+        }
+        else if (child.getType() == juce::Identifier ("midiNoteRegion"))
+        {
+            auto m = MidiNoteRegion::fromValueTree (child);
+            if (m != nullptr)
+                p.midiRegions_.push_back (std::move (m));
+        }
     }
     p.rebuildOrder();
+    p.rebuildMidiOrder();
     return p;
 }
 
