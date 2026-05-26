@@ -154,13 +154,22 @@ PianoRollView::PianoRollView (Services& services)
     };
     addAndMakeVisible (snapBtn_);
 
-    snapBox_.addItem ("1/32",   1);
-    snapBox_.addItem ("1/16",   2);
-    snapBox_.addItem ("1/8",    3);
-    snapBox_.addItem ("1/4",    4);
-    snapBox_.addItem ("1/2",    5);
-    snapBox_.addItem ("Bar",    6);
-    snapBox_.setSelectedId (2, juce::dontSendNotification);
+    /* Snap divisions -- standard DAW menu including triplets.  IDs
+     * are stable across versions so persisted picks (future Phase
+     * 4) stay valid.  Triplet entries express N notes in the time
+     * of N-1 of the next-larger duple division (1/4T = 2/3 beat;
+     * 1/8T = 1/3 beat; 1/16T = 1/6 beat) -- standard music notation
+     * convention. */
+    snapBox_.addItem ("Bar",     1);
+    snapBox_.addItem ("1/2",     2);
+    snapBox_.addItem ("1/4",     3);
+    snapBox_.addItem ("1/8",     4);
+    snapBox_.addItem ("1/16",    5);
+    snapBox_.addItem ("1/32",    6);
+    snapBox_.addItem ("1/4T",   10);   /* quarter triplet -- 2/3 beat */
+    snapBox_.addItem ("1/8T",   11);   /* eighth triplet  -- 1/3 beat */
+    snapBox_.addItem ("1/16T",  12);   /* sixteenth triplet -- 1/6 beat */
+    snapBox_.setSelectedId (5, juce::dontSendNotification);   /* 1/16 */
     snapBox_.onChange = [this]() { applySnapFromComboBox(); };
     snapBox_.setColour (juce::ComboBox::backgroundColourId,
                          juce::Colour (0xff'2c'2c'2c));
@@ -172,13 +181,27 @@ PianoRollView::PianoRollView (Services& services)
                          juce::Colour (0xff'a0'a0'a0));
     addAndMakeVisible (snapBox_);
 
-    /* Zoom controls -- match ArrangementView's [- + Fit] triplet. */
+    /* Zoom controls -- X axis (beat span).  Mirrors ArrangementView's
+     * [- + Fit] triplet. */
     zoomOutBtn_.onClick = [this]() { if (grid_) grid_->zoomBy (1.0 / 1.20); };
     zoomInBtn_ .onClick = [this]() { if (grid_) grid_->zoomBy (1.20); };
     zoomFitBtn_.onClick = [this]() { if (grid_) grid_->zoomToFit(); };
     addAndMakeVisible (zoomOutBtn_);
     addAndMakeVisible (zoomInBtn_);
     addAndMakeVisible (zoomFitBtn_);
+
+    /* Y zoom -- visible pitch span.  Step factor 1.20 matches the X
+     * zoom; the keyboard component clamps to >= 12 semitones visible. */
+    yZoomOutBtn_.setTooltip ("Show more octaves (zoom out vertically)");
+    yZoomInBtn_ .setTooltip ("Show fewer octaves (zoom in vertically)");
+    yZoomOutBtn_.onClick = [this]() {
+        if (keyboard_) { keyboard_->zoomVertically (1.20); if (grid_) grid_->repaint(); }
+    };
+    yZoomInBtn_.onClick = [this]() {
+        if (keyboard_) { keyboard_->zoomVertically (1.0 / 1.20); if (grid_) grid_->repaint(); }
+    };
+    addAndMakeVisible (yZoomOutBtn_);
+    addAndMakeVisible (yZoomInBtn_);
 
     addAndMakeVisible (closeBtn_);
     closeBtn_.setTooltip ("Hide piano-roll dock");
@@ -238,15 +261,22 @@ void PianoRollView::syncToolToggles()
 void PianoRollView::applySnapFromComboBox()
 {
     if (grid_ == nullptr) return;
+    /* Snap-in-beats lookup table.  Beat = quarter note convention so
+     * 1/4 = 1.0 beat.  Triplet values are exact fractions (1/3, 2/3,
+     * 1/6) -- the grid's snapBeat() rounding handles the math
+     * correctly so the user gets pixel-perfect snap at any zoom. */
     double div = 0.25;
     switch (snapBox_.getSelectedId())
     {
-        case 1: div = 0.125; break;   /* 1/32 */
-        case 2: div = 0.25;  break;   /* 1/16 (default) */
-        case 3: div = 0.5;   break;   /* 1/8  */
-        case 4: div = 1.0;   break;   /* 1/4  */
-        case 5: div = 2.0;   break;   /* 1/2  */
-        case 6: div = 4.0;   break;   /* bar (assumes 4/4) */
+        case 1:  div = 4.0;       break;   /* Bar (4/4 assumption) */
+        case 2:  div = 2.0;       break;   /* 1/2 */
+        case 3:  div = 1.0;       break;   /* 1/4 */
+        case 4:  div = 0.5;       break;   /* 1/8 */
+        case 5:  div = 0.25;      break;   /* 1/16 (default) */
+        case 6:  div = 0.125;     break;   /* 1/32 */
+        case 10: div = 2.0 / 3.0; break;   /* 1/4T  -- 2/3 beat */
+        case 11: div = 1.0 / 3.0; break;   /* 1/8T  -- 1/3 beat */
+        case 12: div = 1.0 / 6.0; break;   /* 1/16T -- 1/6 beat */
         default: break;
     }
     grid_->setSnapDivision (div);
@@ -305,47 +335,53 @@ void PianoRollView::resized()
     auto r = getLocalBounds();
     dragHandle_->setBounds (r.removeFromTop (kDragHandleH));
 
+    /* Header layout LEFT -> RIGHT (mirrors ArrangementView's row):
+     *   Select Pencil Erase | Snap snapBox | X+/-/Fit | Y+ Y-
+     *   ...(label fills middle)... | close X
+     */
     auto header = r.removeFromTop (kHeaderH);
-    /* Right side of the header (read R-to-L):
-     *   close X | Fit | + | - | snapBox | Snap | Erase | Pencil | Select
-     * Each chunk slightly padded.  Region label fills the remaining
-     * space on the left. */
-    closeBtn_.setBounds (header.removeFromRight (kHeaderH).reduced (3));
+    const int yPad = 3;
+    header = header.reduced (4, yPad);
+
+    auto layoutLeftBtn = [&header] (juce::Component& c, int w, int gap = 3) {
+        c.setBounds (header.removeFromLeft (w));
+        header.removeFromLeft (gap);
+    };
+
+    layoutLeftBtn (selectBtn_, kToolBtnW);
+    layoutLeftBtn (pencilBtn_, kToolBtnW);
+    layoutLeftBtn (eraseBtn_,  kToolBtnW, 12);
+
+    layoutLeftBtn (snapBtn_,   kToolBtnW);
+    layoutLeftBtn (snapBox_,   kSnapBoxW, 12);
+
+    layoutLeftBtn (zoomOutBtn_, kZoomBtnW);
+    layoutLeftBtn (zoomInBtn_,  kZoomBtnW);
+    layoutLeftBtn (zoomFitBtn_, kZoomBtnW + 6, 12);
+
+    layoutLeftBtn (yZoomOutBtn_, kZoomBtnW + 6);
+    layoutLeftBtn (yZoomInBtn_,  kZoomBtnW + 6, 12);
+
+    /* Close X on the far right. */
+    closeBtn_.setBounds (header.removeFromRight (kHeaderH - 2 * yPad));
     header.removeFromRight (6);
 
-    auto zoomArea = header.removeFromRight (kZoomBtnW * 3 + 6 + kZoomBtnW).reduced (2);
-    /* Layout R-to-L matches the button order Fit / + / - left of Fit. */
-    zoomFitBtn_.setBounds (zoomArea.removeFromRight (kZoomBtnW + 6));
-    zoomArea.removeFromRight (3);
-    zoomInBtn_ .setBounds (zoomArea.removeFromRight (kZoomBtnW));
-    zoomArea.removeFromRight (3);
-    zoomOutBtn_.setBounds (zoomArea.removeFromRight (kZoomBtnW));
-
-    header.removeFromRight (8);
-    snapBox_.setBounds (header.removeFromRight (kSnapBoxW).reduced (2));
-    header.removeFromRight (3);
-    snapBtn_.setBounds (header.removeFromRight (kToolBtnW).reduced (2));
-    header.removeFromRight (10);
-
-    auto toolArea = header.removeFromRight (kToolBtnW * 3 + 6).reduced (2);
-    eraseBtn_  .setBounds (toolArea.removeFromRight (kToolBtnW));
-    toolArea.removeFromRight (3);
-    pencilBtn_ .setBounds (toolArea.removeFromRight (kToolBtnW));
-    toolArea.removeFromRight (3);
-    selectBtn_ .setBounds (toolArea.removeFromRight (kToolBtnW));
-
-    regionLabel_.setBounds (header.reduced (6, 2));
+    /* Region label fills whatever's left in the middle.  Justify left
+     * so the title doesn't drift around as the dock width changes. */
+    regionLabel_.setBounds (header);
 
     /* Body: keyboard column on the left, grid viewport fills the rest.
      * Keyboard is offset DOWN by the grid's ruler height so the first
-     * key (C7 at the top) lines up vertically with the grid's first
-     * note row.  The dock paints the corner above the keyboard with
-     * the same colour as the grid's ruler strip so the gap reads as
-     * intentional. */
+     * key (highest visible pitch) lines up vertically with the grid's
+     * first note row.  The dock paints the corner above the keyboard
+     * with the same colour as the grid's ruler strip so the gap reads
+     * as intentional. */
     if (keyboard_ != nullptr)
     {
         auto kbCol = r.removeFromLeft (kKeyboardW);
         keyboard_->setBounds (kbCol.withTrimmedTop (PianoRollGrid::kRulerH));
+        /* PianoRollKeyboard::resized() recomputes per-key Y extent
+         * from the new height + current visible range. */
     }
     else
     {

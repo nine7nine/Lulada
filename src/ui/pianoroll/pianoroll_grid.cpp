@@ -448,51 +448,76 @@ void PianoRollGrid::paintRuler (juce::Graphics& g, int beatsPerBar)
     const auto vr = visibleRect();
     if (vr.getWidth() <= 0 || pxPerBeat_ <= 0) return;
 
+    /* Palette mirrors ArrangementView::paintRuler -- bezel + cool-grey
+     * vertical gradient inside + LCD-blue ticks at three brightness
+     * tiers.  Single source of truth for the look so the piano-roll
+     * + arrangement rulers read as siblings. */
+    const juce::Colour kBezel       { 0xff'08'08'08 };
+    const juce::Colour kBezelEdge   { 0xff'3a'3a'3a };
+    const juce::Colour kLcdTop      { 0xff'14'19'1e };
+    const juce::Colour kLcdBot      { 0xff'0c'0f'12 };
+    const juce::Colour kLcdBlue     { 0xff'9e'dc'ff };
+    const juce::Colour kLcdBlueMid  { 0xff'6f'b0'e0 };
+    const juce::Colour kLcdBlueDim  { 0xff'4a'7c'a0 };
+
     const juce::Rectangle<int> ruler { 0, 0, getWidth(), kRulerH };
 
-    /* Ruler background -- a touch darker than the grid body so the
-     * separation is unambiguous; bottom 1 px is a brighter divider
-     * line. */
-    g.setColour (juce::Colour (0xff'0c'0c'0c));
+    /* Bezel + inset gradient + hairline divider against the body. */
+    g.setColour (kBezel);
     g.fillRect (ruler);
-    g.setColour (juce::Colour (0xff'30'30'30));
-    g.drawHorizontalLine (kRulerH - 1, (float) vr.getX(), (float) vr.getRight());
+    const auto inner = ruler.reduced (0, 2).toFloat();
+    juce::ColourGradient lcdGrad (kLcdTop, inner.getX(), inner.getY(),
+                                    kLcdBot, inner.getX(), inner.getBottom(),
+                                    false);
+    g.setGradientFill (lcdGrad);
+    g.fillRect (inner);
+    g.setColour (kBezelEdge);
+    g.drawHorizontalLine (kRulerH - 1,
+                            (float) vr.getX(),
+                            (float) vr.getRight());
 
-    const int startBeat = juce::jmax (0, vr.getX() / pxPerBeat_);
-    const int endBeat   = (vr.getRight() + pxPerBeat_ - 1) / pxPerBeat_;
+    /* Tick subdivision scales with zoom -- ArrangementView mirrors
+     * the same thresholds (>=32 px/beat -> 4 sub-ticks, >=16 -> 2,
+     * else 1).  Sub-ticks render as the dim LCD tier so they don't
+     * compete with the beat + bar ticks. */
+    const int subdiv = (pxPerBeat_ >= 32) ? 4
+                     : (pxPerBeat_ >= 16) ? 2 : 1;
+    const int subStepPx = juce::jmax (1, pxPerBeat_ / subdiv);
 
-    /* Beat ticks: short on every beat, taller on every bar.  Bar
-     * numbers labelled centred above the bar tick.  Skip labels when
-     * bars are narrower than ~24 px to avoid overlap. */
-    const float topY      = 2.0f;
-    const float beatTickH = 5.0f;
-    const float barTickH  = (float) kRulerH - 3.0f;
-    const int barPx = beatsPerBar * pxPerBeat_;
-    const bool labelBars = barPx >= 24;
+    /* Loop bounds via clip rect intersected with visible -- caps the
+     * work to what's actually drawn even on long regions. */
+    const int x0 = juce::jmax (vr.getX(), g.getClipBounds().getX());
+    const int x1 = juce::jmin (vr.getRight(), g.getClipBounds().getRight());
+    const int subStart = juce::jmax (0, x0 / subStepPx - 1);
+    const int subEnd   =                 x1 / subStepPx + 1;
 
-    g.setColour (juce::Colour (0xff'6a'6a'6a));
-    for (int beat = startBeat; beat <= endBeat; ++beat)
+    g.setFont (monoFont (10.0f, juce::Font::bold));
+
+    for (int sub = subStart; sub <= subEnd; ++sub)
     {
-        const int x = beat * pxPerBeat_;
-        if (beat % beatsPerBar == 0) continue;
-        g.drawVerticalLine (x, (float) (kRulerH) - beatTickH, (float) kRulerH - 1.0f);
-    }
+        const int x = sub * subStepPx;
+        if (x > vr.getRight()) break;
+        const int beat   = sub / subdiv;
+        const int phase  = sub % subdiv;
+        const bool atBeat = (phase == 0);
+        const bool atBar  = atBeat && (beat % beatsPerBar) == 0;
 
-    g.setColour (juce::Colour (0xff'a8'a8'a8));
-    g.setFont (monoFont (10.0f, juce::Font::plain));
-    const int firstBar = (startBeat / beatsPerBar) * beatsPerBar;
-    for (int beat = firstBar; beat <= endBeat; beat += beatsPerBar)
-    {
-        const int x = beat * pxPerBeat_;
-        g.drawVerticalLine (x, topY, (float) kRulerH - 1.0f);
-        if (labelBars)
+        int tickTop;
+        juce::Colour tickCol;
+        if      (atBar)  { tickTop = 3;            tickCol = kLcdBlue;    }
+        else if (atBeat) { tickTop = kRulerH - 11; tickCol = kLcdBlueMid; }
+        else             { tickTop = kRulerH - 6;  tickCol = kLcdBlueDim; }
+
+        g.setColour (tickCol);
+        g.drawVerticalLine (x, (float) tickTop, (float) (kRulerH - 2));
+
+        if (atBar)
         {
             const int barNum = (beat / beatsPerBar) + 1;
-            const juce::String label (barNum);
-            const int labelW = juce::jmin (barPx - 4, 32);
-            g.drawText (label,
-                        x + 3, 1, labelW, kRulerH - 3,
-                        juce::Justification::centredLeft, false);
+            g.setColour (kLcdBlue);
+            g.drawText (juce::String (barNum),
+                        x + 3, 1, 32, kRulerH - 4,
+                        juce::Justification::topLeft);
         }
     }
 }
@@ -814,6 +839,35 @@ void PianoRollGrid::mouseMove (const juce::MouseEvent& e)
 void PianoRollGrid::mouseWheelMove (const juce::MouseEvent& e,
                                       const juce::MouseWheelDetails& wheel)
 {
+    /* Alt + wheel = VERTICAL zoom (visible pitch span shrinks/grows
+     * around centre).  Shift + wheel = vertical PAN (shift the
+     * visible band up/down without changing the span).  Cmd/Ctrl +
+     * wheel = horizontal zoom (handled below). */
+    if (e.mods.isAltDown())
+    {
+        if (auto* kb = parent_.getKeyboard())
+        {
+            const double factor = (wheel.deltaY > 0.0f) ? (1.0 / 1.15) : 1.15;
+            kb->zoomVertically (factor);
+            /* Keyboard repaint already triggered by setVisibleNoteRange;
+             * the grid's own paint reads kb->getLowestVisibleNoteNumber
+             * + cachedHighest_ live, so a repaint here picks up the
+             * new pitch span. */
+            repaint();
+        }
+        return;
+    }
+    if (e.mods.isShiftDown())
+    {
+        if (auto* kb = parent_.getKeyboard())
+        {
+            const int delta = (wheel.deltaY > 0.0f) ? 2 : -2;
+            kb->shiftVisibleRange (delta);
+            repaint();
+        }
+        return;
+    }
+
     if (e.mods.isCommandDown() || e.mods.isCtrlDown())
     {
         /* Zoom: cmd / ctrl + scroll.  Anchor zoom around the mouse X

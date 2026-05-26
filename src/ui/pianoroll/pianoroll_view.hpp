@@ -114,6 +114,12 @@ private:
     BlockToolButton                     zoomOutBtn_     { "-" };
     BlockToolButton                     zoomInBtn_      { "+" };
     BlockToolButton                     zoomFitBtn_     { "Fit" };
+    /* Y zoom: shrink / grow visible pitch span around the centre.
+     * Independent of the X zoom triplet -- piano-roll users routinely
+     * change Y span (more octaves) and X span (more beats) on different
+     * axes during edits. */
+    BlockToolButton                     yZoomOutBtn_    { "Y-" };
+    BlockToolButton                     yZoomInBtn_     { "Y+" };
 
     std::unique_ptr<PianoRollKeyboard>  keyboard_;
     /** juce::Viewport hosting the grid.  Horizontal scrolling only --
