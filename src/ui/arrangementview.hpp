@@ -99,6 +99,15 @@ public:
      *  action. */
     void applyLaneSnapshot (const juce::Array<Lane>& snap);
 
+    /** Resolve a MIDI region uuid to its live MidiNoteRegion across
+     *  all lanes.  Linear scan; lane counts are small (tens).  Returns
+     *  nullptr if no lane owns a region with this id (region was
+     *  removed, or uuid was never bound to anything).  Public surface
+     *  because StandardContent installs a resolver lambda over this
+     *  for the piano-roll dock's per-paint binding lookup (commit D
+     *  of Phase 3 Session 1). */
+    MidiNoteRegion* findMidiRegion (const juce::Uuid& regionId) noexcept;
+
 private:
     void valueTreeChildAdded   (juce::ValueTree&, juce::ValueTree&) override;
     void valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree&, int) override;
@@ -224,6 +233,12 @@ private:
      *  Services / no Session / subgraph creation failed). */
     int createEmptyAudioLane (bool stereo = true);
 
+    /** Create an empty MIDI lane.  Phase 2 ships paint-only -- no
+     *  backing graph node yet (Phase 3+ wires a MIDI player + adapter
+     *  onto the lane).  Returns the new lane's index, or -1 on
+     *  failure.  Sets lane.kind = Lane::Kind::Midi. */
+    int createEmptyMidiLane();
+
     /** Common path for file-drop and create-from-disk:
      *   - Opens `file` via libsndfile (metadata: sr, channels, length)
      *   - Registers as AudioFileSource via SourceRegistry
@@ -237,6 +252,15 @@ private:
      *  Returns false on any failure.  Side effects: writeLanesToSession,
      *  repaint body. */
     bool importAudioFileToLane (const juce::File& file,
+                                int               laneIdx,
+                                double            positionBeats);
+
+    /** External .mid file drop / picker path.  Reads + parses the SMF
+     *  via SourceRegistry::importMidiFromFile, builds a MidiNoteRegion
+     *  populated with the SMF's notes, and inserts at positionBeats
+     *  on the given lane (or creates a fresh MIDI lane if laneIdx is
+     *  -1 or not a MIDI lane).  Returns true on success. */
+    bool importMidiFileToLane (const juce::File& file,
                                 int               laneIdx,
                                 double            positionBeats);
 
@@ -256,6 +280,7 @@ private:
     Services* services_ = nullptr;
     BlockToolButton rescanBtn_     { "Rescan" };
     BlockToolButton addAudioBtn_   { "+ Audio" };
+    BlockToolButton addMidiBtn_    { "+ MIDI" };
     BlockToolButton loadAudioBtn_  { "Load..." };
     BlockToolButton snapBtn_       { "Snap" };
     BlockToolButton toolSelectBtn_   { "Select" };

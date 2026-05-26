@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include "services/timeline/midi_note_region.hpp"
 #include "services/timeline/region.hpp"
 
+#include <memory>
 #include <vector>
 
 namespace element {
@@ -33,6 +35,20 @@ class Playlist
 {
 public:
     Playlist();
+
+    /** Deep-copy.  Required for juce::Array<Lane> undo snapshots in
+     *  ArrangementView -- MidiNoteRegion is non-copyable so Playlist
+     *  cannot rely on the implicit copy.  Audio Regions copy by
+     *  value; MIDI regions are cloned via MidiNoteRegion::clone(). */
+    Playlist (const Playlist& other);
+    Playlist& operator= (const Playlist& other);
+
+    /** Move ops stay default -- transfers the unique_ptr vector
+     *  cheaply.  noexcept so juce::Array can pick the move path. */
+    Playlist (Playlist&&) noexcept            = default;
+    Playlist& operator= (Playlist&&) noexcept = default;
+
+    ~Playlist() = default;
 
     juce::Uuid id() const noexcept { return id_; }
     void setId (juce::Uuid v) noexcept { id_ = v; }
@@ -74,6 +90,42 @@ public:
 
     const std::vector<Region>& regions() const noexcept { return regions_; }
 
+    //==========================================================================
+    // MIDI region API.  MidiNoteRegion is non-copyable (owns COW snapshot
+    // pointer + atomic epoch + trash deque), so the storage shape diverges
+    // from audio/tracker regions: unique_ptr in a parallel vector.  Same
+    // overlap-allowed policy as audio regions.
+
+    /** Append a MIDI note region.  Takes ownership.  Returns false if
+     *  the region is null or has negative length. */
+    bool addMidiRegion (std::unique_ptr<MidiNoteRegion> r);
+
+    /** Remove the MIDI region with this id.  Returns false if not
+     *  present. */
+    bool removeMidiRegion (juce::Uuid regionId);
+
+    MidiNoteRegion*       findMidiRegion (juce::Uuid regionId) noexcept;
+    const MidiNoteRegion* findMidiRegion (juce::Uuid regionId) const noexcept;
+
+    const std::vector<std::unique_ptr<MidiNoteRegion>>& midiRegions() const noexcept
+    {
+        return midiRegions_;
+    }
+
+    /** Iterate MIDI regions whose positionBeats falls within
+     *  [beatA, beatB).  Linear scan; sorted by positionBeats so the
+     *  iteration can early-exit once positionBeats >= beatB. */
+    template <typename Fn>
+    void forEachMidiStartIn (double beatA, double beatB, Fn&& fn) const
+    {
+        for (const auto& m : midiRegions_)
+        {
+            if (m == nullptr) continue;
+            if (m->positionBeats >= beatB) break;
+            if (m->positionBeats >= beatA) fn (*m);
+        }
+    }
+
     /** Iterate regions whose positionBeats falls within [beatA, beatB).
      *  Used by TimelineScheduler to find clip launches that hit this
      *  audio block.  Linear scan; v2 may add an interval tree if
@@ -94,6 +146,11 @@ public:
 private:
     juce::Uuid          id_;
     std::vector<Region> regions_;
+    std::vector<std::unique_ptr<MidiNoteRegion>> midiRegions_;
+
+    /** Re-sort midiRegions_ by positionBeats.  Same shape as
+     *  rebuildOrder() for the audio regions; called after every mutate. */
+    void rebuildMidiOrder() noexcept;
 
     /** True if the given span overlaps any existing region whose id
      *  is NOT excludeId. */

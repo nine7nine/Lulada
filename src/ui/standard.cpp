@@ -22,6 +22,7 @@
 #include "ui/sessionview.hpp"
 #include "ui/controllersview.hpp"
 #include "ui/trackersidedock.hpp"
+#include "ui/pianoroll/pianoroll_view.hpp"
 #include "ui/trackerhostview.hpp"
 #include "ui/diskopview.hpp"
 #include "ui/datapathbrowser.hpp"
@@ -861,6 +862,23 @@ void StandardContent::resizeContent (const Rectangle<int>& area)
         r.removeFromBottom (1);
     }
 
+    /* Piano-roll dock sits on the BOTTOM edge (full window width, ABOVE
+     * _extra if visible).  Lives outside ContentContainer so the
+     * container's primary/secondary split doesn't squeeze it.  Height
+     * is user-resizable via the dock's TOP-edge drag handle; the
+     * dragHandle callback updates pianoRollHeight_ + retriggers this
+     * layout.  Removed BEFORE the tracker side dock so the tracker
+     * dock spans the FULL HEIGHT remaining above _extra; this matches
+     * the documented orientation in the class comment of
+     * TrackerSideDock and PianoRollView. */
+    if (pianoRollVisible_ && pianoRoll != nullptr)
+    {
+        const int h = juce::jlimit (kPianoRollMinH, kPianoRollMaxH,
+                                      pianoRollHeight_);
+        pianoRoll->setBounds (r.removeFromBottom (h));
+        r.removeFromBottom (1);
+    }
+
     /* Tracker side dock sits on the RIGHT edge (full height, above
      * _extra if visible).  Lives outside ContentContainer so it
      * doesn't get squeezed by the container's primary/secondary
@@ -1041,6 +1059,8 @@ void StandardContent::saveState (PropertiesFile* props)
     props->setValue ("meterBridge", isMeterBridgeVisible());
     props->setValue ("trackerDock",      trackerDockVisible_);
     props->setValue ("trackerDockWidth", trackerDockWidth_);
+    props->setValue ("pianoRoll",        pianoRollVisible_);
+    props->setValue ("pianoRollHeight",  pianoRollHeight_);
     props->setValue ("meterBridgeSize", mo.meterSize());
     props->setValue ("meterBridgeVisibility", (int) mo.visibility());
 }
@@ -1073,6 +1093,10 @@ void StandardContent::restoreState (PropertiesFile* props)
         trackerDockWidth_ = props->getIntValue ("trackerDockWidth", trackerDockWidth_);
     setTrackerDockVisible (props->getBoolValue ("trackerDock",
                                                  props->getBoolValue ("trackerStrip", false)));
+
+    if (props->containsKey ("pianoRollHeight"))
+        pianoRollHeight_ = props->getIntValue ("pianoRollHeight", pianoRollHeight_);
+    setPianoRollVisible (props->getBoolValue ("pianoRoll", false));
 
     {
         /* Prefer the new wrapper-managed keys (navExpandedWidth /
@@ -1257,6 +1281,7 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::toggleMeterBridge,
         Commands::toggleChannelStrip,
         Commands::toggleTrackerStrip,
+        Commands::togglePianoRoll,
         Commands::toggleNavSidebar,
         Commands::showLastContentView,
         Commands::rotateContentView,
@@ -1407,6 +1432,15 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
             result.addDefaultKeypress ('t', ModifierKeys::commandModifier);
             break;
         }
+        case Commands::togglePianoRoll: {
+            int flags = 0;
+            if (isPianoRollVisible()) flags |= Info::isTicked;
+            result.setInfo ("Piano Roll",
+                            "Show / hide the piano-roll editor at the bottom of the window",
+                            "UI", flags);
+            result.addDefaultKeypress ('p', ModifierKeys::commandModifier);
+            break;
+        }
         case Commands::toggleNavSidebar: {
             int flags = 0;
             /* Tick when the sidebar is EXPANDED -- the menu item then
@@ -1513,6 +1547,9 @@ bool StandardContent::perform (const InvocationInfo& info)
             break;
         case Commands::toggleTrackerStrip:
             setTrackerDockVisible (! isTrackerDockVisible());
+            break;
+        case Commands::togglePianoRoll:
+            setPianoRollVisible (! isPianoRollVisible());
             break;
         case Commands::toggleNavSidebar:
             setNavSidebarCollapsed (! isNavSidebarCollapsed());
@@ -1749,6 +1786,84 @@ void StandardContent::showTrackerDockForNode (const juce::Uuid& trackerNodeId,
         setTrackerDockVisible (true);
     if (trackerDock != nullptr)
         trackerDock->setTrackerAndPattern (trackerNodeId, sequenceIdx);
+}
+
+//============================================================================
+// Bottom-attached piano-roll dock
+
+bool StandardContent::isPianoRollVisible() const { return pianoRollVisible_; }
+int  StandardContent::getPianoRollHeight() const { return pianoRollHeight_; }
+
+void StandardContent::setPianoRollHeight (int h)
+{
+    h = juce::jlimit (kPianoRollMinH, kPianoRollMaxH, h);
+    if (h == pianoRollHeight_) return;
+    pianoRollHeight_ = h;
+    resized();
+}
+
+void StandardContent::setPianoRollVisible (bool v)
+{
+    if (v == pianoRollVisible_) return;
+    pianoRollVisible_ = v;
+
+    if (v && pianoRoll == nullptr)
+    {
+        pianoRoll = std::make_unique<PianoRollView> (services());
+        addChildComponent (pianoRoll.get());
+
+        /* Drag handle delta: positive = user dragged DOWN (dock
+         * shrinks); negative = user dragged UP (dock grows).
+         * Subtract delta from the height to invert into the
+         * shrink/grow convention. */
+        pianoRoll->onResizeDrag = [this] (int delta) {
+            setPianoRollHeight (pianoRollHeight_ - delta);
+        };
+        pianoRoll->onResizeDragEnd = [this]() {
+            /* Persist final height on drag end -- writing on every
+             * mouseDrag frame would thrash session XML. */
+            if (auto* props = services().context().settings().getUserSettings())
+                props->setValue ("pianoRollHeight", pianoRollHeight_);
+        };
+        pianoRoll->onCloseClicked = [this]() {
+            setPianoRollVisible (false);
+        };
+    }
+
+    if (pianoRoll != nullptr)
+        pianoRoll->setVisible (v);
+
+    resized();
+}
+
+void StandardContent::showPianoRollForRegion (const juce::Uuid& regionId)
+{
+    /* Implicit show + bind.  Used by ArrangementView's MIDI-region
+     * double-click affordance and by anything else that wants to
+     * surface a specific region without forcing the user to toggle
+     * the dock first. */
+    if (! pianoRollVisible_)
+        setPianoRollVisible (true);
+    if (pianoRoll == nullptr) return;
+
+    /* Install (or refresh) the resolver lambda that walks the
+     * cached ArrangementView and queries findMidiRegion(uuid).  The
+     * lambda captures `this` (StandardContent) so the resolver always
+     * targets the current viewCache_ entry -- the ArrangementView is
+     * built once on first request and reused across view switches.
+     * If the user has not yet visited the arrangement (no entry in
+     * viewCache_), the lambda returns nullptr and the grid paints
+     * its empty-state hint -- harmless. */
+    pianoRoll->setRegionResolver (
+        [this] (const juce::Uuid& uuid) -> MidiNoteRegion* {
+            auto it = viewCache_.find (EL_VIEW_ARRANGEMENT);
+            if (it == viewCache_.end()) return nullptr;
+            auto* arr = dynamic_cast<ArrangementView*> (it->second.get());
+            if (arr == nullptr) return nullptr;
+            return arr->findMidiRegion (uuid);
+        });
+
+    pianoRoll->setRegion (regionId);
 }
 
 bool StandardContent::isMeterBridgeVisible() const

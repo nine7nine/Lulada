@@ -25,8 +25,22 @@ class TimelineAdapter;     // Phase 2: per-kind dispatcher
  */
 struct Lane
 {
+    /** Coarse lane kind for UI dispatch.  Phase 2 introduces this to
+     *  distinguish piano-roll-MIDI lanes from audio/tracker lanes at
+     *  paint + Add-Lane time.  Tracker lanes are NOT a separate kind
+     *  here; they share Kind::Audio + are runtime-distinguished by
+     *  the resolved target-node type (ArrangementView caches an
+     *  audioClipCache OR trackerCache pointer per lane).  This keeps
+     *  Phase 2 minimal -- only the truly new affordance (MIDI lane)
+     *  needs an explicit kind.
+     *
+     *  Sparse-write XML: defaults to Audio so older sessions load
+     *  unchanged. */
+    enum class Kind : int { Audio = 0, Midi = 1 };
+
     juce::Uuid    id;
     juce::String  name;
+    Kind          kind       { Kind::Audio };
     juce::Colour  colour     { 0xff'30'30'30 };
     int           heightPx   { 60 };
     bool          muted      { false };
@@ -37,12 +51,16 @@ struct Lane
      *  bind time -- when the target node is missing (e.g. user
      *  deleted it from the graph editor), the lane stays in the
      *  arrangement but doesn't dispatch.  ArrangementView surfaces
-     *  this as a greyed lane with a "rebind" affordance. */
+     *  this as a greyed lane with a "rebind" affordance.
+     *
+     *  Phase 2 MIDI lanes have a null targetNodeUuid -- MIDI playback
+     *  is wired in a later phase. */
     juce::Uuid    targetNodeUuid;
 
     /** Dispatch contents.  Owned by the Lane; copy-on-write semantics
      *  would be a v2 optimisation if we want lane duplication to
-     *  share regions until the user mutates one. */
+     *  share regions until the user mutates one.  Phase 2: also holds
+     *  per-lane MidiNoteRegion list (Playlist.midiRegions). */
     Playlist      playlist;
 
     /** Sparse-write XML.  Only writes non-default fields. */

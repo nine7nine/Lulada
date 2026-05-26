@@ -42,6 +42,12 @@ const char* const kAudioDropExtensions[] = {
     ".wav", ".aiff", ".aif", ".flac", ".ogg", ".mp3", ".w64", ".au"
 };
 
+/** Acceptable MIDI extensions for external file drop.  Only .mid/.midi
+ *  for now; karaoke (.kar) is structurally SMF but unconventional. */
+const char* const kMidiDropExtensions[] = {
+    ".mid", ".midi"
+};
+
 /* Lane tint palette lives in ui/lanepalette.hpp (shared with the
  * tracker editor + future session-view clip cells).  Local helper
  * kept so call sites read naturally. */
@@ -58,12 +64,33 @@ bool isAcceptableAudioFile (const juce::String& path) noexcept
     return false;
 }
 
+bool isAcceptableMidiFile (const juce::String& path) noexcept
+{
+    for (const char* ext : kMidiDropExtensions)
+        if (path.endsWithIgnoreCase (ext))
+            return true;
+    return false;
+}
+
 bool anyAudioFileIn (const juce::StringArray& files) noexcept
 {
     for (const auto& f : files)
         if (isAcceptableAudioFile (f))
             return true;
     return false;
+}
+
+bool anyMidiFileIn (const juce::StringArray& files) noexcept
+{
+    for (const auto& f : files)
+        if (isAcceptableMidiFile (f))
+            return true;
+    return false;
+}
+
+bool anyDroppableFileIn (const juce::StringArray& files) noexcept
+{
+    return anyAudioFileIn (files) || anyMidiFileIn (files);
 }
 
 } // namespace
@@ -191,7 +218,7 @@ public:
         {
             g.setColour (Colors::textColor.withAlpha (0.5f));
             g.setFont (juce::FontOptions (14.0f));
-            g.drawText ("Drop an audio file here, or click + Audio to add a track.",
+            g.drawText ("Drop an audio or MIDI file here, or click + Audio / + MIDI to add a track.",
                         getLocalBounds().withTrimmedTop (kRulerH),
                         juce::Justification::centred);
         }
@@ -260,7 +287,7 @@ public:
 
     bool isInterestedInFileDrag (const juce::StringArray& files) override
     {
-        const bool interested = anyAudioFileIn (files);
+        const bool interested = anyDroppableFileIn (files);
         juce::Logger::writeToLog (
             juce::String ("[ArrangementView::Body] isInterestedInFileDrag count=")
             + juce::String (files.size())
@@ -274,7 +301,7 @@ public:
             juce::String ("[ArrangementView::Body] fileDragEnter x=")
             + juce::String (x) + " y=" + juce::String (y)
             + " count=" + juce::String (files.size()));
-        if (! anyAudioFileIn (files)) return;
+        if (! anyDroppableFileIn (files)) return;
         dropHover_         = true;
         dropHoverLaneIdx_  = owner.laneIdxFromY (y);
         juce::ignoreUnused (x);
@@ -311,46 +338,90 @@ public:
         const double dropBeats =
             juce::jmax (0.0, (double) (x - kLabelW) / (double) kPxPerBeat);
 
-        /* If dropping on a tracker lane, force-create a fresh audio
-         * lane below it instead of trying to mix kinds.  -1 = create
-         * new. */
-        int laneIdx = targetLane;
-        if (laneIdx >= 0 && laneIdx < owner.lanes_.size())
-        {
-            const auto& runtime = owner.laneRuntime_.getReference (laneIdx);
-            if (! runtime.isAudioLane())
-                laneIdx = -1;
-        }
-        else
-        {
-            laneIdx = -1;
-        }
-
-        double cursor = dropBeats;
+        /* Partition by kind.  Audio files go through the existing
+         * importAudioFileToLane path; MIDI files create / target a
+         * MIDI lane through importMidiFileToLane.  Mixed drops produce
+         * two distinct lanes in sequence rather than trying to coerce
+         * kinds together. */
+        juce::StringArray audioPaths;
+        juce::StringArray midiPaths;
         for (const auto& path : files)
         {
-            if (! isAcceptableAudioFile (path)) continue;
-            const juce::File f (path);
-            if (! f.existsAsFile()) continue;
+            if      (isAcceptableAudioFile (path)) audioPaths.add (path);
+            else if (isAcceptableMidiFile  (path)) midiPaths .add (path);
+        }
 
-            const bool ok = owner.importAudioFileToLane (f, laneIdx, cursor);
-            if (! ok) continue;
-
-            /* First file may have created the lane; subsequent files
-             * append into the same lane.  Lookup by file path is
-             * fragile; the simplest re-target is "the last lane in
-             * the array" since createEmptyAudioLane appends. */
-            if (laneIdx < 0)
-                laneIdx = owner.lanes_.size() - 1;
-
-            /* Walk past the just-appended region for the next file.
-             * Each Region's lengthBeats was computed from file
-             * duration + session bpm. */
+        if (! audioPaths.isEmpty())
+        {
+            int laneIdx = targetLane;
             if (laneIdx >= 0 && laneIdx < owner.lanes_.size())
             {
-                const auto& regs = owner.lanes_.getReference (laneIdx).playlist.regions();
-                if (! regs.empty())
-                    cursor = regs.back().endBeats();
+                const auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+                if (! runtime.isAudioLane())
+                    laneIdx = -1;
+            }
+            else
+            {
+                laneIdx = -1;
+            }
+
+            double cursor = dropBeats;
+            for (const auto& path : audioPaths)
+            {
+                const juce::File f (path);
+                if (! f.existsAsFile()) continue;
+
+                const bool ok = owner.importAudioFileToLane (f, laneIdx, cursor);
+                if (! ok) continue;
+
+                if (laneIdx < 0)
+                    laneIdx = owner.lanes_.size() - 1;
+
+                if (laneIdx >= 0 && laneIdx < owner.lanes_.size())
+                {
+                    const auto& regs = owner.lanes_.getReference (laneIdx).playlist.regions();
+                    if (! regs.empty())
+                        cursor = regs.back().endBeats();
+                }
+            }
+        }
+
+        if (! midiPaths.isEmpty())
+        {
+            /* MIDI drop must land on a MIDI lane.  Same rule as audio:
+             * if the target lane is the wrong kind, create a fresh
+             * lane. */
+            int midiLaneIdx = targetLane;
+            if (midiLaneIdx >= 0 && midiLaneIdx < owner.lanes_.size())
+            {
+                if (owner.lanes_.getReference (midiLaneIdx).kind != Lane::Kind::Midi)
+                    midiLaneIdx = -1;
+            }
+            else
+            {
+                midiLaneIdx = -1;
+            }
+
+            double cursor = dropBeats;
+            for (const auto& path : midiPaths)
+            {
+                const juce::File f (path);
+                if (! f.existsAsFile()) continue;
+
+                const bool ok = owner.importMidiFileToLane (f, midiLaneIdx, cursor);
+                if (! ok) continue;
+
+                if (midiLaneIdx < 0)
+                    midiLaneIdx = owner.lanes_.size() - 1;
+
+                if (midiLaneIdx >= 0 && midiLaneIdx < owner.lanes_.size())
+                {
+                    const auto& midis = owner.lanes_.getReference (midiLaneIdx)
+                                              .playlist.midiRegions();
+                    if (! midis.empty() && midis.back() != nullptr)
+                        cursor = midis.back()->positionBeats
+                               + midis.back()->lengthBeats;
+                }
             }
         }
     }
@@ -819,6 +890,31 @@ public:
                 return;
             }
             return;
+        }
+
+        /* MIDI lane: double-click anywhere on a MIDI region surfaces
+         * the bottom-attached piano-roll dock bound to this region.
+         * Sibling of the tracker branch above; MIDI lanes have no
+         * targetNodeUuid in Phase 2 (paint-only, no backing graph
+         * node) so the binding is by region uuid, not node uuid. */
+        {
+            const auto& lane = owner.lanes_.getReference (laneIdx);
+            if (lane.kind == Lane::Kind::Midi)
+            {
+                const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+                for (const auto& mp : lane.playlist.midiRegions())
+                {
+                    if (mp == nullptr) continue;
+                    const auto& m = *mp;
+                    if (beat <  m.positionBeats) continue;
+                    if (beat >= m.positionBeats + m.lengthBeats) continue;
+                    if (auto* sc = dynamic_cast<StandardContent*> (
+                            ViewHelpers::findContentComponent (this)))
+                        sc->showPianoRollForRegion (m.id);
+                    return;
+                }
+                return;
+            }
         }
 
         if (! runtime.isAudioLane()) return;
@@ -1954,10 +2050,18 @@ private:
         g.setColour (orphan ? tint.withAlpha (0.55f) : tint);
         g.setFont (monoFont (
                                       12.0f, juce::Font::bold));
+        const bool isMidi = (lane.kind == Lane::Kind::Midi);
         juce::String label = lane.name.isNotEmpty()
                                 ? lane.name
-                                : (isAudio ? juce::String ("Audio") : juce::String ("Tracker"));
-        if (orphan) label += " (orphan)";
+                                : (isMidi  ? juce::String ("MIDI")
+                                 : isAudio ? juce::String ("Audio")
+                                           : juce::String ("Tracker"));
+        if (orphan && ! isMidi)
+            /* MIDI lanes carry no graph target in Phase 2 -- they
+             * legitimately read as "orphan" through runtime.isOrphan().
+             * Suppress the orphan suffix on MIDI lanes so the label
+             * doesn't read as broken. */
+            label += " (orphan)";
         g.drawText (label,
                     Rectangle<int> (labelArea.getX() + labelInset,
                                      labelArea.getY() + 3,
@@ -1969,6 +2073,7 @@ private:
                                       10.0f, juce::Font::plain));
         const juce::String pill = isAudio ? "audio"
                                 : runtime.isTrackerLane() ? "trk"
+                                : isMidi  ? "midi"
                                 : "?";
         g.drawText (pill,
                     Rectangle<int> (labelArea.getX() + labelInset,
@@ -2278,6 +2383,149 @@ private:
                         juce::Justification::centredLeft, true);
         }
 
+        /* MIDI regions: parallel loop to the audio/tracker regions
+         * above.  Phase 2 is paint-only -- a coloured block with a
+         * note-count badge + a thin piano-roll-style note scatter in
+         * the body.  No playback yet (Phase 3 piano-roll lands the
+         * audio-thread emit path).  Same clip + selection + rounded-
+         * corner pattern as audio so the two kinds read uniformly. */
+        for (const auto& mp : lane.playlist.midiRegions())
+        {
+            if (mp == nullptr) continue;
+            const auto& m = *mp;
+            const int xs = stripArea.getX() + (int) (m.positionBeats * kPxPerBeat);
+            const int ws = juce::jmax (4, (int) (m.lengthBeats * kPxPerBeat));
+            Rectangle<int> rect (xs, stripArea.getY() + 4,
+                                 ws, stripArea.getHeight() - 8);
+            if (! regionClip.intersects (rect))
+                continue;
+
+            const juce::Colour midiTint = m.colour;
+            juce::Colour fill = midiTint.withMultipliedSaturation (0.55f)
+                                        .withMultipliedBrightness (0.45f);
+
+            g.setColour (fill);
+            g.fillRoundedRectangle (rect.toFloat(), kCornerSize);
+
+            constexpr int kTitleH = 13;
+            const Rectangle<int> titleRect (rect.getX(), rect.getY(),
+                                             rect.getWidth(),
+                                             juce::jmin (kTitleH, rect.getHeight()));
+            const Rectangle<int> bodyRect (rect.getX(),
+                                            rect.getY() + titleRect.getHeight(),
+                                            rect.getWidth(),
+                                            juce::jmax (0, rect.getHeight()
+                                                                - titleRect.getHeight()));
+            const juce::Colour titleBase (0xff'14'14'14);
+            const juce::Colour titleFill = titleBase.interpolatedWith (midiTint, 0.30f);
+            {
+                juce::Graphics::ScopedSaveState save (g);
+                juce::Path clipPath;
+                clipPath.addRoundedRectangle (rect.toFloat(), kCornerSize);
+                g.reduceClipRegion (clipPath);
+                g.setColour (titleFill);
+                g.fillRect (titleRect);
+
+                /* Piano-roll-style scatter inside the body rect.
+                 * Cheap: one drawHorizontalLine per visible note.
+                 * Notes are sorted (onBeat, pitch); pitch range is
+                 * compacted to the body's vertical extent so even a
+                 * narrow lane shows the shape of the pattern. */
+                if (bodyRect.getHeight() > 4)
+                {
+                    if (const auto* snap = m.loadSnapshot())
+                    {
+                        if (! snap->empty())
+                        {
+                            /* Compute pitch range for this region's
+                             * snapshot.  Single-note pattern degenerates
+                             * to a centred row. */
+                            int pMin = (*snap)[0].pitch;
+                            int pMax = (*snap)[0].pitch;
+                            for (const auto& nn : *snap)
+                            {
+                                pMin = juce::jmin (pMin, nn.pitch);
+                                pMax = juce::jmax (pMax, nn.pitch);
+                            }
+                            const int pSpan = juce::jmax (1, pMax - pMin);
+                            const int innerH = bodyRect.getHeight() - 2;
+                            const float pxPerPitch = (float) innerH / (float) pSpan;
+
+                            g.setColour (midiTint.withMultipliedBrightness (1.4f));
+                            for (const auto& nn : *snap)
+                            {
+                                /* x relative to region start; clip to
+                                 * region width so notes past the end
+                                 * are visually trimmed. */
+                                const int nx = rect.getX()
+                                             + (int) (nn.onBeat * kPxPerBeat);
+                                const int nw = juce::jmax (1,
+                                    (int) (nn.lengthBeats * kPxPerBeat));
+                                const int nxEnd = juce::jmin (nx + nw,
+                                                              rect.getRight() - 2);
+                                if (nxEnd <= rect.getX() + 1) continue;
+
+                                /* Higher pitch = higher on screen.  +1
+                                 * to keep a 1 px margin off the title
+                                 * strip; -1 ditto on the bottom. */
+                                const int normPitch = pMax - nn.pitch;
+                                const int ny = bodyRect.getY() + 1
+                                             + (int) (normPitch * pxPerPitch);
+                                g.drawHorizontalLine (ny,
+                                                       (float) juce::jmax (nx,
+                                                                           rect.getX() + 2),
+                                                       (float) nxEnd);
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Outer border + inner ring -- same visual idiom as audio
+             * regions so MIDI sits naturally beside them in the strip. */
+            constexpr float outerWidth = 1.5f;
+            g.setColour (midiTint);
+            g.drawRoundedRectangle (rect.toFloat(), kCornerSize, outerWidth);
+            g.setColour (juce::Colours::black.withAlpha (0.6f));
+            g.drawRoundedRectangle (
+                rect.toFloat().reduced (outerWidth, outerWidth),
+                juce::jmax (0.5f, kCornerSize - outerWidth),
+                1.0f);
+
+            /* Title: bar prefix + name + note-count badge. */
+            const int beatsPerBar = owner.monitor_ != nullptr
+                ? juce::jmax (1, (int) owner.monitor_->beatsPerBar.get())
+                : 4;
+            const int barAt = (int) (m.positionBeats / beatsPerBar) + 1;
+            const juce::String labelText = juce::String (barAt) + " "
+                + (m.name.isNotEmpty() ? m.name : juce::String ("MIDI"));
+            const juce::String badgeText = juce::String ((int) m.noteCount()) + " n";
+
+            g.setColour (juce::Colours::white.withAlpha (0.85f));
+            g.setFont (monoFont (10.0f, juce::Font::plain));
+            /* Reserve right end of title strip for the badge; left
+             * label gets the remaining width.  Fixed-width badge
+             * estimate (6 chars at 10pt mono ~7 px each + padding)
+             * avoids the deprecated Font::getStringWidth path; the
+             * jmin cap below keeps the badge from eating the label
+             * on a very narrow region. */
+            const int badgeW = juce::jmin (titleRect.getWidth() / 2,
+                                            6 * 7 + 8);
+            const Rectangle<int> badgeRect (titleRect.getRight() - badgeW,
+                                             titleRect.getY(),
+                                             badgeW,
+                                             titleRect.getHeight());
+            const Rectangle<int> labelRect (titleRect.getX(),
+                                             titleRect.getY(),
+                                             titleRect.getWidth() - badgeW,
+                                             titleRect.getHeight());
+            g.drawText (labelText, labelRect.reduced (5, 0),
+                        juce::Justification::centredLeft, true);
+            g.setColour (juce::Colours::white.withAlpha (0.65f));
+            g.drawText (badgeText, badgeRect.reduced (4, 0),
+                        juce::Justification::centredRight, true);
+        }
+
         /* Live-recording placeholder: while transport is capturing
          * + this lane is armed, paint a red translucent rect from
          * recordStartBeat to the current playhead, with a
@@ -2326,8 +2574,13 @@ private:
     {
         double maxEnd = 0.0;
         for (const auto& l : owner.lanes_)
+        {
             for (const auto& r : l.playlist.regions())
                 maxEnd = juce::jmax (maxEnd, r.endBeats());
+            for (const auto& m : l.playlist.midiRegions())
+                if (m != nullptr)
+                    maxEnd = juce::jmax (maxEnd, m->positionBeats + m->lengthBeats);
+        }
         const int needW = kLabelW + ((int) maxEnd + 8) * kPxPerBeat;
         const int needH = juce::jmax (kLaneH, owner.lanes_.size() * kLaneH);
         return needW != getWidth() || needH != getHeight();
@@ -2455,6 +2708,7 @@ ArrangementView::ArrangementView()
 
     addAndMakeVisible (rescanBtn_);
     addAndMakeVisible (addAudioBtn_);
+    addAndMakeVisible (addMidiBtn_);
     addAndMakeVisible (loadAudioBtn_);
     addAndMakeVisible (toolSelectBtn_);
     addAndMakeVisible (toolRangeBtn_);
@@ -2515,6 +2769,7 @@ ArrangementView::ArrangementView()
 
     rescanBtn_.onClick    = [this]() { rescanLaneTargets(); };
     addAudioBtn_.onClick  = [this]() { createEmptyAudioLane (true /*stereo*/); };
+    addMidiBtn_.onClick   = [this]() { createEmptyMidiLane(); };
     loadAudioBtn_.onClick = [this]() { promptLoadAudioFile(); };
 
     /* Tool buttons: radio-group toggles; one tool active at a time.
@@ -2829,6 +3084,7 @@ void ArrangementView::resized()
     auto top = r.removeFromTop (kHeaderH).reduced (4, 4);
     rescanBtn_      .setBounds (top.removeFromLeft (60)); top.removeFromLeft (4);
     addAudioBtn_    .setBounds (top.removeFromLeft (70)); top.removeFromLeft (4);
+    addMidiBtn_     .setBounds (top.removeFromLeft (60)); top.removeFromLeft (4);
     loadAudioBtn_   .setBounds (top.removeFromLeft (60)); top.removeFromLeft (12);
 
     toolSelectBtn_  .setBounds (top.removeFromLeft (76)); top.removeFromLeft (2);
@@ -2877,7 +3133,7 @@ void ArrangementView::resized()
 
 bool ArrangementView::isInterestedInFileDrag (const juce::StringArray& files)
 {
-    const bool interested = anyAudioFileIn (files);
+    const bool interested = anyDroppableFileIn (files);
     juce::Logger::writeToLog (
         juce::String ("[ArrangementView] isInterestedInFileDrag count=")
         + juce::String (files.size())
@@ -2917,44 +3173,97 @@ void ArrangementView::filesDropped (const juce::StringArray& files, int x, int y
     const double dropBeats =
         juce::jmax (0.0, (double) (bodyX - kLabelW) / (double) body_->kPxPerBeat);
 
-    int targetLane = laneIdx;
-    if (targetLane >= 0 && targetLane < lanes_.size())
-    {
-        const auto& runtime = laneRuntime_.getReference (targetLane);
-        if (! runtime.isAudioLane())
-            targetLane = -1;   // tracker lane -> create new audio
-    }
-    else
-    {
-        targetLane = -1;       // empty area -> create new audio
-    }
-
-    double cursor = dropBeats;
+    /* Partition by kind first; audio and MIDI files take divergent
+     * lane-create paths.  Mixed drops produce one lane each. */
+    juce::StringArray audioPaths;
+    juce::StringArray midiPaths;
     for (const auto& path : files)
     {
-        const juce::File f (path);
-        if (! f.existsAsFile())
-        {
-            juce::Logger::writeToLog (
-                juce::String ("[ArrangementView] skipping non-existent file: ") + path);
-            continue;
-        }
+        if      (isAcceptableAudioFile (path)) audioPaths.add (path);
+        else if (isAcceptableMidiFile  (path)) midiPaths .add (path);
+    }
 
-        const bool ok = importAudioFileToLane (f, targetLane, cursor);
-        juce::Logger::writeToLog (
-            juce::String ("[ArrangementView] importAudioFileToLane(")
-            + f.getFileName() + ", " + juce::String (targetLane) + ", "
-            + juce::String (cursor, 2) + ") = " + (ok ? "OK" : "FAIL"));
-        if (! ok) continue;
-
-        if (targetLane < 0)
-            targetLane = lanes_.size() - 1;
-
+    if (! audioPaths.isEmpty())
+    {
+        int targetLane = laneIdx;
         if (targetLane >= 0 && targetLane < lanes_.size())
         {
-            const auto& regs = lanes_.getReference (targetLane).playlist.regions();
-            if (! regs.empty())
-                cursor = regs.back().endBeats();
+            const auto& runtime = laneRuntime_.getReference (targetLane);
+            if (! runtime.isAudioLane())
+                targetLane = -1;
+        }
+        else
+        {
+            targetLane = -1;
+        }
+
+        double cursor = dropBeats;
+        for (const auto& path : audioPaths)
+        {
+            const juce::File f (path);
+            if (! f.existsAsFile())
+            {
+                juce::Logger::writeToLog (
+                    juce::String ("[ArrangementView] skipping non-existent file: ") + path);
+                continue;
+            }
+
+            const bool ok = importAudioFileToLane (f, targetLane, cursor);
+            juce::Logger::writeToLog (
+                juce::String ("[ArrangementView] importAudioFileToLane(")
+                + f.getFileName() + ", " + juce::String (targetLane) + ", "
+                + juce::String (cursor, 2) + ") = " + (ok ? "OK" : "FAIL"));
+            if (! ok) continue;
+
+            if (targetLane < 0)
+                targetLane = lanes_.size() - 1;
+
+            if (targetLane >= 0 && targetLane < lanes_.size())
+            {
+                const auto& regs = lanes_.getReference (targetLane).playlist.regions();
+                if (! regs.empty())
+                    cursor = regs.back().endBeats();
+            }
+        }
+    }
+
+    if (! midiPaths.isEmpty())
+    {
+        int midiTarget = laneIdx;
+        if (midiTarget >= 0 && midiTarget < lanes_.size())
+        {
+            if (lanes_.getReference (midiTarget).kind != Lane::Kind::Midi)
+                midiTarget = -1;
+        }
+        else
+        {
+            midiTarget = -1;
+        }
+
+        double cursor = dropBeats;
+        for (const auto& path : midiPaths)
+        {
+            const juce::File f (path);
+            if (! f.existsAsFile()) continue;
+
+            const bool ok = importMidiFileToLane (f, midiTarget, cursor);
+            juce::Logger::writeToLog (
+                juce::String ("[ArrangementView] importMidiFileToLane(")
+                + f.getFileName() + ", " + juce::String (midiTarget) + ", "
+                + juce::String (cursor, 2) + ") = " + (ok ? "OK" : "FAIL"));
+            if (! ok) continue;
+
+            if (midiTarget < 0)
+                midiTarget = lanes_.size() - 1;
+
+            if (midiTarget >= 0 && midiTarget < lanes_.size())
+            {
+                const auto& midis = lanes_.getReference (midiTarget)
+                                          .playlist.midiRegions();
+                if (! midis.empty() && midis.back() != nullptr)
+                    cursor = midis.back()->positionBeats
+                           + midis.back()->lengthBeats;
+            }
         }
     }
 }
@@ -3093,6 +3402,23 @@ AudioClipNode* ArrangementView::resolveAudioClipByUuid (juce::Uuid targetNodeUui
     auto* proc = target.getObject();
     if (proc == nullptr) return nullptr;
     return dynamic_cast<AudioClipNode*> (proc->getAudioProcessor());
+}
+
+MidiNoteRegion* ArrangementView::findMidiRegion (const juce::Uuid& regionId) noexcept
+{
+    /* Linear scan across lanes -> playlist.findMidiRegion (which is
+     * itself a linear scan of midiRegions_).  Lane counts are small
+     * (tens at most), region counts per lane similarly small, so the
+     * per-paint cost from the piano-roll resolver lambda is in the
+     * noise compared to the paint pass itself.  Returns the first
+     * hit; uuids are unique by construction. */
+    for (int i = 0; i < lanes_.size(); ++i)
+    {
+        auto& lane = lanes_.getReference (i);
+        if (auto* r = lane.playlist.findMidiRegion (regionId))
+            return r;
+    }
+    return nullptr;
 }
 
 void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)
@@ -3750,12 +4076,34 @@ int ArrangementView::createEmptyAudioLane (bool stereo)
 
     Lane lane;
     lane.id             = juce::Uuid();
+    lane.kind           = Lane::Kind::Audio;
     lane.targetNodeUuid = clip.getUuid();
     lane.name           = juce::String ("Audio ") + juce::String (lanes_.size() + 1);
     lane.colour         = laneTintForIndex (lanes_.size());
     lanes_.add (std::move (lane));
 
     rescanLaneTargets();   // resolves the new lane's audioClipCache
+    writeLanesToSession();
+    if (body_ != nullptr) body_->resizeForLanes();
+    return lanes_.size() - 1;
+}
+
+int ArrangementView::createEmptyMidiLane()
+{
+    /* MIDI lanes don't yet create a backing graph node (Phase 2 paint-
+     * only; Phase 3+ wires a piano-roll MIDI player onto a graph node
+     * + adapter).  The lane lives in the arrangement with kind=Midi
+     * and a null targetNodeUuid; ArrangementView's rescanLaneTargets
+     * leaves runtime caches null for non-audio non-tracker kinds,
+     * which is the existing orphan-lane visual treatment. */
+    Lane lane;
+    lane.id             = juce::Uuid();
+    lane.kind           = Lane::Kind::Midi;
+    lane.name           = juce::String ("MIDI ") + juce::String (lanes_.size() + 1);
+    lane.colour         = laneTintForIndex (lanes_.size());
+    lanes_.add (std::move (lane));
+
+    rescanLaneTargets();   // no-op for MIDI lanes today; safe to call
     writeLanesToSession();
     if (body_ != nullptr) body_->resizeForLanes();
     return lanes_.size() - 1;
@@ -3835,6 +4183,58 @@ bool ArrangementView::importAudioFileToLane (const juce::File& file,
             (juce::int64) (r.lengthBeats  * secsPerBeat * sessionSR),
             r.fadeInCurve, r.fadeOutCurve);
     }
+
+    writeLanesToSession();
+    if (body_ != nullptr)
+    {
+        body_->resizeForLanes();
+        body_->repaintLane (laneIdx);
+    }
+    return true;
+}
+
+bool ArrangementView::importMidiFileToLane (const juce::File& file,
+                                             int               laneIdx,
+                                             double            positionBeats)
+{
+    if (! file.existsAsFile())
+        return false;
+
+    auto src = SourceRegistry::get().importMidiFromFile (file);
+    if (src == nullptr) return false;
+
+    /* Create lane if requested or the supplied lane is the wrong kind. */
+    if (laneIdx < 0 || laneIdx >= lanes_.size()
+        || lanes_.getReference (laneIdx).kind != Lane::Kind::Midi)
+    {
+        const int newIdx = createEmptyMidiLane();
+        if (newIdx < 0) return false;
+        laneIdx = newIdx;
+    }
+
+    auto& lane = lanes_.getReference (laneIdx);
+
+    /* Decode the SMF into a NoteList + region.  juce::MidiFile inside
+     * MidiSource holds the source-of-truth bytes; the region owns its
+     * own COW snapshot so subsequent user edits don't affect the
+     * source.  Beat-domain length = max(noteOff) for now -- callers
+     * resizing the region UI-side just adjust lane.midiRegions[i]
+     * lengthBeats. */
+    const auto mf      = src->toMidiFile();
+    auto       notes   = MidiSource::extractNotes (mf);
+    const double srcBeats = src->durationBeats (0.0, 0.0);
+    const double regionLen = juce::jmax (0.25, srcBeats);
+
+    auto region = std::make_unique<MidiNoteRegion>();
+    region->id            = juce::Uuid();
+    region->sourceId      = src->uuid();
+    region->positionBeats = juce::jmax (0.0, positionBeats);
+    region->lengthBeats   = regionLen;
+    region->name          = file.getFileNameWithoutExtension();
+    region->setNotes (std::move (notes));
+
+    if (! lane.playlist.addMidiRegion (std::move (region)))
+        return false;
 
     writeLanesToSession();
     if (body_ != nullptr)

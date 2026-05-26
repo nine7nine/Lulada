@@ -23,6 +23,7 @@ class NavigationSidebar;
 class NodeChannelStripView;
 class VirtualKeyboardView;
 class TrackerSideDock;
+class PianoRollView;
 
 class StandardContent : public Content,
                         public juce::ApplicationCommandTarget,
@@ -86,6 +87,23 @@ public:
     void showTrackerDockForNode (const juce::Uuid& trackerNodeId,
                                   int sequenceIdx = -1);
 
+    /** Bottom-attached piano-roll editor dock.  Peer to the tracker
+     *  side dock, but BOTTOM-attached (full window width, height
+     *  user-resizable via the top-edge drag handle).  Paint-only in
+     *  Phase 3 Session 1; the editor surface lands across Sessions
+     *  2 + 3 of the piano-roll work. */
+    void setPianoRollVisible (bool);
+    bool isPianoRollVisible() const;
+    void setPianoRollHeight (int);
+    int  getPianoRollHeight() const;
+
+    /** Bind the piano-roll to a specific MidiNoteRegion (e.g. clicked
+     *  from an ArrangementView MIDI region) and implicitly show the
+     *  dock.  Region lookup is performed per-paint via the resolver
+     *  lambda installed when the ArrangementView::findMidiRegion API
+     *  lands (Session 1 commit D); paint-only fallback otherwise. */
+    void showPianoRollForRegion (const juce::Uuid& regionId);
+
     void setCurrentNode (const Node& node) override;
 
     void stabilize (const bool refreshDataPathTrees = false) override;
@@ -134,6 +152,15 @@ private:
     int  trackerDockWidth_   { 380 };  /* clamped at apply time */
     static constexpr int kTrackerDockMinW = 240;
     static constexpr int kTrackerDockMaxW = 900;
+
+    /* Bottom-attached piano-roll dock.  Lazy-allocated on first
+     * setPianoRollVisible(true).  Persistence keys: "pianoRoll" +
+     * "pianoRollHeight". */
+    std::unique_ptr<PianoRollView> pianoRoll;
+    bool pianoRollVisible_ { false };
+    int  pianoRollHeight_  { 240 };
+    static constexpr int kPianoRollMinH = 140;
+    static constexpr int kPianoRollMaxH = 720;
 
     bool statusBarVisible { true };
     int statusBarSize;
