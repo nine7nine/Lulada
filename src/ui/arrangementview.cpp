@@ -1409,8 +1409,14 @@ public:
     {
         double maxEndBeats = 0.0;
         for (const auto& l : owner.lanes_)
+        {
             for (const auto& r : l.playlist.regions())
                 maxEndBeats = juce::jmax (maxEndBeats, r.endBeats());
+            for (const auto& m : l.playlist.midiRegions())
+                if (m != nullptr)
+                    maxEndBeats = juce::jmax (maxEndBeats,
+                                                m->positionBeats + m->lengthBeats);
+        }
         if (maxEndBeats <= 0.0) return;
 
         const int viewportInnerW = owner.viewport_.getMaximumVisibleWidth();
@@ -1451,6 +1457,14 @@ public:
             double end = 0.0;
             for (const auto& r : l.playlist.regions())
                 end = juce::jmax (end, r.endBeats());
+            /* MIDI regions extend the body width too -- Phase 2 omitted
+             * this loop so MIDI-only lanes capped the body at the 16-beat
+             * floor regardless of their actual span, visually clipping
+             * regions past 4 bars.  body_resizeNeeded already iterates
+             * both kinds; keeping the two methods symmetric. */
+            for (const auto& m : l.playlist.midiRegions())
+                if (m != nullptr)
+                    end = juce::jmax (end, m->positionBeats + m->lengthBeats);
             const int needed = (int) end + kFitPaddingBeats;
             if (needed > maxBeats) maxBeats = needed;
         }
@@ -3795,8 +3809,14 @@ void ArrangementView::maybeAutoFitOnLoad()
 
     double maxEndBeats = 0.0;
     for (const auto& l : lanes_)
+    {
         for (const auto& r : l.playlist.regions())
             maxEndBeats = juce::jmax (maxEndBeats, r.endBeats());
+        for (const auto& m : l.playlist.midiRegions())
+            if (m != nullptr)
+                maxEndBeats = juce::jmax (maxEndBeats,
+                                            m->positionBeats + m->lengthBeats);
+    }
     if (maxEndBeats <= 0.0) return;
 
     /* Two trigger conditions for auto-fit:
