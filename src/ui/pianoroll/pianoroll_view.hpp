@@ -11,6 +11,7 @@
 namespace element {
 
 class MidiNoteRegion;
+class PianoRollKeyboard;
 
 /** Bottom-attached piano-roll editor dock.  Peer to TrackerSideDock
  *  (right-attached) -- the bottom slot was reserved for piano-roll
@@ -96,6 +97,8 @@ private:
     std::unique_ptr<DragHandle>         dragHandle_;
     juce::Label                         regionLabel_;
     juce::TextButton                    closeBtn_ { "X" };
+
+    std::unique_ptr<PianoRollKeyboard>  keyboard_;
 
     void refreshLabel();
 

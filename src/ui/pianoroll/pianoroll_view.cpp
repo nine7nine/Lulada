@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "ui/pianoroll/pianoroll_view.hpp"
+#include "ui/pianoroll/pianoroll_keyboard.hpp"
 #include "ui/fontcache.hpp"
 
 namespace element {
@@ -80,6 +81,9 @@ PianoRollView::PianoRollView (Services& services)
     closeBtn_.onClick = [this]() {
         if (onCloseClicked) onCloseClicked();
     };
+
+    keyboard_ = std::make_unique<PianoRollKeyboard>();
+    addAndMakeVisible (*keyboard_);
 }
 
 PianoRollView::~PianoRollView() = default;
@@ -112,18 +116,22 @@ void PianoRollView::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0xff'0c'0c'0c));
     g.fillRect (0, kDragHandleH, getWidth(), kHeaderH);
 
-    /* Session 1 commits A/B/C: paint the empty-state hint in the body
-     * area.  Commit C replaces this paint with the PianoRollGrid
-     * child component (which paints its own empty state when no
-     * region resolver / region is bound). */
+    /* Session 1 commits B/C: keyboard column paints itself on the
+     * LEFT (juce::MidiKeyboardComponent subclass); the empty-state
+     * hint paints in the GRID slot to the right of the keyboard.
+     * Commit C replaces the hint with the PianoRollGrid child
+     * component (which paints its own empty state when no region
+     * resolver / region is bound). */
     const int bodyY = kDragHandleH + kHeaderH;
     const int bodyH = juce::jmax (0, getHeight() - bodyY);
-    if (bodyH > 0)
+    const int gridX = kKeyboardW;
+    const int gridW = juce::jmax (0, getWidth() - gridX);
+    if (bodyH > 0 && gridW > 0)
     {
         g.setColour (juce::Colours::white.withAlpha (0.35f));
         g.setFont (monoFont (12.0f, juce::Font::plain));
         g.drawText ("Double-click a MIDI region to edit.",
-                    0, bodyY, getWidth(), bodyH,
+                    gridX, bodyY, gridW, bodyH,
                     juce::Justification::centred, false);
     }
 }
@@ -138,9 +146,11 @@ void PianoRollView::resized()
     header.removeFromRight (4);
     regionLabel_.setBounds (header.reduced (4, 2));
 
-    /* Body slot left empty until Session 1 commits B (keyboard) +
-     * C (grid) add child components.  paint() draws the empty-state
-     * hint in this region. */
+    /* Body: keyboard column on the left, grid slot on the right.
+     * Commit C wires the grid child component into the right slot;
+     * for now paint() draws the empty-state hint in that area. */
+    if (keyboard_ != nullptr)
+        keyboard_->setBounds (r.removeFromLeft (kKeyboardW));
 }
 
 } // namespace element
