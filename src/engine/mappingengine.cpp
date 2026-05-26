@@ -4,6 +4,7 @@
 #include <element/processor.hpp>
 #include "engine/mappingengine.hpp"
 #include "engine/midiengine.hpp"
+#include "services/automation/automation_engine.hpp"
 #include <element/controller.hpp>
 #include <element/node.hpp>
 
@@ -87,18 +88,32 @@ struct MidiNoteControllerMap : public ControllerMapHandler,
 
         if (parameter != nullptr)
         {
-            parameter->beginChangeGesture();
-            if (momentary.get() == 0)
+            /* Defer to automation when an AutomationTrack in Read mode
+             * has this parameter bound -- automation wins over live
+             * MIDI mapping for that target this block.  Skip the lookup
+             * entirely when no engine is wired OR when activeTrackCount
+             * is zero (cheap atomic load short-circuit). */
+            const bool muted = [&]
             {
-                parameter->setValueNotifyingHost (parameter->getValue() < 0.5 ? 1.f : 0.f);
-            }
-            else
-            {
-                const bool onOrOff = isInverse ? message.isNoteOff() : message.isNoteOn();
-                parameter->setValueNotifyingHost (onOrOff ? 1.f : 0.f);
-            }
+                auto* eng = mapping.getAutomationEngine();
+                return eng != nullptr && eng->isMappingMutedForPluginParam (parameter.get());
+            }();
 
-            parameter->endChangeGesture();
+            if (! muted)
+            {
+                parameter->beginChangeGesture();
+                if (momentary.get() == 0)
+                {
+                    parameter->setValueNotifyingHost (parameter->getValue() < 0.5 ? 1.f : 0.f);
+                }
+                else
+                {
+                    const bool onOrOff = isInverse ? message.isNoteOff() : message.isNoteOn();
+                    parameter->setValueNotifyingHost (onOrOff ? 1.f : 0.f);
+                }
+
+                parameter->endChangeGesture();
+            }
         }
         else if (parameterIndex == Processor::EnabledParameter || parameterIndex == Processor::BypassParameter || parameterIndex == Processor::MuteParameter)
         {
@@ -252,9 +267,21 @@ struct MidiCCControllerMapHandler : public ControllerMapHandler,
 
         if (nullptr != parameter)
         {
-            parameter->beginChangeGesture();
-            parameter->setValueNotifyingHost (static_cast<float> (ccValue) / 127.f);
-            parameter->endChangeGesture();
+            /* Same automation-mute gate as the note handler -- skip
+             * the live CC write when an AutomationTrack in Read mode
+             * has this parameter bound this block. */
+            const bool muted = [&]
+            {
+                auto* eng = mapping.getAutomationEngine();
+                return eng != nullptr && eng->isMappingMutedForPluginParam (parameter.get());
+            }();
+
+            if (! muted)
+            {
+                parameter->beginChangeGesture();
+                parameter->setValueNotifyingHost (static_cast<float> (ccValue) / 127.f);
+                parameter->endChangeGesture();
+            }
         }
         else if (parameterIndex == Processor::EnabledParameter || parameterIndex == Processor::BypassParameter || parameterIndex == Processor::MuteParameter)
         {

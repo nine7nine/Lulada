@@ -253,4 +253,91 @@ BOOST_AUTO_TEST_CASE (mute_slot_out_of_range_returns_false)
     BOOST_CHECK (! eng.isMappingMuted (1000));
 }
 
+BOOST_AUTO_TEST_CASE (mapping_lookup_empty_engine_short_circuits_false)
+{
+    AutomationEngine eng;
+    FakePluginParam  param;
+    /* activeTrackCount is 0 -- lookup must short-circuit without
+     * taking the lock + return false. */
+    BOOST_CHECK (! eng.isMappingMutedForPluginParam (&param));
+    BOOST_CHECK (! eng.isMappingMutedForPluginParam (nullptr));
+    BOOST_CHECK_EQUAL (eng.activeTrackCount(), 0);
+}
+
+BOOST_AUTO_TEST_CASE (mapping_lookup_finds_read_mode_track_for_plugin_param)
+{
+    AutomationEngine eng;
+    FakePluginParam  param;
+    FakePluginParam  otherParam;
+
+    auto* track = eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.0, 1.0));
+    eng.bindPluginParam (track, &param);
+
+    /* Off mode: bound but not in Read -> mute flag is false ->
+     * lookup returns false. */
+    track->setMode (AutomationMode::Off);
+    juce::MidiBuffer midi;
+    eng.applyForBlock (1.0, 256, 48000.0, &midi);
+    BOOST_CHECK (! eng.isMappingMutedForPluginParam (&param));
+
+    /* Read mode + applyForBlock publishes mute=true -> lookup
+     * returns true. */
+    track->setMode (AutomationMode::Read);
+    eng.applyForBlock (1.0, 256, 48000.0, &midi);
+    BOOST_CHECK (eng.isMappingMutedForPluginParam (&param));
+
+    /* Unrelated parameter must NOT be muted just because some other
+     * track is in Read mode. */
+    BOOST_CHECK (! eng.isMappingMutedForPluginParam (&otherParam));
+}
+
+BOOST_AUTO_TEST_CASE (mapping_lookup_node_param_variant)
+{
+    AutomationEngine eng;
+    juce::ReferenceCountedObjectPtr<FakeNodeParam> p { new FakeNodeParam() };
+
+    auto* track = eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.0, 1.0));
+    eng.bindNodeParam (track, p.get());
+    track->setMode (AutomationMode::Read);
+
+    juce::MidiBuffer midi;
+    eng.applyForBlock (1.0, 256, 48000.0, &midi);
+
+    BOOST_CHECK (eng.isMappingMutedForNodeParam (p.get()));
+
+    /* Querying the wrong target kind for the same pointer must
+     * return false -- discriminator + pointer both have to match. */
+    BOOST_CHECK (! eng.isMappingMutedForPluginParam (
+        reinterpret_cast<juce::AudioProcessorParameter*> (p.get())));
+}
+
+BOOST_AUTO_TEST_CASE (unbind_clears_lookup_state)
+{
+    AutomationEngine eng;
+    FakePluginParam  param;
+
+    auto* track = eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.0, 1.0));
+    eng.bindPluginParam (track, &param);
+    track->setMode (AutomationMode::Read);
+    juce::MidiBuffer midi;
+    eng.applyForBlock (1.0, 256, 48000.0, &midi);
+    BOOST_REQUIRE (eng.isMappingMutedForPluginParam (&param));
+
+    /* Unbind: liveTarget cleared atomically; mute slot cleared too.
+     * Subsequent lookup must return false even though the track is
+     * still in Read mode (it's now bound to nothing). */
+    eng.unbindTarget (track);
+    BOOST_CHECK (! eng.isMappingMutedForPluginParam (&param));
+}
+
+BOOST_AUTO_TEST_CASE (drain_pending_lookups_is_safe_no_crash)
+{
+    /* drainPendingLookups acquires + releases the lookup lock --
+     * smoke-test that it doesn't deadlock or crash when called with
+     * no in-flight readers. */
+    AutomationEngine eng;
+    eng.drainPendingLookups();
+    eng.drainPendingLookups();   /* idempotent */
+}
+
 BOOST_AUTO_TEST_SUITE_END()

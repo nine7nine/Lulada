@@ -14,7 +14,7 @@ class RootGraph : public GraphNode
 public:
     RootGraph() = delete;
     RootGraph (Context&);
-    ~RootGraph() {}
+    ~RootGraph();
 
     enum RenderMode
     {

@@ -30,19 +30,29 @@ AutomationEngine::AutomationTrack* AutomationEngine::addTrack (std::unique_ptr<A
     if (track == nullptr)
         return nullptr;
 
-    AutomationTrack* raw = track.get();
-    ownedTracks_.push_back (std::move (track));
-
-    mutateTracksAndPublish ([raw] (TrackList& copy)
+    AutomationTrack* raw = nullptr;
     {
-        copy.push_back (raw);
-    });
+        /* lookupLock_ serialises against MIDI-thread lookups that
+         * walk ownedTracks_.  Audio thread doesn't touch
+         * ownedTracks_ -- it reads the published snapshot. */
+        const juce::ScopedLock sl (lookupLock_);
+        raw = track.get();
+        ownedTracks_.push_back (std::move (track));
 
+        mutateTracksAndPublish ([raw] (TrackList& copy)
+        {
+            copy.push_back (raw);
+        });
+    }
+
+    activeTrackCount_.fetch_add (1, std::memory_order_acq_rel);
     return raw;
 }
 
 void AutomationEngine::removeTrack (const juce::Uuid& trackId)
 {
+    const juce::ScopedLock sl (lookupLock_);
+
     AutomationTrack* erased = nullptr;
     mutateTracksAndPublish ([&] (TrackList& copy)
     {
@@ -65,7 +75,10 @@ void AutomationEngine::removeTrack (const juce::Uuid& trackId)
     erased->setMode (AutomationMode::Off);
 
     /* Unbind first so the retired target moves to retiredTargetsTrash_
-     * for epoch-gated reclaim. */
+     * for epoch-gated reclaim.  unbindTarget itself would take
+     * lookupLock_ -- already held here -- so call the inner unbind
+     * directly via the public method (juce::CriticalSection is
+     * recursive, so re-entry is safe). */
     unbindTarget (erased);
 
     const auto stamp = audioEpoch_.load (std::memory_order_acquire);
@@ -75,6 +88,7 @@ void AutomationEngine::removeTrack (const juce::Uuid& trackId)
         {
             removedTracksTrash_.push_back (RemovedTrackEntry { std::move (*it), stamp });
             ownedTracks_.erase (it);
+            activeTrackCount_.fetch_sub (1, std::memory_order_acq_rel);
             return;
         }
     }
@@ -86,6 +100,7 @@ void AutomationEngine::bindPluginParam (AutomationTrack* track, juce::AudioProce
 {
     if (track == nullptr || param == nullptr)
         return;
+    const juce::ScopedLock sl (lookupLock_);
     ensureMuteSlot (track);
     auto t = std::make_unique<AutomationTarget>();
     t->kind        = AutomationTarget::Kind::PluginParam;
@@ -97,6 +112,7 @@ void AutomationEngine::bindNodeParam (AutomationTrack* track, element::Parameter
 {
     if (track == nullptr || param == nullptr)
         return;
+    const juce::ScopedLock sl (lookupLock_);
     ensureMuteSlot (track);
     auto t = std::make_unique<AutomationTarget>();
     t->kind      = AutomationTarget::Kind::NodeParam;
@@ -108,6 +124,7 @@ void AutomationEngine::bindMidiCc (AutomationTrack* track, int channel, int ccNu
 {
     if (track == nullptr || ccNumber < 0)
         return;
+    const juce::ScopedLock sl (lookupLock_);
     ensureMuteSlot (track);
     auto t = std::make_unique<AutomationTarget>();
     t->kind         = AutomationTarget::Kind::MidiCc;
@@ -120,6 +137,7 @@ void AutomationEngine::unbindTarget (AutomationTrack* track)
 {
     if (track == nullptr)
         return;
+    const juce::ScopedLock sl (lookupLock_);
 
     /* Clear the mute slot FIRST so MappingEngine immediately stops
      * deferring writes for the (now-unbound) target.  Otherwise a
@@ -128,8 +146,8 @@ void AutomationEngine::unbindTarget (AutomationTrack* track)
      * if a track is later removed, it disappears from the snapshot
      * and its slot is never written again). */
     const int slot = track->muteSlotIndex.load (std::memory_order_acquire);
-    if (slot >= 0 && slot < (int) muteSlots_.size())
-        muteSlots_[(size_t) slot]->store (false, std::memory_order_release);
+    if (slot >= 0 && slot < kMaxMuteSlots)
+        muteSlots_[(size_t) slot].store (false, std::memory_order_release);
 
     /* Atomic-swap the published live-target ptr to null; the displaced
      * target goes to retiredTargetsTrash_ stamped at the current
@@ -199,12 +217,12 @@ void AutomationEngine::applyForBlock (double currentBeats,
          * (engine writes the param; MappingEngine must defer), false
          * otherwise.  Atomic store per block per slot -- bounded by
          * track count, not target count, and skipped when slot is
-         * unallocated (-1). */
+         * unallocated (-1) or past the fixed-size table cap. */
         const int slot = track->muteSlotIndex.load (std::memory_order_acquire);
-        if (slot >= 0 && slot < (int) muteSlots_.size())
+        if (slot >= 0 && slot < kMaxMuteSlots)
         {
             const bool shouldMute = (mode == AutomationMode::Read);
-            muteSlots_[(size_t) slot]->store (shouldMute, std::memory_order_release);
+            muteSlots_[(size_t) slot].store (shouldMute, std::memory_order_release);
         }
 
         if (mode != AutomationMode::Read)
@@ -235,9 +253,58 @@ void AutomationEngine::applyForBlock (double currentBeats,
 
 bool AutomationEngine::isMappingMuted (int slotIndex) const noexcept
 {
-    if (slotIndex < 0 || slotIndex >= (int) muteSlots_.size())
+    if (slotIndex < 0 || slotIndex >= kMaxMuteSlots)
         return false;
-    return muteSlots_[(size_t) slotIndex]->load (std::memory_order_acquire);
+    return muteSlots_[(size_t) slotIndex].load (std::memory_order_acquire);
+}
+
+bool AutomationEngine::isMappingMutedForPluginParam (juce::AudioProcessorParameter* p) const noexcept
+{
+    if (p == nullptr)
+        return false;
+    /* Fast path: cheap atomic load.  No tracks bound -> no automation,
+     * no mute, no lock. */
+    if (activeTrackCount_.load (std::memory_order_acquire) == 0)
+        return false;
+
+    /* Slow path: PI-correct lock + linear walk of ownedTracks_ for a
+     * matching plugin-param binding.  ownedTracks_ is UI-thread-
+     * mutated; lookupLock_ serialises against add/remove/bind/unbind.
+     * MIDI thread tolerates microsecond-level lock holds.  Audio
+     * thread NEVER takes this lock. */
+    const juce::ScopedLock sl (lookupLock_);
+    for (const auto& track : ownedTracks_)
+    {
+        const auto* target = track->liveTarget.load (std::memory_order_acquire);
+        if (target == nullptr || target->kind != AutomationTarget::Kind::PluginParam)
+            continue;
+        if (target->pluginParam != p)
+            continue;
+        const int slot = track->muteSlotIndex.load (std::memory_order_acquire);
+        return isMappingMuted (slot);
+    }
+    return false;
+}
+
+bool AutomationEngine::isMappingMutedForNodeParam (element::Parameter* p) const noexcept
+{
+    if (p == nullptr)
+        return false;
+    if (activeTrackCount_.load (std::memory_order_acquire) == 0)
+        return false;
+
+    const juce::ScopedLock sl (lookupLock_);
+    for (const auto& track : ownedTracks_)
+    {
+        const auto* target = track->liveTarget.load (std::memory_order_acquire);
+        if (target == nullptr || target->kind != AutomationTarget::Kind::NodeParam)
+            continue;
+        if (target->nodeParam.get() != p)
+            continue;
+        const int slot = track->muteSlotIndex.load (std::memory_order_acquire);
+        return isMappingMuted (slot);
+    }
+    return false;
 }
 
 //==============================================================================
@@ -285,11 +352,24 @@ void AutomationEngine::ensureMuteSlot (AutomationTrack* track)
         return;
     if (track->muteSlotIndex.load (std::memory_order_acquire) >= 0)
         return;
-    /* Append a new slot.  Slot indices are stable for the engine's
-     * lifetime (we never compact).  Bounded by distinct-targets-ever-
-     * bound; for a session that's typically tens to low hundreds. */
-    muteSlots_.push_back (std::make_unique<std::atomic<bool>> (false));
-    const int slot = (int) muteSlots_.size() - 1;
+
+    /* fetch_add reserves the next slot atomically.  Slot indices are
+     * stable for the engine's lifetime.  Bounded by kMaxMuteSlots
+     * (256); if we overflow, we silently leave the track unmutable
+     * from MappingEngine's perspective -- it can still automate
+     * normally, just won't fight MIDI mapping writes for that target.
+     * 256 is well above typical per-session automation track counts. */
+    const int slot = muteSlotCount_.fetch_add (1, std::memory_order_acq_rel);
+    if (slot >= kMaxMuteSlots)
+    {
+        muteSlotCount_.store (kMaxMuteSlots, std::memory_order_release);
+        return;   /* slot pool exhausted -- track stays slotless */
+    }
+    /* Explicit init: array's default-construction of atomic<bool>
+     * yields an unspecified initial value (atomics are not zero-
+     * initialised by default before C++20).  Store false explicitly
+     * so the audio thread's first load sees a known state. */
+    muteSlots_[(size_t) slot].store (false, std::memory_order_release);
     track->muteSlotIndex.store (slot, std::memory_order_release);
 }
 
