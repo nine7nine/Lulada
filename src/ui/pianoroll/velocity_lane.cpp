@@ -261,11 +261,22 @@ void VelocityLane::mouseUp (const juce::MouseEvent& e)
             after.velocity = juce::jlimit (1, 127, before.velocity + delta);
             cmd->recordUpdate (before.id, before, after);
         }
+        juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+        cmd->onApplied = [safeView]() {
+            if (auto* v = safeView.getComponent())
+                v->notifyRegionEdited();
+        };
         gui->getUndoManager().perform (cmd.release(), "Edit MIDI velocity");
+    }
+    else
+    {
+        /* No undo trail in the fallback path -- but the live preview
+         * already applied the velocity changes; still need to flush
+         * the session via notifyRegionEdited. */
+        parent_.notifyRegionEdited();
     }
 
     drag_.originals.clear();
-    parent_.notifyRegionEdited();
     repaint();
 }
 

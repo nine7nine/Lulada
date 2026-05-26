@@ -71,6 +71,7 @@ bool MidiNoteDiffCommand::perform()
         region->updateNoteById (u.id, target);
     }
 
+    if (onApplied) onApplied();
     return true;
 }
 
@@ -96,6 +97,7 @@ bool MidiNoteDiffCommand::undo()
     for (auto it = removes_.rbegin(); it != removes_.rend(); ++it)
         region->addNote (it->note);   /* note carries its original id */
 
+    if (onApplied) onApplied();
     return true;
 }
 

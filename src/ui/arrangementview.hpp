@@ -207,6 +207,20 @@ private:
     void loadLanesFromSession();
     void writeLanesToSession();
 
+public:
+    /** Flush the current lanes_ snapshot to the session ValueTree
+     *  WITHOUT pushing an ArrangementSnapshotAction onto the undo
+     *  stack.  Use this from mutation sources that own their own
+     *  undo entry (e.g. piano-roll MidiNoteDiffCommand): the
+     *  ArrangementSnapshot wrapper would double-up entries on the
+     *  global UndoManager, leaving every other Ctrl+Z a silent
+     *  no-op.  Still updates lastCommittedSnapshot_ so subsequent
+     *  arrangement-side writeLanesToSession diffs against this
+     *  newer baseline. */
+    void flushLanesToSession();
+
+private:
+
     /** Snapshot-based undo state.  See public applyLaneSnapshot for
      *  the rationale + invariants. */
     juce::Array<Lane> lastCommittedSnapshot_;

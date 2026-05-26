@@ -4054,6 +4054,28 @@ void ArrangementView::writeLanesToSession()
         lanesTree.appendChild (l.toValueTree(), nullptr);
 }
 
+void ArrangementView::flushLanesToSession()
+{
+    /* Serialise lanes_ to the session tree, refresh the committed
+     * baseline, and skip the ArrangementSnapshotAction push.  Mutation
+     * sources that already own a global UndoManager entry (the
+     * piano-roll's MidiNoteDiffCommand, the velocity-lane edit
+     * command) call this instead of writeLanesToSession so Ctrl+Z
+     * lands on the granular diff and not on a wrapper snapshot. */
+    if (services_ == nullptr) return;
+
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+
+    auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
+    auto lanesTree = tree.getOrCreateChildWithName ("lanes", nullptr);
+    lanesTree.removeAllChildren (nullptr);
+    for (const auto& l : lanes_)
+        lanesTree.appendChild (l.toValueTree(), nullptr);
+
+    lastCommittedSnapshot_ = lanes_;
+}
+
 void ArrangementView::applyLaneSnapshot (const juce::Array<Lane>& snap)
 {
     /* Re-entrancy guard: writeLanesToSession runs inside this method

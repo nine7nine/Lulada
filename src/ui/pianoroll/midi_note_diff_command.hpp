@@ -76,6 +76,15 @@ public:
      *  gesture is its own command. */
     juce::UndoableAction* createCoalescedAction (juce::UndoableAction*) override { return nullptr; }
 
+    /** Fired at the END of every perform() AND undo() invocation, once
+     *  the diff has been applied.  Construction sites use it to keep
+     *  the session ValueTree (ArrangementView::flushLanesToSession)
+     *  and any view-side caches (PianoRollView::notifyRegionEdited)
+     *  in sync across both apply and revert directions -- the UndoMgr
+     *  does not give us a forwarding hook of its own, and without this
+     *  Ctrl+Z silently leaves the session XML carrying stale notes. */
+    std::function<void()> onApplied;
+
 private:
     juce::Uuid     regionId_;
     RegionResolver resolver_;

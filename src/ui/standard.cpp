@@ -1864,15 +1864,29 @@ void StandardContent::showPianoRollForRegion (const juce::Uuid& regionId)
         });
 
     /* Region-edited callback -- piano-roll edits fire this on commit
-     * + on Delete-key + on Erase-tool hit; we repaint the arrangement
-     * view's body so the lane strip's note-count badge tracks live.
-     * Cheap: ArrangementView's paint already reads noteCount() per
-     * region via an atomic load. */
+     * + on Delete-key + on Erase-tool hit + on undo/redo of any of the
+     * above.  Two responsibilities:
+     *
+     *   1. Flush lanes_ to the session ValueTree.  Piano-roll edits
+     *      mutate MidiNoteRegion via the resolver but don't reach the
+     *      session XML on their own; without this, a Save+Reload loses
+     *      every note authored in the piano roll while the parent
+     *      MIDI clip box itself persists.
+     *   2. Repaint the arrangement strip so the lane's note-count
+     *      badge tracks live.  Cheap: ArrangementView's paint reads
+     *      noteCount() per region via an atomic load.
+     *
+     *  flushLanesToSession deliberately skips the ArrangementSnapshot
+     *  undo push -- the MidiNoteDiffCommand already owns this gesture's
+     *  Ctrl+Z slot on the global UndoManager. */
     pianoRoll->onRegionEdited = [this]() {
         auto it = viewCache_.find (EL_VIEW_ARRANGEMENT);
         if (it == viewCache_.end()) return;
-        if (auto* arr = it->second.get())
+        if (auto* arr = dynamic_cast<ArrangementView*> (it->second.get()))
+        {
+            arr->flushLanesToSession();
             arr->repaint();
+        }
     };
 
     pianoRoll->setRegion (regionId);

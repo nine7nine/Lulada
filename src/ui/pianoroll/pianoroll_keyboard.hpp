@@ -62,11 +62,12 @@ public:
     PianoRollKeyboard();
     ~PianoRollKeyboard() override = default;
 
-    /** First (highest pitch) visible MIDI note number.  Bitwig
-     *  default = 96 (C7).  The keyboard's verticalKeyboardFacingRight
-     *  orientation places this at the TOP of the column. */
-    static constexpr int kDefaultLowestVisibleNote  = 36;  // C2
-    static constexpr int kDefaultHighestVisibleNote = 96;  // C7
+    /** Default visible pitch range -- 3 octaves centred on middle C
+     *  (C3..B5).  Aligned to octave boundaries so JUCE's built-in
+     *  scroll arrows (which snap to octave starts) produce clean
+     *  jumps without partial-octave overhang. */
+    static constexpr int kDefaultLowestVisibleNote  = 48;  // C3
+    static constexpr int kDefaultHighestVisibleNote = 83;  // B5
 
     /** Hard bounds on the visible range that vertical zoom is
      *  allowed to span.  We let the user shrink down to ~one octave
@@ -112,17 +113,31 @@ public:
      *  by juce::Component when setBounds changes the height. */
     void resized() override;
 
+    /** Override JUCE's default drawBlackNote which paints a light
+     *  inner-cap highlight on the top half of the key, making the
+     *  cap read as grey on grey under our dark theme.  Match the
+     *  flat-fill override used by VirtualKeyboardComponent so the
+     *  black keys actually look black. */
+    void drawBlackNote (int midiNoteNumber, juce::Graphics&,
+                          juce::Rectangle<float> area,
+                          bool isDown, bool isOver,
+                          juce::Colour noteFillColour) override;
+
     /* State is held by the private detail::PianoRollKeyboardStateHolder
      * base (above) -- accessed via the inherited `state` member.  No
      * notes ever light up in Session 1; Session 3's playback layer
      * will broadcast via a separate channel. */
 
 private:
-    /* Cached high-pitch bound -- juce::MidiKeyboardComponent only
-     * exposes the LOW end via getLowestVisibleKey(); we track the
-     * high bound separately so getHighestVisibleNoteNumber() stays
-     * O(1). */
-    int  cachedHighest_ { kDefaultHighestVisibleNote };
+    /* Cached visible SPAN (number of semitones).  We track the span
+     * rather than an independent high bound because juce::Keyboard-
+     * ComponentBase's built-in scroll arrows fire setLowestVisibleKey
+     * without telling our class -- if we cached an independent
+     * `highest`, scrolling lo would expand the range (looking like a
+     * zoom).  Caching the span instead means the high bound follows
+     * lo naturally and the visible window slides at constant size.
+     * O(1) lookup via getLowestVisibleKey() + cachedSpan_ - 1. */
+    int  cachedSpan_ { kDefaultHighestVisibleNote - kDefaultLowestVisibleNote + 1 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PianoRollKeyboard)
 };

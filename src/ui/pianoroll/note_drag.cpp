@@ -28,22 +28,31 @@ void commitDiff (PianoRollGrid& grid,
 {
     if (cmd == nullptr || cmd->isEmpty()) return;
 
+    /* Plumb the view-side notification through the command so it fires
+     * on BOTH perform() (initial commit) and undo() (Ctrl+Z) -- without
+     * this, Ctrl+Z leaves the ArrangementView session tree carrying
+     * stale notes and the next save reinstates them on reload. */
+    juce::Component::SafePointer<PianoRollView> safeView (
+        grid.findParentComponentOfClass<PianoRollView>());
+    cmd->onApplied = [safeView]() {
+        if (auto* v = safeView.getComponent())
+            v->notifyRegionEdited();
+    };
+
     auto& services = grid.getServices();
     if (auto* gui = services.find<GuiService>())
     {
         /* GuiService::getUndoManager() returns a reference, not a
-         * pointer -- always valid in a live session. */
+         * pointer -- always valid in a live session.  perform() will
+         * fire onApplied internally; no manual notify needed here. */
         gui->getUndoManager().perform (cmd.release(), displayName);
     }
     else
     {
         /* Fallback: apply directly + drop.  No undo trail in this path
-         * but the edit still lands. */
+         * but the edit still lands -- onApplied fires from perform(). */
         cmd->perform();
     }
-
-    if (auto* view = grid.findParentComponentOfClass<PianoRollView>())
-        view->notifyRegionEdited();
 }
 
 } // namespace

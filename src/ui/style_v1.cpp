@@ -322,6 +322,19 @@ LookAndFeel_E1::LookAndFeel_E1()
     setColour (MidiKeyboardComponent::textLabelColourId,           Colour (0xff'd0'd0'd0));
     setColour (MidiKeyboardComponent::shadowColourId,              Colour (0x66'00'00'00));
 
+    /* KeyboardComponentBase scroll-handle ColourIds.  JUCE's
+     * LookAndFeel_V4 defaults paint the small triangle scroll
+     * buttons (top + bottom of vertical keyboards, left + right of
+     * horizontal ones) in a near-white grey, which jumps out against
+     * our dark theme.  Use the same widget-background shade as the
+     * surrounding chrome so the handles read as quiet, dark UI.
+     * The arrow itself is drawn with a built-in alpha mask
+     * (0.4 at rest, 0.6 on hover, 1.0 down), so the chosen colour
+     * appears subtly over the dark background -- "very dark"
+     * matches the user's app-style ask. */
+    setColour (KeyboardComponentBase::upDownButtonBackgroundColourId, Colour (0xff'1a'1a'1a));
+    setColour (KeyboardComponentBase::upDownButtonArrowColourId,      Colour (0xff'70'70'70));
+
     // Alert Window
     setColour (AlertWindow::backgroundColourId, Colors::backgroundColor);
     setColour (AlertWindow::textColourId, Colors::textColor);
