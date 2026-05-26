@@ -12,6 +12,7 @@ namespace element {
 
 class MidiNoteRegion;
 class PianoRollKeyboard;
+class PianoRollGrid;
 
 /** Bottom-attached piano-roll editor dock.  Peer to TrackerSideDock
  *  (right-attached) -- the bottom slot was reserved for piano-roll
@@ -72,6 +73,12 @@ public:
      *  region is bound (initial state, or post-clear). */
     juce::Uuid getBoundRegionId() const noexcept { return boundRegionId_; }
 
+    /** Accessor for the keyboard column.  Returns nullptr only during
+     *  construction / destruction.  PianoRollGrid uses this to read
+     *  the current visible pitch range + per-key dimensions when
+     *  laying out its note rectangles. */
+    PianoRollKeyboard* getKeyboard() const noexcept { return keyboard_.get(); }
+
     /** Drag-handle / close callbacks owned by StandardContent (so the
      *  parent holds the height field + layout trigger).  `deltaPx` is
      *  positive when the user is dragging DOWN (dock shrinks) and
@@ -99,6 +106,7 @@ private:
     juce::TextButton                    closeBtn_ { "X" };
 
     std::unique_ptr<PianoRollKeyboard>  keyboard_;
+    std::unique_ptr<PianoRollGrid>      grid_;
 
     void refreshLabel();
 
