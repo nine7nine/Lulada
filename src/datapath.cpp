@@ -18,6 +18,7 @@ inline static StringArray getSubDirs()
 {
     auto dirs = StringArray ({ "Controllers",
                                "Graphs",
+                               "Midi",
                                "Nodes",
                                "Scripts",
                                "Sessions" });
@@ -88,6 +89,7 @@ const File DataPath::defaultScriptsDir() { return defaultUserDataPath().getChild
 const File DataPath::defaultSessionDir() { return defaultUserDataPath().getChildFile ("Sessions"); }
 const File DataPath::defaultGraphDir() { return defaultUserDataPath().getChildFile ("Graphs"); }
 const File DataPath::defaultControllersDir() { return defaultUserDataPath().getChildFile ("Controllers"); }
+const File DataPath::defaultMidiDir()        { return defaultUserDataPath().getChildFile ("Midi"); }
 
 juce::File DataPath::getPresetFile (const juce::String& name) const
 {

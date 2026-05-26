@@ -48,6 +48,12 @@ public:
     /** Returns the default Controllers directory */
     static const juce::File defaultControllersDir();
 
+    /** Returns the default MIDI directory.  Created on first launch
+     *  alongside Sessions/Graphs/Nodes/etc.  Houses .mid files that
+     *  the user wants to drag into ArrangementView MIDI lanes via
+     *  the data-path browser. */
+    static const juce::File defaultMidiDir();
+
     /** Returns the installation directory. May return an invalid file,
         especially when in debug mode. Use this sparingly.
       */
