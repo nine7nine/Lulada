@@ -9,9 +9,12 @@
 #include <element/arc.hpp>
 #include <element/signals.hpp>
 
+#include <memory>
+
 namespace element {
 
 class Context;
+namespace automation { class AutomationEngine; }
 
 class GraphNode : public Processor,
                   private AsyncUpdater
@@ -192,6 +195,12 @@ public:
     void setParallelExecutionEnabled (bool enabled) noexcept { parallelEnabled = enabled; }
     bool isParallelExecutionEnabled() const noexcept { return parallelEnabled.load(); }
 
+    /** Access this graph's AutomationEngine.  Always non-null after
+     *  construction.  Audio thread reads via applyForBlock at the top
+     *  of render(); UI thread (or session loader) populates tracks +
+     *  binds targets via the engine's public API. */
+    automation::AutomationEngine* automationEngine() noexcept { return automationEngine_.get(); }
+
 protected:
     //==========================================================================
     virtual void preRenderNodes() {}
@@ -238,6 +247,12 @@ private:
     MidiBuffer filteredMidi;
 
     std::atomic<AudioPlayHead*> playhead { nullptr };
+
+    /** Per-graph automation engine.  Constructed eagerly in ctor (so
+     *  the public accessor + applyForBlock call never null-check).
+     *  Idle when zero tracks are bound -- applyForBlock returns after
+     *  ~3 atomic ops in that case. */
+    std::unique_ptr<automation::AutomationEngine> automationEngine_;
 
     bool customPortsSet = false;
     PortList userPorts;
