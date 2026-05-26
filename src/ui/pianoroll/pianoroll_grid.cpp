@@ -476,12 +476,32 @@ void PianoRollGrid::paintRuler (juce::Graphics& g, int beatsPerBar)
                             (float) vr.getX(),
                             (float) vr.getRight());
 
-    /* Tick subdivision scales with zoom -- ArrangementView mirrors
-     * the same thresholds (>=32 px/beat -> 4 sub-ticks, >=16 -> 2,
-     * else 1).  Sub-ticks render as the dim LCD tier so they don't
-     * compete with the beat + bar ticks. */
-    const int subdiv = (pxPerBeat_ >= 32) ? 4
-                     : (pxPerBeat_ >= 16) ? 2 : 1;
+    /* Tick subdivision tracks the active snap setting -- the user
+     * should always SEE the grid they're snapping to.  Snap off (or
+     * snap >= 1 beat) falls back to a zoom-driven 4/2/1 ladder so the
+     * ruler still has some sub-resolution at high zoom.  Triplet
+     * snaps emit 3, 6 or 12 sub-ticks/beat (rounding to the nearest
+     * supported subdivision count).  Final subdiv is capped so no
+     * two adjacent sub-ticks land closer than ~5 px -- below that
+     * they blur into a solid bar. */
+    int subdiv = 1;
+    if (snapEnabled_ && snapDivision_ > 0.0 && snapDivision_ <= 1.0)
+    {
+        const double subsPerBeat = 1.0 / snapDivision_;
+        /* Round to nearest integer; covers duple (2/4/8/16/32) +
+         * triplet (3/6/12) families since 1/0.125 = 8, 1/(1/6) = 6,
+         * etc. */
+        subdiv = juce::jlimit (1, 32, (int) std::round (subsPerBeat));
+    }
+    else
+    {
+        /* No snap -- use the prior zoom ladder so the ruler still
+         * communicates beat resolution at high zoom. */
+        subdiv = (pxPerBeat_ >= 32) ? 4
+              : (pxPerBeat_ >= 16) ? 2 : 1;
+    }
+    while (subdiv > 1 && (double) pxPerBeat_ / (double) subdiv < 5.0)
+        subdiv = juce::jmax (1, subdiv / 2);
     const int subStepPx = juce::jmax (1, pxPerBeat_ / subdiv);
 
     /* Loop bounds via clip rect intersected with visible -- caps the
