@@ -4,11 +4,41 @@
 #include "ui/pianoroll/pianoroll_view.hpp"
 #include "ui/pianoroll/pianoroll_keyboard.hpp"
 #include "ui/pianoroll/pianoroll_grid.hpp"
+#include "ui/pianoroll/velocity_lane.hpp"
 #include "ui/fontcache.hpp"
 
 #include "services/timeline/midi_note_region.hpp"
 
 namespace element {
+
+/* Bridge from juce::Viewport's view-position change -> VelocityLane.
+ * Viewport doesn't expose a public listener interface so we attach a
+ * juce::ScrollBar::Listener to the horizontal scrollbar.  Fires on
+ * every visible-area change (drag, wheel, programmatic). */
+class PianoRollView::ViewportScrollMirror : public juce::ScrollBar::Listener
+{
+public:
+    ViewportScrollMirror (juce::Viewport& vp, VelocityLane& lane)
+        : viewport_ (vp), lane_ (lane)
+    {
+        viewport_.getHorizontalScrollBar().addListener (this);
+    }
+    ~ViewportScrollMirror() override
+    {
+        viewport_.getHorizontalScrollBar().removeListener (this);
+    }
+    void scrollBarMoved (juce::ScrollBar* sb, double /*newRange*/) override
+    {
+        /* The HORIZONTAL scrollbar's range start IS the viewport's
+         * view-position-x.  Push it to the lane so it can re-paint
+         * lollipops aligned with the grid above. */
+        if (sb == &viewport_.getHorizontalScrollBar())
+            lane_.setScrollX (viewport_.getViewPositionX());
+    }
+private:
+    juce::Viewport& viewport_;
+    VelocityLane&   lane_;
+};
 
 /* Top-edge drag handle.  Vertical-only resize -- forwards the pixel
  * delta to the dock's onResizeDrag callback so StandardContent owns
@@ -225,12 +255,28 @@ PianoRollView::PianoRollView (Services& services)
     gridViewport_->setViewedComponent (grid_.get(), false /*deleteOnDelete*/);
     addAndMakeVisible (*gridViewport_);
 
+    /* Velocity lane under the grid.  Lives OUTSIDE the viewport (so
+     * its height doesn't get eaten by the viewport's content sizing)
+     * + mirrors the viewport's horizontal scroll position via a
+     * ScrollBar listener so lollipops stay aligned with notes. */
+    velocityLane_ = std::make_unique<VelocityLane> (*this, services_);
+    addAndMakeVisible (*velocityLane_);
+    scrollMirror_ = std::make_unique<ViewportScrollMirror> (*gridViewport_,
+                                                              *velocityLane_);
+
     /* Seed the grid with the comboBox's default snap pick so the
      * displayed division + the runtime division agree from frame 0. */
     applySnapFromComboBox();
 }
 
 PianoRollView::~PianoRollView() = default;
+
+void PianoRollView::notifyRegionEdited()
+{
+    if (onRegionEdited) onRegionEdited();
+    if (velocityLane_ != nullptr)
+        velocityLane_->repaint();
+}
 
 void PianoRollView::setRegion (const juce::Uuid& regionId)
 {
@@ -376,6 +422,15 @@ void PianoRollView::resized()
      * first note row.  The dock paints the corner above the keyboard
      * with the same colour as the grid's ruler strip so the gap reads
      * as intentional. */
+    /* Reserve kVelocityLaneH at the BOTTOM of the body for the
+     * velocity strip.  Lane spans the same horizontal extent as the
+     * grid viewport (NOT the keyboard column) so its lollipops line
+     * up with the notes above; horizontal scroll is mirrored from the
+     * viewport via the ScrollBar listener installed in the ctor. */
+    juce::Rectangle<int> velLaneArea;
+    if (velocityLane_ != nullptr && velocityLane_->isVisible())
+        velLaneArea = r.removeFromBottom (kVelocityLaneH);
+
     if (keyboard_ != nullptr)
     {
         auto kbCol = r.removeFromLeft (kKeyboardW);
@@ -389,6 +444,17 @@ void PianoRollView::resized()
     }
     if (gridViewport_ != nullptr)
         gridViewport_->setBounds (r);
+
+    if (velocityLane_ != nullptr && ! velLaneArea.isEmpty())
+    {
+        /* Lane occupies the SAME X+W as the grid viewport so notes
+         * + lollipops align vertically. */
+        velocityLane_->setBounds (velLaneArea.withLeft (r.getX())
+                                                .withWidth (r.getWidth()));
+        velocityLane_->setScrollX (gridViewport_ != nullptr
+                                     ? gridViewport_->getViewPositionX()
+                                     : 0);
+    }
 
     /* Grid height tracks the viewport's inner height so each pitch
      * row stays aligned with the keyboard.  Width is updated by the

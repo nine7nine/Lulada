@@ -25,9 +25,8 @@ target_include_directories(element
 )
 
 # Re-glob marker: bump this file's mtime to force CMake to re-scan
-# after adding new sources under src/.  Updated 2026-05-25 for
-# Phase 3 Session 2: nodes/midiplayer + ui/pianoroll/note_drag +
-# ui/pianoroll/midi_note_diff_command.
+# after adding new sources under src/.  Updated 2026-05-26 for the
+# Tier 1 batch: ui/pianoroll/velocity_lane.{hpp,cpp}.
 file(GLOB_RECURSE ELEMENT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")

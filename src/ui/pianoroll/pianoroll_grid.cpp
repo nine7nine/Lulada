@@ -310,6 +310,28 @@ void PianoRollGrid::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0xff'16'16'16));
     g.fillRect (bodyBounds());
 
+    /* Paint the "beyond region" zone darker so the user can see the
+     * span they're actually editing.  Grid component width may exceed
+     * regionLen * pxPerBeat when the viewport is wider than the
+     * region (auto-fit on bind), and we want the user to know clicks
+     * past the right edge are no-ops. */
+    const int regionEndX = (int) std::round (regionLenBeats_ * pxPerBeat_);
+    if (getWidth() > regionEndX)
+    {
+        const auto body = bodyBounds();
+        const juce::Rectangle<int> beyond (regionEndX,
+                                            body.getY(),
+                                            getWidth() - regionEndX,
+                                            body.getHeight());
+        g.setColour (juce::Colour (0xff'08'08'08));
+        g.fillRect (beyond);
+        /* 1 px brighter divider line at the region end. */
+        g.setColour (juce::Colour (0xff'40'40'40));
+        g.drawVerticalLine (regionEndX,
+                              (float) body.getY(),
+                              (float) body.getBottom());
+    }
+
     auto* region = resolveBoundRegion();
     if (region != nullptr && juce::jmax (1.0, region->lengthBeats) != regionLenBeats_)
     {
@@ -582,10 +604,14 @@ void PianoRollGrid::paintNotes (juce::Graphics& g, const MidiNoteRegion& region)
      * scrolled up under the ruler are clipped). */
     const auto cullRect = vr.getIntersection (body);
 
-    /* Base colours derived from the region's colour.  Brighter top
-     * edge gives a subtle "lit from above" depth cue; selected notes
-     * use a saturated wash + accent edge.  Velocity scales the body
-     * brightness so harder-hit notes stand out (Ableton convention). */
+    /* Note style mirrors ArrangementView region paint: a darker
+     * shaded interior tinted from the region's colour, with the full
+     * saturated colour applied as the outer outline.  White note-name
+     * label reads against the dim body across the velocity range
+     * without the black-on-bright fallback the gradient style needed.
+     * Velocity scales body brightness so harder-hit notes still stand
+     * out -- but never bright enough to fight the label or the
+     * saturated outline. */
     const juce::Colour baseBody = region.colour;
     const juce::Colour selWash  { 0xff'40'ff'80 };   /* kAccentGreen */
     const juce::Colour selEdge  { 0xff'cf'ff'd6 };
@@ -604,51 +630,36 @@ void PianoRollGrid::paintNotes (juce::Graphics& g, const MidiNoteRegion& region)
 
         const bool selected = isSelected (n.id);
         const float velNorm = juce::jlimit (0.0f, 1.0f, (float) n.velocity / 127.0f);
-        /* Body brightness: velocity 1 reads at ~70% saturation, velocity 127 at full.
-         * Selection overrides the colour entirely for unambiguous read. */
-        const juce::Colour bodyMid = selected
-            ? selWash
-            : baseBody.withMultipliedSaturation (0.70f + 0.30f * velNorm)
-                       .withMultipliedBrightness (0.85f + 0.30f * velNorm);
-        const juce::Colour bodyTop = bodyMid.brighter (0.30f);
-        const juce::Colour bodyBot = bodyMid.darker   (0.20f);
-        const juce::Colour edge    = selected
-            ? selEdge
-            : bodyMid.brighter (0.45f);
+
+        /* Body fill (shaded/tinted) and outline (saturated tint) --
+         * timeline-region pattern.  ArrangementView's MIDI region uses
+         * sat x 0.55 / brightness x 0.45; piano-roll notes match that
+         * cap exactly but scale brightness down with velocity so soft
+         * notes still read as darker.  Selection uses the accent-green
+         * wash + bright accent edge for unambiguous read. */
+        const juce::Colour fill = selected
+            ? selWash.withMultipliedSaturation (0.85f)
+                     .withMultipliedBrightness (0.45f)
+            : baseBody.withMultipliedSaturation (0.55f)
+                       .withMultipliedBrightness (0.30f + 0.15f * velNorm);
+        const juce::Colour edge = selected ? selEdge : baseBody;
 
         const auto rf = rect.toFloat();
         const float corner = juce::jmin (3.0f, rf.getHeight() * 0.35f);
 
-        /* Body: vertical gradient so the note reads as solid + lit
-         * from above.  Single setGradientFill + fillRoundedRectangle
-         * call -- no overdraw, no per-pixel work. */
-        juce::ColourGradient grad (bodyTop, rf.getX(), rf.getY(),
-                                     bodyBot, rf.getX(), rf.getBottom(),
-                                     false);
-        g.setGradientFill (grad);
+        g.setColour (fill);
         g.fillRoundedRectangle (rf, corner);
 
-        /* Outer outline + a brighter top hairline for the depth cue
-         * (avoids relying on a perceptible gradient at small row
-         * heights where the gradient flattens visually). */
         g.setColour (edge);
         g.drawRoundedRectangle (rf, corner, selected ? 1.6f : 1.0f);
-        if (rf.getHeight() >= 6.0f)
-        {
-            g.setColour (juce::Colours::white.withAlpha (selected ? 0.30f : 0.18f));
-            g.drawLine (rf.getX() + 1.5f, rf.getY() + 1.0f,
-                        rf.getRight() - 1.5f, rf.getY() + 1.0f, 1.0f);
-        }
 
         /* Pitch label inside wide-enough notes.  Skip for tiny rows
-         * (would clip vertically) and short notes.  The text colour
-         * picks black or white depending on body brightness so it
-         * stays readable across the velocity range. */
+         * (would clip vertically) and short notes.  Always-white text
+         * pairs cleanly with the dim shaded body across the velocity
+         * range -- no per-note brightness branch required. */
         if (rf.getWidth() >= 40.0f && rf.getHeight() >= 12.0f)
         {
-            const bool useBlack = bodyMid.getPerceivedBrightness() > 0.62f;
-            g.setColour (useBlack ? juce::Colours::black.withAlpha (0.78f)
-                                  : juce::Colours::white.withAlpha (0.80f));
+            g.setColour (juce::Colours::white.withAlpha (0.90f));
             g.setFont (monoFont (juce::jmin (10.0f, rf.getHeight() * 0.55f),
                                   juce::Font::plain));
             static const char* const pcs[12] = {
@@ -751,6 +762,20 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
     auto* region = resolveBoundRegion();
     if (region == nullptr) return;
 
+    /* "Beyond region" zone -- if the grid component is wider than the
+     * bound region's beat span (auto-fit on bind, or user shrank the
+     * region after a zoom), clicks past the region end are no-ops.
+     * Prevents pencil-create from placing notes outside the region. */
+    const int regionEndX = (int) std::round (regionLenBeats_ * pxPerBeat_);
+    if (e.x >= regionEndX)
+    {
+        /* Click in the void = clear selection, same as empty-body
+         * click inside the region. */
+        if (! e.mods.isCommandDown() && ! e.mods.isCtrlDown())
+            selectClear();
+        return;
+    }
+
     /* First try the resize handle hit (5 px right edge of any note)
      * regardless of tool -- consistent affordance like all DAWs.
      * Then fall back to body hit + branch on active tool. */
@@ -784,14 +809,19 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
                 auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
                                                                    parent_.getRegionResolver());
                 cmd->recordRemove (*region, hitId);
+                juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+                cmd->onApplied = [safeView]() {
+                    if (auto* v = safeView.getComponent())
+                        v->notifyRegionEdited();
+                };
                 gui->getUndoManager().perform (cmd.release(), "Erase MIDI note");
             }
             else
             {
                 region->removeNoteById (hitId);
+                parent_.notifyRegionEdited();
             }
             selectedNoteIds_.erase (hitId);
-            parent_.notifyRegionEdited();
             repaint();
             return;
         }
@@ -859,10 +889,11 @@ void PianoRollGrid::mouseMove (const juce::MouseEvent& e)
 void PianoRollGrid::mouseWheelMove (const juce::MouseEvent& e,
                                       const juce::MouseWheelDetails& wheel)
 {
-    /* Alt + wheel = VERTICAL zoom (visible pitch span shrinks/grows
-     * around centre).  Shift + wheel = vertical PAN (shift the
-     * visible band up/down without changing the span).  Cmd/Ctrl +
-     * wheel = horizontal zoom (handled below). */
+    /* Wheel conventions (piano-roll standard):
+     *   no mod      -> vertical PAN through pitches
+     *   shift+wheel -> horizontal scroll (defer to viewport)
+     *   alt+wheel   -> vertical zoom around centre
+     *   cmd/ctrl+wheel -> horizontal zoom anchored at cursor X */
     if (e.mods.isAltDown())
     {
         if (auto* kb = parent_.getKeyboard())
@@ -871,18 +902,8 @@ void PianoRollGrid::mouseWheelMove (const juce::MouseEvent& e,
             kb->zoomVertically (factor);
             /* Keyboard repaint already triggered by setVisibleNoteRange;
              * the grid's own paint reads kb->getLowestVisibleNoteNumber
-             * + cachedHighest_ live, so a repaint here picks up the
-             * new pitch span. */
-            repaint();
-        }
-        return;
-    }
-    if (e.mods.isShiftDown())
-    {
-        if (auto* kb = parent_.getKeyboard())
-        {
-            const int delta = (wheel.deltaY > 0.0f) ? 2 : -2;
-            kb->shiftVisibleRange (delta);
+             * + getHighestVisibleNoteNumber live, so a repaint here
+             * picks up the new pitch span. */
             repaint();
         }
         return;
@@ -921,17 +942,53 @@ void PianoRollGrid::mouseWheelMove (const juce::MouseEvent& e,
         return;
     }
 
-    /* No mod: let the viewport handle horizontal scroll naturally. */
+    /* Plain wheel: vertical pan through pitches.  Scroll AMOUNT is
+     * derived from wheel.deltaY so a high-resolution trackpad gets
+     * sub-row precision while a notched mouse wheel still moves a
+     * meaningful chunk per click.  Negative sign because wheel.deltaY
+     * positive == finger moving up (= scroll upward in content =
+     * raise visible-pitch lower-bound).
+     *
+     * Shift+wheel forwards to the parent component, letting the host
+     * viewport handle horizontal scroll the same way a non-modified
+     * wheel did before this change. */
+    if (e.mods.isShiftDown())
+    {
+        juce::Component::mouseWheelMove (e, wheel);
+        return;
+    }
+
+    if (auto* kb = parent_.getKeyboard())
+    {
+        /* Convert wheel.deltaY (typically -1.0..+1.0 per notch) into a
+         * semitone delta.  ~3 semitones per full wheel tick feels
+         * close to JUCE's default scroll speed in other vertical
+         * surfaces without being so coarse that an octave click skips
+         * the target row entirely. */
+        const float k = wheel.isReversed ? -3.0f : 3.0f;
+        int delta = (int) std::lround (-wheel.deltaY * k);
+        if (delta == 0)
+            delta = (wheel.deltaY > 0.0f) ? -1 : (wheel.deltaY < 0.0f ? 1 : 0);
+        if (delta != 0)
+        {
+            kb->shiftVisibleRange (delta);
+            repaint();
+        }
+        return;
+    }
+
     juce::Component::mouseWheelMove (e, wheel);
 }
 
 bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
 {
+    auto* region = resolveBoundRegion();
+
+    /* Delete / Backspace -- remove selected notes via undoable diff. */
     if (key == juce::KeyPress::deleteKey
         || key == juce::KeyPress::backspaceKey)
     {
         if (selectedNoteIds_.empty()) return false;
-        auto* region = resolveBoundRegion();
         if (region == nullptr) return false;
 
         if (auto* gui = services_.find<GuiService>())
@@ -940,18 +997,168 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                                                                 parent_.getRegionResolver());
             for (auto id : selectedNoteIds_)
                 cmd->recordRemove (*region, id);
+            juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+            cmd->onApplied = [safeView]() {
+                if (auto* v = safeView.getComponent())
+                    v->notifyRegionEdited();
+            };
             gui->getUndoManager().perform (cmd.release(), "Delete MIDI notes");
         }
         else
         {
             for (auto id : selectedNoteIds_)
                 region->removeNoteById (id);
+            parent_.notifyRegionEdited();
         }
         selectedNoteIds_.clear();
+        repaint();
+        return true;
+    }
+
+    /* Ctrl+A -- select every note in the bound region. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'A')
+    {
+        if (region == nullptr) return false;
+        if (const auto* snap = region->loadSnapshot())
+        {
+            selectedNoteIds_.clear();
+            for (const auto& n : *snap)
+                selectedNoteIds_.insert (n.id);
+            repaint();
+        }
+        return true;
+    }
+
+    /* Ctrl+D -- duplicate selection one snap-division to the right.
+     * Each duplicate gets a fresh id; final selection contains the
+     * duplicates so subsequent edits operate on the new notes. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'D')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+
+        const double step = isSnapEnabled() && getSnapDivision() > 0.0
+                             ? getSnapDivision()
+                             : 1.0;
+        std::vector<MidiNote> dupes;
+        dupes.reserve (selectedNoteIds_.size());
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                MidiNote copy = n;
+                copy.id     = 0;   /* fresh id stamped on add */
+                copy.onBeat = n.onBeat + step;
+                if (copy.onBeat < region->lengthBeats)
+                    dupes.push_back (copy);
+            }
+        if (dupes.empty()) return true;
+
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            for (auto& d : dupes)
+                cmd->recordAdd (*region, d);
+            juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+            cmd->onApplied = [safeView]() {
+                if (auto* v = safeView.getComponent())
+                    v->notifyRegionEdited();
+            };
+            gui->getUndoManager().perform (cmd.release(), "Duplicate MIDI notes");
+        }
+        else
+        {
+            for (auto& d : dupes)
+                region->addNote (d);
+        }
+        /* Re-select the duplicates -- ids assigned by recordAdd are
+         * stable post-perform; the snapshot has new ids in the same
+         * order as `dupes`, so iterating again finds them. */
+        selectedNoteIds_.clear();
+        if (const auto* snap2 = region->loadSnapshot())
+        {
+            for (const auto& n : *snap2)
+                for (const auto& d : dupes)
+                    if (n.pitch == d.pitch
+                        && std::abs (n.onBeat - d.onBeat) < 1e-9
+                        && n.channel == d.channel
+                        && ! isSelected (n.id))
+                    {
+                        selectedNoteIds_.insert (n.id);
+                        break;
+                    }
+        }
         parent_.notifyRegionEdited();
         repaint();
         return true;
     }
+
+    /* Arrow keys -- nudge selection.  Left/Right by snap division (or
+     * 1 beat if snap off); Up/Down by 1 semitone; Shift+Up/Down by 12
+     * (octave).  All routed through the undo path so each press is a
+     * step the user can rewind. */
+    auto nudge = [&] (double beatDelta, int pitchDelta, const juce::String& label) -> bool
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+
+        std::vector<std::pair<MidiNote, MidiNote>> moves;
+        moves.reserve (selectedNoteIds_.size());
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                MidiNote after = n;
+                after.onBeat = juce::jmax (0.0, n.onBeat + beatDelta);
+                if (after.onBeat + after.lengthBeats > region->lengthBeats)
+                    after.onBeat = juce::jmax (0.0,
+                        region->lengthBeats - after.lengthBeats);
+                after.pitch  = juce::jlimit (0, 127, n.pitch + pitchDelta);
+                if (after.pitch == n.pitch
+                    && std::abs (after.onBeat - n.onBeat) < 1e-9) continue;
+                moves.emplace_back (n, after);
+            }
+        if (moves.empty()) return true;
+
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            for (auto& mv : moves)
+                cmd->recordUpdate (mv.first.id, mv.first, mv.second);
+            juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+            cmd->onApplied = [safeView]() {
+                if (auto* v = safeView.getComponent())
+                    v->notifyRegionEdited();
+            };
+            gui->getUndoManager().perform (cmd.release(), label);
+        }
+        else
+        {
+            for (auto& mv : moves)
+                region->updateNoteById (mv.first.id, mv.second);
+        }
+        parent_.notifyRegionEdited();
+        repaint();
+        return true;
+    };
+
+    if (key == juce::KeyPress::leftKey
+        || key == juce::KeyPress::rightKey
+        || key == juce::KeyPress::upKey
+        || key == juce::KeyPress::downKey)
+    {
+        const double step = isSnapEnabled() && getSnapDivision() > 0.0
+                             ? getSnapDivision()
+                             : 1.0;
+        if (key == juce::KeyPress::leftKey)  return nudge (-step, 0,  "Nudge left");
+        if (key == juce::KeyPress::rightKey) return nudge ( step, 0,  "Nudge right");
+        const int p = key.getModifiers().isShiftDown() ? 12 : 1;
+        if (key == juce::KeyPress::upKey)    return nudge (0,  p, "Transpose up");
+        if (key == juce::KeyPress::downKey)  return nudge (0, -p, "Transpose down");
+    }
+
     return false;
 }
 

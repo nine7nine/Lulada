@@ -658,6 +658,80 @@ public:
             return;
         }
 
+        /* MIDI region hit-test.  Parallel to the audio scan above --
+         * MIDI regions live in a separate list (playlist.midiRegions())
+         * and use direct field mutation rather than the audio
+         * playlist::moveRegion / resizeRegion helpers.  Same gesture
+         * surface: Select tool body = Move, right-edge or Trim tool =
+         * Resize.  Right-click opens the region context menu.  Split
+         * is not yet supported for MIDI (data layer has no
+         * splitMidiRegion); a Split-tool click on a MIDI region is
+         * absorbed silently rather than splitting the underlying
+         * audio region at that beat. */
+        for (const auto& mp : lane.playlist.midiRegions())
+        {
+            if (mp == nullptr) continue;
+            const auto& m = *mp;
+            const double endBeat = m.positionBeats + m.lengthBeats;
+            if (beat < m.positionBeats || beat >= endBeat) continue;
+
+            if (e.mods.isPopupMenu())
+            {
+                selectedLane_   = laneIdx;
+                selectedRegion_ = m.id;
+                repaintLane (laneIdx);
+                showRegionContextMenu (laneIdx, m.id, beat);
+                return;
+            }
+
+            /* Split tool: wire to the new splitMidiRegion data-layer
+             * helper.  Returns null on out-of-range cut (the splitMidiRegion
+             * impl rejects cuts within ~1e-9 of either edge), in which
+             * case we leave the region intact + fall through to no-op. */
+            if (activeTool_ == Tool::Split)
+            {
+                const auto newId = lane.playlist.splitMidiRegion (m.id, beat);
+                if (! newId.isNull())
+                {
+                    owner.publishMidiBindingsForLane (laneIdx);
+                    owner.writeLanesToSession();
+                    repaintLane (laneIdx);
+                }
+                return;
+            }
+
+            /* Audition: no MIDI preview wired yet -- absorb. */
+            if (activeTool_ == Tool::Audition)
+            {
+                selectedLane_   = laneIdx;
+                selectedRegion_ = m.id;
+                repaintLane (laneIdx);
+                return;
+            }
+
+            gesture_.laneIdx         = laneIdx;
+            gesture_.regionId        = m.id;
+            gesture_.originalPos     = m.positionBeats;
+            gesture_.originalLen     = m.lengthBeats;
+            gesture_.mouseDownXBeats = beat;
+            gesture_.kind            = Gesture::Midi;
+            gesture_.dragActive      = false;
+
+            const int regionEndX = kLabelW + (int) (endBeat * kPxPerBeat);
+            const bool overRightEdge =
+                (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX);
+
+            gesture_.mode = (activeTool_ == Tool::Trim || overRightEdge)
+                              ? Gesture::Resize
+                              : Gesture::Move;
+
+            selectedLane_    = laneIdx;
+            selectedRegion_  = m.id;
+            grabKeyboardFocus();
+            repaintLane (laneIdx);
+            return;
+        }
+
         /* Empty strip area -- clear selection. */
         selectedLane_   = -1;
         selectedRegion_ = juce::Uuid::null();
@@ -1079,8 +1153,6 @@ public:
 
         if (gesture_.laneIdx >= owner.lanes_.size()) return;
         auto& lane = owner.lanes_.getReference (gesture_.laneIdx);
-        auto* r = lane.playlist.findRegion (gesture_.regionId);
-        if (r == nullptr) return;
 
         const double mouseBeat = juce::jmax (0.0,
             (double) (e.x - kLabelW) / (double) kPxPerBeat);
@@ -1097,24 +1169,54 @@ public:
             return std::round (beats / owner.snapDivision_) * owner.snapDivision_;
         };
 
-        if (gesture_.mode == Gesture::Move)
+        if (gesture_.kind == Gesture::Audio)
         {
-            const double delta  = mouseBeat - gesture_.mouseDownXBeats;
-            const double target = juce::jmax (0.0,
-                snap (gesture_.originalPos + delta));
+            auto* r = lane.playlist.findRegion (gesture_.regionId);
+            if (r == nullptr) return;
 
-            /* moveRegion enforces no-overlap; if the target collides,
-             * snap to the latest non-overlapping position before it.
-             * For v1 we just attempt; failure leaves the region in
-             * place. */
-            lane.playlist.moveRegion (gesture_.regionId, target);
+            if (gesture_.mode == Gesture::Move)
+            {
+                const double delta  = mouseBeat - gesture_.mouseDownXBeats;
+                const double target = juce::jmax (0.0,
+                    snap (gesture_.originalPos + delta));
+
+                /* moveRegion enforces no-overlap; if the target collides,
+                 * snap to the latest non-overlapping position before it.
+                 * For v1 we just attempt; failure leaves the region in
+                 * place. */
+                lane.playlist.moveRegion (gesture_.regionId, target);
+            }
+            else /* Resize */
+            {
+                const double snappedEnd = snap (mouseBeat);
+                const double newLength  = juce::jmax (kMinRegionBeats,
+                    snappedEnd - gesture_.originalPos);
+                lane.playlist.resizeRegion (gesture_.regionId, newLength);
+            }
         }
-        else /* Resize */
+        else /* Gesture::Midi */
         {
-            const double snappedEnd = snap (mouseBeat);
-            const double newLength  = juce::jmax (kMinRegionBeats,
-                snappedEnd - gesture_.originalPos);
-            lane.playlist.resizeRegion (gesture_.regionId, newLength);
+            auto* m = lane.playlist.findMidiRegion (gesture_.regionId);
+            if (m == nullptr) return;
+
+            if (gesture_.mode == Gesture::Move)
+            {
+                const double delta  = mouseBeat - gesture_.mouseDownXBeats;
+                const double target = juce::jmax (0.0,
+                    snap (gesture_.originalPos + delta));
+                m->positionBeats = target;
+            }
+            else /* Resize */
+            {
+                const double snappedEnd = snap (mouseBeat);
+                const double newLength  = juce::jmax (kMinRegionBeats,
+                    snappedEnd - gesture_.originalPos);
+                m->lengthBeats = newLength;
+            }
+            /* Republish bindings during the drag so the audio thread
+             * picks up the new position/length on the next render
+             * block.  Cheap: 1 atomic ptr swap + ~32 entries copied. */
+            owner.publishMidiBindingsForLane (gesture_.laneIdx);
         }
 
         if (body_resizeNeeded()) resizeForLanes();
@@ -1175,6 +1277,7 @@ public:
         const int   laneIdx     = gesture_.laneIdx;
         const bool  wasDragged  = gesture_.dragActive;
         const auto  gestureMode = gesture_.mode;
+        const auto  gestureKind = gesture_.kind;
         const auto  regionId    = gesture_.regionId;
 
         gesture_ = Gesture {};
@@ -1182,6 +1285,38 @@ public:
         if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
         auto& lane    = owner.lanes_.getReference (laneIdx);
         auto& runtime = owner.laneRuntime_.getReference (laneIdx);
+
+        /* MIDI region branch: a drag was already applied + republished
+         * each mouseDrag tick.  On mouseUp persist + repaint so the
+         * session XML + arrangement body strip catch up.  Click
+         * without drag opens the piano-roll dock bound to this region
+         * (mirrors the existing double-click affordance -- single
+         * click = preview the region in the editor; consistent with
+         * Bitwig/Ableton arrangement -> clip-detail handoff). */
+        if (gestureKind == Gesture::Midi)
+        {
+            if (wasDragged)
+            {
+                /* Re-sort the MIDI region list now that positionBeats
+                 * may have changed during the drag.  Direct-field
+                 * mutation on MidiNoteRegion (which the drag handler
+                 * does) bypasses Playlist's addMidiRegion sort -- so
+                 * we restore the invariant here.  Cheap O(N log N)
+                 * on a list with maybe ~32 entries at most. */
+                lane.playlist.rebuildMidiOrder();
+                owner.writeLanesToSession();
+                /* Repaint full body so any region rendered past the
+                 * trimmed/moved bounds clears. */
+                if (body_resizeNeeded()) resizeForLanes();
+                else                     repaint();
+            }
+            else
+            {
+                if (auto* sc = findParentComponentOfClass<StandardContent>())
+                    sc->showPianoRollForRegion (regionId);
+            }
+            return;
+        }
 
         if (! wasDragged)
         {
@@ -1284,64 +1419,140 @@ public:
     void showRegionContextMenu (int laneIdx, juce::Uuid regionId, double atBeat)
     {
         auto& lane = owner.lanes_.getReference (laneIdx);
-        const auto* r = lane.playlist.findRegion (regionId);
-        if (r == nullptr) return;
 
-        enum { ItemLoop = 1, ItemSplit = 2, ItemDelete = 3 };
+        /* Kind-discriminated menu: an audio/tracker region uses the
+         * Region API; a MIDI region uses MidiNoteRegion + the parallel
+         * Playlist mutators.  Both menus expose Loop / Split / Delete
+         * with the same shape so the user sees a uniform surface. */
+        if (const auto* r = lane.playlist.findRegion (regionId))
+        {
+            enum { ItemLoop = 1, ItemSplit = 2, ItemDelete = 3 };
+            juce::PopupMenu menu;
+            menu.addItem (ItemLoop,  "Loop",   true, r->looped);
+            menu.addItem (ItemSplit, "Split at click",
+                           atBeat > r->positionBeats + 0.0625
+                           && atBeat < r->endBeats() - 0.0625);
+            menu.addSeparator();
+            menu.addItem (ItemDelete, "Delete");
 
-        juce::PopupMenu menu;
-        menu.addItem (ItemLoop,  "Loop",   true, r->looped);
-        menu.addItem (ItemSplit, "Split at click",
-                       atBeat > r->positionBeats + 0.0625
-                       && atBeat < r->endBeats() - 0.0625);
-        menu.addSeparator();
-        menu.addItem (ItemDelete, "Delete");
-
-        juce::Component::SafePointer<Body> safe (this);
-        menu.showMenuAsync (juce::PopupMenu::Options(),
-            [safe, laneIdx, regionId, atBeat] (int result)
-            {
-                auto* self = safe.getComponent();
-                if (self == nullptr || result == 0) return;
-
-                if (laneIdx < 0 || laneIdx >= self->owner.lanes_.size()) return;
-                auto& l = self->owner.lanes_.getReference (laneIdx);
-
-                bool changed = false;
-                switch (result)
+            juce::Component::SafePointer<Body> safe (this);
+            menu.showMenuAsync (juce::PopupMenu::Options(),
+                [safe, laneIdx, regionId, atBeat] (int result)
                 {
-                    case ItemLoop:
-                        if (auto* m = l.playlist.findRegion (regionId))
-                        {
-                            m->looped = ! m->looped;
-                            changed = true;
-                        }
-                        break;
-                    case ItemSplit:
-                        if (! l.playlist.splitRegion (regionId, atBeat).isNull())
-                            changed = true;
-                        break;
-                    case ItemDelete:
-                        if (l.playlist.removeRegion (regionId))
-                        {
-                            if (self->selectedRegion_ == regionId)
+                    auto* self = safe.getComponent();
+                    if (self == nullptr || result == 0) return;
+                    if (laneIdx < 0 || laneIdx >= self->owner.lanes_.size()) return;
+                    auto& l = self->owner.lanes_.getReference (laneIdx);
+
+                    bool changed = false;
+                    switch (result)
+                    {
+                        case ItemLoop:
+                            if (auto* mr = l.playlist.findRegion (regionId))
                             {
-                                self->selectedLane_   = -1;
-                                self->selectedRegion_ = juce::Uuid::null();
+                                mr->looped = ! mr->looped;
+                                changed = true;
                             }
-                            changed = true;
-                        }
-                        break;
-                    default: break;
-                }
+                            break;
+                        case ItemSplit:
+                            if (! l.playlist.splitRegion (regionId, atBeat).isNull())
+                                changed = true;
+                            break;
+                        case ItemDelete:
+                            if (l.playlist.removeRegion (regionId))
+                            {
+                                if (self->selectedRegion_ == regionId)
+                                {
+                                    self->selectedLane_   = -1;
+                                    self->selectedRegion_ = juce::Uuid::null();
+                                }
+                                changed = true;
+                            }
+                            break;
+                        default: break;
+                    }
 
-                if (changed)
+                    if (changed)
+                    {
+                        self->owner.writeLanesToSession();
+                        self->resizeForLanes();
+                        self->repaintLane (laneIdx);
+                    }
+                });
+            return;
+        }
+
+        /* MIDI region branch. */
+        if (const auto* m = lane.playlist.findMidiRegion (regionId))
+        {
+            const double midiEnd = m->positionBeats + m->lengthBeats;
+            const bool splittable = atBeat > m->positionBeats + 0.0625
+                                  && atBeat < midiEnd            - 0.0625;
+
+            enum { ItemLoop = 1, ItemSplit = 2, ItemDelete = 3, ItemOpenEditor = 4 };
+            juce::PopupMenu menu;
+            menu.addItem (ItemOpenEditor, "Open in piano-roll");
+            menu.addSeparator();
+            menu.addItem (ItemLoop,   "Loop",          true, m->looped);
+            menu.addItem (ItemSplit,  "Split at click", splittable);
+            menu.addSeparator();
+            menu.addItem (ItemDelete, "Delete");
+
+            juce::Component::SafePointer<Body> safe (this);
+            menu.showMenuAsync (juce::PopupMenu::Options(),
+                [safe, laneIdx, regionId, atBeat] (int result)
                 {
-                    self->owner.writeLanesToSession();
-                    self->resizeForLanes();
-                    self->repaintLane (laneIdx);
-                }
-            });
+                    auto* self = safe.getComponent();
+                    if (self == nullptr || result == 0) return;
+                    if (laneIdx < 0 || laneIdx >= self->owner.lanes_.size()) return;
+                    auto& l = self->owner.lanes_.getReference (laneIdx);
+
+                    bool changed = false;
+                    switch (result)
+                    {
+                        case ItemOpenEditor:
+                            if (auto* sc = self->findParentComponentOfClass<StandardContent>())
+                                sc->showPianoRollForRegion (regionId);
+                            return;   /* no session write needed */
+                        case ItemLoop:
+                            if (auto* mm = l.playlist.findMidiRegion (regionId))
+                            {
+                                mm->looped = ! mm->looped;
+                                self->owner.publishMidiBindingsForLane (laneIdx);
+                                changed = true;
+                            }
+                            break;
+                        case ItemSplit:
+                            if (! l.playlist.splitMidiRegion (regionId, atBeat).isNull())
+                            {
+                                self->owner.publishMidiBindingsForLane (laneIdx);
+                                changed = true;
+                            }
+                            break;
+                        case ItemDelete:
+                            if (l.playlist.removeMidiRegion (regionId))
+                            {
+                                if (self->selectedRegion_ == regionId)
+                                {
+                                    self->selectedLane_   = -1;
+                                    self->selectedRegion_ = juce::Uuid::null();
+                                }
+                                self->owner.publishMidiBindingsForLane (laneIdx);
+                                changed = true;
+                            }
+                            break;
+                        default: break;
+                    }
+
+                    if (changed)
+                    {
+                        self->owner.writeLanesToSession();
+                        self->resizeForLanes();
+                        self->repaintLane (laneIdx);
+                    }
+                });
+            return;
+        }
     }
 
     bool keyPressed (const juce::KeyPress& key) override
@@ -1351,8 +1562,24 @@ public:
             if (selectedLane_ < 0 || selectedLane_ >= owner.lanes_.size())
                 return false;
             auto& lane = owner.lanes_.getReference (selectedLane_);
-            if (! lane.playlist.removeRegion (selectedRegion_))
-                return false;
+            /* Try audio first; fall through to MIDI.  Either match
+             * clears selection + persists + repaints; no match leaves
+             * the key unconsumed so a parent component can handle. */
+            bool removed = lane.playlist.removeRegion (selectedRegion_);
+            if (! removed)
+            {
+                if (lane.playlist.removeMidiRegion (selectedRegion_))
+                {
+                    /* Tear-down: republish bindings so the MidiPlayerNode
+                     * drops the deleted region from its EntryList before
+                     * the MidiNoteRegion pointer goes away.  emitAllNotesOff
+                     * fires on the audio thread when entries become empty
+                     * + held_.any() (midiplayer.cpp render()). */
+                    owner.publishMidiBindingsForLane (selectedLane_);
+                    removed = true;
+                }
+            }
+            if (! removed) return false;
             const int laneIdx = selectedLane_;
             selectedLane_   = -1;
             selectedRegion_ = juce::Uuid::null();
@@ -2440,12 +2667,26 @@ private:
             if (! regionClip.intersects (rect))
                 continue;
 
+            const bool selected = (selectedLane_ == laneIdx
+                                    && selectedRegion_ == m.id);
             const juce::Colour midiTint = m.colour;
-            juce::Colour fill = midiTint.withMultipliedSaturation (0.55f)
-                                        .withMultipliedBrightness (0.45f);
+            juce::Colour fill = midiTint.withMultipliedSaturation (
+                                              selected ? 0.85f : 0.55f)
+                                        .withMultipliedBrightness (
+                                              selected ? 0.65f : 0.45f);
 
             g.setColour (fill);
             g.fillRoundedRectangle (rect.toFloat(), kCornerSize);
+            /* Selection outline -- 2 px bright stroke inset slightly
+             * so it reads on top of the body fill at every zoom. */
+            if (selected)
+            {
+                const float outerWidth = 1.0f;
+                g.setColour (midiTint.brighter (0.50f));
+                g.drawRoundedRectangle (rect.toFloat().reduced (outerWidth, outerWidth),
+                                         juce::jmax (0.5f, kCornerSize - outerWidth),
+                                         1.6f);
+            }
 
             constexpr int kTitleH = 13;
             const Rectangle<int> titleRect (rect.getX(), rect.getY(),
@@ -2671,12 +2912,14 @@ private:
      * mouseUp.  laneIdx < 0 means no gesture. */
     struct Gesture {
         enum Mode { Move, Resize };
+        enum Kind { Audio, Midi };
         int        laneIdx         = -1;
         juce::Uuid regionId;
         double     originalPos     = 0.0;
         double     originalLen     = 0.0;
         double     mouseDownXBeats = 0.0;
         Mode       mode            = Move;
+        Kind       kind            = Audio;
         bool       dragActive      = false;
     };
     Gesture gesture_;
@@ -3809,6 +4052,28 @@ void ArrangementView::writeLanesToSession()
     lanesTree.removeAllChildren (nullptr);
     for (const auto& l : lanes_)
         lanesTree.appendChild (l.toValueTree(), nullptr);
+}
+
+void ArrangementView::flushLanesToSession()
+{
+    /* Serialise lanes_ to the session tree, refresh the committed
+     * baseline, and skip the ArrangementSnapshotAction push.  Mutation
+     * sources that already own a global UndoManager entry (the
+     * piano-roll's MidiNoteDiffCommand, the velocity-lane edit
+     * command) call this instead of writeLanesToSession so Ctrl+Z
+     * lands on the granular diff and not on a wrapper snapshot. */
+    if (services_ == nullptr) return;
+
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+
+    auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
+    auto lanesTree = tree.getOrCreateChildWithName ("lanes", nullptr);
+    lanesTree.removeAllChildren (nullptr);
+    for (const auto& l : lanes_)
+        lanesTree.appendChild (l.toValueTree(), nullptr);
+
+    lastCommittedSnapshot_ = lanes_;
 }
 
 void ArrangementView::applyLaneSnapshot (const juce::Array<Lane>& snap)

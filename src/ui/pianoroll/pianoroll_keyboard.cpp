@@ -49,8 +49,11 @@ int PianoRollKeyboard::getLowestVisibleNoteNumber() const noexcept
 
 int PianoRollKeyboard::getHighestVisibleNoteNumber() const noexcept
 {
-    /* Computed at setVisibleNoteRange time so the read is O(1). */
-    return cachedHighest_;
+    /* Derived from the live JUCE low-bound + cached span.  Clamped to
+     * kAbsoluteHighestNote so the result stays meaningful at the edge
+     * (when the user has scrolled all the way up). */
+    const int lo = (int) getLowestVisibleKey();
+    return juce::jmin (kAbsoluteHighestNote, lo + cachedSpan_ - 1);
 }
 
 void PianoRollKeyboard::setVisibleNoteRange (int lo, int hi)
@@ -62,19 +65,27 @@ void PianoRollKeyboard::setVisibleNoteRange (int lo, int hi)
     if (hi - lo < kMinPitchSpan)
         lo = juce::jmax (kAbsoluteLowestNote,  hi - kMinPitchSpan);
 
-    if (lo == (int) getLowestVisibleKey() && hi == cachedHighest_) return;
+    const int newSpan = hi - lo + 1;
+    if (lo == (int) getLowestVisibleKey() && newSpan == cachedSpan_) return;
 
-    cachedHighest_ = hi;
+    cachedSpan_ = newSpan;
+    /* Re-clamp JUCE's internal lo bound so its built-in scroll arrows
+     * (and any direct setLowestVisibleKey call) can't push lo past
+     * the point where lo + span - 1 would exceed kAbsoluteHighestNote.
+     * Without this, scrolling to the top edge would shrink the visible
+     * window (lo creeps past 127 - span + 1 and getHighest clamps
+     * down), which reads as a zoom-in at the boundary. */
+    const int maxLowestKey = juce::jmax (kAbsoluteLowestNote,
+                                            kAbsoluteHighestNote - cachedSpan_ + 1);
+    setAvailableRange (kAbsoluteLowestNote, maxLowestKey);
     setLowestVisibleKey (lo);
 
     /* Adjust per-key extent so the visible range fills the component
      * height.  In verticalKeyboardFacingRight orientation, setKeyWidth
      * controls the per-key Y extent.  If the component isn't laid
      * out yet (height == 0) the next resized() pass will recompute. */
-    const int span = hi - lo + 1;
-    const int h    = juce::jmax (1, getHeight());
-    if (span > 0)
-        setKeyWidth (juce::jmax (3.0f, (float) h / (float) span));
+    const int h = juce::jmax (1, getHeight());
+    setKeyWidth (juce::jmax (3.0f, (float) h / (float) cachedSpan_));
     repaint();
 }
 
@@ -111,14 +122,32 @@ int PianoRollKeyboard::getKeyRowHeight() const noexcept
 void PianoRollKeyboard::resized()
 {
     /* Recompute per-key Y extent so the visible pitch range fills the
-     * new height.  In verticalKeyboardFacingRight orientation,
-     * setKeyWidth controls the per-key Y extent. */
-    const int lo = getLowestVisibleNoteNumber();
-    const int hi = getHighestVisibleNoteNumber();
-    const int span = juce::jmax (1, hi - lo + 1);
+     * new height.  Using cachedSpan_ directly (rather than deriving
+     * span from getHighestVisibleNoteNumber()) keeps the per-key
+     * extent stable while the user scrolls -- the span is invariant
+     * across a scroll, only lo moves. */
+    const int span = juce::jmax (1, cachedSpan_);
     const int h    = juce::jmax (1, getHeight());
     setKeyWidth (juce::jmax (3.0f, (float) h / (float) span));
     juce::MidiKeyboardComponent::resized();
+}
+
+void PianoRollKeyboard::drawBlackNote (int /*midiNoteNumber*/,
+                                         juce::Graphics& g,
+                                         juce::Rectangle<float> area,
+                                         bool isDown, bool isOver,
+                                         juce::Colour noteFillColour)
+{
+    /* Flat fill, no JUCE "lit-from-above" inner highlight cap.  Same
+     * override as VirtualKeyboardComponent: under our dark theme the
+     * default highlight reads as grey-on-grey and obliterates the
+     * black-key silhouette.  Down/over overlays still composite via
+     * the LookAndFeel ColourIds the host registered. */
+    auto c = noteFillColour;
+    if (isDown) c = c.overlaidWith (findColour (keyDownOverlayColourId));
+    if (isOver) c = c.overlaidWith (findColour (mouseOverKeyOverlayColourId));
+    g.setColour (c);
+    g.fillRect (area);
 }
 
 int PianoRollKeyboard::yForPitch (int pitch) const noexcept
