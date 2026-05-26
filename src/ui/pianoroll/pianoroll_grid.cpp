@@ -963,11 +963,13 @@ void PianoRollGrid::mouseWheelMove (const juce::MouseEvent& e,
 
 bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
 {
+    auto* region = resolveBoundRegion();
+
+    /* Delete / Backspace -- remove selected notes via undoable diff. */
     if (key == juce::KeyPress::deleteKey
         || key == juce::KeyPress::backspaceKey)
     {
         if (selectedNoteIds_.empty()) return false;
-        auto* region = resolveBoundRegion();
         if (region == nullptr) return false;
 
         if (auto* gui = services_.find<GuiService>())
@@ -988,6 +990,141 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
         repaint();
         return true;
     }
+
+    /* Ctrl+A -- select every note in the bound region. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'A')
+    {
+        if (region == nullptr) return false;
+        if (const auto* snap = region->loadSnapshot())
+        {
+            selectedNoteIds_.clear();
+            for (const auto& n : *snap)
+                selectedNoteIds_.insert (n.id);
+            repaint();
+        }
+        return true;
+    }
+
+    /* Ctrl+D -- duplicate selection one snap-division to the right.
+     * Each duplicate gets a fresh id; final selection contains the
+     * duplicates so subsequent edits operate on the new notes. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'D')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+
+        const double step = isSnapEnabled() && getSnapDivision() > 0.0
+                             ? getSnapDivision()
+                             : 1.0;
+        std::vector<MidiNote> dupes;
+        dupes.reserve (selectedNoteIds_.size());
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                MidiNote copy = n;
+                copy.id     = 0;   /* fresh id stamped on add */
+                copy.onBeat = n.onBeat + step;
+                if (copy.onBeat < region->lengthBeats)
+                    dupes.push_back (copy);
+            }
+        if (dupes.empty()) return true;
+
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            for (auto& d : dupes)
+                cmd->recordAdd (*region, d);
+            gui->getUndoManager().perform (cmd.release(), "Duplicate MIDI notes");
+        }
+        else
+        {
+            for (auto& d : dupes)
+                region->addNote (d);
+        }
+        /* Re-select the duplicates -- ids assigned by recordAdd are
+         * stable post-perform; the snapshot has new ids in the same
+         * order as `dupes`, so iterating again finds them. */
+        selectedNoteIds_.clear();
+        if (const auto* snap2 = region->loadSnapshot())
+        {
+            for (const auto& n : *snap2)
+                for (const auto& d : dupes)
+                    if (n.pitch == d.pitch
+                        && std::abs (n.onBeat - d.onBeat) < 1e-9
+                        && n.channel == d.channel
+                        && ! isSelected (n.id))
+                    {
+                        selectedNoteIds_.insert (n.id);
+                        break;
+                    }
+        }
+        parent_.notifyRegionEdited();
+        repaint();
+        return true;
+    }
+
+    /* Arrow keys -- nudge selection.  Left/Right by snap division (or
+     * 1 beat if snap off); Up/Down by 1 semitone; Shift+Up/Down by 12
+     * (octave).  All routed through the undo path so each press is a
+     * step the user can rewind. */
+    auto nudge = [&] (double beatDelta, int pitchDelta, const juce::String& label) -> bool
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+
+        std::vector<std::pair<MidiNote, MidiNote>> moves;
+        moves.reserve (selectedNoteIds_.size());
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                MidiNote after = n;
+                after.onBeat = juce::jmax (0.0, n.onBeat + beatDelta);
+                if (after.onBeat + after.lengthBeats > region->lengthBeats)
+                    after.onBeat = juce::jmax (0.0,
+                        region->lengthBeats - after.lengthBeats);
+                after.pitch  = juce::jlimit (0, 127, n.pitch + pitchDelta);
+                if (after.pitch == n.pitch
+                    && std::abs (after.onBeat - n.onBeat) < 1e-9) continue;
+                moves.emplace_back (n, after);
+            }
+        if (moves.empty()) return true;
+
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            for (auto& mv : moves)
+                cmd->recordUpdate (mv.first.id, mv.first, mv.second);
+            gui->getUndoManager().perform (cmd.release(), label);
+        }
+        else
+        {
+            for (auto& mv : moves)
+                region->updateNoteById (mv.first.id, mv.second);
+        }
+        parent_.notifyRegionEdited();
+        repaint();
+        return true;
+    };
+
+    if (key == juce::KeyPress::leftKey
+        || key == juce::KeyPress::rightKey
+        || key == juce::KeyPress::upKey
+        || key == juce::KeyPress::downKey)
+    {
+        const double step = isSnapEnabled() && getSnapDivision() > 0.0
+                             ? getSnapDivision()
+                             : 1.0;
+        if (key == juce::KeyPress::leftKey)  return nudge (-step, 0,  "Nudge left");
+        if (key == juce::KeyPress::rightKey) return nudge ( step, 0,  "Nudge right");
+        const int p = key.getModifiers().isShiftDown() ? 12 : 1;
+        if (key == juce::KeyPress::upKey)    return nudge (0,  p, "Transpose up");
+        if (key == juce::KeyPress::downKey)  return nudge (0, -p, "Transpose down");
+    }
+
     return false;
 }
 

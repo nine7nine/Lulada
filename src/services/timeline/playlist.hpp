@@ -169,10 +169,6 @@ private:
     std::vector<Region> regions_;
     std::vector<std::unique_ptr<MidiNoteRegion>> midiRegions_;
 
-    /** Re-sort midiRegions_ by positionBeats.  Same shape as
-     *  rebuildOrder() for the audio regions; called after every mutate. */
-    void rebuildMidiOrder() noexcept;
-
     /** True if the given span overlaps any existing region whose id
      *  is NOT excludeId. */
     bool overlapsExisting (double position, double length,
