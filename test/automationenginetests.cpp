@@ -330,6 +330,108 @@ BOOST_AUTO_TEST_CASE (unbind_clears_lookup_state)
     BOOST_CHECK (! eng.isMappingMutedForPluginParam (&param));
 }
 
+BOOST_AUTO_TEST_CASE (midi_cc_sub_block_emission_at_stride_offsets)
+{
+    /* A linear ramp 0 -> 1 over 4 beats; play head at 0 beats, block
+     * spans 1024 samples at 96 bpm @ 48kHz -> beatsPerBlock =
+     * (1024/48000) * (96/60) = ~0.0341 beats per block.  Inside the
+     * region, ramp slope is 1.0/4.0 = 0.25/beat -> per-block delta
+     * is ~0.00853 normalized; per-stride (64 samples) delta is
+     * 0.00853 / 16 = ~0.000533 -- BELOW the 1/256 threshold.  Make
+     * the curve steep enough by setting region length to 0.5 beats
+     * (delta 16x larger) so the delta gate emits every stride. */
+    AutomationEngine eng;
+    auto* track = eng.addTrack (makeTrackWithLinearRegion (0.0, 0.5, 0.0, 1.0));
+    eng.bindMidiCc (track, 1, 11);
+    track->setMode (AutomationMode::Read);
+
+    constexpr int   blockSize     = 1024;
+    constexpr double sampleRate   = 48000.0;
+    constexpr double bpm          = 96.0;
+    const     double beatsPerBlock = ((double) blockSize / sampleRate) * (bpm / 60.0);
+
+    juce::MidiBuffer midi;
+    eng.applyForBlock (0.0, beatsPerBlock, blockSize, sampleRate, &midi);
+
+    /* Expected events: 1024 / 64 = 16 sub-block strides; the first
+     * always emits + subsequent emit when delta > 1/256.  With this
+     * curve and block size, every stride crosses the threshold. */
+    BOOST_CHECK_GE (midi.getNumEvents(), 8);   /* well over half of 16 */
+
+    /* Verify the events are spaced at stride boundaries -- i.e. the
+     * sample positions are multiples of kAutomationSubBlockStride. */
+    juce::MidiBuffer::Iterator it (midi);
+    juce::MidiMessage msg;
+    int samplePos = -1;
+    int eventCount = 0;
+    while (it.getNextEvent (msg, samplePos))
+    {
+        BOOST_CHECK_EQUAL (samplePos % AutomationEngine::kAutomationSubBlockStride, 0);
+        BOOST_CHECK (msg.isController());
+        BOOST_CHECK_EQUAL (msg.getControllerNumber(), 11);
+        ++eventCount;
+    }
+    BOOST_CHECK_GT (eventCount, 0);
+}
+
+BOOST_AUTO_TEST_CASE (midi_cc_flat_curve_emits_just_one_event_per_block)
+{
+    /* A constant-value region -- the delta gate must suppress all
+     * but the first emission.  Validates the 1/256 threshold. */
+    AutomationEngine eng;
+    auto* track = eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.5, 0.5));
+    eng.bindMidiCc (track, 1, 1);
+    track->setMode (AutomationMode::Read);
+
+    constexpr int    blockSize     = 1024;
+    constexpr double sampleRate    = 48000.0;
+    constexpr double beatsPerBlock = 0.05;
+
+    juce::MidiBuffer midi;
+    eng.applyForBlock (1.0, beatsPerBlock, blockSize, sampleRate, &midi);
+
+    /* k == 0 always emits; all subsequent strides see |delta| == 0
+     * which is NOT > 1/256, so they're suppressed. */
+    BOOST_CHECK_EQUAL (midi.getNumEvents(), 1);
+}
+
+BOOST_AUTO_TEST_CASE (zero_beats_per_block_falls_back_to_coarse)
+{
+    AutomationEngine eng;
+    auto* track = eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.0, 1.0));
+    eng.bindMidiCc (track, 1, 11);
+    track->setMode (AutomationMode::Read);
+
+    juce::MidiBuffer midi;
+    /* beatsPerBlock == 0 -> SA path disabled -> single coarse
+     * emission at frameOffset 0. */
+    eng.applyForBlock (2.0, /*beatsPerBlock*/ 0.0, 1024, 48000.0, &midi);
+    BOOST_CHECK_EQUAL (midi.getNumEvents(), 1);
+
+    juce::MidiBuffer::Iterator it (midi);
+    juce::MidiMessage msg;
+    int samplePos = -1;
+    BOOST_REQUIRE (it.getNextEvent (msg, samplePos));
+    BOOST_CHECK_EQUAL (samplePos, 0);
+}
+
+BOOST_AUTO_TEST_CASE (plugin_param_stays_coarse_under_sa_path)
+{
+    /* Verifies the Phase 1 scope decision: plugin + node params get
+     * exactly ONE coarse write per block even when SA emission is
+     * enabled.  Sub-block plugin emission is Phase 1.5. */
+    AutomationEngine eng;
+    FakePluginParam  param;
+    auto* track = eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.0, 1.0));
+    eng.bindPluginParam (track, &param);
+    track->setMode (AutomationMode::Read);
+
+    juce::MidiBuffer midi;
+    eng.applyForBlock (1.0, 0.05, 1024, 48000.0, &midi);
+    BOOST_CHECK_EQUAL (param.setCallCount, 1);   /* coarse, not 16x */
+    BOOST_CHECK (midi.isEmpty());                /* not a MIDI target */
+}
+
 BOOST_AUTO_TEST_CASE (drain_pending_lookups_is_safe_no_crash)
 {
     /* drainPendingLookups acquires + releases the lookup lock --

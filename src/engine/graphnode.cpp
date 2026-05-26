@@ -693,19 +693,33 @@ void GraphNode::render (RenderContext& rc)
      * parameter writes land before plugins read them.  Empty-engine
      * cost is ~3 atomic ops; loaded-engine cost scales with active
      * track count + active region complexity (one snapshot load +
-     * binary search per active track + one setValue per active
-     * target).  Beats derived from the same playhead path
+     * binary search per active track + per-block dispatch per active
+     * target).  Beats + bpm derived from the same playhead path
      * audioclip.cpp uses -- absence of a playhead leaves beats == -1
-     * which findActiveRegion correctly returns nullptr for. */
+     * which findActiveRegion correctly returns nullptr for, and
+     * beatsPerBlock == 0 which disables sample-accurate MIDI emission
+     * (engine falls back to coarse single-write for all kinds). */
     if (automationEngine_ != nullptr)
     {
-        double currentBeats = -1.0;
+        double currentBeats   = -1.0;
+        double beatsPerBlock  = 0.0;
         if (auto* ph = getPlayHead())
+        {
             if (auto pos = ph->getPosition())
+            {
                 if (auto ppq = pos->getPpqPosition())
                     currentBeats = *ppq;
 
+                const auto bpmOpt   = pos->getBpm();
+                const double bpm    = (bpmOpt.hasValue() ? *bpmOpt : 0.0);
+                const double sr     = getSampleRate();
+                if (sr > 0.0 && bpm > 0.0)
+                    beatsPerBlock = ((double) numSamples / sr) * (bpm / 60.0);
+            }
+        }
+
         automationEngine_->applyForBlock (currentBeats,
+                                          beatsPerBlock,
                                           numSamples,
                                           getSampleRate(),
                                           &midiMessages);

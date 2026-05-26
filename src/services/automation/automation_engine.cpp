@@ -4,6 +4,7 @@
 #include "services/automation/automation_engine.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace element::automation {
 
@@ -189,7 +190,21 @@ AutomationEngine::AutomationTrack* AutomationEngine::findTrackById (const juce::
 //==============================================================================
 
 void AutomationEngine::applyForBlock (double currentBeats,
-                                      int    /*numSamples*/,
+                                      int    numSamples,
+                                      double sampleRate,
+                                      juce::MidiBuffer* outMidi) noexcept
+{
+    /* Convenience overload: skip the sub-block path entirely (pass
+     * beatsPerBlock == 0).  GraphNode::render uses the full overload
+     * with a playhead-derived beatsPerBlock for real sample-accurate
+     * MIDI CC; this overload is the simpler form for tests + callers
+     * that don't have tempo info. */
+    applyForBlock (currentBeats, 0.0, numSamples, sampleRate, outMidi);
+}
+
+void AutomationEngine::applyForBlock (double currentBeats,
+                                      double beatsPerBlock,
+                                      int    numSamples,
                                       double /*sampleRate*/,
                                       juce::MidiBuffer* outMidi) noexcept
 {
@@ -204,6 +219,13 @@ void AutomationEngine::applyForBlock (double currentBeats,
     const auto* snap = liveTracks_.load (std::memory_order_acquire);
     if (snap == nullptr || snap->empty())
         return;
+
+    /* Sub-block sampling is only meaningful when we know beatsPerBlock
+     * AND the block is long enough to amortise the extra MIDI events.
+     * Below the stride, single-shot coarse is just as good. */
+    const bool subBlockEnabled = (beatsPerBlock > 0.0)
+                              && (numSamples   >= kAutomationSubBlockStride)
+                              && (outMidi      != nullptr);
 
     for (AutomationTrack* track : *snap)
     {
@@ -242,10 +264,40 @@ void AutomationEngine::applyForBlock (double currentBeats,
          * the bump for THIS region). */
         region->advanceAudioEpoch();
 
-        const double localBeats = currentBeats - region->positionBeats;
-        const double v          = region->sampleAtBeats (localBeats);
+        /* Sample-accurate MIDI CC: emit events at sub-block stride.
+         * Other target kinds (plugin / node param) stay COARSE in
+         * Phase 1 -- one setValue per block at frameOffset 0. */
+        if (subBlockEnabled && target->kind == AutomationTarget::Kind::MidiCc)
+        {
+            const double regionStart    = region->positionBeats;
+            const double beatsPerSample = beatsPerBlock / (double) numSamples;
+            const int    numStrides     = numSamples / kAutomationSubBlockStride;
 
-        target->writeCoarseValue ((float) v, outMidi);
+            float lastEmitted = -1.0f;   /* impossible normalised value */
+            for (int k = 0; k < numStrides; ++k)
+            {
+                const int    sampleOffset = k * kAutomationSubBlockStride;
+                const double subBeats     = currentBeats + sampleOffset * beatsPerSample;
+                const float  v            = (float) region->sampleAtBeats (subBeats - regionStart);
+
+                /* Delta gate: skip events that don't change the
+                 * 7-bit CC quantisation slot -- avoids flooding MIDI
+                 * with redundant events when the curve is locally
+                 * flat.  Threshold = 1/256 of normalised range
+                 * (half of 1/128, the CC quantum). */
+                if (k == 0 || std::abs (v - lastEmitted) > (1.0f / 256.0f))
+                {
+                    target->emitEventAt (sampleOffset, v, *outMidi);
+                    lastEmitted = v;
+                }
+            }
+        }
+        else
+        {
+            const double localBeats = currentBeats - region->positionBeats;
+            const double v          = region->sampleAtBeats (localBeats);
+            target->writeCoarseValue ((float) v, outMidi);
+        }
     }
 }
 

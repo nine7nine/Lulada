@@ -115,6 +115,28 @@ public:
     // Audio-thread per-block call.  outMidi may be null when the
     // engine is operating in a no-MIDI-out context this block.
 
+    /** Sub-block sampling stride for sample-accurate MIDI CC emission.
+     *  At 48kHz / 1024-sample blocks, 64-sample stride yields ~16
+     *  events per block per active MIDI-CC target -- well under any
+     *  reasonable MIDI bandwidth ceiling.  Plugin + internal-node
+     *  param targets stay COARSE in Phase 1 (one setValue per block);
+     *  sub-block plugin emission is deferred to Phase 1.5. */
+    static constexpr int kAutomationSubBlockStride = 64;
+
+    /** beatsPerBlock comes from the caller (GraphNode::render uses
+     *  playhead bpm + sample rate to compute it).  Pass 0.0 to skip
+     *  sample-accurate MIDI emission entirely and fall back to single
+     *  setValue at frame offset 0 for ALL target kinds -- useful when
+     *  the playhead has no tempo info (test bench, no transport). */
+    void applyForBlock (double currentBeats,
+                        double beatsPerBlock,
+                        int    numSamples,
+                        double sampleRate,
+                        juce::MidiBuffer* outMidi) noexcept;
+
+    /** Convenience overload: derives beatsPerBlock from the playhead-
+     *  reported bpm via beatsPerBlock = (numSamples / sampleRate) *
+     *  (bpm / 60).  Pass bpm <= 0 to disable SA MIDI emission. */
     void applyForBlock (double currentBeats,
                         int    numSamples,
                         double sampleRate,
