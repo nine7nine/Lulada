@@ -58,6 +58,7 @@ extern "C" {
 #define EL_NODE_ID_MIDI_PROGRAM_MAP      "element.programChangeMap"
 #define EL_NODE_ID_MIDI_ROUTER           "element.midiRouter"
 #define EL_NODE_ID_MIDI_SEQUENCER        "element.midiSequencer"
+#define EL_NODE_ID_MIDI_PLAYER           "element.midiPlayer"
 #define EL_NODE_ID_OSC_RECEIVER          "element.oscReceiver"
 #define EL_NODE_ID_OSC_SENDER            "element.oscSender"
 #define EL_NODE_ID_SAMPLER               "element.sampler"
@@ -102,6 +103,7 @@ extern "C" {
 #define EL_NODE_UID_AUDIO_CLIP            1033
 #define EL_NODE_UID_AUDIO_CLIP_MONO       1034
 #define EL_NODE_UID_ARRANGEMENT_TRACKS    1035
+#define EL_NODE_UID_MIDI_PLAYER           1036
 
 #ifdef __cplusplus
 }

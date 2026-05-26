@@ -11,6 +11,7 @@
 #include "nodes/midimonitor.hpp"
 #include "nodes/midiprogrammap.hpp"
 #include "nodes/midirouter.hpp"
+#include "nodes/midiplayer.hpp"
 #include "nodes/tracker.hpp"
 #include "nodes/oscreceiver.hpp"
 #include "nodes/oscsender.hpp"
@@ -111,6 +112,7 @@ NodeFactory::NodeFactory()
     add (new SingleNodeProvider<MidiProgramMapNode> (EL_NODE_ID_MIDI_PROGRAM_MAP));
     add (new SingleNodeProvider<MidiRouterNode> (EL_NODE_ID_MIDI_ROUTER));
     add (new SingleNodeProvider<TrackerNode> (EL_NODE_ID_MIDI_SEQUENCER));
+    add (new SingleNodeProvider<MidiPlayerNode> (EL_NODE_ID_MIDI_PLAYER));
     add (new SingleNodeProvider<OSCSenderNode> (EL_NODE_ID_OSC_SENDER));
     add (new SingleNodeProvider<OSCReceiverNode> (EL_NODE_ID_OSC_RECEIVER));
     add (new SingleNodeProvider<ScriptNode> (EL_NODE_ID_SCRIPT));
