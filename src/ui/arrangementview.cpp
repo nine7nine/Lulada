@@ -14,6 +14,7 @@
 #include <element/ui/style.hpp>
 
 #include "nodes/audioclip.hpp"
+#include "nodes/midiplayer.hpp"
 #include "nodes/tracker.hpp"
 #include "services/arrangementtracksservice.hpp"
 #include "services/sources/sourceregistry.hpp"
@@ -892,16 +893,21 @@ public:
             return;
         }
 
-        /* MIDI lane: double-click anywhere on a MIDI region surfaces
-         * the bottom-attached piano-roll dock bound to this region.
-         * Sibling of the tracker branch above; MIDI lanes have no
-         * targetNodeUuid in Phase 2 (paint-only, no backing graph
-         * node) so the binding is by region uuid, not node uuid. */
+        /* MIDI lane: double-click on a region surfaces the bottom
+         * piano-roll dock bound to that region.  Double-click on
+         * empty area of the MIDI lane creates a fresh empty MIDI
+         * region at the clicked beat (snapped to bar) + opens the
+         * piano-roll on it.  This is the create-from-scratch path
+         * that matches the real-DAW workflow -- load-a-.mid is
+         * supported but atypical. */
         {
             const auto& lane = owner.lanes_.getReference (laneIdx);
             if (lane.kind == Lane::Kind::Midi)
             {
                 const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+                if (beat < 0.0) return;
+
+                /* Region hit -- open piano-roll on it. */
                 for (const auto& mp : lane.playlist.midiRegions())
                 {
                     if (mp == nullptr) continue;
@@ -912,6 +918,26 @@ public:
                             ViewHelpers::findContentComponent (this)))
                         sc->showPianoRollForRegion (m.id);
                     return;
+                }
+
+                /* Empty MIDI lane area -- create a fresh region.
+                 * Snap the click beat down to the nearest bar so
+                 * created regions align to the grid by default;
+                 * default length is one bar (BPM-current). */
+                const int beatsPerBar = owner.monitor_ != nullptr
+                    ? juce::jmax (1, (int) owner.monitor_->beatsPerBar.get())
+                    : 4;
+                const double snappedStart =
+                    std::floor (beat / beatsPerBar) * beatsPerBar;
+                const double defaultLen   = (double) beatsPerBar;
+
+                const juce::Uuid newId =
+                    owner.createEmptyMidiRegion (laneIdx, snappedStart, defaultLen);
+                if (! newId.isNull())
+                {
+                    if (auto* sc = dynamic_cast<StandardContent*> (
+                            ViewHelpers::findContentComponent (this)))
+                        sc->showPianoRollForRegion (newId);
                 }
                 return;
             }
@@ -1409,8 +1435,14 @@ public:
     {
         double maxEndBeats = 0.0;
         for (const auto& l : owner.lanes_)
+        {
             for (const auto& r : l.playlist.regions())
                 maxEndBeats = juce::jmax (maxEndBeats, r.endBeats());
+            for (const auto& m : l.playlist.midiRegions())
+                if (m != nullptr)
+                    maxEndBeats = juce::jmax (maxEndBeats,
+                                                m->positionBeats + m->lengthBeats);
+        }
         if (maxEndBeats <= 0.0) return;
 
         const int viewportInnerW = owner.viewport_.getMaximumVisibleWidth();
@@ -1451,6 +1483,14 @@ public:
             double end = 0.0;
             for (const auto& r : l.playlist.regions())
                 end = juce::jmax (end, r.endBeats());
+            /* MIDI regions extend the body width too -- Phase 2 omitted
+             * this loop so MIDI-only lanes capped the body at the 16-beat
+             * floor regardless of their actual span, visually clipping
+             * regions past 4 bars.  body_resizeNeeded already iterates
+             * both kinds; keeping the two methods symmetric. */
+            for (const auto& m : l.playlist.midiRegions())
+                if (m != nullptr)
+                    end = juce::jmax (end, m->positionBeats + m->lengthBeats);
             const int needed = (int) end + kFitPaddingBeats;
             if (needed > maxBeats) maxBeats = needed;
         }
@@ -3303,13 +3343,16 @@ void ArrangementView::paint (Graphics& g)
 
 namespace {
 
-/** Recursive: collects every TrackerNode AND AudioClipNode reachable
- *  from `graph`, including subgraphs.  Used to seed / rebind lanes
- *  against the live graph. */
+/** Recursive: collects every TrackerNode, AudioClipNode, AND
+ *  MidiPlayerNode reachable from `graph`, including subgraphs.  Used
+ *  to seed / rebind lanes against the live graph.  Output arrays are
+ *  parallel: outNodes[i] -> outTrackers[i] OR outAudioClips[i] OR
+ *  outMidiPlayers[i] (exactly one non-null per index). */
 void collectLaneTargetsFromGraph (const Node& graph,
-                                  juce::Array<Node>&           outNodes,
-                                  juce::Array<TrackerNode*>&   outTrackers,
-                                  juce::Array<AudioClipNode*>& outAudioClips)
+                                  juce::Array<Node>&            outNodes,
+                                  juce::Array<TrackerNode*>&    outTrackers,
+                                  juce::Array<AudioClipNode*>&  outAudioClips,
+                                  juce::Array<MidiPlayerNode*>& outMidiPlayers)
 {
     const int n = graph.getNumNodes();
     for (int i = 0; i < n; ++i)
@@ -3325,6 +3368,18 @@ void collectLaneTargetsFromGraph (const Node& graph,
                 outNodes.add (child);
                 outTrackers.add (t);
                 outAudioClips.add (nullptr);
+                outMidiPlayers.add (nullptr);
+                continue;
+            }
+            /* MidiPlayerNode is also a Processor (subclass of
+             * MidiFilterNode like TrackerNode) so the same direct
+             * cast applies -- no getAudioProcessor() unwrap needed. */
+            if (auto* mp = dynamic_cast<MidiPlayerNode*> (proc))
+            {
+                outNodes.add (child);
+                outTrackers.add (nullptr);
+                outAudioClips.add (nullptr);
+                outMidiPlayers.add (mp);
                 continue;
             }
             /* AudioClipNode is a juce::AudioPluginInstance wrapped by
@@ -3341,12 +3396,14 @@ void collectLaneTargetsFromGraph (const Node& graph,
                     outNodes.add (child);
                     outTrackers.add (nullptr);
                     outAudioClips.add (a);
+                    outMidiPlayers.add (nullptr);
                     continue;
                 }
             }
         }
         if (child.isGraph())
-            collectLaneTargetsFromGraph (child, outNodes, outTrackers, outAudioClips);
+            collectLaneTargetsFromGraph (child, outNodes, outTrackers,
+                                          outAudioClips, outMidiPlayers);
     }
 }
 
@@ -3460,9 +3517,10 @@ void ArrangementView::rescanLaneTargets()
         lastCommittedSnapshot_ = lanes_;
     }
 
-    juce::Array<Node>            foundNodes;
-    juce::Array<TrackerNode*>    foundTrackers;
-    juce::Array<AudioClipNode*>  foundAudioClips;
+    juce::Array<Node>             foundNodes;
+    juce::Array<TrackerNode*>     foundTrackers;
+    juce::Array<AudioClipNode*>   foundAudioClips;
+    juce::Array<MidiPlayerNode*>  foundMidiPlayers;
 
     if (services_ != nullptr)
     {
@@ -3471,15 +3529,19 @@ void ArrangementView::rescanLaneTargets()
             const Node active = sess->getActiveGraph();
             if (active.isValid())
                 collectLaneTargetsFromGraph (active, foundNodes,
-                                              foundTrackers, foundAudioClips);
+                                              foundTrackers, foundAudioClips,
+                                              foundMidiPlayers);
         }
     }
+
+    bool mutated = false;   /* shared with the auto-fill loop below */
 
     /* Auto-fill: tracker nodes get a default lane on first discovery.
      * AudioClipNodes do NOT auto-fill -- they're created explicitly
      * via "+ Audio Track" or file drop, both of which create the lane
-     * inline. */
-    bool mutated = false;
+     * inline.  MidiPlayerNodes are spawned via createEmptyMidiLane /
+     * MIDI migration above; they don't auto-fill either (their lane
+     * is created in lockstep with the node). */
     for (int i = 0; i < foundNodes.size(); ++i)
     {
         if (foundTrackers[i] == nullptr) continue;   // skip audio clips here
@@ -3536,8 +3598,9 @@ void ArrangementView::rescanLaneTargets()
         {
             if (foundNodes.getReference (j).getUuid() == l.targetNodeUuid)
             {
-                s.trackerCache   = foundTrackers  [j];
-                s.audioClipCache = foundAudioClips[j];
+                s.trackerCache    = foundTrackers   [j];
+                s.audioClipCache  = foundAudioClips [j];
+                s.midiPlayerCache = foundMidiPlayers[j];
                 break;
             }
         }
@@ -3616,7 +3679,7 @@ void ArrangementView::rescanLaneTargets()
                     }
                 });
         }
-        else if (s.trackerCache == nullptr)
+        else if (s.trackerCache == nullptr && s.midiPlayerCache == nullptr)
         {
             /* Orphan lane: defensively detach any previous adapter
              * binding so dispatch silently skips. */
@@ -3624,6 +3687,17 @@ void ArrangementView::rescanLaneTargets()
         }
 
         laneRuntime_.add (std::move (s));
+    }
+
+    /* Republish MIDI region bindings for every MIDI lane with a live
+     * MidiPlayerNode.  Does this AFTER the laneRuntime_ population
+     * loop so publishMidiBindingsForLane can read the freshly-bound
+     * midiPlayerCache from laneRuntime_. */
+    for (int i = 0; i < lanes_.size(); ++i)
+    {
+        const auto& l = lanes_.getReference (i);
+        if (l.kind == Lane::Kind::Midi)
+            publishMidiBindingsForLane (i);
     }
 
     if (mutated) writeLanesToSession();
@@ -3795,8 +3869,14 @@ void ArrangementView::maybeAutoFitOnLoad()
 
     double maxEndBeats = 0.0;
     for (const auto& l : lanes_)
+    {
         for (const auto& r : l.playlist.regions())
             maxEndBeats = juce::jmax (maxEndBeats, r.endBeats());
+        for (const auto& m : l.playlist.midiRegions())
+            if (m != nullptr)
+                maxEndBeats = juce::jmax (maxEndBeats,
+                                            m->positionBeats + m->lengthBeats);
+    }
     if (maxEndBeats <= 0.0) return;
 
     /* Two trigger conditions for auto-fit:
@@ -4090,20 +4170,46 @@ int ArrangementView::createEmptyAudioLane (bool stereo)
 
 int ArrangementView::createEmptyMidiLane()
 {
-    /* MIDI lanes don't yet create a backing graph node (Phase 2 paint-
-     * only; Phase 3+ wires a piano-roll MIDI player onto a graph node
-     * + adapter).  The lane lives in the arrangement with kind=Midi
-     * and a null targetNodeUuid; ArrangementView's rescanLaneTargets
-     * leaves runtime caches null for non-audio non-tracker kinds,
-     * which is the existing orphan-lane visual treatment. */
+    /* MIDI lane creation spawns a MidiPlayerNode inside the
+     * ArrangementTracks subgraph, mirroring createEmptyAudioLane's
+     * AudioClipNode spawn.  The node's MIDI output is left unwired;
+     * the user routes it into a Sampler / synth via the main graph
+     * (same workflow as TrackerNode).  Without a player node MIDI
+     * lanes are silent; this entry point is the only sanctioned way
+     * to create a MIDI lane. */
+    if (services_ == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyMidiLane] services_ null");
+        return -1;
+    }
+    auto sess = services_->context().session();
+    if (sess == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyMidiLane] session null");
+        return -1;
+    }
+    auto* engineService = services_->find<EngineService>();
+    if (engineService == nullptr)
+    {
+        juce::Logger::writeToLog ("[ArrangementView::createEmptyMidiLane] EngineService null");
+        return -1;
+    }
+
+    Node subgraph = ArrangementTracksService::findOrCreateSubgraph (*engineService, *sess);
+    if (! subgraph.isValid()) return -1;
+
+    Node player = ArrangementTracksService::addMidiPlayerNode (*engineService, subgraph);
+    if (! player.isValid()) return -1;
+
     Lane lane;
     lane.id             = juce::Uuid();
     lane.kind           = Lane::Kind::Midi;
+    lane.targetNodeUuid = player.getUuid();
     lane.name           = juce::String ("MIDI ") + juce::String (lanes_.size() + 1);
     lane.colour         = laneTintForIndex (lanes_.size());
     lanes_.add (std::move (lane));
 
-    rescanLaneTargets();   // no-op for MIDI lanes today; safe to call
+    rescanLaneTargets();   // resolves the new lane's midiPlayerCache
     writeLanesToSession();
     if (body_ != nullptr) body_->resizeForLanes();
     return lanes_.size() - 1;
@@ -4231,10 +4337,17 @@ bool ArrangementView::importMidiFileToLane (const juce::File& file,
     region->positionBeats = juce::jmax (0.0, positionBeats);
     region->lengthBeats   = regionLen;
     region->name          = file.getFileNameWithoutExtension();
-    region->setNotes (std::move (notes));
+    /* setNotesAssigningIds stamps fresh per-note ids so the piano-roll
+     * selection model has stable identities across snapshot swaps. */
+    region->setNotesAssigningIds (std::move (notes));
 
     if (! lane.playlist.addMidiRegion (std::move (region)))
         return false;
+
+    /* Republish the lane's region table onto its MidiPlayerNode so
+     * the audio thread starts emitting from the new region on the
+     * next transport tick. */
+    publishMidiBindingsForLane (laneIdx);
 
     writeLanesToSession();
     if (body_ != nullptr)
@@ -4243,6 +4356,62 @@ bool ArrangementView::importMidiFileToLane (const juce::File& file,
         body_->repaintLane (laneIdx);
     }
     return true;
+}
+
+juce::Uuid ArrangementView::createEmptyMidiRegion (int    laneIdx,
+                                                     double positionBeats,
+                                                     double lengthBeats)
+{
+    if (laneIdx < 0 || laneIdx >= lanes_.size())
+        return juce::Uuid::null();
+
+    auto& lane = lanes_.getReference (laneIdx);
+    if (lane.kind != Lane::Kind::Midi)
+        return juce::Uuid::null();
+
+    auto region = std::make_unique<MidiNoteRegion>();
+    region->id            = juce::Uuid();
+    region->positionBeats = juce::jmax (0.0, positionBeats);
+    region->lengthBeats   = juce::jmax (0.25, lengthBeats);
+    region->name          = juce::String ("MIDI ") + juce::String (lane.playlist.midiRegions().size() + 1);
+
+    const juce::Uuid newId = region->id;
+
+    if (! lane.playlist.addMidiRegion (std::move (region)))
+        return juce::Uuid::null();
+
+    publishMidiBindingsForLane (laneIdx);
+    writeLanesToSession();
+    if (body_ != nullptr)
+    {
+        body_->resizeForLanes();
+        body_->repaintLane (laneIdx);
+    }
+    return newId;
+}
+
+void ArrangementView::publishMidiBindingsForLane (int laneIdx)
+{
+    if (laneIdx < 0 || laneIdx >= lanes_.size()) return;
+    if (laneIdx >= laneRuntime_.size()) return;
+
+    auto& runtime = laneRuntime_.getReference (laneIdx);
+    if (runtime.midiPlayerCache == nullptr) return;
+
+    const auto& lane = lanes_.getReference (laneIdx);
+    std::vector<MidiPlayerNode::RegionEntry> entries;
+    entries.reserve (lane.playlist.midiRegions().size());
+    for (const auto& mp : lane.playlist.midiRegions())
+    {
+        if (mp == nullptr) continue;
+        MidiPlayerNode::RegionEntry e;
+        e.region        = mp.get();
+        e.positionBeats = mp->positionBeats;
+        e.lengthBeats   = mp->lengthBeats;
+        e.looped        = mp->looped;
+        entries.push_back (e);
+    }
+    runtime.midiPlayerCache->setBoundRegions (std::move (entries));
 }
 
 void ArrangementView::promptLoadAudioFile()

@@ -53,6 +53,16 @@ struct ArrangementTracksService
                                   const Node&    subgraph,
                                   bool           stereo = true);
 
+    /** Add a MidiPlayerNode inside the given subgraph.  Peer of
+     *  addAudioClipNode for MIDI lanes.  The MidiPlayerNode is a
+     *  MIDI-output-only graph node; its output is left unwired so
+     *  the user can route it into whatever synth / Sampler they want.
+     *  No auto-wiring inside the subgraph (no audio.input/output
+     *  destination makes sense for a MIDI-only node).  Returns invalid
+     *  Node on failure. */
+    static Node addMidiPlayerNode (EngineService& engine,
+                                   const Node&    subgraph);
+
     /** End-to-end audio-file import, decoupled from ArrangementView's
      *  lifecycle.  Opens `file` via libsndfile, registers as an
      *  AudioFileSource, finds-or-creates the ArrangementTracks

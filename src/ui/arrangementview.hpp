@@ -26,6 +26,7 @@
 namespace element {
 
 class AudioClipNode;
+class MidiPlayerNode;
 class TrackerNode;
 
 /** Main-window arrangement view.
@@ -108,6 +109,24 @@ public:
      *  of Phase 3 Session 1). */
     MidiNoteRegion* findMidiRegion (const juce::Uuid& regionId) noexcept;
 
+    /** Create an empty MIDI region on the lane at `laneIdx`.  This
+     *  is the primary author-from-scratch path -- matches the real-
+     *  DAW workflow where the user creates a region then opens the
+     *  piano-roll to add notes.  Returns the new region's uuid on
+     *  success, juce::Uuid::null() on failure (lane index out of
+     *  range, lane not MIDI, region overlap rejected by Playlist). */
+    juce::Uuid createEmptyMidiRegion (int    laneIdx,
+                                       double positionBeats,
+                                       double lengthBeats);
+
+    /** Republish the MidiPlayerNode region bindings for the lane at
+     *  `laneIdx`.  Called by the piano-roll edit gestures + by
+     *  rescanLaneTargets after a fresh MidiPlayerNode is bound.  No-op
+     *  for non-MIDI lanes or orphan MIDI lanes (no player node yet).
+     *  Builds a fresh RegionEntry vector from the lane's playlist's
+     *  midiRegions and atomic-swaps it into the player node. */
+    void publishMidiBindingsForLane (int laneIdx);
+
 private:
     void valueTreeChildAdded   (juce::ValueTree&, juce::ValueTree&) override;
     void valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree&, int) override;
@@ -126,13 +145,18 @@ private:
     {
         TrackerNode*     trackerCache    = nullptr;
         AudioClipNode*   audioClipCache  = nullptr;
+        MidiPlayerNode*  midiPlayerCache = nullptr;
         AudioLaneAdapter audioAdapter    { nullptr };   // target rebound on each rescan
         juce::Uuid       lastDispatchedRegion;
         int              lastDispatchedSeqIdx = -1;
 
-        bool isTrackerLane() const noexcept { return trackerCache   != nullptr; }
-        bool isAudioLane()   const noexcept { return audioClipCache != nullptr; }
-        bool isOrphan()      const noexcept { return ! isTrackerLane() && ! isAudioLane(); }
+        bool isTrackerLane()    const noexcept { return trackerCache    != nullptr; }
+        bool isAudioLane()      const noexcept { return audioClipCache  != nullptr; }
+        bool isMidiPlayerLane() const noexcept { return midiPlayerCache != nullptr; }
+        bool isOrphan()         const noexcept
+        {
+            return ! isTrackerLane() && ! isAudioLane() && ! isMidiPlayerLane();
+        }
     };
 
     /* Body: single inline-paint component holding all lanes (no per-

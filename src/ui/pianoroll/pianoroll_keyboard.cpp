@@ -6,9 +6,14 @@
 namespace element {
 
 PianoRollKeyboard::PianoRollKeyboard()
-    : juce::MidiKeyboardComponent (state_,
+    : detail::PianoRollKeyboardStateHolder(),
+      juce::MidiKeyboardComponent (internalState,
                                      juce::MidiKeyboardComponent::verticalKeyboardFacingRight)
 {
+    /* Base init order (left-to-right): PianoRollKeyboardStateHolder
+     * runs first, so `internalState` is fully constructed by the
+     * time MidiKeyboardComponent::ctor calls state.addListener(this).
+     * See the class comment for the rationale. */
     /* Fixed visible range, Bitwig default.  Session 2 will likely
      * make this user-zoomable; for now the static range keeps the
      * paint loop cheap (~60 keys regardless of dock height). */
