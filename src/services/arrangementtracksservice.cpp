@@ -174,6 +174,34 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
     return clip;
 }
 
+Node
+ArrangementTracksService::addMidiPlayerNode (EngineService& engine,
+                                              const Node&    subgraph)
+{
+    if (! subgraph.isValid() || ! subgraph.isGraph())
+        return Node();
+
+    juce::PluginDescription desc;
+    desc.fileOrIdentifier = EL_NODE_ID_MIDI_PLAYER;
+    desc.pluginFormatName = EL_NODE_FORMAT_NAME;
+    desc.name             = "MIDI Player";
+
+    Node player = engine.addPlugin (subgraph, desc);
+    if (! player.isValid())
+        return player;
+
+    /* Intentionally NO auto-wire here -- MidiPlayerNode's output is
+     * MIDI, and there's no canonical MIDI sink inside the subgraph.
+     * The user wires MidiPlayerNode -> Sampler / synth on the main
+     * graph (or inside the subgraph) according to their topology.
+     *
+     * Future: if Element grows a per-subgraph "default MIDI sink"
+     * convention (e.g. the subgraph's MIDI output IO node), this is
+     * where we'd auto-connect. */
+
+    return player;
+}
+
 bool
 ArrangementTracksService::importAudioFileAsNewLane (const juce::File& file,
                                                     Services&         services)
