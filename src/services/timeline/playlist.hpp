@@ -97,12 +97,33 @@ public:
     // overlap-allowed policy as audio regions.
 
     /** Append a MIDI note region.  Takes ownership.  Returns false if
-     *  the region is null or has negative length. */
+     *  the region is null, has negative length, OR if its time range
+     *  [position, position+length) overlaps an existing MIDI region
+     *  on this playlist (mirrors the audio path's no-overlap policy). */
     bool addMidiRegion (std::unique_ptr<MidiNoteRegion> r);
 
     /** Remove the MIDI region with this id.  Returns false if not
      *  present. */
     bool removeMidiRegion (juce::Uuid regionId);
+
+    /** Cleave the MIDI region at the given absolute beat into two.
+     *  The left half keeps the original id + positionBeats; the right
+     *  half gets a fresh uuid + positionBeats = original.positionBeats
+     *  + atBeatOffset.  Notes split between halves: notes whose onBeat
+     *  falls before the cut stay with the left, notes whose onBeat is
+     *  at or after the cut move to the right (with onBeat re-based to
+     *  the new region's coords).  Notes that STRADDLE the cut are
+     *  truncated at the cut (left half) and not duplicated -- matches
+     *  Ableton + Bitwig convention.  Returns the new right-half uuid
+     *  on success, null on failure (out-of-range cut, region not
+     *  found, region not splittable). */
+    juce::Uuid splitMidiRegion (juce::Uuid regionId, double atBeat);
+
+    /** Re-sort midiRegions_ by positionBeats.  Call after any direct
+     *  mutation of an existing region's positionBeats (e.g. an
+     *  arrangement-view drag) so the sorted invariant holds for
+     *  forEachMidiStartIn + paint order. */
+    void rebuildMidiOrder() noexcept;
 
     MidiNoteRegion*       findMidiRegion (juce::Uuid regionId) noexcept;
     const MidiNoteRegion* findMidiRegion (juce::Uuid regionId) const noexcept;

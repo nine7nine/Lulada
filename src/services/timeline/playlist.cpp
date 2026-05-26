@@ -182,6 +182,22 @@ bool Playlist::addMidiRegion (std::unique_ptr<MidiNoteRegion> r)
     if (r == nullptr)                return false;
     if (r->lengthBeats < 0.0)        return false;
 
+    /* Overlap rejection -- mirror the audio path's no-overlap policy.
+     * Two MIDI regions on the same lane occupying the same beat range
+     * would feed duplicate NoteOn/NoteOff streams into the bound
+     * MidiPlayerNode; even when the synth handles it gracefully the
+     * extra event traffic is wasted work.  Caller can split first +
+     * add second to butt-join cleanly. */
+    const double newStart = r->positionBeats;
+    const double newEnd   = newStart + r->lengthBeats;
+    for (const auto& other : midiRegions_)
+    {
+        if (other == nullptr) continue;
+        const double otherEnd = other->positionBeats + other->lengthBeats;
+        if (newStart < otherEnd && newEnd > other->positionBeats)
+            return false;
+    }
+
     midiRegions_.push_back (std::move (r));
     rebuildMidiOrder();
     return true;
@@ -226,6 +242,85 @@ void Playlist::rebuildMidiOrder() noexcept
                    if (b == nullptr) return true;
                    return a->positionBeats < b->positionBeats;
                });
+}
+
+juce::Uuid Playlist::splitMidiRegion (juce::Uuid regionId, double atBeat)
+{
+    /* atBeat is in SESSION beats (same coord system as positionBeats);
+     * split is rejected if it lands on or outside the region's actual
+     * range (no zero-length halves). */
+    auto* left = findMidiRegion (regionId);
+    if (left == nullptr) return juce::Uuid::null();
+
+    const double leftStart = left->positionBeats;
+    const double leftEnd   = leftStart + left->lengthBeats;
+    if (atBeat <= leftStart + 1e-9)  return juce::Uuid::null();
+    if (atBeat >= leftEnd   - 1e-9)  return juce::Uuid::null();
+
+    const double cutLocal = atBeat - leftStart;   /* offset into left region */
+
+    /* Snapshot the left region's note list, partition into stays /
+     * moves.  Notes whose onBeat falls before the cut stay; notes at
+     * or after the cut migrate.  Notes that STRADDLE the cut (start
+     * before, end after) are TRUNCATED at the cut on the left half
+     * and not duplicated into the right -- matches Ableton + Bitwig. */
+    auto leftNotes  = MidiNoteRegion::NoteList{};
+    auto rightNotes = MidiNoteRegion::NoteList{};
+
+    if (const auto* snap = left->loadSnapshot())
+    {
+        leftNotes .reserve (snap->size());
+        rightNotes.reserve (snap->size());
+        for (const auto& n : *snap)
+        {
+            if (n.onBeat >= cutLocal)
+            {
+                MidiNote r = n;
+                r.onBeat -= cutLocal;
+                rightNotes.push_back (r);
+            }
+            else
+            {
+                MidiNote l = n;
+                /* Truncate at the cut if the note extends past it. */
+                const double localEnd = l.onBeat + l.lengthBeats;
+                if (localEnd > cutLocal)
+                    l.lengthBeats = cutLocal - l.onBeat;
+                leftNotes.push_back (l);
+            }
+        }
+    }
+
+    /* Mutate the left half in place: shrink lengthBeats + publish the
+     * truncated note set.  ID + positionBeats + sourceId untouched. */
+    left->lengthBeats = cutLocal;
+    left->setNotes (std::move (leftNotes));
+
+    /* Build the right half.  Fresh uuid + positionBeats placed at the
+     * cut.  Inherit name / colour / looped / sourceId from the left
+     * (sourceId is shared if the original was imported; both halves
+     * trace back to the same SMF blob).  Note ids are stamped fresh
+     * by setNotesAssigningIds so the right half's piano-roll
+     * selection has clean identities. */
+    auto right = std::make_unique<MidiNoteRegion>();
+    right->id            = juce::Uuid();
+    right->sourceId      = left->sourceId;
+    right->positionBeats = atBeat;
+    right->lengthBeats   = leftEnd - atBeat;
+    right->looped        = left->looped;
+    right->colour        = left->colour;
+    right->name          = left->name;
+    right->setNotesAssigningIds (std::move (rightNotes));
+
+    const juce::Uuid newId = right->id;
+
+    /* addMidiRegion's overlap check runs against the now-shortened
+     * left so the right half lands cleanly.  rebuildMidiOrder runs
+     * inside addMidiRegion. */
+    if (! addMidiRegion (std::move (right)))
+        return juce::Uuid::null();
+
+    return newId;
 }
 
 juce::ValueTree Playlist::toValueTree() const
