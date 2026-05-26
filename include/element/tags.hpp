@@ -151,6 +151,14 @@ static const juce::Identifier sessionView = "sessionView";
  * as the child of a Session ValueTree holding the arrangement
  * view's persistent state (lanes + playlists + regions).  See
  * timeline-audio-design.md Sections 1.3-1.4. */
+/* tags::automationTracks is the top-level peer to tags::arrangement
+ * holding the per-graph AutomationEngine state -- list of
+ * AutomationTracks with their target keys, modes, and inline
+ * AutomationRegions / AutomationPoints.  See
+ * piano-roll-automation-design.md Section 3.3.  Phase 1 ships the
+ * round-trip API on AutomationEngine; the actual session save/load
+ * trigger lands in Phase 4 when the UI work needs it. */
+static const juce::Identifier automationTracks = "automationTracks";
 static const juce::Identifier state = "state";
 static const juce::Identifier programState = "programState";
 static const juce::Identifier beatsPerBar = "beatsPerBar";

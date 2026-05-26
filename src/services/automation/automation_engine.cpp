@@ -3,6 +3,8 @@
 
 #include "services/automation/automation_engine.hpp"
 
+#include <element/tags.hpp>
+
 #include <algorithm>
 #include <cmath>
 
@@ -357,6 +359,62 @@ bool AutomationEngine::isMappingMutedForNodeParam (element::Parameter* p) const 
         return isMappingMuted (slot);
     }
     return false;
+}
+
+//==============================================================================
+
+//==============================================================================
+
+void AutomationEngine::saveToValueTree (juce::ValueTree& root) const
+{
+    /* Remove any existing tags::automationTracks child so save is
+     * idempotent (re-saving doesn't accumulate). */
+    auto existing = root.getChildWithName (tags::automationTracks);
+    if (existing.isValid())
+        root.removeChild (existing, nullptr);
+
+    if (ownedTracks_.empty())
+        return;   /* sparse-write: no tag when no tracks bound */
+
+    juce::ValueTree node (tags::automationTracks);
+    for (const auto& t : ownedTracks_)
+        node.appendChild (t->toValueTree(), nullptr);
+    root.appendChild (node, nullptr);
+}
+
+void AutomationEngine::loadFromValueTree (const juce::ValueTree& root)
+{
+    /* Tear down current tracks BEFORE replacing -- unbind targets,
+     * clear mute slots, push to trash for epoch-gated reclaim. */
+    {
+        const juce::ScopedLock sl (lookupLock_);
+
+        /* Snapshot the IDs first since removeTrack mutates
+         * ownedTracks_ under iteration. */
+        std::vector<juce::Uuid> toRemove;
+        toRemove.reserve (ownedTracks_.size());
+        for (const auto& t : ownedTracks_)
+            toRemove.push_back (t->id);
+        for (const auto& id : toRemove)
+            removeTrack (id);
+    }
+
+    /* Missing child = empty engine.  Forwards-compat: legacy
+     * sessions saved before this commit just load as if no
+     * automation existed. */
+    auto node = root.getChildWithName (tags::automationTracks);
+    if (! node.isValid())
+        return;
+
+    for (int i = 0; i < node.getNumChildren(); ++i)
+    {
+        auto child = node.getChild (i);
+        if (auto t = AutomationTrack::fromValueTree (child))
+            addTrack (std::move (t));
+        /* No bindXxx() call here -- target resolution is the
+         * caller's job (Phase 4 session-load hook walks each
+         * track's targetKey + binds against the live graph). */
+    }
 }
 
 //==============================================================================

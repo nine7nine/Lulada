@@ -432,6 +432,98 @@ BOOST_AUTO_TEST_CASE (plugin_param_stays_coarse_under_sa_path)
     BOOST_CHECK (midi.isEmpty());                /* not a MIDI target */
 }
 
+BOOST_AUTO_TEST_CASE (save_to_value_tree_empty_engine_writes_nothing)
+{
+    AutomationEngine eng;
+    juce::ValueTree root ("session");
+    eng.saveToValueTree (root);
+    /* No tracks bound -> no tags::automationTracks child added. */
+    BOOST_CHECK_EQUAL (root.getNumChildren(), 0);
+}
+
+BOOST_AUTO_TEST_CASE (save_load_round_trip_preserves_tracks_and_regions)
+{
+    juce::ValueTree root ("session");
+    {
+        AutomationEngine eng;
+        auto* t1 = eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.2, 0.8));
+        auto* t2 = eng.addTrack (makeTrackWithLinearRegion (8.0, 2.0, 0.1, 0.9));
+        t1->setMode (AutomationMode::Read);
+        t2->setMode (AutomationMode::Off);
+        t1->targetKey.nodeId  = juce::Uuid();
+        t1->targetKey.paramId = "volume";
+        t2->targetKey.midiCcChannel = 5;
+        t2->targetKey.midiCcNumber  = 74;
+
+        eng.saveToValueTree (root);
+    }
+
+    BOOST_REQUIRE (root.getChildWithName (juce::Identifier ("automationTracks")).isValid());
+
+    /* Load into a fresh engine. */
+    AutomationEngine restored;
+    restored.loadFromValueTree (root);
+
+    BOOST_CHECK_EQUAL (restored.numTracks(), 2);
+
+    /* Sampling parity at known beats -- regions must round-trip
+     * with their point lists intact. */
+    int seenMidi = 0, seenInternal = 0;
+    restored.forEachTrack ([&] (AutomationTrack* t)
+    {
+        if (t->targetKey.isMidi())
+        {
+            ++seenMidi;
+            BOOST_CHECK_EQUAL (t->targetKey.midiCcChannel, 5);
+            BOOST_CHECK_EQUAL (t->targetKey.midiCcNumber,  74);
+        }
+        else
+        {
+            ++seenInternal;
+            BOOST_CHECK_EQUAL (t->targetKey.paramId, "volume");
+            /* Sampling parity at midpoint of the (0..4) region. */
+            auto* r = t->findActiveRegion (2.0);
+            BOOST_REQUIRE (r != nullptr);
+            BOOST_CHECK_CLOSE (r->sampleAtBeats (2.0), 0.5, 1e-4);
+        }
+    });
+    BOOST_CHECK_EQUAL (seenMidi,     1);
+    BOOST_CHECK_EQUAL (seenInternal, 1);
+}
+
+BOOST_AUTO_TEST_CASE (load_replaces_existing_tracks)
+{
+    AutomationEngine eng;
+    /* Seed with two tracks. */
+    eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.0, 1.0));
+    eng.addTrack (makeTrackWithLinearRegion (8.0, 4.0, 0.0, 1.0));
+    BOOST_REQUIRE_EQUAL (eng.numTracks(), 2);
+
+    /* Now load from a tree with just ONE track -- existing two must
+     * be cleared first. */
+    juce::ValueTree root ("session");
+    {
+        AutomationEngine src;
+        src.addTrack (makeTrackWithLinearRegion (0.0, 2.0, 0.5, 0.5));
+        src.saveToValueTree (root);
+    }
+    eng.loadFromValueTree (root);
+    BOOST_CHECK_EQUAL (eng.numTracks(), 1);
+}
+
+BOOST_AUTO_TEST_CASE (load_missing_tag_clears_engine_no_crash)
+{
+    AutomationEngine eng;
+    eng.addTrack (makeTrackWithLinearRegion (0.0, 4.0, 0.0, 1.0));
+    BOOST_REQUIRE_EQUAL (eng.numTracks(), 1);
+
+    /* Empty root -> load clears everything (forwards-compat: legacy
+     * session with no automation tag). */
+    juce::ValueTree root ("session");
+    eng.loadFromValueTree (root);
+    BOOST_CHECK_EQUAL (eng.numTracks(), 0);
+}
+
 BOOST_AUTO_TEST_CASE (drain_pending_lookups_is_safe_no_crash)
 {
     /* drainPendingLookups acquires + releases the lookup lock --

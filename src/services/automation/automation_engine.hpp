@@ -187,6 +187,26 @@ public:
     }
 
     //==========================================================================
+    // Session XML persistence.  Pure data round-trip -- the engine
+    // doesn't know about Session's lifecycle (save/load triggers are
+    // wired in Phase 4 when the UI work needs them).
+
+    /** Save all owned tracks to a child ValueTree under root tagged
+     *  tags::automationTracks.  Overwrites the existing child if
+     *  present.  No-op if zero tracks bound (no child added). */
+    void saveToValueTree (juce::ValueTree& root) const;
+
+    /** Clear current state + reconstruct AutomationTracks from a
+     *  tags::automationTracks child of root.  Missing child = empty
+     *  engine (backwards-compat: legacy sessions just load as if no
+     *  automation existed).  Target binding (live AutomationTarget
+     *  pointers + mute slot allocation) is NOT performed here -- the
+     *  caller is responsible for resolving each track's
+     *  targetKey to a live binding via bindXxx() after load,
+     *  typically driven by a Phase 4 session-load hook. */
+    void loadFromValueTree (const juce::ValueTree& root);
+
+    //==========================================================================
     // Message-thread cleanup.  Reclaims trashed track-list snapshots,
     // retired targets, removed tracks -- all epoch-gated against the
     // engine's audio epoch (and each track's own epoch for nested
