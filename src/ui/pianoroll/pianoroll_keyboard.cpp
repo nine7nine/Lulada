@@ -25,28 +25,14 @@ PianoRollKeyboard::PianoRollKeyboard()
                             * the keyboard's primary axis; in vertical
                             * orientation that's the per-key HEIGHT. */
 
-    /* Override Element's LookAndFeel keyboard palette LOCALLY for the
-     * piano-roll instance only -- the global LCD-grey scheme works on
-     * the virtual keyboard up top but reads as low-contrast in the
-     * piano-roll dock context (the dock background is darker, so the
-     * dark-grey white keys disappear into it).  Bring contrast back
-     * by giving white keys a proper light-grey body and black keys a
-     * deep black with a brighter top edge.  Mirrors Ableton + Zrythm
-     * keyboard column conventions. */
-    setColour (juce::MidiKeyboardComponent::whiteNoteColourId,
-                juce::Colour (0xff'd8'd8'd8));
-    setColour (juce::MidiKeyboardComponent::blackNoteColourId,
-                juce::Colour (0xff'08'08'08));
-    setColour (juce::MidiKeyboardComponent::keySeparatorLineColourId,
-                juce::Colour (0xff'18'18'18));
-    setColour (juce::MidiKeyboardComponent::mouseOverKeyOverlayColourId,
-                juce::Colour (0x60'80'a0'c0));
-    setColour (juce::MidiKeyboardComponent::keyDownOverlayColourId,
-                juce::Colour (0xa0'5a'be'e5));
-    setColour (juce::MidiKeyboardComponent::textLabelColourId,
-                juce::Colour (0xff'30'30'30));   /* dark text on light keys */
-    setColour (juce::MidiKeyboardComponent::shadowColourId,
-                juce::Colour (0x66'00'00'00));
+    /* Keyboard palette inherits the global LookAndFeel scheme
+     * (style_v1.cpp -- MidiKeyboardComponent::ColourIds set by
+     * LookAndFeel_E1).  Same colours as the transport's virtual
+     * keyboard + the sampler keyboard so all three read as one
+     * family.  Do NOT override locally -- previous attempts to
+     * "boost contrast" by lightening the white keys produced a
+     * near-white strip in vertical orientation that obliterated
+     * the black-key shape. */
 
     /* No mouse interaction in Session 1.  We don't disable the
      * component entirely -- that would dim it via the LookAndFeel
