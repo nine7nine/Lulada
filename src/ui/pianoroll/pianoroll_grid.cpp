@@ -310,6 +310,28 @@ void PianoRollGrid::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0xff'16'16'16));
     g.fillRect (bodyBounds());
 
+    /* Paint the "beyond region" zone darker so the user can see the
+     * span they're actually editing.  Grid component width may exceed
+     * regionLen * pxPerBeat when the viewport is wider than the
+     * region (auto-fit on bind), and we want the user to know clicks
+     * past the right edge are no-ops. */
+    const int regionEndX = (int) std::round (regionLenBeats_ * pxPerBeat_);
+    if (getWidth() > regionEndX)
+    {
+        const auto body = bodyBounds();
+        const juce::Rectangle<int> beyond (regionEndX,
+                                            body.getY(),
+                                            getWidth() - regionEndX,
+                                            body.getHeight());
+        g.setColour (juce::Colour (0xff'08'08'08));
+        g.fillRect (beyond);
+        /* 1 px brighter divider line at the region end. */
+        g.setColour (juce::Colour (0xff'40'40'40));
+        g.drawVerticalLine (regionEndX,
+                              (float) body.getY(),
+                              (float) body.getBottom());
+    }
+
     auto* region = resolveBoundRegion();
     if (region != nullptr && juce::jmax (1.0, region->lengthBeats) != regionLenBeats_)
     {
@@ -750,6 +772,20 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
 
     auto* region = resolveBoundRegion();
     if (region == nullptr) return;
+
+    /* "Beyond region" zone -- if the grid component is wider than the
+     * bound region's beat span (auto-fit on bind, or user shrank the
+     * region after a zoom), clicks past the region end are no-ops.
+     * Prevents pencil-create from placing notes outside the region. */
+    const int regionEndX = (int) std::round (regionLenBeats_ * pxPerBeat_);
+    if (e.x >= regionEndX)
+    {
+        /* Click in the void = clear selection, same as empty-body
+         * click inside the region. */
+        if (! e.mods.isCommandDown() && ! e.mods.isCtrlDown())
+            selectClear();
+        return;
+    }
 
     /* First try the resize handle hit (5 px right edge of any note)
      * regardless of tool -- consistent affordance like all DAWs.
