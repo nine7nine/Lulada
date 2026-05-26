@@ -1863,6 +1863,18 @@ void StandardContent::showPianoRollForRegion (const juce::Uuid& regionId)
             return arr->findMidiRegion (uuid);
         });
 
+    /* Region-edited callback -- piano-roll edits fire this on commit
+     * + on Delete-key + on Erase-tool hit; we repaint the arrangement
+     * view's body so the lane strip's note-count badge tracks live.
+     * Cheap: ArrangementView's paint already reads noteCount() per
+     * region via an atomic load. */
+    pianoRoll->onRegionEdited = [this]() {
+        auto it = viewCache_.find (EL_VIEW_ARRANGEMENT);
+        if (it == viewCache_.end()) return;
+        if (auto* arr = it->second.get())
+            arr->repaint();
+    };
+
     pianoRoll->setRegion (regionId);
 }
 

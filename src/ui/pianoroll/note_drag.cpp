@@ -19,7 +19,9 @@ namespace {
 /* Helper: push a populated MidiNoteDiffCommand through the global
  * UndoManager.  Falls back to direct apply when no GuiService /
  * UndoManager is available (defensive -- in practice the GuiService
- * is always present in a running Element session). */
+ * is always present in a running Element session).  Notifies the
+ * parent PianoRollView so it can broadcast region-edited (drives
+ * ArrangementView's live note-count badge refresh). */
 void commitDiff (PianoRollGrid& grid,
                  std::unique_ptr<MidiNoteDiffCommand> cmd,
                  const juce::String& displayName)
@@ -32,12 +34,16 @@ void commitDiff (PianoRollGrid& grid,
         /* GuiService::getUndoManager() returns a reference, not a
          * pointer -- always valid in a live session. */
         gui->getUndoManager().perform (cmd.release(), displayName);
-        return;
+    }
+    else
+    {
+        /* Fallback: apply directly + drop.  No undo trail in this path
+         * but the edit still lands. */
+        cmd->perform();
     }
 
-    /* Fallback: apply directly + drop.  No undo trail in this path
-     * but the edit still lands. */
-    cmd->perform();
+    if (auto* view = grid.findParentComponentOfClass<PianoRollView>())
+        view->notifyRegionEdited();
 }
 
 } // namespace
@@ -86,9 +92,11 @@ public:
 
         /* Snap the BEAT delta (not the absolute position) so the
          * gesture feels relative.  Pitch is integer so no snap
-         * needed. */
+         * needed.  When snap is off, drag is continuous. */
         const double rawDeltaBeats = curBeat - anchorBeat_;
-        deltaBeats_ = std::round (rawDeltaBeats);   /* whole-beat snap v1 */
+        deltaBeats_ = grid.isSnapEnabled()
+            ? grid.snapBeat (rawDeltaBeats)
+            : rawDeltaBeats;
         deltaPitch_ = curPitch - anchorPitch_;
 
         grid.repaint();
@@ -157,15 +165,25 @@ public:
                      const juce::MouseEvent& e)
     {
         (void) region;
-        anchorBeat_ = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
+        const double rawBeat = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
+        anchorBeat_ = grid.isSnapEnabled()
+            ? juce::jmax (0.0, grid.snapBeat (rawBeat))
+            : juce::jmax (0.0, rawBeat);
         anchorPitch_ = grid.pitchForY (e.y);
-        anchorBeat_ = std::floor (anchorBeat_);   /* snap to start of beat */
+
+        /* Initial length = current snap division (Ableton/Zrythm
+         * convention -- pencil-clicked note matches the grid grain).
+         * Falls back to a quarter beat when snap is off. */
+        const double initLen = grid.isSnapEnabled() && grid.getSnapDivision() > 0.0
+            ? grid.getSnapDivision()
+            : 0.25;
+
         live_.id          = 0;   /* assigned at commit time */
         live_.pitch       = anchorPitch_;
         live_.velocity    = 100;
         live_.channel     = 1;
         live_.onBeat      = anchorBeat_;
-        live_.lengthBeats = 1.0;
+        live_.lengthBeats = initLen;
 
         if (auto* view = grid.findParentComponentOfClass<PianoRollView>())
         {
@@ -177,8 +195,14 @@ public:
     void mouseDrag (const juce::MouseEvent& e, PianoRollGrid& grid) override
     {
         const double curBeat = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
-        const double len = juce::jmax (0.25, std::round (curBeat - anchorBeat_));
-        live_.lengthBeats = len;
+        const double minLen = grid.isSnapEnabled() && grid.getSnapDivision() > 0.0
+            ? grid.getSnapDivision()
+            : 0.0625;
+        const double rawLen = curBeat - anchorBeat_;
+        const double snapped = grid.isSnapEnabled()
+            ? grid.snapBeat (rawLen)
+            : rawLen;
+        live_.lengthBeats = juce::jmax (minLen, snapped);
         grid.repaint();
     }
 
@@ -259,8 +283,14 @@ public:
     {
         const double pxb     = (double) juce::jmax (1, grid.getPxPerBeat());
         const double newEnd  = (double) e.x / pxb;
-        const double newLen  = juce::jmax (0.25, std::round (newEnd - before_.onBeat));
-        liveLen_ = newLen;
+        const double minLen = grid.isSnapEnabled() && grid.getSnapDivision() > 0.0
+            ? grid.getSnapDivision()
+            : 0.0625;
+        const double rawLen = newEnd - before_.onBeat;
+        const double snapped = grid.isSnapEnabled()
+            ? grid.snapBeat (rawLen)
+            : rawLen;
+        liveLen_ = juce::jmax (minLen, snapped);
         grid.repaint();
     }
 

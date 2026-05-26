@@ -4,6 +4,7 @@
 #pragma once
 
 #include <element/midipipe.hpp>
+#include <element/node.h>
 #include "nodes/midifilter.hpp"
 #include "services/timeline/midi_note_region.hpp"
 
