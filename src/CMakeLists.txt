@@ -26,8 +26,8 @@ target_include_directories(element
 
 # Re-glob marker: bump this file's mtime to force CMake to re-scan
 # after adding new sources under src/.  Updated 2026-05-25 for the
-# automation engine Phase 1 (dsp/automation/automation_region.cpp +
-# automation_track.cpp).
+# automation engine Phase 1 (dsp/automation/{region,track}.cpp +
+# services/automation/automation_engine.cpp).
 file(GLOB_RECURSE ELEMENT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")

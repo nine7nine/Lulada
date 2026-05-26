@@ -14,6 +14,8 @@
 #include <memory>
 #include <vector>
 
+namespace element::automation { struct AutomationTarget; }
+
 namespace element::dsp::automation {
 
 /** Read / Record / Off, mirroring zrythm + ardour.
@@ -113,6 +115,18 @@ public:
      *  Cached at engine-bind time.  -1 = unbound (engine hasn't seen
      *  this track yet or the track is Off-mode). */
     std::atomic<int>       muteSlotIndex { -1 };
+
+    /** Live resolved AutomationTarget pointer.  Owned + lifecycled by
+     *  the AutomationEngine (heap allocation; epoch-gated trash for
+     *  rebinds).  nullptr means the track has been added but the
+     *  engine hasn't bound a target yet (e.g. immediately after
+     *  AutomationTrack::fromValueTree on session load -- bound on
+     *  first engine resolution pass).
+     *
+     *  Audio thread: load(acquire) once per track per block.  Engine
+     *  (UI thread / message thread) sets via store(release) at
+     *  bind/unbind time, NOT per block. */
+    std::atomic<const element::automation::AutomationTarget*> liveTarget { nullptr };
 
     //==========================================================================
     // Mode -- atomic, lock-free on every supported platform.
