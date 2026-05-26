@@ -1839,13 +1839,31 @@ void StandardContent::setPianoRollVisible (bool v)
 void StandardContent::showPianoRollForRegion (const juce::Uuid& regionId)
 {
     /* Implicit show + bind.  Used by ArrangementView's MIDI-region
-     * double-click affordance (Session 1 commit D) and by anything
-     * else that wants to surface a specific region without forcing
-     * the user to toggle the dock first. */
+     * double-click affordance and by anything else that wants to
+     * surface a specific region without forcing the user to toggle
+     * the dock first. */
     if (! pianoRollVisible_)
         setPianoRollVisible (true);
-    if (pianoRoll != nullptr)
-        pianoRoll->setRegion (regionId);
+    if (pianoRoll == nullptr) return;
+
+    /* Install (or refresh) the resolver lambda that walks the
+     * cached ArrangementView and queries findMidiRegion(uuid).  The
+     * lambda captures `this` (StandardContent) so the resolver always
+     * targets the current viewCache_ entry -- the ArrangementView is
+     * built once on first request and reused across view switches.
+     * If the user has not yet visited the arrangement (no entry in
+     * viewCache_), the lambda returns nullptr and the grid paints
+     * its empty-state hint -- harmless. */
+    pianoRoll->setRegionResolver (
+        [this] (const juce::Uuid& uuid) -> MidiNoteRegion* {
+            auto it = viewCache_.find (EL_VIEW_ARRANGEMENT);
+            if (it == viewCache_.end()) return nullptr;
+            auto* arr = dynamic_cast<ArrangementView*> (it->second.get());
+            if (arr == nullptr) return nullptr;
+            return arr->findMidiRegion (uuid);
+        });
+
+    pianoRoll->setRegion (regionId);
 }
 
 bool StandardContent::isMeterBridgeVisible() const

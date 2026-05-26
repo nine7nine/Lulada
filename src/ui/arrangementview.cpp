@@ -892,6 +892,31 @@ public:
             return;
         }
 
+        /* MIDI lane: double-click anywhere on a MIDI region surfaces
+         * the bottom-attached piano-roll dock bound to this region.
+         * Sibling of the tracker branch above; MIDI lanes have no
+         * targetNodeUuid in Phase 2 (paint-only, no backing graph
+         * node) so the binding is by region uuid, not node uuid. */
+        {
+            const auto& lane = owner.lanes_.getReference (laneIdx);
+            if (lane.kind == Lane::Kind::Midi)
+            {
+                const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+                for (const auto& mp : lane.playlist.midiRegions())
+                {
+                    if (mp == nullptr) continue;
+                    const auto& m = *mp;
+                    if (beat <  m.positionBeats) continue;
+                    if (beat >= m.positionBeats + m.lengthBeats) continue;
+                    if (auto* sc = dynamic_cast<StandardContent*> (
+                            ViewHelpers::findContentComponent (this)))
+                        sc->showPianoRollForRegion (m.id);
+                    return;
+                }
+                return;
+            }
+        }
+
         if (! runtime.isAudioLane()) return;
 
         const auto& lane = owner.lanes_.getReference (laneIdx);
@@ -3377,6 +3402,23 @@ AudioClipNode* ArrangementView::resolveAudioClipByUuid (juce::Uuid targetNodeUui
     auto* proc = target.getObject();
     if (proc == nullptr) return nullptr;
     return dynamic_cast<AudioClipNode*> (proc->getAudioProcessor());
+}
+
+MidiNoteRegion* ArrangementView::findMidiRegion (const juce::Uuid& regionId) noexcept
+{
+    /* Linear scan across lanes -> playlist.findMidiRegion (which is
+     * itself a linear scan of midiRegions_).  Lane counts are small
+     * (tens at most), region counts per lane similarly small, so the
+     * per-paint cost from the piano-roll resolver lambda is in the
+     * noise compared to the paint pass itself.  Returns the first
+     * hit; uuids are unique by construction. */
+    for (int i = 0; i < lanes_.size(); ++i)
+    {
+        auto& lane = lanes_.getReference (i);
+        if (auto* r = lane.playlist.findMidiRegion (regionId))
+            return r;
+    }
+    return nullptr;
 }
 
 void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)

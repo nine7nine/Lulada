@@ -99,6 +99,15 @@ public:
      *  action. */
     void applyLaneSnapshot (const juce::Array<Lane>& snap);
 
+    /** Resolve a MIDI region uuid to its live MidiNoteRegion across
+     *  all lanes.  Linear scan; lane counts are small (tens).  Returns
+     *  nullptr if no lane owns a region with this id (region was
+     *  removed, or uuid was never bound to anything).  Public surface
+     *  because StandardContent installs a resolver lambda over this
+     *  for the piano-roll dock's per-paint binding lookup (commit D
+     *  of Phase 3 Session 1). */
+    MidiNoteRegion* findMidiRegion (const juce::Uuid& regionId) noexcept;
+
 private:
     void valueTreeChildAdded   (juce::ValueTree&, juce::ValueTree&) override;
     void valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree&, int) override;
