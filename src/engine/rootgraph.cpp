@@ -35,7 +35,7 @@ RootGraph::~RootGraph()
      *   4. GraphNode's dtor (called next) destroys the engine -- safe
      *      now that no MIDI handler holds it. */
     auto* eng = automationEngine();
-    _context.mapping().setAutomationEngine (nullptr);
+    context().mapping().setAutomationEngine (nullptr);
     if (eng != nullptr)
         eng->drainPendingLookups();
 }

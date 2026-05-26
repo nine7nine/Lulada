@@ -27,13 +27,15 @@ struct MidiNoteControllerMap : public ControllerMapHandler,
     MidiNoteControllerMap (const Control& ctl,
                            const MidiMessage& message,
                            const Node& _node,
-                           const int _parameter)
+                           const int _parameter,
+                           MappingEngine& _mapping)
         : control (ctl),
           model (_node),
           node (_node.getObject()),
           parameter (nullptr),
           parameterIndex (_parameter),
-          noteNumber (message.getNoteNumber())
+          noteNumber (message.getNoteNumber()),
+          mappingEngine (_mapping)
     {
         jassert (message.isNoteOn());
         jassert (node);
@@ -90,13 +92,15 @@ struct MidiNoteControllerMap : public ControllerMapHandler,
         {
             /* Defer to automation when an AutomationTrack in Read mode
              * has this parameter bound -- automation wins over live
-             * MIDI mapping for that target this block.  Skip the lookup
-             * entirely when no engine is wired OR when activeTrackCount
-             * is zero (cheap atomic load short-circuit). */
+             * MIDI mapping for that target this block.  Engine
+             * pointer comes from the MappingEngine (wired by
+             * RootGraph at construction).  Fast path short-circuits
+             * to false when activeTrackCount is zero (cheap atomic
+             * load inside isMappingMutedForNodeParam). */
             const bool muted = [&]
             {
-                auto* eng = mapping.getAutomationEngine();
-                return eng != nullptr && eng->isMappingMutedForPluginParam (parameter.get());
+                auto* eng = mappingEngine.getAutomationEngine();
+                return eng != nullptr && eng->isMappingMutedForNodeParam (parameter.get());
             }();
 
             if (! muted)
@@ -191,6 +195,8 @@ private:
     SpinLock eventLock;
     MidiMessage lastEvent;
 
+    MappingEngine& mappingEngine;
+
     void valueChanged (Value& value) override
     {
         if (channelObject.refersToSameSourceAs (value))
@@ -215,8 +221,9 @@ struct MidiCCControllerMapHandler : public ControllerMapHandler,
     MidiCCControllerMapHandler (const Control& ctl,
                                 const MidiMessage& message,
                                 const Node& _node,
-                                const int _parameter)
-        : control (ctl), model (_node), node (_node.getObject()), parameter (nullptr), controllerNumber (message.getControllerNumber()), parameterIndex (_parameter)
+                                const int _parameter,
+                                MappingEngine& _mapping)
+        : control (ctl), model (_node), node (_node.getObject()), parameter (nullptr), controllerNumber (message.getControllerNumber()), parameterIndex (_parameter), mappingEngine (_mapping)
     {
         jassert (message.isController());
         jassert (node != nullptr);
@@ -272,8 +279,8 @@ struct MidiCCControllerMapHandler : public ControllerMapHandler,
              * has this parameter bound this block. */
             const bool muted = [&]
             {
-                auto* eng = mapping.getAutomationEngine();
-                return eng != nullptr && eng->isMappingMutedForPluginParam (parameter.get());
+                auto* eng = mappingEngine.getAutomationEngine();
+                return eng != nullptr && eng->isMappingMutedForNodeParam (parameter.get());
             }();
 
             if (! muted)
@@ -379,6 +386,8 @@ private:
     const int controllerNumber { -1 };
     const int parameterIndex { -1 };
     int lastControllerValue = 0;
+
+    MappingEngine& mappingEngine;
 
     Value toggleValueObject;
     Atomic<int> toggleValue { 64 };
@@ -638,9 +647,9 @@ bool MappingEngine::addHandler (const Control& control,
             std::unique_ptr<ControllerMapHandler> handler;
 
             if (message.isController())
-                handler.reset (new MidiCCControllerMapHandler (control, message, node, parameter));
+                handler.reset (new MidiCCControllerMapHandler (control, message, node, parameter, *this));
             else if (message.isNoteOn())
-                handler.reset (new MidiNoteControllerMap (control, message, node, parameter));
+                handler.reset (new MidiNoteControllerMap (control, message, node, parameter, *this));
 
             if (nullptr != handler)
             {

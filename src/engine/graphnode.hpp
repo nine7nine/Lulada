@@ -206,6 +206,11 @@ protected:
     virtual void preRenderNodes() {}
     virtual void postRenderNodes() {}
 
+    /** Access the Context this graph was constructed with.  Protected
+     *  so subclasses (e.g. RootGraph) can reach the Context-owned
+     *  MappingEngine for wiring without breaking encapsulation. */
+    Context& context() noexcept { return _context; }
+
     //==========================================================================
     void initialize() override {}
 
