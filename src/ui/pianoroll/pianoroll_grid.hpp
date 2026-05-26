@@ -111,6 +111,29 @@ public:
     static constexpr int kPxPerBeatMin = 4;
     static constexpr int kPxPerBeatMax = 256;
 
+    /** Zoom step API for toolbar +/- buttons + Fit.  Anchored zoom
+     *  (mouseWheelMove) handles its own pivot; these versions zoom
+     *  around the viewport's visible centre so the user keeps roughly
+     *  the same beat range in view. */
+    void zoomBy   (double factor);
+    void zoomToFit();
+
+    /** Snap-to-grid resolution in beats.  0.0 = no snap (continuous).
+     *  Standard musical values: 0.25 = sixteenth, 0.5 = eighth, 1.0 =
+     *  quarter, 2.0 = half, 4.0 = bar (assumes 4/4).  Default = 0.25
+     *  (sixteenth) to match Ableton + Zrythm.  Driven by the toolbar
+     *  snap selector in PianoRollView. */
+    void   setSnapDivision (double beats) noexcept;
+    double getSnapDivision() const noexcept { return snapDivision_; }
+    void   setSnapEnabled  (bool b) noexcept;
+    bool   isSnapEnabled() const noexcept { return snapEnabled_; }
+
+    /** Ruler height (bar/beat strip painted across the top of the
+     *  grid).  Public so PianoRollKeyboard can offset its keys to
+     *  match -- the keyboard column needs an equivalent gap so the
+     *  first pitch row aligns with the grid's first pitch row. */
+    static constexpr int kRulerH = 18;
+
     //==========================================================================
     // Coordinate helpers used by NoteDrag classes.
 
@@ -134,9 +157,9 @@ public:
      *  visible pitch span. */
     int    rowHeight() const noexcept;
 
-    /** Snap a local beat to the current grid resolution.  Session 2
-     *  v1: snap to one beat (1/4 note).  Future enhancement reads a
-     *  per-view snap setting. */
+    /** Snap a local beat to the current grid resolution.  Returns the
+     *  input unchanged when snap is disabled or `snapDivision_` is 0;
+     *  otherwise rounds to the nearest multiple of `snapDivision_`. */
     double snapBeat (double localBeat) const noexcept;
 
     //==========================================================================
@@ -178,6 +201,12 @@ private:
      * lazily via resolveBoundRegion->lengthBeats on bind. */
     double          regionLenBeats_ { 16.0 };
 
+    /* Snap resolution + on/off.  Set by PianoRollView's toolbar
+     * snapBox + snap toggle button.  Default sixteenth-note snap
+     * matches Ableton + Zrythm defaults. */
+    double          snapDivision_ { 0.25 };
+    bool            snapEnabled_  { true };
+
     /* Viewport visible-height cache.  Set by updateSizeForViewport;
      * height of one pitch row = visibleH / span. */
     int             visibleH_ { 1 };
@@ -194,8 +223,17 @@ private:
 
     void paintEmptyState    (juce::Graphics&);
     void paintBarGrid       (juce::Graphics&, int beatsPerBar);
+    void paintRuler         (juce::Graphics&, int beatsPerBar);
+    void paintPlayhead      (juce::Graphics&);
     void paintNotes         (juce::Graphics&, const MidiNoteRegion& region);
     void paintActiveDragOverlay (juce::Graphics&);
+
+    /** Body rectangle (everything below the ruler).  Note paint + hit
+     *  test work in body-local Y; the ruler claims the top kRulerH px. */
+    juce::Rectangle<int> bodyBounds() const noexcept
+    {
+        return { 0, kRulerH, getWidth(), juce::jmax (1, getHeight() - kRulerH) };
+    }
 
     /** Hit test -- returns the note id under (x, y) or 0 if none. */
     std::uint64_t hitTestNote (int x, int y, const MidiNoteRegion& region) const noexcept;
