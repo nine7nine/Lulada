@@ -282,7 +282,12 @@ ArrangementTracksService::importAudioFileAsNewLane (const juce::File& file,
     r.positionBeats = 0.0;
     r.lengthBeats   = lengthBeats;
     r.name          = file.getFileNameWithoutExtension();
-    r.colour        = juce::Colour::fromRGB (90, 170, 130);
+    /* Regions inherit their parent lane's tint -- ArrangementView's
+     * rescanLaneTargets reassigns lane.colour from the palette on
+     * load and propagates to regions, but seeding here keeps the
+     * region visible at the correct tint between this write and the
+     * first didBecomeActive of the arrangement view. */
+    r.colour        = lane.colour;
 
     const juce::Uuid regionIdCopy = r.id;
     const juce::Uuid sourceIdCopy = r.sourceId;

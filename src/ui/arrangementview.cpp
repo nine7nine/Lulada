@@ -1859,7 +1859,14 @@ private:
         const int subdiv = (kPxPerBeat >= 32) ? 4
                         : (kPxPerBeat >= 16) ? 2
                         : 1;
-        const int subStepPx   = kPxPerBeat / subdiv;
+        /* subStepPx is FLOATING-POINT.  Integer kPxPerBeat / subdiv
+         * floors and drops the remainder, so each sub-step is short
+         * by `kPxPerBeat % subdiv` pixels -- the drift accumulates
+         * across bars and the ruler falls behind the regions (which
+         * use full-precision r.positionBeats * kPxPerBeat).  At
+         * kPxPerBeat = 33, subdiv = 4, bar 5 (beat 16) lands 16 px
+         * left of the regions.  Compute in double + round on use. */
+        const double subStepPx = (double) kPxPerBeat / (double) subdiv;
         const int totalSubticks = totalBeats * subdiv;
 
         /* Viewport-clip the tick loop.  At low kPxPerBeat (zoomed out)
@@ -1870,13 +1877,13 @@ private:
          * tick by a few px. */
         const auto rulerClip = g.getClipBounds();
         const int subStart = juce::jmax (0,
-            (rulerClip.getX() - stripX) / subStepPx - 1);
+            (int) std::floor ((double) (rulerClip.getX()     - stripX) / subStepPx) - 1);
         const int subEnd   = juce::jmin (totalSubticks,
-            (rulerClip.getRight() - stripX) / subStepPx + 1);
+            (int) std::ceil  ((double) (rulerClip.getRight() - stripX) / subStepPx) + 1);
 
         for (int sub = subStart; sub <= subEnd; ++sub)
         {
-            const int x      = stripX + sub * subStepPx;
+            const int x      = stripX + (int) std::round (sub * subStepPx);
             const int beat   = sub / subdiv;
             const int phase  = sub % subdiv;
             const bool atBeat = (phase == 0);
@@ -3734,7 +3741,11 @@ void ArrangementView::autoFillLaneForTracker (Lane& lane, TrackerNode* trk)
         r.sequenceIdx   = p;
         r.positionBeats = cursor;
         r.lengthBeats   = 4.0;
-        r.colour        = juce::Colour::fromRGB (90, 130, 170);
+        /* Lane tint propagates at paint time and is bulk-refreshed by
+         * rescanLaneTargets after this method returns (palette by
+         * lane index).  Seed to the current lane colour so the brief
+         * window between create + the palette pass paints correctly. */
+        r.colour        = lane.colour;
         lane.playlist.addRegion (std::move (r));
         cursor += 4.0;
     }
@@ -3809,9 +3820,20 @@ void ArrangementView::rescanLaneTargets()
      * created before the palette landed default to dark-gray; this
      * line replaces those with the shared tracker palette.  Future
      * "lane colour picker" UI will introduce a separate override
-     * flag so user-customised colours aren't reset on rescan. */
+     * flag so user-customised colours aren't reset on rescan.
+     *
+     * Propagate the freshly-assigned tint to every audio + MIDI
+     * region on the lane so paint sites that read region.colour /
+     * m.colour (piano-roll paintNotes, arrangement MIDI strip) track
+     * the lane.  Single source of truth is lane.colour; per-region
+     * .colour is a cached copy maintained here + at region-creation
+     * sites. */
     for (int i = 0; i < lanes_.size(); ++i)
-        lanes_.getReference (i).colour = laneTintForIndex (i);
+    {
+        auto& l = lanes_.getReference (i);
+        l.colour = laneTintForIndex (i);
+        l.playlist.setAllRegionColours (l.colour);
+    }
 
     /* Rebuild runtime state in lockstep.  For each persisted lane,
      * resolve which kind of node it binds to + wire up the
@@ -3911,7 +3933,10 @@ void ArrangementView::rescanLaneTargets()
                     r.positionBeats = position;
                     r.lengthBeats   = lengthBeats;
                     r.name          = file.getFileNameWithoutExtension();
-                    r.colour        = juce::Colour::fromRGB (90, 170, 130);
+                    /* Inherit lane tint -- single source of truth at
+                     * lane.colour; this is the cached per-region copy
+                     * read by piano-roll + MIDI strip paint. */
+                    r.colour        = lane.colour;
                     lane.playlist.addRegion (std::move (r));
 
                     self->writeLanesToSession();
@@ -4524,7 +4549,8 @@ bool ArrangementView::importAudioFileToLane (const juce::File& file,
     r.positionBeats = juce::jmax (0.0, positionBeats);
     r.lengthBeats   = lengthBeats;
     r.name          = file.getFileNameWithoutExtension();
-    r.colour        = juce::Colour::fromRGB (90, 170, 130);
+    /* Inherit lane tint -- single source of truth at lane.colour. */
+    r.colour        = lane.colour;
 
     if (! lane.playlist.addRegion (Region (r)))
     {
@@ -4602,6 +4628,8 @@ bool ArrangementView::importMidiFileToLane (const juce::File& file,
     region->positionBeats = juce::jmax (0.0, positionBeats);
     region->lengthBeats   = regionLen;
     region->name          = file.getFileNameWithoutExtension();
+    /* Inherit lane tint -- piano-roll paintNotes reads region->colour. */
+    region->colour        = lane.colour;
     /* setNotesAssigningIds stamps fresh per-note ids so the piano-roll
      * selection model has stable identities across snapshot swaps. */
     region->setNotesAssigningIds (std::move (notes));
@@ -4639,6 +4667,8 @@ juce::Uuid ArrangementView::createEmptyMidiRegion (int    laneIdx,
     region->positionBeats = juce::jmax (0.0, positionBeats);
     region->lengthBeats   = juce::jmax (0.25, lengthBeats);
     region->name          = juce::String ("MIDI ") + juce::String (lane.playlist.midiRegions().size() + 1);
+    /* Inherit lane tint -- piano-roll paintNotes reads region->colour. */
+    region->colour        = lane.colour;
 
     const juce::Uuid newId = region->id;
 
