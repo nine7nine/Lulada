@@ -512,6 +512,102 @@ BOOST_AUTO_TEST_CASE (track_xml_round_trip_internal_target)
     BOOST_CHECK (restored->findActiveRegion (2.0) != nullptr);
 }
 
+BOOST_AUTO_TEST_CASE (write_fifo_push_drain_round_trip)
+{
+    AutomationTrack t;
+    using element::dsp::automation::AutomationWriteEvent;
+
+    BOOST_CHECK_EQUAL (t.getNumPendingWriteEvents(), 0);
+
+    /* Push a handful of events from "the UI thread". */
+    BOOST_REQUIRE (t.tryPushWriteEvent ({ 0.10, 1.0 }));
+    BOOST_REQUIRE (t.tryPushWriteEvent ({ 0.20, 1.5 }));
+    BOOST_REQUIRE (t.tryPushWriteEvent ({ 0.30, 2.0 }));
+    BOOST_CHECK_EQUAL (t.getNumPendingWriteEvents(), 3);
+
+    /* Drain on "the audio thread" -- events come out in order. */
+    AutomationWriteEvent buf[8];
+    const int n = t.drainWriteEvents (buf, 8);
+    BOOST_REQUIRE_EQUAL (n, 3);
+    BOOST_CHECK_CLOSE (buf[0].valueNormalized, 0.10, 1e-9);
+    BOOST_CHECK_CLOSE (buf[1].hostBeats,       1.5,  1e-9);
+    BOOST_CHECK_CLOSE (buf[2].hostBeats,       2.0,  1e-9);
+    BOOST_CHECK_EQUAL (t.getNumPendingWriteEvents(), 0);
+}
+
+BOOST_AUTO_TEST_CASE (write_fifo_returns_false_when_full)
+{
+    AutomationTrack t;
+    using element::dsp::automation::AutomationWriteEvent;
+
+    /* AbstractFifo's published capacity is N-1 usable slots (one
+     * slot is reserved as the empty/full sentinel).  Push until
+     * exhausted then assert overflow returns false. */
+    int pushed = 0;
+    while (t.tryPushWriteEvent ({ (double) pushed / 1000.0, (double) pushed }))
+        ++pushed;
+    BOOST_CHECK_GT (pushed, 0);
+    BOOST_CHECK_EQUAL (t.tryPushWriteEvent ({ 0.0, 0.0 }), false);
+
+    /* Drain partial and confirm we can push again. */
+    AutomationWriteEvent buf[16];
+    const int drained = t.drainWriteEvents (buf, 16);
+    BOOST_CHECK_GT (drained, 0);
+    BOOST_CHECK (t.tryPushWriteEvent ({ 0.5, 99.0 }));
+}
+
+BOOST_AUTO_TEST_CASE (write_fifo_drain_with_zero_max_out_is_safe_noop)
+{
+    AutomationTrack t;
+    using element::dsp::automation::AutomationWriteEvent;
+    t.tryPushWriteEvent ({ 0.5, 1.0 });
+
+    AutomationWriteEvent buf[1];
+    BOOST_CHECK_EQUAL (t.drainWriteEvents (buf,     0), 0);
+    BOOST_CHECK_EQUAL (t.drainWriteEvents (nullptr, 8), 0);
+    BOOST_CHECK_EQUAL (t.getNumPendingWriteEvents(), 1);   /* untouched */
+}
+
+BOOST_AUTO_TEST_CASE (write_fifo_cross_thread_smoke)
+{
+    /* SPSC stress: one thread pushes, one thread drains in a loop.
+     * Verifies no event tearing + no event loss + no leak. */
+    AutomationTrack t;
+    using element::dsp::automation::AutomationWriteEvent;
+
+    constexpr int kTotal = 5000;
+    std::atomic<int> drainedSum  { 0 };
+    std::atomic<bool> producerDone { false };
+
+    std::thread consumer ([&] ()
+    {
+        AutomationWriteEvent buf[32];
+        while (true)
+        {
+            const int n = t.drainWriteEvents (buf, 32);
+            for (int i = 0; i < n; ++i)
+                drainedSum.fetch_add ((int) buf[i].valueNormalized,
+                                      std::memory_order_relaxed);
+            if (n == 0 && producerDone.load (std::memory_order_acquire)
+                && t.getNumPendingWriteEvents() == 0)
+                return;
+        }
+    });
+
+    int expectedSum = 0;
+    for (int i = 0; i < kTotal; ++i)
+    {
+        /* Spin-wait if FIFO temporarily full -- production-side
+         * back-pressure rather than dropping. */
+        while (! t.tryPushWriteEvent ({ (double) i, 0.0 }))
+            std::this_thread::yield();
+        expectedSum += i;
+    }
+    producerDone.store (true, std::memory_order_release);
+    consumer.join();
+    BOOST_CHECK_EQUAL (drainedSum.load(), expectedSum);
+}
+
 BOOST_AUTO_TEST_CASE (track_xml_round_trip_midi_target)
 {
     AutomationTrack t;

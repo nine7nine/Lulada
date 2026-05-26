@@ -161,6 +161,56 @@ void AutomationTrack::advanceAudioEpoch() noexcept
     audioEpoch_.fetch_add (1, std::memory_order_acq_rel);
 }
 
+//==============================================================================
+// Touch-record SPSC FIFO -- juce::AbstractFifo prepareToWrite / write /
+// finishedWrite + prepareToRead / read / finishedRead pattern.  Single
+// producer (UI/control thread), single consumer (audio thread).  Lock-
+// free + wait-free for both sides.
+
+bool AutomationTrack::tryPushWriteEvent (const AutomationWriteEvent& ev) noexcept
+{
+    int s1Start = 0, s1Size = 0, s2Start = 0, s2Size = 0;
+    writeFifo_.prepareToWrite (1, s1Start, s1Size, s2Start, s2Size);
+    if (s1Size + s2Size == 0)
+        return false;   /* FIFO full */
+    /* prepareToWrite(1, ...) returns at most one slot total.  Use
+     * whichever segment got the allocation. */
+    if (s1Size > 0)
+        writeFifoStorage_[(size_t) s1Start] = ev;
+    else
+        writeFifoStorage_[(size_t) s2Start] = ev;
+    writeFifo_.finishedWrite (1);
+    return true;
+}
+
+int AutomationTrack::drainWriteEvents (AutomationWriteEvent* out, int maxOut) noexcept
+{
+    if (out == nullptr || maxOut <= 0)
+        return 0;
+
+    int s1Start = 0, s1Size = 0, s2Start = 0, s2Size = 0;
+    writeFifo_.prepareToRead (maxOut, s1Start, s1Size, s2Start, s2Size);
+    const int total = s1Size + s2Size;
+    if (total <= 0)
+        return 0;
+
+    int n = 0;
+    for (int i = 0; i < s1Size; ++i)
+        out[n++] = writeFifoStorage_[(size_t) (s1Start + i)];
+    for (int i = 0; i < s2Size; ++i)
+        out[n++] = writeFifoStorage_[(size_t) (s2Start + i)];
+
+    writeFifo_.finishedRead (total);
+    return total;
+}
+
+int AutomationTrack::getNumPendingWriteEvents() const noexcept
+{
+    return writeFifo_.getNumReady();
+}
+
+//==============================================================================
+
 void AutomationTrack::sweepTrash() noexcept
 {
     /* Message-thread reclaim, gated on audioEpoch_ STRICTLY exceeding

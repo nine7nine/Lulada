@@ -8,6 +8,7 @@
 #include <element/juce/core.hpp>
 #include <element/juce/data_structures.hpp>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -45,6 +46,20 @@ enum class AutomationRecordMode : std::uint8_t
 {
     Touch = 0,
     Latch,
+};
+
+/** A single touch-record event pushed by the UI / control thread into
+ *  an AutomationTrack's writeFifo_ during a Record-mode touch.  Audio
+ *  thread drains the FIFO at block start.  Eventually materialised
+ *  into a hard AutomationRegion snapshot on touch release (Phase 4
+ *  UI work).
+ *
+ *  POD; trivially copyable + destructible so AbstractFifo storage
+ *  doesn't need per-slot construction. */
+struct AutomationWriteEvent
+{
+    double valueNormalized;   /**< Touch value, in [0, 1]. */
+    double hostBeats;         /**< Timeline beat at touch moment. */
 };
 
 /** Stable persistent key identifying an automation target across
@@ -180,6 +195,30 @@ public:
     AutomationRegion* findActiveRegion (double timelineBeats) noexcept;
 
     //==========================================================================
+    // Touch-record SPSC FIFO.  UI / control thread pushes events
+    // during Record-mode touches; audio thread drains at block start.
+    // No locks -- juce::AbstractFifo is single-producer / single-
+    // consumer lock-free.  Backing storage pre-allocated at ctor.
+    // Capacity sized for ~5s of finger-twiddling at ~200 Hz with
+    // headroom for slow audio-thread drains.
+
+    static constexpr int kWriteFifoCapacity = 256;
+
+    /** UI / control thread: try to push one event.  Returns false if
+     *  the FIFO is full -- caller can drop the event or retry.  Wait-
+     *  free for a single writer (which is the touch-handling thread). */
+    bool tryPushWriteEvent (const AutomationWriteEvent& ev) noexcept;
+
+    /** Audio thread: drain up to maxOut events into out[].  Returns
+     *  the actual count drained (0..maxOut).  Wait-free for a single
+     *  reader.  out must point at storage with capacity maxOut. */
+    int drainWriteEvents (AutomationWriteEvent* out, int maxOut) noexcept;
+
+    /** Lock-free count of currently-pending events.  Cheap atomic
+     *  load.  For diagnostics + tests. */
+    int getNumPendingWriteEvents() const noexcept;
+
+    //==========================================================================
     // Trash sweep -- message thread reclaims displaced region-list
     // snapshots + per-region trash sweeps.  Called by AutomationEngine
     // on its AsyncUpdater tick.
@@ -244,6 +283,12 @@ private:
      *  single-reader (audio thread).  Atomic for visibility, not for
      *  cross-thread synchronisation. */
     std::atomic<AutomationRegion*>    cachedActiveRegion_ { nullptr };
+
+    /** Touch-record FIFO + its backing storage.  juce::AbstractFifo
+     *  is the SPSC index manager; we provide the actual element
+     *  array.  Capacity is a power of two for cheap modulo math. */
+    juce::AbstractFifo                                  writeFifo_ { kWriteFifoCapacity };
+    std::array<AutomationWriteEvent, kWriteFifoCapacity> writeFifoStorage_ {};
 };
 
 } // namespace element::dsp::automation
