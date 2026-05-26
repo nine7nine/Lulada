@@ -24,7 +24,11 @@
 #include "ui/viewhelpers.hpp"
 #include <element/ui/standard.hpp>
 
+#include <climits>
+#include <limits>
+#include <set>
 #include <unordered_map>
+#include <vector>
 
 namespace element {
 
@@ -516,8 +520,7 @@ public:
             rangeEnd_      = beat;
             rangeActive_   = true;
             rangeDragging_ = true;
-            selectedLane_   = -1;
-            selectedRegion_ = juce::Uuid::null();
+            clearSelection();
             grabKeyboardFocus();
             repaint();
             return;
@@ -551,8 +554,8 @@ public:
                     envGesture_.regionId   = r.id;
                     envGesture_.pointId    = pointId;
                     envGesture_.dragActive = false;
-                    selectedLane_   = laneIdx;
-                    selectedRegion_ = r.id;
+                    setPrimarySelection (laneIdx, r.id);
+                    lastInteractedLane_ = laneIdx;
                     grabKeyboardFocus();
                     repaintLane (laneIdx);
                     return;
@@ -599,13 +602,36 @@ public:
                 }
             }
 
-            /* Right-click context menu works in every tool. */
+            lastInteractedLane_ = laneIdx;
+
+            /* Right-click context menu works in every tool.  Preserve
+             * an existing multi-selection if the right-clicked region
+             * is already part of it -- otherwise collapse to a single
+             * selection so the menu's act on a clear target. */
             if (e.mods.isPopupMenu())
             {
-                selectedLane_   = laneIdx;
-                selectedRegion_ = r.id;
+                if (! isSelected (laneIdx, r.id))
+                    setPrimarySelection (laneIdx, r.id);
                 repaintLane (laneIdx);
                 showRegionContextMenu (laneIdx, r.id, beat);
+                return;
+            }
+
+            /* Ctrl/Cmd+click toggles the clicked region in the
+             * multi-selection without starting a drag.  Shift+click
+             * range-extends along the same lane from the primary. */
+            if (e.mods.isCommandDown() || e.mods.isCtrlDown())
+            {
+                toggleSelection (laneIdx, r.id);
+                grabKeyboardFocus();
+                repaintLane (laneIdx);
+                return;
+            }
+            if (e.mods.isShiftDown())
+            {
+                extendSelection (laneIdx, r.id);
+                grabKeyboardFocus();
+                repaintLane (laneIdx);
                 return;
             }
 
@@ -626,8 +652,7 @@ public:
             if (activeTool_ == Tool::Audition)
             {
                 launchRegionAudition (laneIdx, r);
-                selectedLane_   = laneIdx;
-                selectedRegion_ = r.id;
+                setPrimarySelection (laneIdx, r.id);
                 repaintLane (laneIdx);
                 return;
             }
@@ -650,8 +675,12 @@ public:
                               ? Gesture::Resize
                               : Gesture::Move;
 
-            selectedLane_    = laneIdx;
-            selectedRegion_  = r.id;
+            /* No-modifier click collapses to single-selection.  Multi-
+             * region drag-to-move is a future enhancement; today the
+             * gesture path moves only gesture_.regionId, so leaving
+             * multiple regions visibly selected after a click on one
+             * of them would mislead the user about what drag affects. */
+            setPrimarySelection (laneIdx, r.id);
 
             grabKeyboardFocus();
             repaintLane (laneIdx);
@@ -675,12 +704,29 @@ public:
             const double endBeat = m.positionBeats + m.lengthBeats;
             if (beat < m.positionBeats || beat >= endBeat) continue;
 
+            lastInteractedLane_ = laneIdx;
+
             if (e.mods.isPopupMenu())
             {
-                selectedLane_   = laneIdx;
-                selectedRegion_ = m.id;
+                if (! isSelected (laneIdx, m.id))
+                    setPrimarySelection (laneIdx, m.id);
                 repaintLane (laneIdx);
                 showRegionContextMenu (laneIdx, m.id, beat);
+                return;
+            }
+
+            if (e.mods.isCommandDown() || e.mods.isCtrlDown())
+            {
+                toggleSelection (laneIdx, m.id);
+                grabKeyboardFocus();
+                repaintLane (laneIdx);
+                return;
+            }
+            if (e.mods.isShiftDown())
+            {
+                extendSelection (laneIdx, m.id);
+                grabKeyboardFocus();
+                repaintLane (laneIdx);
                 return;
             }
 
@@ -703,8 +749,7 @@ public:
             /* Audition: no MIDI preview wired yet -- absorb. */
             if (activeTool_ == Tool::Audition)
             {
-                selectedLane_   = laneIdx;
-                selectedRegion_ = m.id;
+                setPrimarySelection (laneIdx, m.id);
                 repaintLane (laneIdx);
                 return;
             }
@@ -725,16 +770,23 @@ public:
                               ? Gesture::Resize
                               : Gesture::Move;
 
-            selectedLane_    = laneIdx;
-            selectedRegion_  = m.id;
+            setPrimarySelection (laneIdx, m.id);
             grabKeyboardFocus();
             repaintLane (laneIdx);
             return;
         }
 
-        /* Empty strip area -- clear selection. */
-        selectedLane_   = -1;
-        selectedRegion_ = juce::Uuid::null();
+        /* Empty strip area.  Right-click here brings up the paste-only
+         * context menu (no region target).  Plain click clears the
+         * selection so the user sees the click registered as "select
+         * nothing". */
+        lastInteractedLane_ = laneIdx;
+        if (e.mods.isPopupMenu())
+        {
+            showEmptyStripContextMenu (laneIdx, beat);
+            return;
+        }
+        clearSelection();
         gesture_        = Gesture {};
         repaint();
     }
@@ -1411,6 +1463,31 @@ public:
      * The default Component::mouseWheelMove forwards to the parent
      * Viewport which gives standard vertical-scroll behaviour. */
 
+    /** Empty-strip right-click menu.  Exposes "Paste here" so a user
+     *  who has just copied/cut a selection can drop it at the click
+     *  position without first picking a target via keyboard.  The
+     *  menu is dimmed-out when the clipboard is empty so the user
+     *  knows the affordance exists but isn't usable yet. */
+    void showEmptyStripContextMenu (int laneIdx, double atBeat)
+    {
+        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
+
+        enum { ItemPaste = 1 };
+        juce::PopupMenu menu;
+        menu.addItem (ItemPaste, "Paste here (Ctrl+V)", ! clipboard_.empty());
+
+        juce::Component::SafePointer<Body> safe (this);
+        const double clickBeat = juce::jmax (0.0, atBeat);
+        menu.showMenuAsync (juce::PopupMenu::Options(),
+            [safe, laneIdx, clickBeat] (int result)
+            {
+                auto* self = safe.getComponent();
+                if (self == nullptr || result == 0) return;
+                if (result == ItemPaste)
+                    self->pasteClipboardAt (laneIdx, clickBeat);
+            });
+    }
+
     /** Build + show the region right-click popup.  Stop-gap UI until
      *  the Ardour-style tool-mode toolbar lands -- once the toolbar
      *  exists, tool selection determines mouseDown behaviour and
@@ -1422,16 +1499,24 @@ public:
 
         /* Kind-discriminated menu: an audio/tracker region uses the
          * Region API; a MIDI region uses MidiNoteRegion + the parallel
-         * Playlist mutators.  Both menus expose Loop / Split / Delete
-         * with the same shape so the user sees a uniform surface. */
+         * Playlist mutators.  Both menus expose Loop / Split / Cut /
+         * Copy / Duplicate / Delete with the same shape so the user
+         * sees a uniform surface.  Cut / Copy / Duplicate operate on
+         * the CURRENT MULTI-SELECTION (which always contains the
+         * right-clicked region -- mouseDown promotes it if necessary
+         * before the menu opens). */
         if (const auto* r = lane.playlist.findRegion (regionId))
         {
-            enum { ItemLoop = 1, ItemSplit = 2, ItemDelete = 3 };
+            enum { ItemLoop = 1, ItemSplit, ItemCut, ItemCopy, ItemDuplicate, ItemDelete };
             juce::PopupMenu menu;
-            menu.addItem (ItemLoop,  "Loop",   true, r->looped);
+            menu.addItem (ItemLoop,  "Loop (Ctrl+L)", true, r->looped);
             menu.addItem (ItemSplit, "Split at click",
                            atBeat > r->positionBeats + 0.0625
                            && atBeat < r->endBeats() - 0.0625);
+            menu.addSeparator();
+            menu.addItem (ItemCut,       "Cut (Ctrl+X)");
+            menu.addItem (ItemCopy,      "Copy (Ctrl+C)");
+            menu.addItem (ItemDuplicate, "Duplicate (Ctrl+D)");
             menu.addSeparator();
             menu.addItem (ItemDelete, "Delete");
 
@@ -1448,24 +1533,26 @@ public:
                     switch (result)
                     {
                         case ItemLoop:
-                            if (auto* mr = l.playlist.findRegion (regionId))
-                            {
-                                mr->looped = ! mr->looped;
-                                changed = true;
-                            }
-                            break;
+                            self->toggleLoopOnSelection();
+                            return;     /* helper handles persist + repaint */
                         case ItemSplit:
                             if (! l.playlist.splitRegion (regionId, atBeat).isNull())
                                 changed = true;
                             break;
+                        case ItemCut:
+                            self->cutSelectionToClipboard();
+                            return;
+                        case ItemCopy:
+                            self->copySelectionToClipboard();
+                            return;
+                        case ItemDuplicate:
+                            self->duplicateSelection();
+                            return;
                         case ItemDelete:
                             if (l.playlist.removeRegion (regionId))
                             {
                                 if (self->selectedRegion_ == regionId)
-                                {
-                                    self->selectedLane_   = -1;
-                                    self->selectedRegion_ = juce::Uuid::null();
-                                }
+                                    self->clearSelection();
                                 changed = true;
                             }
                             break;
@@ -1489,12 +1576,17 @@ public:
             const bool splittable = atBeat > m->positionBeats + 0.0625
                                   && atBeat < midiEnd            - 0.0625;
 
-            enum { ItemLoop = 1, ItemSplit = 2, ItemDelete = 3, ItemOpenEditor = 4 };
+            enum { ItemOpenEditor = 1, ItemLoop, ItemSplit,
+                    ItemCut, ItemCopy, ItemDuplicate, ItemDelete };
             juce::PopupMenu menu;
             menu.addItem (ItemOpenEditor, "Open in piano-roll");
             menu.addSeparator();
-            menu.addItem (ItemLoop,   "Loop",          true, m->looped);
+            menu.addItem (ItemLoop,   "Loop (Ctrl+L)", true, m->looped);
             menu.addItem (ItemSplit,  "Split at click", splittable);
+            menu.addSeparator();
+            menu.addItem (ItemCut,       "Cut (Ctrl+X)");
+            menu.addItem (ItemCopy,      "Copy (Ctrl+C)");
+            menu.addItem (ItemDuplicate, "Duplicate (Ctrl+D)");
             menu.addSeparator();
             menu.addItem (ItemDelete, "Delete");
 
@@ -1515,13 +1607,8 @@ public:
                                 sc->showPianoRollForRegion (regionId);
                             return;   /* no session write needed */
                         case ItemLoop:
-                            if (auto* mm = l.playlist.findMidiRegion (regionId))
-                            {
-                                mm->looped = ! mm->looped;
-                                self->owner.publishMidiBindingsForLane (laneIdx);
-                                changed = true;
-                            }
-                            break;
+                            self->toggleLoopOnSelection();
+                            return;     /* helper handles MIDI republish + persist */
                         case ItemSplit:
                             if (! l.playlist.splitMidiRegion (regionId, atBeat).isNull())
                             {
@@ -1529,14 +1616,20 @@ public:
                                 changed = true;
                             }
                             break;
+                        case ItemCut:
+                            self->cutSelectionToClipboard();
+                            return;
+                        case ItemCopy:
+                            self->copySelectionToClipboard();
+                            return;
+                        case ItemDuplicate:
+                            self->duplicateSelection();
+                            return;
                         case ItemDelete:
                             if (l.playlist.removeMidiRegion (regionId))
                             {
                                 if (self->selectedRegion_ == regionId)
-                                {
-                                    self->selectedLane_   = -1;
-                                    self->selectedRegion_ = juce::Uuid::null();
-                                }
+                                    self->clearSelection();
                                 self->owner.publishMidiBindingsForLane (laneIdx);
                                 changed = true;
                             }
@@ -1555,37 +1648,439 @@ public:
         }
     }
 
+    //==========================================================================
+    // Multi-selection helpers.
+    //==========================================================================
+
+    bool isSelected (int lane, juce::Uuid id) const noexcept
+    {
+        for (const auto& s : selected_)
+            if (s.first == lane && s.second == id) return true;
+        return false;
+    }
+
+    void clearSelection()
+    {
+        selected_.clearQuick();
+        selectedLane_   = -1;
+        selectedRegion_ = juce::Uuid::null();
+    }
+
+    void setPrimarySelection (int lane, juce::Uuid id)
+    {
+        selected_.clearQuick();
+        if (lane >= 0 && ! id.isNull())
+            selected_.add ({ lane, id });
+        selectedLane_   = lane;
+        selectedRegion_ = id;
+    }
+
+    void toggleSelection (int lane, juce::Uuid id)
+    {
+        if (lane < 0 || id.isNull()) return;
+        for (int i = 0; i < selected_.size(); ++i)
+        {
+            if (selected_.getReference (i).first == lane
+                && selected_.getReference (i).second == id)
+            {
+                selected_.remove (i);
+                if (selectedLane_ == lane && selectedRegion_ == id)
+                {
+                    if (selected_.isEmpty())
+                    {
+                        selectedLane_   = -1;
+                        selectedRegion_ = juce::Uuid::null();
+                    }
+                    else
+                    {
+                        const auto& back = selected_.getLast();
+                        selectedLane_   = back.first;
+                        selectedRegion_ = back.second;
+                    }
+                }
+                return;
+            }
+        }
+        selected_.add ({ lane, id });
+        selectedLane_   = lane;
+        selectedRegion_ = id;
+    }
+
+    /** Shift+click range-extend.  Anchor = current primary; clicked
+     *  region defines the other endpoint.  Selects every region (both
+     *  audio AND MIDI) on the SAME lane whose positionBeats falls
+     *  inside [min, max] of the two anchor + click positions.  If the
+     *  primary is on a different lane, falls back to a plain primary
+     *  select on the clicked region. */
+    void extendSelection (int lane, juce::Uuid id)
+    {
+        if (lane < 0 || id.isNull()) return;
+        if (selectedLane_ < 0 || selectedLane_ != lane || selectedRegion_.isNull())
+        {
+            setPrimarySelection (lane, id);
+            return;
+        }
+        if (lane >= owner.lanes_.size()) return;
+        auto& l = owner.lanes_.getReference (lane);
+
+        auto rangeOf = [&] (juce::Uuid rid) -> std::pair<double, double> {
+            if (auto* r = l.playlist.findRegion (rid))
+                return { r->positionBeats, r->endBeats() };
+            if (auto* m = l.playlist.findMidiRegion (rid))
+                return { m->positionBeats, m->positionBeats + m->lengthBeats };
+            return { 0.0, 0.0 };
+        };
+        const auto a = rangeOf (selectedRegion_);
+        const auto b = rangeOf (id);
+        const double lo = juce::jmin (a.first,  b.first);
+        const double hi = juce::jmax (a.second, b.second);
+
+        for (const auto& r : l.playlist.regions())
+        {
+            if (r.positionBeats >= lo && r.positionBeats <= hi
+                && ! isSelected (lane, r.id))
+                selected_.add ({ lane, r.id });
+        }
+        for (const auto& mp : l.playlist.midiRegions())
+        {
+            if (mp == nullptr) continue;
+            if (mp->positionBeats >= lo && mp->positionBeats <= hi
+                && ! isSelected (lane, mp->id))
+                selected_.add ({ lane, mp->id });
+        }
+        selectedLane_   = lane;
+        selectedRegion_ = id;
+    }
+
+    //==========================================================================
+    // Clipboard ops.
+    //==========================================================================
+
+    /** Snapshot every selected region into clipboard_.  Anchor =
+     *  earliest (laneIdx, beat) across the selection; offsets are
+     *  stored relative so paste at any (lane, beat) reconstructs the
+     *  spatial structure.  Empty selection -> no-op. */
+    void copySelectionToClipboard()
+    {
+        if (selected_.isEmpty()) return;
+
+        int anchorLane = INT_MAX;
+        double anchorBeat = std::numeric_limits<double>::infinity();
+        for (const auto& s : selected_)
+        {
+            if (s.first >= owner.lanes_.size()) continue;
+            auto& l = owner.lanes_.getReference (s.first);
+            if (const auto* r = l.playlist.findRegion (s.second))
+            {
+                anchorLane = juce::jmin (anchorLane, s.first);
+                anchorBeat = juce::jmin (anchorBeat, r->positionBeats);
+            }
+            else if (const auto* m = l.playlist.findMidiRegion (s.second))
+            {
+                anchorLane = juce::jmin (anchorLane, s.first);
+                anchorBeat = juce::jmin (anchorBeat, m->positionBeats);
+            }
+        }
+        if (anchorLane == INT_MAX) return;
+
+        clipboard_.clear();
+        for (const auto& s : selected_)
+        {
+            if (s.first >= owner.lanes_.size()) continue;
+            auto& l = owner.lanes_.getReference (s.first);
+            if (const auto* r = l.playlist.findRegion (s.second))
+            {
+                ClipboardEntry e;
+                e.originLaneKind = l.kind;
+                e.laneOffset     = s.first - anchorLane;
+                e.beatOffset     = r->positionBeats - anchorBeat;
+                e.isAudio        = true;
+                e.audioRegion    = *r;
+                clipboard_.push_back (std::move (e));
+            }
+            else if (const auto* m = l.playlist.findMidiRegion (s.second))
+            {
+                ClipboardEntry e;
+                e.originLaneKind = l.kind;
+                e.laneOffset     = s.first - anchorLane;
+                e.beatOffset     = m->positionBeats - anchorBeat;
+                e.isAudio        = false;
+                e.midiRegion     = m->clone();
+                clipboard_.push_back (std::move (e));
+            }
+        }
+    }
+
+    /** Cut = copy + delete every selected region.  Touched lanes get
+     *  their MIDI bindings republished after the bulk delete so the
+     *  audio thread drops stale entries before any held NoteOff. */
+    void cutSelectionToClipboard()
+    {
+        if (selected_.isEmpty()) return;
+        copySelectionToClipboard();
+
+        std::set<int> midiLanesTouched;
+        const auto victims = selected_;        /* iterate a copy */
+        for (const auto& s : victims)
+        {
+            if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
+            auto& l = owner.lanes_.getReference (s.first);
+            if (l.playlist.removeRegion (s.second)) continue;
+            if (l.playlist.removeMidiRegion (s.second))
+                midiLanesTouched.insert (s.first);
+        }
+        clearSelection();
+        for (int lane : midiLanesTouched)
+            owner.publishMidiBindingsForLane (lane);
+        owner.writeLanesToSession();
+        resizeForLanes();
+        repaint();
+    }
+
+    /** Paste every clipboard entry relative to (targetLane, targetBeat).
+     *  Entries whose target lane is out of range OR whose origin kind
+     *  doesn't match the destination's kind are skipped.  Overlap on
+     *  MIDI lanes is rejected by Playlist; we silently drop those (the
+     *  audio path allows overlap by design).  Pasted regions become
+     *  the new selection so the user can immediately drag or copy
+     *  them again. */
+    void pasteClipboardAt (int targetLane, double targetBeat)
+    {
+        if (clipboard_.empty()) return;
+        if (targetLane < 0 || targetLane >= owner.lanes_.size()) return;
+
+        std::set<int> midiLanesTouched;
+        juce::Array<std::pair<int, juce::Uuid>> newSelection;
+
+        for (const auto& e : clipboard_)
+        {
+            const int destLaneIdx = targetLane + e.laneOffset;
+            if (destLaneIdx < 0 || destLaneIdx >= owner.lanes_.size()) continue;
+            auto& destLane = owner.lanes_.getReference (destLaneIdx);
+            if (destLane.kind != e.originLaneKind) continue;
+
+            const double destBeat = juce::jmax (0.0, targetBeat + e.beatOffset);
+
+            if (e.isAudio)
+            {
+                Region copy        = e.audioRegion;
+                copy.id            = juce::Uuid();
+                copy.positionBeats = destBeat;
+                /* Inherit destination lane tint -- the cached colour
+                 * on the clipboard entry tracked the SOURCE lane. */
+                copy.colour        = destLane.colour;
+                if (destLane.playlist.addRegion (Region (copy)))
+                    newSelection.add ({ destLaneIdx, copy.id });
+            }
+            else
+            {
+                if (e.midiRegion == nullptr) continue;
+                auto clone           = e.midiRegion->clone();
+                clone->id            = juce::Uuid();
+                clone->positionBeats = destBeat;
+                clone->colour        = destLane.colour;
+                const juce::Uuid newId = clone->id;
+                if (destLane.playlist.addMidiRegion (std::move (clone)))
+                {
+                    newSelection.add ({ destLaneIdx, newId });
+                    midiLanesTouched.insert (destLaneIdx);
+                }
+            }
+        }
+
+        if (newSelection.isEmpty()) return;
+
+        selected_ = newSelection;
+        const auto& back = selected_.getLast();
+        selectedLane_   = back.first;
+        selectedRegion_ = back.second;
+
+        for (int lane : midiLanesTouched)
+            owner.publishMidiBindingsForLane (lane);
+        owner.writeLanesToSession();
+        resizeForLanes();
+        repaint();
+    }
+
+    /** Duplicate every selected region in place: each copy lands at
+     *  the original's endBeats on the same lane.  Audio lanes allow
+     *  overlap by Playlist design; MIDI overlap is rejected by
+     *  addMidiRegion so the dup silently drops -- callers can split
+     *  the original to make room first. */
+    void duplicateSelection()
+    {
+        if (selected_.isEmpty()) return;
+
+        std::set<int> midiLanesTouched;
+        juce::Array<std::pair<int, juce::Uuid>> newSelection;
+
+        for (const auto& s : selected_)
+        {
+            if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
+            auto& lane = owner.lanes_.getReference (s.first);
+            if (const auto* r = lane.playlist.findRegion (s.second))
+            {
+                Region copy        = *r;
+                copy.id            = juce::Uuid();
+                copy.positionBeats = r->endBeats();
+                if (lane.playlist.addRegion (Region (copy)))
+                    newSelection.add ({ s.first, copy.id });
+            }
+            else if (const auto* m = lane.playlist.findMidiRegion (s.second))
+            {
+                auto clone           = m->clone();
+                clone->id            = juce::Uuid();
+                clone->positionBeats = m->positionBeats + m->lengthBeats;
+                const juce::Uuid newId = clone->id;
+                if (lane.playlist.addMidiRegion (std::move (clone)))
+                {
+                    newSelection.add ({ s.first, newId });
+                    midiLanesTouched.insert (s.first);
+                }
+            }
+        }
+
+        if (newSelection.isEmpty()) return;
+
+        selected_ = newSelection;
+        const auto& back = selected_.getLast();
+        selectedLane_   = back.first;
+        selectedRegion_ = back.second;
+
+        for (int lane : midiLanesTouched)
+            owner.publishMidiBindingsForLane (lane);
+        owner.writeLanesToSession();
+        resizeForLanes();
+        repaint();
+    }
+
+    /** Flip the .looped flag on every selected region.  All-on if any
+     *  was off; all-off only when every one was already looped.  MIDI
+     *  lanes get their bindings republished so the audio thread's
+     *  EntryList picks up the new boundary-loop behaviour. */
+    void toggleLoopOnSelection()
+    {
+        if (selected_.isEmpty()) return;
+
+        bool anyOff = false;
+        for (const auto& s : selected_)
+        {
+            if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
+            auto& l = owner.lanes_.getReference (s.first);
+            if (auto* r = l.playlist.findRegion (s.second))      { if (! r->looped) { anyOff = true; break; } }
+            else if (auto* m = l.playlist.findMidiRegion (s.second)) { if (! m->looped) { anyOff = true; break; } }
+        }
+        const bool target = anyOff;  /* if any is off -> turn all on; else turn all off */
+
+        std::set<int> midiLanesTouched;
+        bool changed = false;
+        for (const auto& s : selected_)
+        {
+            if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
+            auto& l = owner.lanes_.getReference (s.first);
+            if (auto* r = l.playlist.findRegion (s.second))
+            {
+                if (r->looped != target) { r->looped = target; changed = true; }
+            }
+            else if (auto* m = l.playlist.findMidiRegion (s.second))
+            {
+                if (m->looped != target)
+                {
+                    m->looped = target;
+                    midiLanesTouched.insert (s.first);
+                    changed = true;
+                }
+            }
+        }
+
+        if (! changed) return;
+        for (int lane : midiLanesTouched)
+            owner.publishMidiBindingsForLane (lane);
+        owner.writeLanesToSession();
+        repaint();
+    }
+
     bool keyPressed (const juce::KeyPress& key) override
     {
+        /* Ctrl/Cmd shortcuts -- handled before the legacy Delete /
+         * zoom branches so the modifier-bearing keys don't fall
+         * through to a parent's command dispatcher. */
+        const auto mods = key.getModifiers();
+        if (mods.isCommandDown() || mods.isCtrlDown())
+        {
+            if (key.getKeyCode() == 'C')
+            {
+                copySelectionToClipboard();
+                return true;
+            }
+            if (key.getKeyCode() == 'X')
+            {
+                cutSelectionToClipboard();
+                return true;
+            }
+            if (key.getKeyCode() == 'V')
+            {
+                /* Paste anchor: primary selection's lane (still
+                 * meaningful even after Cut since Ctrl+X clears
+                 * selection -> use lastInteractedLane_).  Beat = the
+                 * transport's current playhead, which the Body
+                 * paints in the ruler regardless of playback state. */
+                int   targetLane = selectedLane_;
+                if (targetLane < 0) targetLane = lastInteractedLane_;
+                if (targetLane < 0) return true;
+                pasteClipboardAt (targetLane, juce::jmax (0.0, owner.lastBeat_));
+                return true;
+            }
+            if (key.getKeyCode() == 'D')
+            {
+                duplicateSelection();
+                return true;
+            }
+            if (key.getKeyCode() == 'L')
+            {
+                toggleLoopOnSelection();
+                return true;
+            }
+        }
+
         if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey)
         {
-            if (selectedLane_ < 0 || selectedLane_ >= owner.lanes_.size())
-                return false;
-            auto& lane = owner.lanes_.getReference (selectedLane_);
-            /* Try audio first; fall through to MIDI.  Either match
-             * clears selection + persists + repaints; no match leaves
-             * the key unconsumed so a parent component can handle. */
-            bool removed = lane.playlist.removeRegion (selectedRegion_);
-            if (! removed)
+            if (selected_.isEmpty()) return false;
+
+            std::set<int> midiLanesTouched;
+            std::set<int> lanesTouched;
+            bool removed = false;
+            const auto victims = selected_;
+            for (const auto& s : victims)
             {
-                if (lane.playlist.removeMidiRegion (selectedRegion_))
+                if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
+                auto& lane = owner.lanes_.getReference (s.first);
+                /* Try audio first; fall through to MIDI.  Same
+                 * tear-down semantics as the single-region delete:
+                 * MIDI deletion republishes bindings so the audio
+                 * thread drops stale entries before any held NoteOff. */
+                if (lane.playlist.removeRegion (s.second))
                 {
-                    /* Tear-down: republish bindings so the MidiPlayerNode
-                     * drops the deleted region from its EntryList before
-                     * the MidiNoteRegion pointer goes away.  emitAllNotesOff
-                     * fires on the audio thread when entries become empty
-                     * + held_.any() (midiplayer.cpp render()). */
-                    owner.publishMidiBindingsForLane (selectedLane_);
+                    lanesTouched.insert (s.first);
+                    removed = true;
+                }
+                else if (lane.playlist.removeMidiRegion (s.second))
+                {
+                    midiLanesTouched.insert (s.first);
+                    lanesTouched.insert (s.first);
                     removed = true;
                 }
             }
             if (! removed) return false;
-            const int laneIdx = selectedLane_;
-            selectedLane_   = -1;
-            selectedRegion_ = juce::Uuid::null();
+            clearSelection();
+            for (int lane : midiLanesTouched)
+                owner.publishMidiBindingsForLane (lane);
             owner.writeLanesToSession();
             resizeForLanes();
-            repaintLane (laneIdx);
+            if (lanesTouched.size() <= 2)
+                for (int lane : lanesTouched) repaintLane (lane);
+            else
+                repaint();
             return true;
         }
 
@@ -2488,7 +2983,7 @@ private:
             if (! regionClip.intersects (rect))
                 continue;
 
-            const bool selected = (laneIdx == selectedLane_ && r.id == selectedRegion_);
+            const bool selected = isSelected (laneIdx, r.id);
 
             /* Tint = lane colour, desaturated + dimmed for orphan
              * lanes.  The previous active-region brightening (when
@@ -2674,8 +3169,7 @@ private:
             if (! regionClip.intersects (rect))
                 continue;
 
-            const bool selected = (selectedLane_ == laneIdx
-                                    && selectedRegion_ == m.id);
+            const bool selected = isSelected (laneIdx, m.id);
             const juce::Colour midiTint = m.colour;
             juce::Colour fill = midiTint.withMultipliedSaturation (
                                               selected ? 0.85f : 0.55f)
@@ -2911,9 +3405,39 @@ private:
     bool dropHover_         = false;
     int  dropHoverLaneIdx_  = -1;
 
-    /* Region selection state.  selectedLane_ < 0 means no selection. */
+    /* Region selection state.  selectedLane_ < 0 means no primary
+     * selection.  selectedLane_ + selectedRegion_ track the PRIMARY
+     * (last-clicked) region; selected_ holds the full multi-selection
+     * list including the primary.  Paint sites and the delete /
+     * loop / copy / cut / duplicate paths read selected_ (via
+     * isSelected) so a no-modifier click still behaves identically
+     * to the old single-selection model. */
     int        selectedLane_   = -1;
     juce::Uuid selectedRegion_;
+    juce::Array<std::pair<int, juce::Uuid>> selected_;
+
+    /* Tracks the lane most recently interacted with even when the
+     * selection is empty.  Ctrl+V uses this as the paste target if
+     * the user has just cut every selected region (clearing the
+     * primary).  Updated on every mouseDown that lands inside a
+     * known lane strip. */
+    int lastInteractedLane_ = -1;
+
+    /* Clipboard.  Anchor-relative entries cloned from the selection
+     * via Ctrl+C / Ctrl+X / right-click Copy / Cut.  Survives across
+     * mutation cycles, cleared only by next Copy/Cut.  std::vector
+     * (not juce::Array) because MidiNoteRegion is non-copyable --
+     * unique_ptr inside the entry handles the move-only payload. */
+    struct ClipboardEntry
+    {
+        Lane::Kind originLaneKind = Lane::Kind::Audio;
+        int        laneOffset     = 0;     /* relative to anchor lane */
+        double     beatOffset     = 0.0;   /* relative to anchor beat */
+        bool       isAudio        = true;
+        Region     audioRegion {};                       /* valid if isAudio */
+        std::unique_ptr<MidiNoteRegion> midiRegion;      /* valid if ! isAudio */
+    };
+    std::vector<ClipboardEntry> clipboard_;
 
     /* Active gesture (move / resize) -- valid between mouseDown and
      * mouseUp.  laneIdx < 0 means no gesture. */
@@ -4116,6 +4640,10 @@ void ArrangementView::applyLaneSnapshot (const juce::Array<Lane>& snap)
 
     if (body_ != nullptr)
     {
+        /* Selection may point at regions that no longer exist in the
+         * restored snapshot.  Cheaper + safer to clear than to walk
+         * the new lanes_ confirming each uuid still resolves. */
+        body_->clearSelection();
         body_->resizeForLanes();
         body_->repaint();
     }
