@@ -5,6 +5,7 @@
 
 #include "services/sources/source.hpp"
 #include "services/sources/audiofilesource.hpp"
+#include "services/sources/midi_source.hpp"
 #include "services/sources/vhtsequencesource.hpp"
 
 #include <unordered_map>
@@ -80,6 +81,27 @@ public:
      *  registered. */
     AudioFileSource::Ptr findAudioFile (juce::Uuid uuid) const;
 
+    /** Register an imported MIDI source.  Returns the existing Ptr if
+     *  a Source with this uuid is already registered.  smfBytes is
+     *  the raw SMF file contents (caller has already read them off
+     *  disk OR has them from a session-restore base64 blob).
+     *  noteCount may be -1 to trigger an immediate parse + count;
+     *  otherwise pass the pre-computed value to skip re-parsing. */
+    MidiSource::Ptr registerMidiFile (juce::Uuid uuid,
+                                       const juce::File& originalPath,
+                                       juce::MemoryBlock smfBytes,
+                                       int noteCount = -1);
+
+    /** Convenience importer for the arrangement-view file-drop path.
+     *  Reads the .mid file from disk, parses with juce::MidiFile,
+     *  counts NoteOns, registers a fresh MidiSource.  Returns nullptr
+     *  on missing file or unparseable SMF. */
+    MidiSource::Ptr importMidiFromFile (const juce::File& file);
+
+    /** Look up a MidiSource by uuid.  Returns nullptr if not
+     *  registered. */
+    MidiSource::Ptr findMidiFile (juce::Uuid uuid) const;
+
     /** Generic lookup -- returns base Ptr for any source kind, or
      *  nullptr.  Used by adapters when they only have the Region's
      *  sourceId and don't know the kind up front. */
@@ -138,6 +160,9 @@ private:
     std::unordered_map<juce::Uuid,
                        AudioFileSource::Ptr,
                        UuidHash> audioFiles_;
+    std::unordered_map<juce::Uuid,
+                       MidiSource::Ptr,
+                       UuidHash> midiFiles_;
     bool hasLoaded_ = false;
 };
 
