@@ -21,6 +21,7 @@ const juce::Identifier kLoopedAttr    { "loop" };
 const juce::Identifier kColourAttr    { "col" };
 const juce::Identifier kNameAttr      { "name" };
 const juce::Identifier kNoteTag       { "n" };
+const juce::Identifier kNoteIdAttr    { "i" };
 const juce::Identifier kNotePitchAttr { "p" };
 const juce::Identifier kNoteVelAttr   { "v" };
 const juce::Identifier kNoteChanAttr  { "ch" };
@@ -88,13 +89,38 @@ void MidiNoteRegion::setNotes (NoteList newNotes)
     publishSnapshot (std::move (snap));
 }
 
-void MidiNoteRegion::addNote (MidiNote n)
+void MidiNoteRegion::setNotesAssigningIds (NoteList newNotes)
 {
+    /* Stamp fresh ids for any note with id == 0.  Preserve existing
+     * ids so callers that pre-assigned (e.g. undo replay) get
+     * round-trip stability.  Bumps noteIdAllocator_ past every
+     * pre-assigned id to keep the monotonic invariant. */
+    for (auto& n : newNotes)
+    {
+        if (n.id == 0)
+            n.id = nextNoteId();
+        else if (n.id > noteIdAllocator_)
+            noteIdAllocator_ = n.id;
+    }
+    setNotes (std::move (newNotes));
+}
+
+std::uint64_t MidiNoteRegion::addNote (MidiNote n)
+{
+    if (n.id == 0)
+        n.id = nextNoteId();
+    else if (n.id > noteIdAllocator_)
+        noteIdAllocator_ = n.id;
+
+    const std::uint64_t finalId = n.id;
+
     mutateAndPublish ([&] (NoteList& copy)
     {
         copy.push_back (n);
         std::sort (copy.begin(), copy.end(), noteLess);
     });
+
+    return finalId;
 }
 
 void MidiNoteRegion::removeNotesMatching (const MidiNote& example) noexcept
@@ -110,6 +136,56 @@ void MidiNoteRegion::removeNotesMatching (const MidiNote& example) noexcept
                        }),
                     copy.end());
     });
+}
+
+bool MidiNoteRegion::removeNoteById (std::uint64_t noteId) noexcept
+{
+    if (noteId == 0) return false;
+    bool removed = false;
+    mutateAndPublish ([&] (NoteList& copy)
+    {
+        auto it = std::find_if (copy.begin(), copy.end(),
+            [noteId] (const MidiNote& n) noexcept { return n.id == noteId; });
+        if (it != copy.end())
+        {
+            copy.erase (it);
+            removed = true;
+        }
+    });
+    return removed;
+}
+
+bool MidiNoteRegion::updateNoteById (std::uint64_t noteId, const MidiNote& replacement) noexcept
+{
+    if (noteId == 0) return false;
+    bool updated = false;
+    mutateAndPublish ([&] (NoteList& copy)
+    {
+        for (auto& n : copy)
+        {
+            if (n.id == noteId)
+            {
+                /* Preserve the id (caller's replacement may have a
+                 * stale or zero id from a temporary).  All other
+                 * mutable fields take from replacement. */
+                n.pitch       = replacement.pitch;
+                n.velocity    = replacement.velocity;
+                n.channel     = replacement.channel;
+                n.onBeat      = replacement.onBeat;
+                n.lengthBeats = replacement.lengthBeats;
+                updated = true;
+                break;
+            }
+        }
+        if (updated)
+            std::sort (copy.begin(), copy.end(), noteLess);
+    });
+    return updated;
+}
+
+std::uint64_t MidiNoteRegion::nextNoteId() noexcept
+{
+    return ++noteIdAllocator_;
 }
 
 void MidiNoteRegion::sweepTrash() noexcept
@@ -167,6 +243,8 @@ juce::ValueTree MidiNoteRegion::toValueTree() const
         for (const auto& n : *snap)
         {
             juce::ValueTree nv (kNoteTag);
+            if (n.id != 0)
+                nv.setProperty (kNoteIdAttr, (juce::int64) n.id, nullptr);
             nv.setProperty (kNotePitchAttr, n.pitch,       nullptr);
             nv.setProperty (kNoteVelAttr,   n.velocity,    nullptr);
             /* Channel 1 is the default; sparse-write skips it. */
@@ -204,6 +282,7 @@ std::unique_ptr<MidiNoteRegion> MidiNoteRegion::fromValueTree (const juce::Value
         if (! nv.hasType (kNoteTag))
             continue;
         MidiNote n;
+        n.id          = (std::uint64_t) (juce::int64) nv.getProperty (kNoteIdAttr, (juce::int64) 0);
         n.pitch       = (int)    nv.getProperty (kNotePitchAttr, 60);
         n.velocity    = (int)    nv.getProperty (kNoteVelAttr,   100);
         n.channel     = (int)    nv.getProperty (kNoteChanAttr,  1);
@@ -211,7 +290,11 @@ std::unique_ptr<MidiNoteRegion> MidiNoteRegion::fromValueTree (const juce::Value
         n.lengthBeats = (double) nv.getProperty (kNoteLenAttr,   0.25);
         notes.push_back (n);
     }
-    r->setNotes (std::move (notes));
+    /* setNotesAssigningIds: pre-1.0 sessions without note ids get
+     * fresh monotonic ids stamped; sessions with ids preserve them
+     * AND bump the allocator past the maximum so subsequent
+     * piano-roll edits stay unique. */
+    r->setNotesAssigningIds (std::move (notes));
     return r;
 }
 

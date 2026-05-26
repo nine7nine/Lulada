@@ -3,10 +3,20 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace element {
 
 /** Single MIDI note inside a MidiNoteRegion.
  *
+ *  id             -- stable per-note identifier, monotonically assigned
+ *                    by the owning MidiNoteRegion on insert.  Survives
+ *                    snapshot-swap edits so the piano-roll's selection
+ *                    model can re-resolve notes after a publish (which
+ *                    swaps the entire NoteList).  0 is the invalid /
+ *                    "unassigned" sentinel -- importers that allocate
+ *                    notes before insertion can leave it 0 and the
+ *                    region will stamp a fresh id during addNote().
  *  pitch          -- MIDI note number 0..127 (C-1..G9).  Centre C = 60.
  *  velocity       -- 1..127.  Velocity 0 is a note-off marker in the wire
  *                    protocol and never stored as a live on-note; the
@@ -28,11 +38,12 @@ namespace element {
  *  this -- vector copy is just memcpy of the underlying buffer. */
 struct MidiNote
 {
-    int    pitch       { 60 };
-    int    velocity    { 100 };
-    int    channel     { 1 };
-    double onBeat      { 0.0 };
-    double lengthBeats { 0.25 };
+    std::uint64_t id           { 0 };
+    int           pitch        { 60 };
+    int           velocity     { 100 };
+    int           channel      { 1 };
+    double        onBeat       { 0.0 };
+    double        lengthBeats  { 0.25 };
 };
 
 } // namespace element

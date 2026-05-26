@@ -143,17 +143,40 @@ public:
      *  paint code can rely on without re-sorting per frame. */
     void setNotes (NoteList newNotes);
 
-    /** Append a note + re-sort + publish.  Convenience for UI
-     *  add-on-click (Phase 3 piano-roll); also used by the SMF import
-     *  path one note at a time. */
-    void addNote (MidiNote n);
+    /** Append a note + re-sort + publish.  If `n.id` is 0 the region
+     *  stamps a fresh monotonic id before insertion; otherwise the
+     *  supplied id is preserved (allows bulk insert paths -- SMF
+     *  import, undo redo -- to pre-assign ids and have them survive
+     *  the publish).  Returns the final id of the inserted note. */
+    std::uint64_t addNote (MidiNote n);
 
     /** Remove notes whose (pitch, channel, onBeat-within-eps) match
-     *  the example.  Used by UI undo when re-removing a note that was
-     *  just added needs a stable identity until Phase 3 introduces
-     *  per-note uuids.  In Phase 2 the UI doesn't yet exist; this is
-     *  exercised by tests. */
+     *  the example.  Used by tests and legacy callers; the piano-roll
+     *  edit path prefers id-keyed removal (removeNoteById) so
+     *  selection state survives mutation. */
     void removeNotesMatching (const MidiNote& example) noexcept;
+
+    /** Remove a single note by stable id.  Returns true if a note was
+     *  removed.  Used by the piano-roll edit gestures (delete key,
+     *  marquee-erase, undo redo). */
+    bool removeNoteById (std::uint64_t noteId) noexcept;
+
+    /** Replace a single note's mutable fields (pitch / velocity /
+     *  channel / onBeat / lengthBeats) by stable id.  Used by the
+     *  piano-roll Move / Resize / Velocity gestures so each edit
+     *  publishes a fresh snapshot with the same note ids.  Returns
+     *  true if a note with this id was found. */
+    bool updateNoteById (std::uint64_t noteId, const MidiNote& replacement) noexcept;
+
+    /** Bulk replace -- like setNotes but stamps fresh ids for entries
+     *  with id == 0.  Preferred over setNotes for callers that want
+     *  the region's id allocator to take responsibility for filling
+     *  in missing ids (SMF import path uses this). */
+    void setNotesAssigningIds (NoteList newNotes);
+
+    /** Allocator hook -- next monotonic id.  Used by piano-roll edit
+     *  paths that want to pre-stamp ids for undo before publishing. */
+    std::uint64_t nextNoteId() noexcept;
 
     /** Drain the trash deque.  Called on the message thread by the
      *  arrangement view's AsyncUpdater tick (Phase 4 wiring) or by
@@ -202,6 +225,12 @@ private:
 
     /** Per-region epoch counter.  Audio thread advances at block start. */
     std::atomic<std::uint64_t> audioEpoch_ { 0 };
+
+    /** Per-region monotonic note-id allocator.  Starts at 1 (0 is the
+     *  "unassigned" sentinel) and advances each time the region needs
+     *  to stamp an id.  Lives on the message thread; never accessed
+     *  from the audio thread. */
+    std::uint64_t noteIdAllocator_ { 0 };
 };
 
 } // namespace element
