@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "ui/blocktoolbutton.hpp"
+
 #include <element/juce/gui_basics.hpp>
 #include <element/services.hpp>
 
@@ -68,13 +70,30 @@ public:
     std::function<void()>                  onResizeDragEnd;
     std::function<void()>                  onCloseClicked;
 
+    /** Fired after every region-mutating gesture commit (Move, Create,
+     *  Resize, Erase, Delete-key) on the bound region.  StandardContent
+     *  wires this to ArrangementView::body_->repaint() so the lane
+     *  strip's note-count badge tracks live edits. */
+    std::function<void()>                  onRegionEdited;
+    void notifyRegionEdited()
+    {
+        if (onRegionEdited) onRegionEdited();
+    }
+
     void paint (juce::Graphics&) override;
     void resized() override;
 
-    static constexpr int kHeaderH      = 22;
+    /* Layout constants:
+     *   kDragHandleH   thin top edge for vertical resize.
+     *   kHeaderH       toolbar row (tool palette + snap + zoom + close).
+     *   kKeyboardW     left-side piano key column width.
+     */
+    static constexpr int kHeaderH      = 28;
     static constexpr int kDragHandleH  = 4;
     static constexpr int kKeyboardW    = 56;
-    static constexpr int kToolBtnW     = 52;
+    static constexpr int kToolBtnW     = 56;
+    static constexpr int kZoomBtnW     = 24;
+    static constexpr int kSnapBoxW     = 70;
 
 private:
     Services&    services_;
@@ -86,10 +105,15 @@ private:
     class DragHandle;
     std::unique_ptr<DragHandle>         dragHandle_;
     juce::Label                         regionLabel_;
-    juce::TextButton                    closeBtn_       { "X" };
-    juce::TextButton                    selectBtn_      { "Select" };
-    juce::TextButton                    pencilBtn_      { "Pencil" };
-    juce::TextButton                    eraseBtn_       { "Erase" };
+    BlockToolButton                     closeBtn_       { "X" };
+    BlockToolButton                     selectBtn_      { "Select" };
+    BlockToolButton                     pencilBtn_      { "Pencil" };
+    BlockToolButton                     eraseBtn_       { "Erase" };
+    BlockToolButton                     snapBtn_        { "Snap" };
+    juce::ComboBox                      snapBox_;
+    BlockToolButton                     zoomOutBtn_     { "-" };
+    BlockToolButton                     zoomInBtn_      { "+" };
+    BlockToolButton                     zoomFitBtn_     { "Fit" };
 
     std::unique_ptr<PianoRollKeyboard>  keyboard_;
     /** juce::Viewport hosting the grid.  Horizontal scrolling only --
@@ -99,6 +123,7 @@ private:
 
     void refreshLabel();
     void syncToolToggles();
+    void applySnapFromComboBox();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PianoRollView)
 };

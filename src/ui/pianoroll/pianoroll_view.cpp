@@ -71,19 +71,114 @@ PianoRollView::PianoRollView (Services& services)
     refreshLabel();
     addAndMakeVisible (regionLabel_);
 
-    /* Tool palette: radio toggle.  Buttons are toggleable; clicking
-     * one sets the active tool and refreshes the visual toggle state
-     * on all three.  Default Select. */
-    auto initToolBtn = [this] (juce::TextButton& btn, Tool t) {
+    /* Active-state green tint mirrors ArrangementView's tool buttons
+     * + tracker FOLLOW button.  Single source of truth so the dock
+     * reads as part of the same toolbar family. */
+    const juce::Colour kActiveTint { 0xff'4a'a5'5a };
+
+    /* Tool palette: radio toggle.  Buttons are togglable BlockToolButtons
+     * styled to match ArrangementView's tool row.  Manual radio
+     * handling -- juce::Button's radio group machinery doesn't
+     * cooperate with BlockToolButton's custom paint. */
+    auto initToolBtn = [this, kActiveTint] (BlockToolButton& btn, Tool t)
+    {
         btn.setClickingTogglesState (true);
-        btn.setRadioGroupId (0); /* manual radio handling below */
+        btn.setActiveTint (kActiveTint);
         btn.onClick = [this, t]() { setActiveTool (t); };
         addAndMakeVisible (btn);
     };
     initToolBtn (selectBtn_, Tool::Select);
     initToolBtn (pencilBtn_, Tool::Pencil);
     initToolBtn (eraseBtn_,  Tool::Erase);
+
+    /* Vector tool icons -- same drawing style as ArrangementView's tool
+     * row so the user reads them as siblings. */
+    selectBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            juce::Path p;
+            const float w = b.getWidth(), h = b.getHeight();
+            p.startNewSubPath (b.getX() + w * 0.20f, b.getY() + h * 0.15f);
+            p.lineTo          (b.getX() + w * 0.55f, b.getY() + h * 0.55f);
+            p.lineTo          (b.getX() + w * 0.35f, b.getY() + h * 0.55f);
+            p.lineTo          (b.getX() + w * 0.55f, b.getY() + h * 0.85f);
+            p.lineTo          (b.getX() + w * 0.35f, b.getY() + h * 0.85f);
+            p.lineTo          (b.getX() + w * 0.20f, b.getY() + h * 0.65f);
+            p.closeSubPath();
+            g.setColour (fg);
+            g.fillPath (p);
+        });
+    pencilBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Diagonal pencil glyph -- short angled line + tip wedge. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float x0 = b.getX() + w * 0.20f;
+            const float y0 = b.getY() + h * 0.85f;
+            const float x1 = b.getX() + w * 0.80f;
+            const float y1 = b.getY() + h * 0.20f;
+            g.setColour (fg);
+            g.drawLine (x0, y0, x1, y1, 1.8f);
+            juce::Path tip;
+            tip.startNewSubPath (x1, y1);
+            tip.lineTo (x1 + w * 0.08f, y1 + h * 0.06f);
+            tip.lineTo (x1 - w * 0.05f, y1 + h * 0.16f);
+            tip.closeSubPath();
+            g.fillPath (tip);
+        });
+    eraseBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* X glyph -- two crossing diagonals. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float pad = juce::jmin (w, h) * 0.22f;
+            g.setColour (fg);
+            g.drawLine (b.getX() + pad, b.getY() + pad,
+                        b.getRight() - pad, b.getBottom() - pad, 1.6f);
+            g.drawLine (b.getRight() - pad, b.getY() + pad,
+                        b.getX() + pad, b.getBottom() - pad, 1.6f);
+        });
+
     syncToolToggles();
+
+    /* Snap controls -- mirror ArrangementView's pair.  snapBtn toggles
+     * snap enable/disable; snapBox picks the resolution.  Default is
+     * 1/16 (Ableton + Zrythm default). */
+    snapBtn_.setClickingTogglesState (true);
+    snapBtn_.setToggleState (true, juce::dontSendNotification);
+    snapBtn_.setActiveTint (kActiveTint);
+    snapBtn_.onClick = [this]() {
+        if (grid_ != nullptr)
+            grid_->setSnapEnabled (snapBtn_.getToggleState());
+        snapBox_.setEnabled (snapBtn_.getToggleState());
+    };
+    addAndMakeVisible (snapBtn_);
+
+    snapBox_.addItem ("1/32",   1);
+    snapBox_.addItem ("1/16",   2);
+    snapBox_.addItem ("1/8",    3);
+    snapBox_.addItem ("1/4",    4);
+    snapBox_.addItem ("1/2",    5);
+    snapBox_.addItem ("Bar",    6);
+    snapBox_.setSelectedId (2, juce::dontSendNotification);
+    snapBox_.onChange = [this]() { applySnapFromComboBox(); };
+    snapBox_.setColour (juce::ComboBox::backgroundColourId,
+                         juce::Colour (0xff'2c'2c'2c));
+    snapBox_.setColour (juce::ComboBox::textColourId,
+                         juce::Colour (0xff'd0'd0'd0));
+    snapBox_.setColour (juce::ComboBox::outlineColourId,
+                         juce::Colour (0xff'5a'5a'5a));
+    snapBox_.setColour (juce::ComboBox::arrowColourId,
+                         juce::Colour (0xff'a0'a0'a0));
+    addAndMakeVisible (snapBox_);
+
+    /* Zoom controls -- match ArrangementView's [- + Fit] triplet. */
+    zoomOutBtn_.onClick = [this]() { if (grid_) grid_->zoomBy (1.0 / 1.20); };
+    zoomInBtn_ .onClick = [this]() { if (grid_) grid_->zoomBy (1.20); };
+    zoomFitBtn_.onClick = [this]() { if (grid_) grid_->zoomToFit(); };
+    addAndMakeVisible (zoomOutBtn_);
+    addAndMakeVisible (zoomInBtn_);
+    addAndMakeVisible (zoomFitBtn_);
 
     addAndMakeVisible (closeBtn_);
     closeBtn_.setTooltip ("Hide piano-roll dock");
@@ -106,6 +201,10 @@ PianoRollView::PianoRollView (Services& services)
     gridViewport_->setScrollBarsShown (false /*vertical*/, true /*horizontal*/);
     gridViewport_->setViewedComponent (grid_.get(), false /*deleteOnDelete*/);
     addAndMakeVisible (*gridViewport_);
+
+    /* Seed the grid with the comboBox's default snap pick so the
+     * displayed division + the runtime division agree from frame 0. */
+    applySnapFromComboBox();
 }
 
 PianoRollView::~PianoRollView() = default;
@@ -136,6 +235,23 @@ void PianoRollView::syncToolToggles()
     eraseBtn_ .setToggleState (activeTool_ == Tool::Erase,  juce::dontSendNotification);
 }
 
+void PianoRollView::applySnapFromComboBox()
+{
+    if (grid_ == nullptr) return;
+    double div = 0.25;
+    switch (snapBox_.getSelectedId())
+    {
+        case 1: div = 0.125; break;   /* 1/32 */
+        case 2: div = 0.25;  break;   /* 1/16 (default) */
+        case 3: div = 0.5;   break;   /* 1/8  */
+        case 4: div = 1.0;   break;   /* 1/4  */
+        case 5: div = 2.0;   break;   /* 1/2  */
+        case 6: div = 4.0;   break;   /* bar (assumes 4/4) */
+        default: break;
+    }
+    grid_->setSnapDivision (div);
+}
+
 void PianoRollView::refreshLabel()
 {
     juce::String text ("Piano Roll -- no region bound");
@@ -164,8 +280,24 @@ void PianoRollView::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff'0a'0a'0a));
 
-    g.setColour (juce::Colour (0xff'0c'0c'0c));
+    /* Header strip backdrop -- matches ArrangementView's toolbar tone
+     * so the dock reads as a sibling row. */
+    g.setColour (juce::Colour (0xff'14'14'14));
     g.fillRect (0, kDragHandleH, getWidth(), kHeaderH);
+
+    /* Top-left corner above the keyboard column: the same tone as the
+     * grid's internal ruler so there's a continuous horizontal band
+     * across the dock width (keyboard top-cap + grid ruler).  Without
+     * this the corner reads as a darker square that looks like a
+     * paint bug. */
+    const int rulerTop = kDragHandleH + kHeaderH;
+    g.setColour (juce::Colour (0xff'0c'0c'0c));
+    g.fillRect (0, rulerTop, kKeyboardW, PianoRollGrid::kRulerH);
+    /* 1 px brightener at the bottom of that corner cell, lining up
+     * with the grid's ruler-bottom divider. */
+    g.setColour (juce::Colour (0xff'30'30'30));
+    g.drawHorizontalLine (rulerTop + PianoRollGrid::kRulerH - 1,
+                           0.0f, (float) kKeyboardW);
 }
 
 void PianoRollView::resized()
@@ -174,27 +306,51 @@ void PianoRollView::resized()
     dragHandle_->setBounds (r.removeFromTop (kDragHandleH));
 
     auto header = r.removeFromTop (kHeaderH);
-    closeBtn_  .setBounds (header.removeFromRight (kHeaderH).reduced (3));
-    header.removeFromRight (4);
+    /* Right side of the header (read R-to-L):
+     *   close X | Fit | + | - | snapBox | Snap | Erase | Pencil | Select
+     * Each chunk slightly padded.  Region label fills the remaining
+     * space on the left. */
+    closeBtn_.setBounds (header.removeFromRight (kHeaderH).reduced (3));
+    header.removeFromRight (6);
 
-    /* Tool palette occupies the right portion of the header next to
-     * the close button.  Three equal-width slots; the rest of the
-     * header is the region label on the left. */
-    auto toolArea = header.removeFromRight (kToolBtnW * 3 + 8).reduced (2);
+    auto zoomArea = header.removeFromRight (kZoomBtnW * 3 + 6 + kZoomBtnW).reduced (2);
+    /* Layout R-to-L matches the button order Fit / + / - left of Fit. */
+    zoomFitBtn_.setBounds (zoomArea.removeFromRight (kZoomBtnW + 6));
+    zoomArea.removeFromRight (3);
+    zoomInBtn_ .setBounds (zoomArea.removeFromRight (kZoomBtnW));
+    zoomArea.removeFromRight (3);
+    zoomOutBtn_.setBounds (zoomArea.removeFromRight (kZoomBtnW));
+
+    header.removeFromRight (8);
+    snapBox_.setBounds (header.removeFromRight (kSnapBoxW).reduced (2));
+    header.removeFromRight (3);
+    snapBtn_.setBounds (header.removeFromRight (kToolBtnW).reduced (2));
+    header.removeFromRight (10);
+
+    auto toolArea = header.removeFromRight (kToolBtnW * 3 + 6).reduced (2);
     eraseBtn_  .setBounds (toolArea.removeFromRight (kToolBtnW));
-    toolArea.removeFromRight (2);
+    toolArea.removeFromRight (3);
     pencilBtn_ .setBounds (toolArea.removeFromRight (kToolBtnW));
-    toolArea.removeFromRight (2);
+    toolArea.removeFromRight (3);
     selectBtn_ .setBounds (toolArea.removeFromRight (kToolBtnW));
 
-    regionLabel_.setBounds (header.reduced (4, 2));
+    regionLabel_.setBounds (header.reduced (6, 2));
 
-    /* Body: keyboard column on the left, grid viewport fills the
-     * rest.  PianoRollGrid sets its own actual width (region span *
-     * kPxPerBeat) so the viewport's horizontal scrollbar engages
-     * when the content extends past the visible area. */
+    /* Body: keyboard column on the left, grid viewport fills the rest.
+     * Keyboard is offset DOWN by the grid's ruler height so the first
+     * key (C7 at the top) lines up vertically with the grid's first
+     * note row.  The dock paints the corner above the keyboard with
+     * the same colour as the grid's ruler strip so the gap reads as
+     * intentional. */
     if (keyboard_ != nullptr)
-        keyboard_->setBounds (r.removeFromLeft (kKeyboardW));
+    {
+        auto kbCol = r.removeFromLeft (kKeyboardW);
+        keyboard_->setBounds (kbCol.withTrimmedTop (PianoRollGrid::kRulerH));
+    }
+    else
+    {
+        r.removeFromLeft (kKeyboardW);
+    }
     if (gridViewport_ != nullptr)
         gridViewport_->setBounds (r);
 
