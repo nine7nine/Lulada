@@ -15,6 +15,7 @@ namespace element {
 class MidiNoteRegion;
 class PianoRollKeyboard;
 class PianoRollGrid;
+class VelocityLane;
 
 /** Bottom-attached piano-roll editor dock.  Peer to TrackerSideDock
  *  (right-attached) -- the bottom slot was reserved for piano-roll
@@ -75,10 +76,10 @@ public:
      *  wires this to ArrangementView::body_->repaint() so the lane
      *  strip's note-count badge tracks live edits. */
     std::function<void()>                  onRegionEdited;
-    void notifyRegionEdited()
-    {
-        if (onRegionEdited) onRegionEdited();
-    }
+    /** Internal fanout for region-edit notifications.  Defined in the
+     *  cpp so it can repaint the (forward-declared) VelocityLane in
+     *  addition to firing the outbound callback. */
+    void notifyRegionEdited();
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -126,6 +127,14 @@ private:
      *  the keyboard column and grid both fill the dock's body height. */
     std::unique_ptr<juce::Viewport>     gridViewport_;
     std::unique_ptr<PianoRollGrid>      grid_;
+    /** Velocity lollipops strip under the grid viewport.  Mirrors the
+     *  viewport's horizontal scroll via a Viewport listener so the
+     *  lane stays aligned with the notes above. */
+    std::unique_ptr<VelocityLane>       velocityLane_;
+    class ViewportScrollMirror;
+    std::unique_ptr<ViewportScrollMirror> scrollMirror_;
+
+    static constexpr int kVelocityLaneH = 72;
 
     void refreshLabel();
     void syncToolToggles();
