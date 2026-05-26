@@ -26,7 +26,7 @@ target_include_directories(element
 
 # Re-glob marker: bump this file's mtime to force CMake to re-scan
 # after adding new sources under src/.  Updated 2026-05-25 for
-# Phase 2 piano-roll/automation -- services/timeline/midi_note_region.cpp.
+# Phase 3 Session 1 commit A -- ui/pianoroll/pianoroll_view.{hpp,cpp}.
 file(GLOB_RECURSE ELEMENT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
