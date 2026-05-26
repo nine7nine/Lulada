@@ -19,70 +19,51 @@ class PianoRollGrid;
  *  back when the tracker editor moved to the right column.
  *
  *  Layout (inside the dock's own bounds):
- *   - Top edge: thin drag handle for VERTICAL resize.
- *   - Header:   region label ("MIDI -- <name>") + close X.
- *   - Body:     left = PianoRollKeyboard column (added Session 1 B),
- *               right = PianoRollGrid (added Session 1 C).
+ *   - Top edge:   thin drag handle for VERTICAL resize.
+ *   - Header:     region label ("MIDI -- <filename>") + tool palette
+ *                 (Select / Pencil / Erase) + close X.
+ *   - Body:       left = PianoRollKeyboard column (fixed width),
+ *                 right = juce::Viewport hosting the PianoRollGrid
+ *                 (full region beat span, horizontal scroll + zoom).
  *
- *  Position in StandardContent layout: removed from the BOTTOM of the
- *  inner content area AFTER `_extra` (if visible) but BEFORE the
- *  tracker side-dock width is removed from the right.  This keeps the
- *  piano roll full-width but stops short of the right tracker dock
- *  when both are visible.
+ *  Tool palette: radio-toggle on the header, default Select.  The
+ *  active tool is stored on PianoRollView and read by PianoRollGrid's
+ *  mouse handlers via getActiveTool().
  *
- *  Binding policy (Phase 3 Session 1 -- paint-only):
- *   - The dock binds to a single MidiNoteRegion by uuid.
- *   - Resolution is performed per-paint via `regionResolver_` so the
- *     dock survives region deletion / lane mutation without dangling
- *     pointers.  StandardContent installs the resolver lambda when
- *     ArrangementView::findMidiRegion lands (Session 1 commit D); in
- *     commits A/B/C the resolver is empty and the body paints the
- *     empty-state hint.
- *
- *  Session 1 is paint-only.  Session 2 adds the Ardour-style drag
- *  taxonomy + selection + undo; Session 3 adds audio-thread MIDI emit
- *  for playback through the live snapshot. */
+ *  Region binding: per-paint resolver lookup (Q3 design pick from
+ *  Session 1).  See setRegionResolver. */
 class PianoRollView : public juce::Component
 {
 public:
+    enum class Tool : int { Select = 0, Pencil = 1, Erase = 2 };
+
     PianoRollView (Services& services);
     ~PianoRollView() override;
 
     /** Resolver hook -- returns a pointer to the live MidiNoteRegion
-     *  for the given uuid, or nullptr if the region has been removed
-     *  from the arrangement (lane deletion, region delete, session
-     *  switch).  Called once per paint from PianoRollGrid (Session 1
-     *  commit C) so the pointer lifetime is the single paint pass.
-     *
-     *  StandardContent installs this lambda once ArrangementView's
-     *  findMidiRegion lookup is available (Session 1 commit D). */
+     *  for the given uuid, or nullptr.  Called once per paint from
+     *  PianoRollGrid + once per gesture commit. */
     using RegionResolver = std::function<MidiNoteRegion* (const juce::Uuid&)>;
     void setRegionResolver (RegionResolver resolver) { regionResolver_ = std::move (resolver); }
-
-    /** Returns the installed resolver; empty std::function means
-     *  resolver has not been wired yet (Session 1 commits A/B/C). */
     const RegionResolver& getRegionResolver() const noexcept { return regionResolver_; }
 
-    /** Bind the dock to a specific MIDI region.  Subsequent paint
-     *  passes will look up the live region by this uuid.  Pass
-     *  juce::Uuid::null() to clear the binding (grid then paints the
-     *  empty-state hint). */
+    /** Bind the dock to a specific MIDI region. */
     void setRegion (const juce::Uuid& regionId);
-
-    /** Returns the currently-bound region uuid, or null Uuid when no
-     *  region is bound (initial state, or post-clear). */
     juce::Uuid getBoundRegionId() const noexcept { return boundRegionId_; }
 
-    /** Accessor for the keyboard column.  Returns nullptr only during
-     *  construction / destruction.  PianoRollGrid uses this to read
-     *  the current visible pitch range + per-key dimensions when
-     *  laying out its note rectangles. */
+    /** Accessor for the keyboard column. */
     PianoRollKeyboard* getKeyboard() const noexcept { return keyboard_.get(); }
 
-    /** Drag-handle / close callbacks owned by StandardContent (so the
-     *  parent holds the height field + layout trigger).  `deltaPx` is
-     *  positive when the user is dragging DOWN (dock shrinks) and
-     *  negative when dragging UP (dock grows). */
+    /** Accessor for the grid (used by gesture-commit code to invoke
+     *  region mutation and undo-push paths). */
+    PianoRollGrid* getGrid() const noexcept { return grid_.get(); }
+
+    /** Active tool selection.  Mouse handlers in the grid branch on
+     *  this; selection paint highlights respect it too. */
+    Tool getActiveTool() const noexcept { return activeTool_; }
+    void setActiveTool (Tool t);
+
+    /** Drag-handle / close callbacks owned by StandardContent. */
     std::function<void (int /*deltaPx*/)> onResizeDrag;
     std::function<void()>                  onResizeDragEnd;
     std::function<void()>                  onCloseClicked;
@@ -93,22 +74,31 @@ public:
     static constexpr int kHeaderH      = 22;
     static constexpr int kDragHandleH  = 4;
     static constexpr int kKeyboardW    = 56;
+    static constexpr int kToolBtnW     = 52;
 
 private:
-    Services&   services_;
-    juce::Uuid  boundRegionId_;
+    Services&    services_;
+    juce::Uuid   boundRegionId_;
+    Tool         activeTool_ { Tool::Select };
 
     RegionResolver regionResolver_;
 
     class DragHandle;
     std::unique_ptr<DragHandle>         dragHandle_;
     juce::Label                         regionLabel_;
-    juce::TextButton                    closeBtn_ { "X" };
+    juce::TextButton                    closeBtn_       { "X" };
+    juce::TextButton                    selectBtn_      { "Select" };
+    juce::TextButton                    pencilBtn_      { "Pencil" };
+    juce::TextButton                    eraseBtn_       { "Erase" };
 
     std::unique_ptr<PianoRollKeyboard>  keyboard_;
+    /** juce::Viewport hosting the grid.  Horizontal scrolling only --
+     *  the keyboard column and grid both fill the dock's body height. */
+    std::unique_ptr<juce::Viewport>     gridViewport_;
     std::unique_ptr<PianoRollGrid>      grid_;
 
     void refreshLabel();
+    void syncToolToggles();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PianoRollView)
 };
