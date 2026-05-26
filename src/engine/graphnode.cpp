@@ -11,6 +11,7 @@
 #include "engine/ionode.hpp"
 #include "nodes/audioprocessor.hpp"
 #include "engine/graphnode.hpp"
+#include "services/automation/automation_engine.hpp"
 
 #include <pthread.h>
 #include <sched.h>
@@ -138,6 +139,11 @@ GraphNode::GraphNode (Context& c)
     for (int i = 0; i < IONode::numDeviceTypes; ++i)
         ioNodes[i] = EL_INVALID_PORT;
     setName (EL_GRAPH_NODE_NAME);
+
+    /* Construct the automation engine eagerly so the audio-thread
+     * applyForBlock call in render() never null-checks.  Idle state
+     * (zero tracks) costs ~3 atomic ops per block. */
+    automationEngine_ = std::make_unique<automation::AutomationEngine>();
 }
 
 GraphNode::~GraphNode()
@@ -682,6 +688,42 @@ void GraphNode::render (RenderContext& rc)
     currentAudioInputBuffer = &rc.audio;
     currentAudioOutputBuffer.setSize (jmax (1, rc.audio.getNumChannels()), numSamples);
     currentAudioOutputBuffer.clear();
+
+    /* AutomationEngine per-block pass.  Runs BEFORE renderingOps so
+     * parameter writes land before plugins read them.  Empty-engine
+     * cost is ~3 atomic ops; loaded-engine cost scales with active
+     * track count + active region complexity (one snapshot load +
+     * binary search per active track + per-block dispatch per active
+     * target).  Beats + bpm derived from the same playhead path
+     * audioclip.cpp uses -- absence of a playhead leaves beats == -1
+     * which findActiveRegion correctly returns nullptr for, and
+     * beatsPerBlock == 0 which disables sample-accurate MIDI emission
+     * (engine falls back to coarse single-write for all kinds). */
+    if (automationEngine_ != nullptr)
+    {
+        double currentBeats   = -1.0;
+        double beatsPerBlock  = 0.0;
+        if (auto* ph = getPlayHead())
+        {
+            if (auto pos = ph->getPosition())
+            {
+                if (auto ppq = pos->getPpqPosition())
+                    currentBeats = *ppq;
+
+                const auto bpmOpt   = pos->getBpm();
+                const double bpm    = (bpmOpt.hasValue() ? *bpmOpt : 0.0);
+                const double sr     = getSampleRate();
+                if (sr > 0.0 && bpm > 0.0)
+                    beatsPerBlock = ((double) numSamples / sr) * (bpm / 60.0);
+            }
+        }
+
+        automationEngine_->applyForBlock (currentBeats,
+                                          beatsPerBlock,
+                                          numSamples,
+                                          getSampleRate(),
+                                          &midiMessages);
+    }
 
     if (midiChannels.isOmni() && velocityCurve.getMode() == VelocityCurve::Linear)
     {

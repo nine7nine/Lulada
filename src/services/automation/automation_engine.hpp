@@ -10,6 +10,7 @@
 #include <element/juce/core.hpp>
 #include <element/parameter.hpp>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -114,6 +115,28 @@ public:
     // Audio-thread per-block call.  outMidi may be null when the
     // engine is operating in a no-MIDI-out context this block.
 
+    /** Sub-block sampling stride for sample-accurate MIDI CC emission.
+     *  At 48kHz / 1024-sample blocks, 64-sample stride yields ~16
+     *  events per block per active MIDI-CC target -- well under any
+     *  reasonable MIDI bandwidth ceiling.  Plugin + internal-node
+     *  param targets stay COARSE in Phase 1 (one setValue per block);
+     *  sub-block plugin emission is deferred to Phase 1.5. */
+    static constexpr int kAutomationSubBlockStride = 64;
+
+    /** beatsPerBlock comes from the caller (GraphNode::render uses
+     *  playhead bpm + sample rate to compute it).  Pass 0.0 to skip
+     *  sample-accurate MIDI emission entirely and fall back to single
+     *  setValue at frame offset 0 for ALL target kinds -- useful when
+     *  the playhead has no tempo info (test bench, no transport). */
+    void applyForBlock (double currentBeats,
+                        double beatsPerBlock,
+                        int    numSamples,
+                        double sampleRate,
+                        juce::MidiBuffer* outMidi) noexcept;
+
+    /** Convenience overload: derives beatsPerBlock from the playhead-
+     *  reported bpm via beatsPerBlock = (numSamples / sampleRate) *
+     *  (bpm / 60).  Pass bpm <= 0 to disable SA MIDI emission. */
     void applyForBlock (double currentBeats,
                         int    numSamples,
                         double sampleRate,
@@ -126,6 +149,62 @@ public:
     // configured" case). */
 
     bool isMappingMuted (int slotIndex) const noexcept;
+
+    /** Lookup the mute state by plugin parameter pointer.  Called by
+     *  MappingEngine handlers (MIDI thread) before each
+     *  setValueNotifyingHost write.  Fast path: cheap atomic load on
+     *  activeTrackCount_ short-circuits to false when zero tracks
+     *  are bound -- the common "no automation configured" case.
+     *
+     *  Slow path: takes a brief juce::CriticalSection (PI-correct on
+     *  PREEMPT_RT) + walks ownedTracks_ for a matching binding.  O(N)
+     *  in track count; bounded by user-bound automation tracks
+     *  (typically <100).  Tolerates UI-thread bind/unbind racing
+     *  against this lookup -- both operations take the same lock. */
+    bool isMappingMutedForPluginParam (juce::AudioProcessorParameter* p) const noexcept;
+
+    /** Same as above for element::Parameter (internal node params). */
+    bool isMappingMutedForNodeParam (element::Parameter* p) const noexcept;
+
+    /** Cheap atomic snapshot of the bound-track count.  MIDI thread
+     *  uses this to skip the lock entirely in the common "no
+     *  automation" case. */
+    int activeTrackCount() const noexcept
+    {
+        return activeTrackCount_.load (std::memory_order_acquire);
+    }
+
+    /** Drain in-flight MIDI-thread lookups by acquiring + releasing
+     *  the lookupLock_.  Called by the engine owner (e.g. RootGraph)
+     *  during teardown, AFTER the MappingEngine's engine pointer has
+     *  been cleared to nullptr -- guarantees no MIDI handler is mid-
+     *  deref when the engine is destroyed.  Acquires the same PI-
+     *  correct lock the MIDI lookups use; brief contention. */
+    void drainPendingLookups() noexcept
+    {
+        const juce::ScopedLock sl (lookupLock_);
+        (void) sl;
+    }
+
+    //==========================================================================
+    // Session XML persistence.  Pure data round-trip -- the engine
+    // doesn't know about Session's lifecycle (save/load triggers are
+    // wired in Phase 4 when the UI work needs them).
+
+    /** Save all owned tracks to a child ValueTree under root tagged
+     *  tags::automationTracks.  Overwrites the existing child if
+     *  present.  No-op if zero tracks bound (no child added). */
+    void saveToValueTree (juce::ValueTree& root) const;
+
+    /** Clear current state + reconstruct AutomationTracks from a
+     *  tags::automationTracks child of root.  Missing child = empty
+     *  engine (backwards-compat: legacy sessions just load as if no
+     *  automation existed).  Target binding (live AutomationTarget
+     *  pointers + mute slot allocation) is NOT performed here -- the
+     *  caller is responsible for resolving each track's
+     *  targetKey to a live binding via bindXxx() after load,
+     *  typically driven by a Phase 4 session-load hook. */
+    void loadFromValueTree (const juce::ValueTree& root);
 
     //==========================================================================
     // Message-thread cleanup.  Reclaims trashed track-list snapshots,
@@ -150,14 +229,33 @@ private:
      *  retiredTargets_ for epoch-gated reclaim. */
     void publishTarget (AutomationTrack* track, std::unique_ptr<AutomationTarget> target);
 
+    /* MIDI-thread lookup lock.  PI-correct juce::CriticalSection.
+     * Acquired by isMappingMutedForXxx (MIDI thread, per CC event)
+     * AND by addTrack / removeTrack / bindXxx / unbindTarget (UI
+     * thread, rare).  NEVER acquired on the audio thread. */
+    mutable juce::CriticalSection                  lookupLock_;
+
+    /* Cheap "no tracks at all" short-circuit for MIDI thread.  When
+     * zero, MIDI handlers skip the lock + walk entirely. */
+    std::atomic<int>                               activeTrackCount_ { 0 };
+
     /* Owned storage (UI-thread mutated only).  Audio thread never
      * reads these directly. */
     std::vector<std::unique_ptr<AutomationTrack>>  ownedTracks_;
     std::vector<std::unique_ptr<AutomationTarget>> ownedTargets_;
-    /* Mute slots: one std::atomic<bool> per allocated slot.  Indexed
-     * by the slot index stored on each AutomationTrack.  unique_ptr
-     * so the atomic<bool>'s address is stable across vector growth. */
-    std::vector<std::unique_ptr<std::atomic<bool>>> muteSlots_;
+
+    /* Fixed-size mute-slot table.  Avoids std::vector reallocation
+     * race against concurrent audio-thread reads.  256 slots is well
+     * above typical per-session automation target counts; ensureMuteSlot
+     * silently no-ops past the cap (track stays unmutable from
+     * MappingEngine's perspective -- it can still automate, just
+     * won't fight MIDI mapping for that target). */
+    static constexpr int kMaxMuteSlots = 256;
+    std::array<std::atomic<bool>, kMaxMuteSlots>   muteSlots_ {};
+
+    /* Slot allocation cursor.  fetch_add for atomic claim; never
+     * shrinks (slots are stable for the engine's lifetime). */
+    std::atomic<int>                               muteSlotCount_ { 0 };
 
     /* Published live track-pointer snapshot.  Pre-published empty so
      * audio thread never sees null. */

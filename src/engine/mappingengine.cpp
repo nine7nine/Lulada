@@ -4,6 +4,7 @@
 #include <element/processor.hpp>
 #include "engine/mappingengine.hpp"
 #include "engine/midiengine.hpp"
+#include "services/automation/automation_engine.hpp"
 #include <element/controller.hpp>
 #include <element/node.hpp>
 
@@ -26,13 +27,15 @@ struct MidiNoteControllerMap : public ControllerMapHandler,
     MidiNoteControllerMap (const Control& ctl,
                            const MidiMessage& message,
                            const Node& _node,
-                           const int _parameter)
+                           const int _parameter,
+                           MappingEngine& _mapping)
         : control (ctl),
           model (_node),
           node (_node.getObject()),
           parameter (nullptr),
           parameterIndex (_parameter),
-          noteNumber (message.getNoteNumber())
+          noteNumber (message.getNoteNumber()),
+          mappingEngine (_mapping)
     {
         jassert (message.isNoteOn());
         jassert (node);
@@ -87,18 +90,34 @@ struct MidiNoteControllerMap : public ControllerMapHandler,
 
         if (parameter != nullptr)
         {
-            parameter->beginChangeGesture();
-            if (momentary.get() == 0)
+            /* Defer to automation when an AutomationTrack in Read mode
+             * has this parameter bound -- automation wins over live
+             * MIDI mapping for that target this block.  Engine
+             * pointer comes from the MappingEngine (wired by
+             * RootGraph at construction).  Fast path short-circuits
+             * to false when activeTrackCount is zero (cheap atomic
+             * load inside isMappingMutedForNodeParam). */
+            const bool muted = [&]
             {
-                parameter->setValueNotifyingHost (parameter->getValue() < 0.5 ? 1.f : 0.f);
-            }
-            else
-            {
-                const bool onOrOff = isInverse ? message.isNoteOff() : message.isNoteOn();
-                parameter->setValueNotifyingHost (onOrOff ? 1.f : 0.f);
-            }
+                auto* eng = mappingEngine.getAutomationEngine();
+                return eng != nullptr && eng->isMappingMutedForNodeParam (parameter.get());
+            }();
 
-            parameter->endChangeGesture();
+            if (! muted)
+            {
+                parameter->beginChangeGesture();
+                if (momentary.get() == 0)
+                {
+                    parameter->setValueNotifyingHost (parameter->getValue() < 0.5 ? 1.f : 0.f);
+                }
+                else
+                {
+                    const bool onOrOff = isInverse ? message.isNoteOff() : message.isNoteOn();
+                    parameter->setValueNotifyingHost (onOrOff ? 1.f : 0.f);
+                }
+
+                parameter->endChangeGesture();
+            }
         }
         else if (parameterIndex == Processor::EnabledParameter || parameterIndex == Processor::BypassParameter || parameterIndex == Processor::MuteParameter)
         {
@@ -176,6 +195,8 @@ private:
     SpinLock eventLock;
     MidiMessage lastEvent;
 
+    MappingEngine& mappingEngine;
+
     void valueChanged (Value& value) override
     {
         if (channelObject.refersToSameSourceAs (value))
@@ -200,8 +221,9 @@ struct MidiCCControllerMapHandler : public ControllerMapHandler,
     MidiCCControllerMapHandler (const Control& ctl,
                                 const MidiMessage& message,
                                 const Node& _node,
-                                const int _parameter)
-        : control (ctl), model (_node), node (_node.getObject()), parameter (nullptr), controllerNumber (message.getControllerNumber()), parameterIndex (_parameter)
+                                const int _parameter,
+                                MappingEngine& _mapping)
+        : control (ctl), model (_node), node (_node.getObject()), parameter (nullptr), controllerNumber (message.getControllerNumber()), parameterIndex (_parameter), mappingEngine (_mapping)
     {
         jassert (message.isController());
         jassert (node != nullptr);
@@ -252,9 +274,21 @@ struct MidiCCControllerMapHandler : public ControllerMapHandler,
 
         if (nullptr != parameter)
         {
-            parameter->beginChangeGesture();
-            parameter->setValueNotifyingHost (static_cast<float> (ccValue) / 127.f);
-            parameter->endChangeGesture();
+            /* Same automation-mute gate as the note handler -- skip
+             * the live CC write when an AutomationTrack in Read mode
+             * has this parameter bound this block. */
+            const bool muted = [&]
+            {
+                auto* eng = mappingEngine.getAutomationEngine();
+                return eng != nullptr && eng->isMappingMutedForNodeParam (parameter.get());
+            }();
+
+            if (! muted)
+            {
+                parameter->beginChangeGesture();
+                parameter->setValueNotifyingHost (static_cast<float> (ccValue) / 127.f);
+                parameter->endChangeGesture();
+            }
         }
         else if (parameterIndex == Processor::EnabledParameter || parameterIndex == Processor::BypassParameter || parameterIndex == Processor::MuteParameter)
         {
@@ -352,6 +386,8 @@ private:
     const int controllerNumber { -1 };
     const int parameterIndex { -1 };
     int lastControllerValue = 0;
+
+    MappingEngine& mappingEngine;
 
     Value toggleValueObject;
     Atomic<int> toggleValue { 64 };
@@ -611,9 +647,9 @@ bool MappingEngine::addHandler (const Control& control,
             std::unique_ptr<ControllerMapHandler> handler;
 
             if (message.isController())
-                handler.reset (new MidiCCControllerMapHandler (control, message, node, parameter));
+                handler.reset (new MidiCCControllerMapHandler (control, message, node, parameter, *this));
             else if (message.isNoteOn())
-                handler.reset (new MidiNoteControllerMap (control, message, node, parameter));
+                handler.reset (new MidiNoteControllerMap (control, message, node, parameter, *this));
 
             if (nullptr != handler)
             {
