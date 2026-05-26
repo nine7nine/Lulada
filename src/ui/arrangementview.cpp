@@ -893,16 +893,21 @@ public:
             return;
         }
 
-        /* MIDI lane: double-click anywhere on a MIDI region surfaces
-         * the bottom-attached piano-roll dock bound to this region.
-         * Sibling of the tracker branch above; MIDI lanes have no
-         * targetNodeUuid in Phase 2 (paint-only, no backing graph
-         * node) so the binding is by region uuid, not node uuid. */
+        /* MIDI lane: double-click on a region surfaces the bottom
+         * piano-roll dock bound to that region.  Double-click on
+         * empty area of the MIDI lane creates a fresh empty MIDI
+         * region at the clicked beat (snapped to bar) + opens the
+         * piano-roll on it.  This is the create-from-scratch path
+         * that matches the real-DAW workflow -- load-a-.mid is
+         * supported but atypical. */
         {
             const auto& lane = owner.lanes_.getReference (laneIdx);
             if (lane.kind == Lane::Kind::Midi)
             {
                 const double beat = (e.x - kLabelW) / (double) kPxPerBeat;
+                if (beat < 0.0) return;
+
+                /* Region hit -- open piano-roll on it. */
                 for (const auto& mp : lane.playlist.midiRegions())
                 {
                     if (mp == nullptr) continue;
@@ -913,6 +918,26 @@ public:
                             ViewHelpers::findContentComponent (this)))
                         sc->showPianoRollForRegion (m.id);
                     return;
+                }
+
+                /* Empty MIDI lane area -- create a fresh region.
+                 * Snap the click beat down to the nearest bar so
+                 * created regions align to the grid by default;
+                 * default length is one bar (BPM-current). */
+                const int beatsPerBar = owner.monitor_ != nullptr
+                    ? juce::jmax (1, (int) owner.monitor_->beatsPerBar.get())
+                    : 4;
+                const double snappedStart =
+                    std::floor (beat / beatsPerBar) * beatsPerBar;
+                const double defaultLen   = (double) beatsPerBar;
+
+                const juce::Uuid newId =
+                    owner.createEmptyMidiRegion (laneIdx, snappedStart, defaultLen);
+                if (! newId.isNull())
+                {
+                    if (auto* sc = dynamic_cast<StandardContent*> (
+                            ViewHelpers::findContentComponent (this)))
+                        sc->showPianoRollForRegion (newId);
                 }
                 return;
             }
@@ -4331,6 +4356,38 @@ bool ArrangementView::importMidiFileToLane (const juce::File& file,
         body_->repaintLane (laneIdx);
     }
     return true;
+}
+
+juce::Uuid ArrangementView::createEmptyMidiRegion (int    laneIdx,
+                                                     double positionBeats,
+                                                     double lengthBeats)
+{
+    if (laneIdx < 0 || laneIdx >= lanes_.size())
+        return juce::Uuid::null();
+
+    auto& lane = lanes_.getReference (laneIdx);
+    if (lane.kind != Lane::Kind::Midi)
+        return juce::Uuid::null();
+
+    auto region = std::make_unique<MidiNoteRegion>();
+    region->id            = juce::Uuid();
+    region->positionBeats = juce::jmax (0.0, positionBeats);
+    region->lengthBeats   = juce::jmax (0.25, lengthBeats);
+    region->name          = juce::String ("MIDI ") + juce::String (lane.playlist.midiRegions().size() + 1);
+
+    const juce::Uuid newId = region->id;
+
+    if (! lane.playlist.addMidiRegion (std::move (region)))
+        return juce::Uuid::null();
+
+    publishMidiBindingsForLane (laneIdx);
+    writeLanesToSession();
+    if (body_ != nullptr)
+    {
+        body_->resizeForLanes();
+        body_->repaintLane (laneIdx);
+    }
+    return newId;
 }
 
 void ArrangementView::publishMidiBindingsForLane (int laneIdx)

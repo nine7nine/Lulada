@@ -109,6 +109,16 @@ public:
      *  of Phase 3 Session 1). */
     MidiNoteRegion* findMidiRegion (const juce::Uuid& regionId) noexcept;
 
+    /** Create an empty MIDI region on the lane at `laneIdx`.  This
+     *  is the primary author-from-scratch path -- matches the real-
+     *  DAW workflow where the user creates a region then opens the
+     *  piano-roll to add notes.  Returns the new region's uuid on
+     *  success, juce::Uuid::null() on failure (lane index out of
+     *  range, lane not MIDI, region overlap rejected by Playlist). */
+    juce::Uuid createEmptyMidiRegion (int    laneIdx,
+                                       double positionBeats,
+                                       double lengthBeats);
+
     /** Republish the MidiPlayerNode region bindings for the lane at
      *  `laneIdx`.  Called by the piano-roll edit gestures + by
      *  rescanLaneTargets after a fresh MidiPlayerNode is bound.  No-op
