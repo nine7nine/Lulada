@@ -29,6 +29,7 @@ void MidiPlayerNode::prepareToRender (double sampleRate, int maxBufferSize)
     currentSampleRate_ = sampleRate;
     currentBlockSize_  = maxBufferSize;
     lastPlayingState_  = false;
+    lastMutedState_    = false;
     held_.reset();
 }
 
@@ -155,7 +156,13 @@ void MidiPlayerNode::render (RenderContext& rc)
 
     /* Audio thread always clears its output buffer at block start --
      * we don't forward anything from upstream (no MIDI input on this
-     * node).  refreshPorts() reserves output port 0 only. */
+     * node).  refreshPorts() reserves output port 0 only.  Reserve
+     * a generous initial capacity so the addEvent hot path doesn't
+     * realloc under the busiest plausible block (32 regions x ~16
+     * sub-block events each).  juce::MidiBuffer::ensureSize is a
+     * no-op once the underlying buffer is at least the requested
+     * size, so this is one branch on the steady-state path. */
+    out->ensureSize (2048);
     out->clear();
 
     const int nsamples = rc.audio.getNumSamples();
@@ -165,6 +172,22 @@ void MidiPlayerNode::render (RenderContext& rc)
      * block see the bumped value but the snapshot pointer they got
      * was published BEFORE the bump, so it stays valid. */
     audioEpoch_.fetch_add (1, std::memory_order_acq_rel);
+
+    /* Mute gate.  The graph-builder mute path applies gain ramps to
+     * AUDIO buffers only -- MIDI output is unaffected unless this
+     * node consults isMuted() itself.  Same shape as transport stop:
+     * on the mute transition, flush every held NoteOn so downstream
+     * synth voices don't hang. */
+    const bool muted = isMuted();
+    if (muted)
+    {
+        if (! lastMutedState_)
+            emitAllNotesOff (*out, 0);
+        lastMutedState_  = true;
+        lastPlayingState_ = false;
+        return;
+    }
+    lastMutedState_ = false;
 
     /* Read transport state once at the top.  No playhead / no
      * play position means "stopped" -- emit all-notes-off for any
@@ -197,7 +220,17 @@ void MidiPlayerNode::render (RenderContext& rc)
     }
 
     const EntryList* entries = activeEntries_.load (std::memory_order_acquire);
-    if (entries == nullptr || entries->empty()) return;
+    if (entries == nullptr || entries->empty())
+    {
+        /* No bound regions but transport is playing -- if we have
+         * lingering held notes from a region that was just unbound
+         * (region delete during playback), emit a flush so the
+         * downstream synth doesn't hang.  Cheap: held_.any() is a
+         * single 256-byte scan + branch. */
+        if (held_.any())
+            emitAllNotesOff (*out, 0);
+        return;
+    }
 
     for (const auto& entry : *entries)
     {

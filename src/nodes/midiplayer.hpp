@@ -149,6 +149,7 @@ private:
     double              currentSampleRate_ { 48000.0 };
     int                 currentBlockSize_  { 1024 };
     bool                lastPlayingState_  { false };
+    bool                lastMutedState_    { false };
 
     /** Active entry table (atomic pointer).  Always non-null after
      *  ctor publishes an empty table. */
