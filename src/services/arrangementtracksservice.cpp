@@ -425,6 +425,17 @@ ArrangementTracksService::migrateMultiTrackSubgraph (EngineService& engine,
             != juce::String (EL_NODE_ID_ARRANGEMENT_TRACKS))
         return;
 
+    /* Lock the display name back to "Multi-Track" on every migrate
+     * pass.  Without this, a user-typo rename (e.g. "Multi-Tracks"
+     * plural, "MultiTrack" without hyphen, "MT" abbreviated) sticks
+     * across sessions and the patchbay breadcrumb shows the typo'd
+     * label forever.  Per user direction 2026-05-26: this subgraph
+     * should always be called Multi-Track.  Idempotent: skipped
+     * when the name already matches. */
+    Node mut (subgraph);
+    if (mut.getName() != "Multi-Track")
+        mut.setName ("Multi-Track");
+
     migrateExistingSubgraph (engine, subgraph);
 }
 
