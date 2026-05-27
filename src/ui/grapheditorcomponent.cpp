@@ -1220,6 +1220,20 @@ void GraphEditorComponent::valueTreeChildAdded (ValueTree& parent, ValueTree& ch
 {
     if (child.hasType (types::Node))
     {
+        /* JUCE ValueTree::Listener fires for adds anywhere in the
+         * subtree -- including grandchildren of subgraphs.  If we
+         * unconditionally create a BlockComponent for any Node-typed
+         * child, every subgraph-internal node spawn produces a
+         * PHANTOM block on the parent graph + clobbers the spawned
+         * node's tags::x / tags::y with our stale lastDropX/Y.
+         *
+         * The block I should create here is only for nodes added as
+         * DIRECT children of MY graph's nodes tree.  Subgraph adds
+         * are the inner subgraph editor's responsibility (it sets a
+         * separate listener when the user navigates into it). */
+        if (parent != graph.getNodesValueTree())
+            return;
+
         child.setProperty (tags::x, verticalLayout ? lastDropX : lastDropY, 0);
         child.setProperty (tags::y, verticalLayout ? lastDropY : lastDropX, 0);
         auto* comp = createBlock (Node (child, false));
@@ -1232,6 +1246,13 @@ void GraphEditorComponent::valueTreeChildAdded (ValueTree& parent, ValueTree& ch
     }
     else if (child.hasType (tags::ports))
     {
+        /* Ports children can also bubble up from subgraph IO nodes.
+         * Same defensive scope -- only react when the ports child
+         * belongs to a node in MY graph (i.e. parent.getParent()
+         * is my nodes tree). */
+        if (parent.getParent() != graph.getNodesValueTree())
+            return;
+
         const Node node (parent, false);
         for (int i = 0; i < getNumChildComponents(); ++i)
             if (auto* const filter = dynamic_cast<BlockComponent*> (getChildComponent (i)))
