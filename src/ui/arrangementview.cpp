@@ -197,11 +197,6 @@ public:
     {
         g.fillAll (Colors::contentBackgroundColor);
 
-        /* Ruler at the top, ahead of any lanes; matches tracker
-         * gutter colour for visual continuity with the rest of
-         * Element's timeline-style views. */
-        paintRuler (g);
-
         const int laneCount = owner.lanes_.size();
         /* Viewport-clip skip: at high lane counts + zoomed-in vertical
          * extent, the dirty rect from a scroll / playhead / zoom only
@@ -230,13 +225,14 @@ public:
 
         /* Range overlay -- drawn over all lanes so it reads as a
          * timeline-wide selection.  Loop-armed range gets a brighter
-         * outline + tinted fill; plain range gets a softer wash. */
+         * outline + tinted fill; plain range gets a softer wash.  The
+         * ruler-row band + LOOP badge are painted by paintRuler so
+         * they follow the sticky ruler's vertical position. */
         if (rangeActive_ && rangeEnd_ > rangeStart_)
         {
             const int xs = kLabelW + (int) (rangeStart_ * kPxPerBeat);
             const int xe = kLabelW + (int) (rangeEnd_   * kPxPerBeat);
             const int w  = juce::jmax (1, xe - xs);
-            const int yTop  = 0;
             const int yLanes = kRulerH + juce::jmax (1, laneCount) * kLaneH;
 
             const juce::Colour fillCol = loopActive_
@@ -246,31 +242,16 @@ public:
                 ? juce::Colour::fromRGB (110, 220, 130)
                 : juce::Colour::fromRGB (170, 200, 240);
 
-            /* Ruler-row band (brighter, marks the range as a loop
-             * marker when looping is on). */
-            g.setColour (loopActive_
-                            ? juce::Colour::fromRGBA (90, 200, 110, 130)
-                            : juce::Colour::fromRGBA (140, 170, 210, 100));
-            g.fillRect (xs, yTop, w, kRulerH);
-
             /* Lane-area wash. */
             g.setColour (fillCol);
             g.fillRect (xs, kRulerH, w, juce::jmax (0, yLanes - kRulerH));
 
-            /* Edges -- 1 px vertical lines at start + end. */
+            /* Edges -- 1 px vertical lines at start + end across the
+             * lane area; the ruler paints its own band edges so they
+             * track the sticky scroll offset. */
             g.setColour (edgeCol);
-            g.drawVerticalLine (xs,        (float) yTop, (float) yLanes);
-            g.drawVerticalLine (xe - 1,    (float) yTop, (float) yLanes);
-
-            /* Loop badge in the ruler row when loop is on. */
-            if (loopActive_)
-            {
-                g.setColour (juce::Colours::black);
-                g.setFont (monoFont (
-                                              9.0f, juce::Font::bold));
-                g.drawText ("LOOP", xs + 4, 2, juce::jmin (40, w - 8), kRulerH - 4,
-                            juce::Justification::centredLeft, false);
-            }
+            g.drawVerticalLine (xs,        (float) kRulerH, (float) yLanes);
+            g.drawVerticalLine (xe - 1,    (float) kRulerH, (float) yLanes);
         }
 
         if (dropHover_)
@@ -322,6 +303,12 @@ public:
                 g.drawRect (ghost, 2);
             }
         }
+
+        /* Sticky ruler.  Painted LAST so it overlays whatever lane
+         * content sits under it once the viewport scrolls down.
+         * paintRuler offsets the LCD strip by the viewport's vertical
+         * scroll so it always reads at the visible top of the body. */
+        paintRuler (g, owner.viewport_.getViewPositionY());
     }
 
     //==========================================================================
@@ -2857,6 +2844,29 @@ public:
     //==========================================================================
     // Layout helpers
 
+    /** Beat at which the live recording placeholder currently ends.
+     *  Used by resizeForLanes + body_resizeNeeded so the body width
+     *  grows in real time as the playhead extends past the previous
+     *  edge -- otherwise the ruler / placeholder freeze at the old
+     *  size until the AudioClipNode commit hands back a finalised
+     *  Region.  Returns 0.0 unless transport is recording AND at
+     *  least one audio lane is armed. */
+    double liveRecordingEnd() const noexcept
+    {
+        if (owner.monitor_ == nullptr) return 0.0;
+        if (! owner.monitor_->recording.get()) return 0.0;
+        bool anyArmed = false;
+        for (int i = 0; i < owner.lanes_.size(); ++i)
+        {
+            if (i >= owner.laneRuntime_.size()) break;
+            const auto& l  = owner.lanes_.getReference (i);
+            const auto& rs = owner.laneRuntime_.getReference (i);
+            if (rs.isAudioLane() && l.armed) { anyArmed = true; break; }
+        }
+        if (! anyArmed) return 0.0;
+        return juce::jmax (0.0, owner.lastBeat_);
+    }
+
     void resizeForLanes()
     {
         /* Floor + per-lane padding tuned to keep the strip flush with
@@ -2883,8 +2893,23 @@ public:
             const int needed = (int) end + kFitPaddingBeats;
             if (needed > maxBeats) maxBeats = needed;
         }
+        /* Live recording end overrides the static region scan -- the
+         * placeholder grows past the last committed region. */
+        const double recEnd = liveRecordingEnd();
+        if (recEnd > 0.0)
+        {
+            const int recNeeded = (int) recEnd + kFitPaddingBeats;
+            if (recNeeded > maxBeats) maxBeats = recNeeded;
+        }
         const int w = kLabelW + maxBeats * kPxPerBeat;
-        const int h = kRulerH + juce::jmax (kLaneH, owner.lanes_.size() * kLaneH);
+        /* Sticky ruler reserves an extra kRulerH at the bottom so the
+         * user can scroll the last lane fully into view without the
+         * sticky overlay clipping its top.  Without this padding, the
+         * lane at the very bottom never reaches a position where its
+         * top edge is below the sticky ruler band. */
+        const int h = kRulerH
+                       + juce::jmax (kLaneH, owner.lanes_.size() * kLaneH)
+                       + kRulerH;
         if (w != getWidth() || h != getHeight())
             setSize (w, h);
         else
@@ -2948,14 +2973,21 @@ public:
     static constexpr int kThumbnailCacheEntries    = 256;
 
 private:
-    /** Paint the bars:beats ruler row at the top of the strip area.
+    /** Paint the bars:beats ruler row.  rulerY is the body-coord Y
+     *  origin -- the caller passes viewport_.getViewPositionY() so the
+     *  ruler always lands at the visible top of the body, regardless
+     *  of vertical scroll.  Lane content under [rulerY, rulerY+kRulerH]
+     *  is occluded by the LCD strip; the body height reserves an
+     *  extra kRulerH bottom margin so the last lane can still be
+     *  scrolled fully into view.
+     *
      *  LCD-style faceplate matching TransportBar + MainDisplayPanel
      *  (matte-black bezel + cool-grey vertical gradient inside), bar
      *  numbers + ticks in LCD digit blue so the ruler reads as a
      *  hardware-style display flush with the transport cluster.  Bar
      *  count derives from the session's beatsPerBar (default 4 in
      *  4/4). */
-    void paintRuler (Graphics& g)
+    void paintRuler (Graphics& g, int rulerY)
     {
         /* LCD palette: matches the digit blue used in MainDisplayPanel
          * (content.cpp BPM / POS displays) so the ruler + transport
@@ -2970,7 +3002,7 @@ private:
         const juce::Colour kLcdBlueMid  { 0xff'6f'b0'e0 };  // beat tick -- mid
         const juce::Colour kLcdBlueDim  { 0xff'4a'7c'a0 };  // sub-beat tick -- dim
 
-        const Rectangle<int> rulerArea (0, 0, getWidth(), kRulerH);
+        const Rectangle<int> rulerArea (0, rulerY, getWidth(), kRulerH);
 
         /* Outer matte-black bezel, then cool-grey vertical gradient
          * inset by 2 px so the bezel band is visible top + bottom.
@@ -2991,13 +3023,13 @@ private:
 
         /* Hairline below the ruler against the lane bodies. */
         g.setColour (kBezelEdge);
-        g.drawHorizontalLine (kRulerH - 1, 0.0f, (float) getWidth());
+        g.drawHorizontalLine (rulerY + kRulerH - 1, 0.0f, (float) getWidth());
 
         /* Label column header: "Bars:Beats" in LCD blue. */
         g.setColour (kLcdBlue);
         g.setFont (monoFont (10.0f, juce::Font::bold));
         g.drawText ("Bars:Beats",
-                    Rectangle<int> (6, 0, kLabelW - 12, kRulerH),
+                    Rectangle<int> (6, rulerY, kLabelW - 12, kRulerH),
                     juce::Justification::centredLeft, true);
 
         /* Determine beats per bar from the session monitor; fall back
@@ -3057,20 +3089,42 @@ private:
              *   sub  -> short stub at bottom, dim LCD blue */
             int tickTop;
             juce::Colour tickCol;
-            if (atBar)        { tickTop = 3;            tickCol = kLcdBlue;    }
-            else if (atBeat)  { tickTop = kRulerH - 12; tickCol = kLcdBlueMid; }
-            else              { tickTop = kRulerH - 6;  tickCol = kLcdBlueDim; }
+            if (atBar)        { tickTop = rulerY + 3;            tickCol = kLcdBlue;    }
+            else if (atBeat)  { tickTop = rulerY + kRulerH - 12; tickCol = kLcdBlueMid; }
+            else              { tickTop = rulerY + kRulerH - 6;  tickCol = kLcdBlueDim; }
 
             g.setColour (tickCol);
-            g.drawVerticalLine (x, (float) tickTop, (float) (kRulerH - 2));
+            g.drawVerticalLine (x, (float) tickTop, (float) (rulerY + kRulerH - 2));
 
             if (atBar)
             {
                 const int barNum = beat / beatsPerBar + 1;
                 g.setColour (kLcdBlue);
                 g.drawText (juce::String (barNum),
-                            x + 3, 1, 28, kRulerH - 4,
+                            x + 3, rulerY + 1, 28, kRulerH - 4,
                             juce::Justification::topLeft);
+            }
+        }
+
+        /* Range overlay band + LOOP badge -- painted inside the ruler
+         * so it tracks the sticky vertical scroll instead of staying
+         * fixed at body.y=0 (which would scroll off with the lanes). */
+        if (rangeActive_ && rangeEnd_ > rangeStart_)
+        {
+            const int rxs = kLabelW + (int) (rangeStart_ * kPxPerBeat);
+            const int rxe = kLabelW + (int) (rangeEnd_   * kPxPerBeat);
+            const int rw  = juce::jmax (1, rxe - rxs);
+            g.setColour (loopActive_
+                            ? juce::Colour::fromRGBA (90, 200, 110, 130)
+                            : juce::Colour::fromRGBA (140, 170, 210, 100));
+            g.fillRect (rxs, rulerY, rw, kRulerH);
+            if (loopActive_)
+            {
+                g.setColour (juce::Colours::black);
+                g.setFont (monoFont (9.0f, juce::Font::bold));
+                g.drawText ("LOOP", rxs + 4, rulerY + 2,
+                            juce::jmin (40, rw - 8), kRulerH - 4,
+                            juce::Justification::centredLeft, false);
             }
         }
 
@@ -3079,7 +3133,7 @@ private:
         if (phx >= stripX && phx < getWidth())
         {
             g.setColour (Colours::limegreen);
-            g.drawVerticalLine (phx, 0.0f, (float) kRulerH);
+            g.drawVerticalLine (phx, (float) rulerY, (float) (rulerY + kRulerH));
         }
     }
 
@@ -4016,9 +4070,13 @@ private:
         }
     }
 
+public:
     /** Returns true if the body's current size doesn't fit the
      *  current lane content extent (e.g. resize pushed a region past
-     *  the existing total width).  resizeForLanes() recomputes. */
+     *  the existing total width, or live recording grew past it).
+     *  resizeForLanes() recomputes.  Public so ArrangementView's
+     *  timerCallback can gate its growth check on this without
+     *  forcing a full body repaint on every 30 Hz tick. */
     bool body_resizeNeeded() const noexcept
     {
         double maxEnd = 0.0;
@@ -4030,11 +4088,15 @@ private:
                 if (m != nullptr)
                     maxEnd = juce::jmax (maxEnd, m->positionBeats + m->lengthBeats);
         }
-        const int needW = kLabelW + ((int) maxEnd + 8) * kPxPerBeat;
-        const int needH = juce::jmax (kLaneH, owner.lanes_.size() * kLaneH);
+        maxEnd = juce::jmax (maxEnd, liveRecordingEnd());
+        const int needW = kLabelW + ((int) maxEnd + kFitPaddingBeats) * kPxPerBeat;
+        const int needH = kRulerH
+                           + juce::jmax (kLaneH, owner.lanes_.size() * kLaneH)
+                           + kRulerH;
         return needW != getWidth() || needH != getHeight();
     }
 
+private:
     /** Lookup or lazily-create the juce::AudioThumbnail for the given
      *  AudioFileSource uuid.  Returns nullptr if the source isn't
      *  registered (region might point at a missing source, e.g.
@@ -4166,6 +4228,29 @@ private:
 };
 
 /* ===================================================================== */
+
+/* Sticky-ruler scroll follow.  PersistingViewport's visibleAreaChanged
+ * lives here (out of the inline hpp body) so it can repaint the body's
+ * old + new ruler strips by referencing Body::kRulerH directly.  Each
+ * vertical-scroll event invalidates two narrow body regions: the body-
+ * coord row where the LCD strip used to sit (so the lane underneath
+ * paints back through) and the new row (so the LCD strip paints over
+ * the freshly-revealed lane content).  Horizontal-only scrolls bypass
+ * this entirely. */
+void ArrangementView::PersistingViewport::visibleAreaChanged (const juce::Rectangle<int>& newVisibleArea)
+{
+    if (owner.body_ == nullptr) return;
+    owner.writeViewStateToSession();
+    const int newY = newVisibleArea.getY();
+    if (newY != lastScrollY_)
+    {
+        const int w = owner.body_->getWidth();
+        const int h = ArrangementView::Body::kRulerH;
+        owner.body_->repaint (0, lastScrollY_, w, h);
+        owner.body_->repaint (0, newY,         w, h);
+        lastScrollY_ = newY;
+    }
+}
 
 ArrangementView::ArrangementView()
 {
@@ -6039,6 +6124,15 @@ void ArrangementView::timerCallback()
     {
         if (body_ != nullptr)
         {
+            /* Grow the body when the live recording crosses the
+             * current right edge so the ruler + placeholder keep
+             * drawing past the previous extent.  Without this, the
+             * timeline freezes at the last-region width and the
+             * placeholder gets clipped until commit on stop.
+             * body_resizeNeeded gates the call so non-growth ticks
+             * (30 Hz) don't trigger a full-body repaint. */
+            if (recording && body_->body_resizeNeeded())
+                body_->resizeForLanes();
             for (int i = 0; i < lanes_.size(); ++i)
             {
                 const auto& l = lanes_.getReference (i);

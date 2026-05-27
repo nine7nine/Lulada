@@ -345,11 +345,11 @@ private:
     {
         ArrangementView& owner;
         PersistingViewport (ArrangementView& o) : owner (o) {}
-        void visibleAreaChanged (const juce::Rectangle<int>&) override
-        {
-            if (owner.body_ != nullptr)
-                owner.writeViewStateToSession();
-        }
+        /* Defined in arrangementview.cpp so the implementation can
+         * reference Body::kRulerH directly (Body is only forward-
+         * declared in this header). */
+        void visibleAreaChanged (const juce::Rectangle<int>& newVisibleArea) override;
+        int lastScrollY_ { 0 };
     };
     PersistingViewport viewport_ { *this };
     std::unique_ptr<Body> body_;
