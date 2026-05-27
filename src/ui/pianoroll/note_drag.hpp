@@ -61,6 +61,12 @@ public:
     static std::unique_ptr<NoteDrag> makeMarquee (PianoRollGrid&,
                                                     const juce::MouseEvent& e,
                                                     bool                    eraseMode);
+    /** Brush: drag paints fresh notes at every visited (beat-cell,
+     *  pitch) pair, length = current snap division.  All accumulated
+     *  notes commit as a single MidiNoteDiffCommand on mouseUp.  B17. */
+    static std::unique_ptr<NoteDrag> makeBrush   (PianoRollGrid&,
+                                                    MidiNoteRegion&,
+                                                    const juce::MouseEvent& e);
 };
 
 } // namespace element

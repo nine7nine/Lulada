@@ -422,6 +422,128 @@ private:
 };
 
 //==============================================================================
+// NoteDragBrush -- continuous-paint note creation.  As the cursor
+// sweeps grid cells, one note is emitted per unique (beat-cell,
+// pitch) pair.  Notes accumulate in pending_ during the drag; on
+// mouseUp the lot is committed via a single MidiNoteDiffCommand so
+// undo treats the entire stroke as one operation.  B17 in
+// midi-implementation-audit-20260526.md.
+
+class NoteDragBrush final : public NoteDrag
+{
+public:
+    NoteDragBrush (PianoRollGrid& grid, MidiNoteRegion& region,
+                    const juce::MouseEvent& e)
+    {
+        (void) region;
+        if (auto* view = grid.findParentComponentOfClass<PianoRollView>())
+        {
+            regionId_ = view->getBoundRegionId();
+            resolver_ = view->getRegionResolver();
+        }
+        cellLen_ = brushCellLen (grid);
+        emitCellAt (e, grid);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e, PianoRollGrid& grid) override
+    {
+        emitCellAt (e, grid);
+        grid.repaint();
+    }
+
+    void mouseUp (const juce::MouseEvent& /*e*/, PianoRollGrid& grid) override
+    {
+        auto* region = resolver_ ? resolver_ (regionId_) : nullptr;
+        if (region == nullptr) return;
+        if (pending_.empty()) return;
+
+        auto cmd = std::make_unique<MidiNoteDiffCommand> (regionId_, resolver_);
+        const double regionLen = juce::jmax (0.0, region->lengthBeats);
+        for (auto& n : pending_)
+        {
+            /* Clamp each brush note to the remaining region span so a
+             * cell near the right edge doesn't ring past the boundary. */
+            const double maxLen = juce::jmax (0.0, regionLen - n.onBeat);
+            if (maxLen <= 0.0) continue;
+            n.lengthBeats = juce::jmin (n.lengthBeats, maxLen);
+            cmd->recordAdd (*region, n);
+        }
+        commitDiff (grid, std::move (cmd), "Brush MIDI notes");
+    }
+
+    void paintOverlay (juce::Graphics& g, PianoRollGrid& grid) override
+    {
+        const int pxb  = grid.getPxPerBeat();
+        const int rowH = grid.rowHeight();
+        const int h    = juce::jmax (1, rowH - 1);
+        g.setColour (juce::Colours::yellow.withAlpha (0.6f));
+        for (const auto& n : pending_)
+        {
+            const int x = (int) std::round (n.onBeat * pxb);
+            const int w = juce::jmax (2, (int) std::round (n.lengthBeats * pxb));
+            const int y = grid.yForPitch (n.pitch);
+            g.fillRect (x, y, w, h);
+        }
+    }
+
+private:
+    static double brushCellLen (PianoRollGrid& grid)
+    {
+        if (grid.isSnapEnabled() && grid.getSnapDivision() > 0.0)
+            return grid.getSnapDivision();
+        return 0.25;     /* fallback: quarter note */
+    }
+
+    void emitCellAt (const juce::MouseEvent& e, PianoRollGrid& grid)
+    {
+        const double rawBeat = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
+        const double cellBeat = grid.isSnapEnabled()
+            ? juce::jmax (0.0, grid.snapBeat (rawBeat))
+            : juce::jmax (0.0, std::floor (rawBeat / cellLen_) * cellLen_);
+        const int pitch = grid.pitchForY (e.y);
+        if (pitch < 0 || pitch > 127) return;
+
+        /* Deduplicate against the most recent emit AND against the
+         * full pending_ list (so a back-and-forth sweep doesn't double
+         * up).  Linear scan is fine -- a typical brush stroke is
+         * dozens of notes, not thousands. */
+        if (lastCellValid_
+            && juce::approximatelyEqual (cellBeat, lastCellBeat_)
+            && pitch == lastCellPitch_)
+            return;
+        for (const auto& n : pending_)
+            if (n.pitch == pitch && juce::approximatelyEqual (n.onBeat, cellBeat))
+            {
+                lastCellBeat_  = cellBeat;
+                lastCellPitch_ = pitch;
+                lastCellValid_ = true;
+                return;
+            }
+
+        MidiNote n {};
+        n.id          = 0;
+        n.pitch       = pitch;
+        n.velocity    = 100;
+        n.channel     = 1;
+        n.onBeat      = cellBeat;
+        n.lengthBeats = cellLen_;
+        pending_.push_back (n);
+
+        lastCellBeat_  = cellBeat;
+        lastCellPitch_ = pitch;
+        lastCellValid_ = true;
+    }
+
+    juce::Uuid                                regionId_;
+    std::function<MidiNoteRegion* (const juce::Uuid&)> resolver_;
+    std::vector<MidiNote> pending_;
+    double cellLen_       { 0.25 };
+    double lastCellBeat_  { 0.0 };
+    int    lastCellPitch_ { -1 };
+    bool   lastCellValid_ { false };
+};
+
+//==============================================================================
 // Factory.
 
 std::unique_ptr<NoteDrag> NoteDrag::makeMove (PianoRollGrid& grid,
@@ -452,6 +574,13 @@ std::unique_ptr<NoteDrag> NoteDrag::makeMarquee (PianoRollGrid& grid,
                                                    bool eraseMode)
 {
     return std::make_unique<NoteDragMarquee> (grid, e, eraseMode);
+}
+
+std::unique_ptr<NoteDrag> NoteDrag::makeBrush (PianoRollGrid& grid,
+                                                 MidiNoteRegion& region,
+                                                 const juce::MouseEvent& e)
+{
+    return std::make_unique<NoteDragBrush> (grid, region, e);
 }
 
 } // namespace element

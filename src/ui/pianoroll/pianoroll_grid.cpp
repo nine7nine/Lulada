@@ -776,6 +776,15 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
+    /* Brush tool short-circuits hit-test + selection so it always
+     * paints fresh notes regardless of what's underneath the cursor.
+     * No selection update either -- the brush is purely additive. */
+    if (parent_.getActiveTool() == PianoRollView::Tool::Brush)
+    {
+        activeDrag_ = NoteDrag::makeBrush (*this, *region, e);
+        return;
+    }
+
     /* First try the resize handle hit (5 px right edge of any note)
      * regardless of tool -- consistent affordance like all DAWs.
      * Then fall back to body hit + branch on active tool. */
@@ -881,7 +890,9 @@ void PianoRollGrid::mouseMove (const juce::MouseEvent& e)
             return;
         }
     }
-    setMouseCursor (parent_.getActiveTool() == PianoRollView::Tool::Pencil
+    const auto tool = parent_.getActiveTool();
+    setMouseCursor ((tool == PianoRollView::Tool::Pencil
+                     || tool == PianoRollView::Tool::Brush)
                       ? juce::MouseCursor::CrosshairCursor
                       : juce::MouseCursor::NormalCursor);
 }

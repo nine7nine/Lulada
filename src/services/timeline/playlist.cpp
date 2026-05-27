@@ -216,6 +216,89 @@ bool Playlist::removeMidiRegion (juce::Uuid regionId)
     return midiRegions_.size() != before;
 }
 
+std::vector<juce::Uuid> Playlist::displaceMidiRegionsForSpan (double newStart,
+                                                              double newEnd)
+{
+    std::vector<juce::Uuid> touched;
+    if (newEnd <= newStart) return touched;
+
+    /* Snapshot ids BEFORE displacement.  splitMidiRegion appends fresh
+     * regions to midiRegions_; reprocessing those would double-cut. */
+    std::vector<juce::Uuid> originalIds;
+    originalIds.reserve (midiRegions_.size());
+    for (const auto& m : midiRegions_)
+        if (m != nullptr) originalIds.push_back (m->id);
+
+    for (auto id : originalIds)
+    {
+        const auto* eConst = findMidiRegion (id);
+        if (eConst == nullptr) continue;   /* already removed this pass */
+
+        const double eStart = eConst->positionBeats;
+        const double eEnd   = eStart + eConst->lengthBeats;
+        if (eEnd <= newStart || eStart >= newEnd) continue;   /* no overlap */
+
+        const bool startsBeforeNew = eStart < newStart;
+        const bool endsAfterNew    = eEnd   > newEnd;
+
+        if (! startsBeforeNew && ! endsAfterNew)
+        {
+            /* E fully inside N -- delete. */
+            removeMidiRegion (id);
+            touched.push_back (id);
+        }
+        else if (startsBeforeNew && ! endsAfterNew)
+        {
+            /* Trim E's right edge: split at newStart, delete tail. */
+            const auto tailId = splitMidiRegion (id, newStart);
+            if (! tailId.isNull())
+                removeMidiRegion (tailId);
+            else
+                removeMidiRegion (id);   /* split too tight -- drop whole */
+            touched.push_back (id);
+        }
+        else if (! startsBeforeNew && endsAfterNew)
+        {
+            /* Shift E's start to newEnd: split at newEnd, delete head. */
+            const auto tailId = splitMidiRegion (id, newEnd);
+            removeMidiRegion (id);
+            touched.push_back (id);
+            if (! tailId.isNull()) touched.push_back (tailId);
+        }
+        else
+        {
+            /* N fully inside E -- split twice, delete the middle. */
+            const auto midId = splitMidiRegion (id, newStart);
+            if (midId.isNull())
+            {
+                removeMidiRegion (id);
+                touched.push_back (id);
+                continue;
+            }
+            const auto rightId = splitMidiRegion (midId, newEnd);
+            removeMidiRegion (midId);
+            touched.push_back (id);
+            touched.push_back (midId);
+            if (! rightId.isNull()) touched.push_back (rightId);
+        }
+    }
+    return touched;
+}
+
+std::unique_ptr<MidiNoteRegion> Playlist::extractMidiRegion (juce::Uuid regionId)
+{
+    for (auto it = midiRegions_.begin(); it != midiRegions_.end(); ++it)
+    {
+        if (*it != nullptr && (*it)->id == regionId)
+        {
+            auto detached = std::move (*it);
+            midiRegions_.erase (it);
+            return detached;
+        }
+    }
+    return {};
+}
+
 MidiNoteRegion* Playlist::findMidiRegion (juce::Uuid regionId) noexcept
 {
     for (auto& m : midiRegions_)
