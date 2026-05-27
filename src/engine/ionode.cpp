@@ -64,6 +64,16 @@ void IONode::refreshPorts()
     }
 
     setPorts (list);
+    /* Fire portsChanged so the bound NodeModelUpdater rebuilds the
+     * ValueTree's <ports> child + the BlockComponent re-reads its
+     * pin count.  Without this, IONode's internal port list grows
+     * silently when the parent GraphNode resizes its port count
+     * (Multi-Track sub-graph adding clips) but the UI keeps showing
+     * the stale pre-resize pin set -- block.cpp's updatePins reads
+     * from Node::getNumPorts() which is the ValueTree count, not
+     * the Processor's internal list.  GraphNode::setNumPorts emits
+     * portsChanged explicitly; IONode::refreshPorts forgot to. */
+    portsChanged();
 }
 
 void IONode::fillInPluginDescription (PluginDescription& d) const
