@@ -26,33 +26,41 @@ namespace element {
 
 namespace {
 
-/* Multi-Track patchbay layout + wiring helpers.
+/* Multi-Track patchbay helpers.  The Multi-Track is a regular
+ * sub-graph that holds N AudioClipNode children + N MidiPlayerNode
+ * children + 4 IO pseudo-nodes (audio.in/out, midi.in/out).  These
+ * helpers give it smart spawn behaviour:
  *
- * The Multi-Track subgraph is just a regular sub-graph (not a
- * dedicated class -- 6f847bdf and earlier proved a type marker
- * adds nothing observable).  These helpers give it smart defaults
- * that ACTUALLY work:
+ *  - Children land at grid positions (column = ordinal, row by
+ *    kind).  rx/ry threaded through GraphManager::addNode BEFORE
+ *    the BlockComponent is created so the position is visible on
+ *    first paint.  Setting position post-spawn doesn't refresh
+ *    block layout (block.cpp:1365 reads relativeX/Y once, writes
+ *    absolute tags::x/y, then later relative writes are ignored).
  *
- *  - Children spawn at grid positions (column = ordinal, row by
- *    kind).  Position is set via the rx/ry path through
- *    GraphManager::addNode, BEFORE the BlockComponent reads it,
- *    so the placement is visible on first paint.  My earlier
- *    attempt (setRelativePosition after addPlugin) didn't work
- *    because BlockComponent::updatePosition reads relativeX/Y
- *    ONCE then writes absolute tags::x/y; subsequent relative
- *    writes are ignored (see block.cpp:1365-1371).
- *  - Outer audio IO grows to 2*N channels (N audio clips) so
- *    each clip gets its OWN dedicated outer port pair (per-track
- *    direct-outs).  Today's "all clips share ch 0/1" mix-bus
- *    behavior is gone -- 1:1 mapping per user direction
- *    2026-05-26.
- *  - MIDI stays as one shared midi.output IO (Q-S5 resolved).
- *  - On opening an existing Multi-Track subgraph, a migration
- *    pass snaps existing children to grid + rewires them per
- *    the 1:1 model.
+ *  - Outer audio IO grows to 2*N channels as audio clips are
+ *    added so each clip gets its own dedicated outer pair (per-
+ *    track direct-outs, 1:1 mapping -- user direction 2026-05-26).
+ *
+ *  - Each audio clip wires 1:1 to its dedicated outer pair on
+ *    spawn.  Existing clips keep their wiring (growing IO ports
+ *    is append-only, doesn't shift older indices on the IO side).
+ *
+ *  - Parent-graph cables to/from the Multi-Track block are
+ *    snapshotted + replayed around the port-resize -- the resize
+ *    fires removeIllegalConnections on the parent GraphManager,
+ *    which would otherwise nuke the user's external wiring
+ *    because PortCount's port list interleaves inputs-before-
+ *    outputs-per-type, so growing inputs shifts output indices.
+ *
+ *  - MIDI stays as ONE shared midi.output IO (Q-S5).  Wired via
+ *    EngineService::connect(PortType::Midi, ...) -- the audio-
+ *    shortcut connectChannels overload is hardcoded to
+ *    PortType::Audio (engineservice.cpp:487) and never worked
+ *    for MIDI.
  */
 
-/* Grid layout (relative 0..1 coords inside the subgraph canvas):
+/* Grid layout (relative 0..1 coords inside the subgraph canvas).
  *
  *   [audio.in]                              [midi.in]
  *
@@ -78,193 +86,215 @@ float gridXForChild (int ordinal) noexcept
                        kMaxChildX);
 }
 
-/* Snap a node's persisted position so the BlockComponent picks it
- * up on next creation.  We write relativeX/Y AND clear tags::x/y
- * (the absolute cache) so block.cpp:1365's `! node.hasPosition()`
- * branch fires + reads our relative position fresh.  For NEWLY-
- * spawned nodes this isn't needed (rx/ry threaded through the
- * GraphManager::addNode path is sufficient); for MIGRATION of
- * existing nodes the absolute cache HAS to go for the new
- * relative coords to take effect. */
-void snapNodePosition (Node n, float rx, float ry)
-{
-    if (! n.isValid()) return;
-    n.setRelativePosition (rx, ry);
-    n.data().removeProperty (tags::x, nullptr);
-    n.data().removeProperty (tags::y, nullptr);
-}
-
 void placeIONodesAtCorners (const Node& subgraph)
 {
-    snapNodePosition (subgraph.getIONode (PortType::Audio, true  /*input*/),
-                       kIoLeftX,  kIoTopY);
-    snapNodePosition (subgraph.getIONode (PortType::Audio, false /*output*/),
-                       kIoLeftX,  kIoBottomY);
-    snapNodePosition (subgraph.getIONode (PortType::Midi,  true),
-                       kIoRightX, kIoTopY);
-    snapNodePosition (subgraph.getIONode (PortType::Midi,  false),
-                       kIoRightX, kIoBottomY);
+    auto place = [] (Node n, float rx, float ry)
+    {
+        if (n.isValid()) n.setRelativePosition (rx, ry);
+    };
+    place (subgraph.getIONode (PortType::Audio, true  /*input*/),  kIoLeftX,  kIoTopY);
+    place (subgraph.getIONode (PortType::Audio, false /*output*/), kIoLeftX,  kIoBottomY);
+    place (subgraph.getIONode (PortType::Midi,  true),             kIoRightX, kIoTopY);
+    place (subgraph.getIONode (PortType::Midi,  false),            kIoRightX, kIoBottomY);
 }
 
-/* Collect AudioClipNode + MidiPlayerNode children in their
- * current display order (the order they appear in the subgraph's
- * ValueTree, which is the order they were added).  Used by the
- * grid pass + the rewire pass so ordinals agree. */
-std::vector<Node>
-collectChildrenByPluginId (const Node& subgraph, const juce::String& pluginId)
+/* Count children of `subgraph` with the given fileOrIdentifier.
+ * Linear scan; lane counts are tens, fine. */
+int countChildrenByPluginId (const Node& subgraph, const juce::String& pluginId)
 {
-    std::vector<Node> out;
+    int n = 0;
     const int total = subgraph.getNumNodes();
-    out.reserve ((size_t) total);
     for (int i = 0; i < total; ++i)
     {
-        Node child = subgraph.getNode (i);
+        const Node child = subgraph.getNode (i);
         if (child.getProperty (tags::identifier).toString() == pluginId)
-            out.push_back (child);
+            ++n;
     }
-    return out;
+    return n;
 }
 
-std::vector<Node> collectAudioClips (const Node& subgraph)
+int countAudioClips (const Node& subgraph)
 {
-    auto stereo = collectChildrenByPluginId (subgraph,
-                                              juce::String (EL_NODE_ID_AUDIO_CLIP));
-    auto mono   = collectChildrenByPluginId (subgraph,
-                                              juce::String (EL_NODE_ID_AUDIO_CLIP_MONO));
-    stereo.insert (stereo.end(), mono.begin(), mono.end());
-    return stereo;
+    return countChildrenByPluginId (subgraph, juce::String (EL_NODE_ID_AUDIO_CLIP))
+         + countChildrenByPluginId (subgraph, juce::String (EL_NODE_ID_AUDIO_CLIP_MONO));
 }
 
-std::vector<Node> collectMidiPlayers (const Node& subgraph)
+int countMidiPlayers (const Node& subgraph)
 {
-    return collectChildrenByPluginId (subgraph,
-                                       juce::String (EL_NODE_ID_MIDI_PLAYER));
+    return countChildrenByPluginId (subgraph, juce::String (EL_NODE_ID_MIDI_PLAYER));
 }
 
-/* Set the subgraph's outer audio port count.  Triggers the
- * GraphManager's addMissingIONodes pass via portsChanged, which
- * resizes (not destroys) the audio.input + audio.output IO
- * pseudo-nodes to the new channel count.  Existing connections
- * to channels still within range are preserved. */
+/* Walk `node`'s port list + return the channel ordinal (0-based
+ * count within its type+direction group) for the port at the
+ * given absolute index.  Inverse of absPortForChannel below.
+ * Returns -1 if the abs index is out of range. */
+int channelForAbsPort (const Node& node, int absPort) noexcept
+{
+    if (absPort < 0 || absPort >= node.getNumPorts()) return -1;
+    const Port target = node.getPort (absPort);
+    const PortType type = target.getType();
+    const bool isInput = target.isInput();
+    int channel = 0;
+    for (int i = 0; i < absPort; ++i)
+    {
+        const Port p = node.getPort (i);
+        if (p.getType() == type && p.isInput() == isInput)
+            ++channel;
+    }
+    return channel;
+}
+
+/* Inverse of channelForAbsPort: find the absolute port index
+ * matching (type, direction, ordinal).  Used after a port-count
+ * resize to relocate connections by semantic identity instead
+ * of stale absolute indices (PortCount's port list reorders when
+ * counts change -- growing audio inputs shifts where audio
+ * outputs sit). */
+int absPortForChannel (const Node& node, PortType type, int channel, bool isInput) noexcept
+{
+    int count = 0;
+    const int total = node.getNumPorts();
+    for (int i = 0; i < total; ++i)
+    {
+        const Port p = node.getPort (i);
+        if (p.getType() == type && p.isInput() == isInput)
+        {
+            if (count == channel) return i;
+            ++count;
+        }
+    }
+    return -1;
+}
+
+/* Find a child Node of `parent` whose nodeId matches.  Used by
+ * the external-connection replayer to recover the OTHER node
+ * referenced in a snapshotted connection. */
+Node findChildById (const Node& parent, juce::uint32 nodeId)
+{
+    const int n = parent.getNumNodes();
+    for (int i = 0; i < n; ++i)
+    {
+        Node child = parent.getNode (i);
+        if (child.getNodeId() == nodeId) return child;
+    }
+    return Node();
+}
+
+/* Snapshot every connection on the PARENT graph that involves
+ * the given subgraph.  Stored as semantic identity (type +
+ * channel ordinal + direction) so re-applying after a port
+ * resize finds the correct new absolute port indices.  Without
+ * this, GraphNode::setNumPorts triggers removeIllegalConnections
+ * on the parent GraphManager (via the Multi-Track's bound
+ * NodeModelUpdater) and the user's main-graph cables to/from
+ * the Multi-Track block get silently nuked because PortCount
+ * reorders the port list when counts change. */
+struct ExternalConn
+{
+    bool        subIsSrc;
+    juce::uint32 otherNodeId;
+    PortType    type;
+    int         subChannel;
+    int         otherChannel;
+};
+
+std::vector<ExternalConn>
+snapshotExternalConnections (const Node& subgraph)
+{
+    std::vector<ExternalConn> snaps;
+    const Node parentNode = subgraph.getParentGraph();
+    if (! parentNode.isValid()) return snaps;
+    auto* parentGraph = dynamic_cast<GraphNode*> (parentNode.getObject());
+    if (parentGraph == nullptr) return snaps;
+
+    const juce::uint32 subId = subgraph.getNodeId();
+    const int total = parentGraph->getNumConnections();
+    snaps.reserve ((size_t) total);
+
+    for (int i = 0; i < total; ++i)
+    {
+        const auto* c = parentGraph->getConnection (i);
+        if (c == nullptr) continue;
+
+        if (c->sourceNode == subId)
+        {
+            const int subCh   = channelForAbsPort (subgraph, (int) c->sourcePort);
+            const Node other  = findChildById (parentNode, c->destNode);
+            if (! other.isValid() || subCh < 0) continue;
+            const int otherCh = channelForAbsPort (other, (int) c->destPort);
+            if (otherCh < 0) continue;
+            const PortType type = subgraph.getPort ((int) c->sourcePort).getType();
+            snaps.push_back ({ true, c->destNode, type, subCh, otherCh });
+        }
+        else if (c->destNode == subId)
+        {
+            const int subCh   = channelForAbsPort (subgraph, (int) c->destPort);
+            const Node other  = findChildById (parentNode, c->sourceNode);
+            if (! other.isValid() || subCh < 0) continue;
+            const int otherCh = channelForAbsPort (other, (int) c->sourcePort);
+            if (otherCh < 0) continue;
+            const PortType type = subgraph.getPort ((int) c->destPort).getType();
+            snaps.push_back ({ false, c->sourceNode, type, subCh, otherCh });
+        }
+    }
+    return snaps;
+}
+
+void replayExternalConnections (EngineService& engine,
+                                  const Node& subgraph,
+                                  const std::vector<ExternalConn>& snaps)
+{
+    if (snaps.empty()) return;
+    const Node parentNode = subgraph.getParentGraph();
+    if (! parentNode.isValid()) return;
+    const juce::uint32 subId = subgraph.getNodeId();
+
+    for (const auto& s : snaps)
+    {
+        const Node other = findChildById (parentNode, s.otherNodeId);
+        if (! other.isValid()) continue;
+
+        /* Resolve channel ordinals back to absolute port indices on
+         * the post-resize port lists.  If either side's port no
+         * longer exists (e.g. a future shrink path drops channels),
+         * silently skip -- there's no valid connection to restore. */
+        const bool subIsInput = ! s.subIsSrc;
+        const int subAbs      = absPortForChannel (subgraph, s.type,
+                                                    s.subChannel, subIsInput);
+        const bool otherIsInput = s.subIsSrc;
+        const int otherAbs    = absPortForChannel (other, s.type,
+                                                    s.otherChannel, otherIsInput);
+        if (subAbs < 0 || otherAbs < 0) continue;
+
+        const juce::uint32 srcNodeId = s.subIsSrc ? subId : s.otherNodeId;
+        const juce::uint32 srcPort   = (juce::uint32) (s.subIsSrc ? subAbs : otherAbs);
+        const juce::uint32 dstNodeId = s.subIsSrc ? s.otherNodeId : subId;
+        const juce::uint32 dstPort   = (juce::uint32) (s.subIsSrc ? otherAbs : subAbs);
+
+        engine.addConnection (srcNodeId, srcPort, dstNodeId, dstPort, parentNode);
+    }
+}
+
+/* Resize the subgraph's outer audio IO to the given channel
+ * count.  Sync (not async) so the new port topology + IO node
+ * port lists are in place by the time we add the new clip's
+ * wiring.  Triggers portsChanged signals on both the subgraph
+ * GraphNode (parent's NodeModelUpdater + removeIllegalConnections)
+ * and each IO pseudo-node (the inside-view BlockComponent
+ * refresh path -- see IONode::refreshPorts portsChanged emit). */
 void setSubgraphAudioChannels (const Node& subgraph, int channels)
 {
     if (auto* proc = subgraph.getObject())
     {
         if (auto* graph = dynamic_cast<GraphNode*> (proc))
         {
-            const int current = graph->getNumPorts (PortType::Audio, false);
-            if (current == channels) return;
+            const int currentIn  = graph->getNumPorts (PortType::Audio, true);
+            const int currentOut = graph->getNumPorts (PortType::Audio, false);
+            if (currentIn == channels && currentOut == channels) return;
             graph->setNumPorts (PortType::Audio, channels, true,  false /*sync*/);
             graph->setNumPorts (PortType::Audio, channels, false, false /*sync*/);
         }
     }
-}
-
-/* Rewire all AudioClipNode children for 1:1 per-track direct-out
- * mapping.  Tears down every clip's audio connections + rebuilds:
- *   clip[i].input  <- subgraph.audio.input  (channels 2i, 2i+1)
- *   clip[i].output ->  subgraph.audio.output (channels 2i, 2i+1)
- * The subgraph's outer face exposes a stereo pair per clip, so
- * downstream code on the main graph can route each track to its
- * own destination (mastering bus, FX chain, external send, ...)
- * instead of mashing everything into a single shared bus. */
-void rewireAudioClips (EngineService& engine, const Node& subgraph)
-{
-    auto clips = collectAudioClips (subgraph);
-    const int n = (int) clips.size();
-    setSubgraphAudioChannels (subgraph, juce::jmax (kStereoChannels, n * kStereoChannels));
-
-    const Node audioInIO  = subgraph.getIONode (PortType::Audio, true);
-    const Node audioOutIO = subgraph.getIONode (PortType::Audio, false);
-    if (! audioInIO.isValid() || ! audioOutIO.isValid()) return;
-
-    /* Clear every clip's audio connections inside the subgraph,
-     * then rebuild per-ordinal.  disconnectNode walks the parent
-     * graph's connection table so this is safe for clips already
-     * partially-wired (legacy shared-bus connections + any user
-     * manual cables both get cleared). */
-    for (Node& clip : clips)
-        engine.disconnectNode (clip, true /*ins*/, true /*outs*/,
-                                true /*audio*/, false /*midi*/);
-
-    /* Disconnect the IO nodes themselves from each other / from
-     * other targets within the subgraph so previous per-channel
-     * connections don't linger.  Audio IO disconnects only --
-     * MIDI plumbing stays alone (managed by the M1 sink wire
-     * separately). */
-    engine.disconnectNode (audioInIO,  true, true, true, false);
-    engine.disconnectNode (audioOutIO, true, true, true, false);
-
-    for (int i = 0; i < n; ++i)
-    {
-        Node& clip = clips[(size_t) i];
-        const int outerLeft  = i * kStereoChannels;
-        const int outerRight = outerLeft + 1;
-
-        /* Record path: outer audio.input pair -> this clip's
-         * input ports 0/1.  AudioClipNode is stereo; mono variant
-         * just ignores the second channel. */
-        engine.connectChannels (subgraph, audioInIO,  outerLeft,  clip, 0);
-        engine.connectChannels (subgraph, audioInIO,  outerRight, clip, 1);
-
-        /* Playback path: clip output 0/1 -> outer audio.output
-         * pair.  Each clip lands on its OWN outer pair, not a
-         * shared mix bus -- the 1:1 mapping user direction
-         * 2026-05-26 confirmed. */
-        engine.connectChannels (subgraph, clip, 0, audioOutIO, outerLeft);
-        engine.connectChannels (subgraph, clip, 1, audioOutIO, outerRight);
-    }
-}
-
-/* Ensure each MidiPlayerNode is wired to the subgraph's
- * midi.output IO (Option M1 default sink).  Idempotent -- skips
- * players that already have the connection.  Used by both the
- * spawn path + the migration pass. */
-void ensureMidiSinkWires (EngineService& engine, const Node& subgraph)
-{
-    const Node midiOutIO = subgraph.getIONode (PortType::Midi, false);
-    if (! midiOutIO.isValid()) return;
-
-    for (Node& player : collectMidiPlayers (subgraph))
-    {
-        /* connectChannels is idempotent at the addConnection level
-         * (rejects exact duplicates) so re-running this on a
-         * player that's already wired is a no-op. */
-        engine.connectChannels (subgraph, player, 0, midiOutIO, 0);
-    }
-}
-
-/* Grid-snap every existing child of the Multi-Track subgraph so
- * the patchbay opens to a tidy layout instead of the default
- * pile.  Audio clips fill the audio row by ordinal, MIDI players
- * fill the MIDI row, IO nodes get pinned to the corners.  Removes
- * tags::x / tags::y on each child so the new relative position
- * is read by BlockComponent::updatePosition on the next paint
- * (existing absolute coords would otherwise win -- see comment
- * in snapNodePosition). */
-void snapChildrenToGrid (const Node& subgraph)
-{
-    placeIONodesAtCorners (subgraph);
-
-    auto audioClips = collectAudioClips (subgraph);
-    for (size_t i = 0; i < audioClips.size(); ++i)
-        snapNodePosition (audioClips[i], gridXForChild ((int) i), kAudioRowY);
-
-    auto midiPlayers = collectMidiPlayers (subgraph);
-    for (size_t i = 0; i < midiPlayers.size(); ++i)
-        snapNodePosition (midiPlayers[i], gridXForChild ((int) i), kMidiRowY);
-}
-
-/* Full migration pass for an existing Multi-Track subgraph
- * (loaded from a pre-this-commit session, or any session where
- * the layout drifted).  Idempotent: re-running on an already-
- * migrated subgraph snaps identical positions + ensures the
- * same connections still exist. */
-void migrateExistingSubgraph (EngineService& engine, const Node& subgraph)
-{
-    snapChildrenToGrid (subgraph);
-    rewireAudioClips (engine, subgraph);
-    ensureMidiSinkWires (engine, subgraph);
 }
 
 } // namespace
@@ -293,27 +323,18 @@ ArrangementTracksService::findOrCreateSubgraph (EngineService& engine,
     Node existing = findSubgraph (session);
     if (existing.isValid())
     {
-        /* Ensure existing subgraphs get the canonical name on first
-         * touch -- pre-rename sessions just show empty or the
-         * generic plugin id otherwise. */
+        /* Lock canonical name on every lookup -- user-typo renames
+         * persist in the ValueTree and the patchbay breadcrumb shows
+         * the typo across sessions.  Idempotent: skipped when the
+         * name already matches. */
         if (existing.getName() != "Multi-Track")
             existing.setName ("Multi-Track");
-
-        /* Migration pass: snap existing children to the grid,
-         * resize outer audio IO to 2*N (one stereo pair per clip),
-         * rewire clips for 1:1 per-track direct-outs, ensure each
-         * MidiPlayerNode is wired to midi.output (M1).
-         * Idempotent so calling per session-load is safe even after
-         * the layout is already correct -- relative positions don't
-         * change, connections are reasserted but addConnection is
-         * dedupe-safe. */
-        migrateExistingSubgraph (engine, existing);
         return existing;
     }
 
-    /* EngineService::addNode adds to the active root graph by default
-     * (see services/engineservice.cpp:570 -- delegates to addPlugin
-     * which lands on the active controller). */
+    /* Fresh creation.  EngineService::addNode lands on the active
+     * root graph (engineservice.cpp:570 delegates to addPlugin
+     * against the active controller). */
     Node created = engine.addNode (EL_NODE_ID_ARRANGEMENT_TRACKS,
                                    EL_NODE_FORMAT_NAME);
 
@@ -321,22 +342,19 @@ ArrangementTracksService::findOrCreateSubgraph (EngineService& engine,
     {
         created.setName ("Multi-Track");
 
-        /* Fresh subgraph: start with zero outer audio channels
-         * (will grow to 2 on first clip).  Park IO nodes at the
-         * corners so the patchbay opens to a tidy layout when the
-         * user first navigates in.  MIDI ports stay at the
-         * GraphNode default (1 in / 1 out) -- single shared sink
-         * per Q-S5. */
+        /* Fresh subgraph: outer audio starts at 0 channels + grows
+         * as audio clips are added (addAudioClipNode bumps to
+         * 2*N).  MIDI stays at the GraphNode default (1 in / 1 out)
+         * -- single shared sink per Q-S5.  Park IO pseudo-nodes
+         * at the four corners of the patchbay canvas so the
+         * inside view opens tidy. */
         setSubgraphAudioChannels (created, 0);
         placeIONodesAtCorners (created);
     }
 
-    /* Subgraph -> root sink (master Audio Out) wiring intentionally
-     * stays manual.  Per design philosophy, the main graph belongs
-     * to the user; we don't auto-wire anything visible to them.
-     * The user wires the Multi-Track's outer audio pairs to wherever
-     * they want (master, FX chain, external send, ...). */
-
+    /* Subgraph -> root sink wiring stays manual.  The user wires
+     * the Multi-Track's outer audio pairs to whatever they want
+     * (master, FX chain, external send) from the main graph. */
     return created;
 }
 
@@ -353,33 +371,69 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
     desc.pluginFormatName = EL_NODE_FORMAT_NAME;
     desc.name             = stereo ? "Audio Clip" : "Audio Clip (Mono)";
 
-    /* Ordinal of the new clip = existing clip count.  Drives both
-     * the grid column and the outer audio port pair this clip
-     * will be wired to. */
-    const int ordinal = (int) collectAudioClips (subgraph).size();
+    /* Ordinal of the new clip = existing clip count BEFORE spawn.
+     * Drives both the grid column and the outer audio port pair
+     * this clip wires to. */
+    const int ordinal = countAudioClips (subgraph);
     const float rx = gridXForChild (ordinal);
     const float ry = kAudioRowY;
 
-    /* Spawn via the rx/ry-aware overload so the BlockComponent
-     * lands at the right grid column on FIRST paint -- not a
-     * default-centre then async fixup that doesn't actually
-     * refresh (the earlier failure mode). */
+    /* Spawn with rx/ry threaded through GraphManager::addNode so
+     * the BlockComponent lands at the right grid column on FIRST
+     * paint -- BlockComponent::updatePosition reads relativeX/Y
+     * once at construction (block.cpp:1365) so post-spawn
+     * setRelativePosition calls are silently ignored. */
     Node clip = engine.addPlugin (subgraph, desc, rx, ry);
     if (! clip.isValid())
         return clip;
 
-    /* Resize outer audio IO + rewire ALL clips (including the new
-     * one) for 1:1 per-track direct-outs.  Each clip's input pair
-     * comes from its dedicated outer pair on audio.input; output
-     * pair goes to its dedicated outer pair on audio.output.  No
-     * shared mix bus -- downstream user code on the main graph
-     * decides what each pair feeds (master, FX, send, ...).
+    /* Grow outer audio IO to fit the new clip, snapshotting +
+     * replaying parent-graph external connections around the
+     * resize so user cables to/from the Multi-Track block survive.
      *
-     * Full rewire on every add is O(N) connections per add, O(N^2)
-     * across N adds.  N is small (tens, capped by the user's
-     * track count); the connect call is a cheap ValueTree write
-     * + GraphManager bookkeeping.  Re-evaluate if N exceeds ~100. */
-    rewireAudioClips (engine, subgraph);
+     * Why the snapshot/replay: GraphNode::setNumPorts emits
+     * portsChanged which triggers removeIllegalConnections on the
+     * parent GraphManager.  PortCount's port list interleaves
+     * inputs-before-outputs-per-type (portcount.hpp:80-105), so
+     * growing audio inputs shifts the absolute index of audio
+     * outputs (and midi).  Connections stored by abs port index
+     * become invalid + get removed.  Snapshotting by semantic
+     * identity (type + channel ordinal within direction) lets us
+     * replay against the new port list. */
+    {
+        auto snaps = snapshotExternalConnections (subgraph);
+        setSubgraphAudioChannels (subgraph, (ordinal + 1) * kStereoChannels);
+        replayExternalConnections (engine, subgraph, snaps);
+    }
+
+    /* Wire ONLY the new clip to its dedicated outer pair.  Existing
+     * clips keep their wiring -- growing IO ports is append-only
+     * on the IO node side (channels 2N, 2N+1 are NEW; channels 0..2N-1
+     * keep their abs port indices).  No tear-down dance needed.
+     *
+     * Use EngineService::connect (PortType::Audio, ...) -- the
+     * connectChannels shortcut overload (engineservice.cpp:472)
+     * is hardcoded to Audio AND has no port-type discrimination
+     * in its impl which masks failures; connect with explicit type
+     * is the correct path. */
+    const Node audioInIO  = subgraph.getIONode (PortType::Audio, true);
+    const Node audioOutIO = subgraph.getIONode (PortType::Audio, false);
+    if (audioInIO.isValid() && audioOutIO.isValid())
+    {
+        const int outerLeft  = ordinal * kStereoChannels;
+        const int outerRight = outerLeft + 1;
+
+        /* Record path: outer audio.input pair -> this clip's
+         * stereo input.  Mono clip variant ignores the second. */
+        engine.connect (PortType::Audio, audioInIO,  outerLeft,  clip, 0, 1);
+        engine.connect (PortType::Audio, audioInIO,  outerRight, clip, 1, 1);
+
+        /* Playback path: clip's stereo output -> outer audio.output
+         * pair.  Per-track direct-out (1:1 mapping), not shared
+         * mix bus -- user direction 2026-05-26. */
+        engine.connect (PortType::Audio, clip, 0, audioOutIO, outerLeft,  1);
+        engine.connect (PortType::Audio, clip, 1, audioOutIO, outerRight, 1);
+    }
 
     /* Point the new clip's recording target at a session-adjacent
      * "recordings/" directory if the session is saved, else fall
@@ -412,33 +466,6 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
     return clip;
 }
 
-void
-ArrangementTracksService::migrateMultiTrackSubgraph (EngineService& engine,
-                                                       const Node&    subgraph)
-{
-    if (! subgraph.isValid() || ! subgraph.isGraph()) return;
-
-    /* Defensive identifier guard -- callers (GraphEditorComponent
-     * navigation hook) should pre-filter but mis-targets here would
-     * disconnect + rewire arbitrary user subgraphs.  Hard refuse. */
-    if (subgraph.getProperty (tags::identifier).toString()
-            != juce::String (EL_NODE_ID_ARRANGEMENT_TRACKS))
-        return;
-
-    /* Lock the display name back to "Multi-Track" on every migrate
-     * pass.  Without this, a user-typo rename (e.g. "Multi-Tracks"
-     * plural, "MultiTrack" without hyphen, "MT" abbreviated) sticks
-     * across sessions and the patchbay breadcrumb shows the typo'd
-     * label forever.  Per user direction 2026-05-26: this subgraph
-     * should always be called Multi-Track.  Idempotent: skipped
-     * when the name already matches. */
-    Node mut (subgraph);
-    if (mut.getName() != "Multi-Track")
-        mut.setName ("Multi-Track");
-
-    migrateExistingSubgraph (engine, subgraph);
-}
-
 Node
 ArrangementTracksService::addMidiPlayerNode (EngineService& engine,
                                               const Node&    subgraph)
@@ -451,9 +478,9 @@ ArrangementTracksService::addMidiPlayerNode (EngineService& engine,
     desc.pluginFormatName = EL_NODE_FORMAT_NAME;
     desc.name             = "MIDI Player";
 
-    /* Ordinal of the new player = existing player count.  Drives
-     * the grid column on the MIDI row. */
-    const int ordinal = (int) collectMidiPlayers (subgraph).size();
+    /* Ordinal = existing MIDI player count.  Drives the grid
+     * column on the MIDI row. */
+    const int ordinal = countMidiPlayers (subgraph);
     const float rx = gridXForChild (ordinal);
     const float ry = kMidiRowY;
 
@@ -461,14 +488,21 @@ ArrangementTracksService::addMidiPlayerNode (EngineService& engine,
     if (! player.isValid())
         return player;
 
-    /* M1 default MIDI sink: auto-wire to the subgraph's midi.output
-     * IO so the user wires the Multi-Track's outer MIDI face ONCE
-     * to their synth / sampler.  All subsequent MIDI lanes route
-     * through the same sink (multi-source summing handled by JUCE's
-     * graph processor automatically -- no internal MIDI mixer
-     * needed).  Q-S5 resolved 2026-05-26: MIDI stays as one shared
-     * port; protocol-level multi-channel covers the multiplexing. */
-    ensureMidiSinkWires (engine, subgraph);
+    /* M1 default MIDI sink: auto-wire MidiPlayerNode.midi.out ->
+     * subgraph.midi.output IO so the user wires the Multi-Track's
+     * outer MIDI face ONCE to their synth / sampler.  All MIDI
+     * players route through the same sink; JUCE's graph processor
+     * sums MIDI buffers across connections automatically.
+     *
+     * Uses engine.connect (PortType::Midi, ...) -- the
+     * connectChannels shortcut overload is hardcoded to
+     * PortType::Audio (engineservice.cpp:487) and silently fails
+     * for MIDI nodes (the previous M1 wire never actually worked). */
+    const Node midiOutIO = subgraph.getIONode (PortType::Midi, false);
+    if (midiOutIO.isValid())
+    {
+        engine.connect (PortType::Midi, player, 0, midiOutIO, 0, 1);
+    }
 
     return player;
 }
