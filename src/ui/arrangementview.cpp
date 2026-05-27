@@ -739,7 +739,7 @@ public:
              * current selection, or no multi-selection) collapse to
              * single-selection -- same shape as before the multi-drag
              * landed.  Resize gestures stay anchor-only per roadmap
-             * §1.1 (selection-wide resize is awkward + rarely
+             * S1.1 (selection-wide resize is awkward + rarely
              * wanted). */
             if (gesture_.mode == Gesture::Move
                 && isSelected (laneIdx, r.id)
@@ -1325,7 +1325,7 @@ public:
         };
 
         /* Resize gestures stay anchor-only -- selection-wide resize is
-         * awkward + rarely wanted (roadmap §1.1).  Mutate the anchor's
+         * awkward + rarely wanted (roadmap S1.1).  Mutate the anchor's
          * playlist directly; mouseUp persists.  Edge determines which
          * boundary the drag moves -- RightEdge mutates lengthBeats only;
          * LeftEdge also shifts positionBeats + advances startBeats
@@ -1909,6 +1909,83 @@ public:
             return;
         }
     }
+
+    //==========================================================================
+    // Active gesture (move / resize) data.  Declared HERE -- above the
+    // Multi-region gesture helpers -- because those helpers reference
+    // Gesture::Member + Gesture::Kind in their function signatures;
+    // ordinary lookup demands the type be visible at signature time
+    // (only method BODIES get deferred class-scope lookup).  Keep the
+    // rest of the class data section at the bottom.
+    //==========================================================================
+
+    /* Anchor fields describe the region that was clicked; members
+     * describes the full set of regions being moved together (single-
+     * region drag = 1 entry = anchor only; multi-region drag = anchor
+     * + every other selected region).  Resize gestures stay anchor-only
+     * (roadmap S1.1 decision: selection-wide resize is awkward + rarely
+     * wanted).  laneIdx < 0 means no active gesture. */
+    struct Gesture {
+        enum Mode { Move, Resize };
+        enum Kind { Audio, Midi };
+        /* Resize gestures track which edge was grabbed.  Right (default)
+         * mutates lengthBeats; Left also shifts positionBeats + for MIDI
+         * re-bases the note list, for audio advances startBeats (source
+         * offset).  B13 in midi-implementation-audit-20260526.md. */
+        enum Edge { RightEdge, LeftEdge };
+        /* Shift-axis constrain on Move.  Locks the drag to either
+         * horizontal (time) or vertical (lane) once Shift is first
+         * detected; cleared when Shift is released.  Decision is sticky
+         * for the duration of the Shift hold so a small mouse jitter
+         * doesn't flip the lock.  B18. */
+        enum Axis { AxisFree, AxisHorizontal, AxisVertical };
+
+        struct Member {
+            int        laneIdx       = -1;
+            juce::Uuid regionId;
+            double     originalPos   = 0.0;
+            double     originalLen   = 0.0;
+            double     originalStart = 0.0;   /* audio source offset (Region.startBeats) */
+            Kind       kind          = Audio;
+        };
+
+        int        laneIdx         = -1;      /* anchor */
+        juce::Uuid regionId;                   /* anchor */
+        double     originalPos     = 0.0;     /* anchor */
+        double     originalLen     = 0.0;     /* anchor */
+        double     originalStart   = 0.0;     /* anchor audio source offset */
+        double     mouseDownXBeats = 0.0;
+        int        mouseDownYPx    = 0;       /* anchor pixel y for axis lock */
+        Mode       mode            = Move;
+        Edge       edge            = RightEdge;
+        Kind       kind            = Audio;   /* anchor */
+        bool       dragActive      = false;
+
+        /* Multi-region drag.  Populated on mouseDown.  Empty == not
+         * a Move gesture (Resize) or anchor wasn't part of an active
+         * multi-selection.  When populated, the Move path iterates
+         * this list instead of the single-region anchor fields. */
+        std::vector<Member> members;
+
+        /* Live cross-lane state, recomputed every mouseDrag tick.
+         * laneOffset = current target lane delta (anchor's destLane -
+         * anchor's source lane).  crossLaneInvalid = at least one
+         * member would land out-of-bounds, on a wrong-kind lane, OR
+         * (MIDI only) on an overlapping span; ghost paint tints red
+         * and mouseUp refuses + snaps back. */
+        int    laneOffset       = 0;
+        bool   crossLaneInvalid = false;
+        double appliedDelta     = 0.0;        /* snapped beat delta */
+        Axis   axis             = AxisFree;
+
+        /* LeftEdge MIDI resize: pristine note snapshot captured at
+         * mouseDown.  Each drag tick filters + shifts from this list
+         * and publishes -- otherwise notes dropped in tick N stay
+         * dropped on tick N+1 even when the user drags back toward
+         * the original start. */
+        std::vector<MidiNote> originalMidiNotes;
+    };
+    Gesture gesture_;
 
     //==========================================================================
     // Multi-region gesture helpers.  Members are populated on mouseDown;
@@ -4028,75 +4105,6 @@ private:
         std::unique_ptr<MidiNoteRegion> midiRegion;      /* valid if ! isAudio */
     };
     std::vector<ClipboardEntry> clipboard_;
-
-    /* Active gesture (move / resize) -- valid between mouseDown and
-     * mouseUp.  laneIdx < 0 means no gesture.  Anchor fields describe
-     * the region that was clicked; members describes the full set of
-     * regions being moved together (single-region drag = 1 entry =
-     * anchor only; multi-region drag = anchor + every other selected
-     * region).  Resize gestures stay anchor-only (the roadmap §1.1
-     * decision: selection-wide resize is awkward + rarely wanted). */
-    struct Gesture {
-        enum Mode { Move, Resize };
-        enum Kind { Audio, Midi };
-        /* Resize gestures track which edge was grabbed.  Right (default)
-         * mutates lengthBeats; Left also shifts positionBeats + for MIDI
-         * re-bases the note list, for audio advances startBeats (source
-         * offset).  B13 in midi-implementation-audit-20260526.md. */
-        enum Edge { RightEdge, LeftEdge };
-        /* Shift-axis constrain on Move.  Locks the drag to either
-         * horizontal (time) or vertical (lane) once Shift is first
-         * detected; cleared when Shift is released.  Decision is sticky
-         * for the duration of the Shift hold so a small mouse jitter
-         * doesn't flip the lock.  B18. */
-        enum Axis { AxisFree, AxisHorizontal, AxisVertical };
-
-        struct Member {
-            int        laneIdx     = -1;
-            juce::Uuid regionId;
-            double     originalPos = 0.0;
-            double     originalLen = 0.0;
-            double     originalStart = 0.0;  /* audio source offset (Region.startBeats) */
-            Kind       kind        = Audio;
-        };
-
-        int        laneIdx         = -1;     /* anchor */
-        juce::Uuid regionId;                  /* anchor */
-        double     originalPos     = 0.0;     /* anchor */
-        double     originalLen     = 0.0;     /* anchor */
-        double     originalStart   = 0.0;     /* anchor audio source offset */
-        double     mouseDownXBeats = 0.0;
-        int        mouseDownYPx    = 0;       /* anchor pixel y for axis lock */
-        Mode       mode            = Move;
-        Edge       edge            = RightEdge;
-        Kind       kind            = Audio;   /* anchor */
-        bool       dragActive      = false;
-
-        /* Multi-region drag.  Populated on mouseDown.  Empty == not
-         * a Move gesture (Resize) or anchor wasn't part of an active
-         * multi-selection.  When populated, the Move path iterates
-         * this list instead of the single-region anchor fields. */
-        std::vector<Member> members;
-
-        /* Live cross-lane state, recomputed every mouseDrag tick.
-         * laneOffset = current target lane delta (anchor's destLane -
-         * anchor's source lane).  crossLaneInvalid = at least one
-         * member would land out-of-bounds, on a wrong-kind lane, OR
-         * (MIDI only) on an overlapping span; ghost paint tints red
-         * and mouseUp refuses + snaps back. */
-        int    laneOffset       = 0;
-        bool   crossLaneInvalid = false;
-        double appliedDelta     = 0.0;        /* snapped beat delta */
-        Axis   axis             = AxisFree;
-
-        /* LeftEdge MIDI resize: pristine note snapshot captured at
-         * mouseDown.  Each drag tick filters + shifts from this list
-         * and publishes -- otherwise notes dropped in tick N stay
-         * dropped on tick N+1 even when the user drags back toward
-         * the original start. */
-        std::vector<MidiNote> originalMidiNotes;
-    };
-    Gesture gesture_;
 
     /** Live drag of an envelope breakpoint.  Set in mouseDown when
      *  the cursor lands on a breakpoint dot; updated in mouseDrag;
