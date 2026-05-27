@@ -412,6 +412,22 @@ ArrangementTracksService::addAudioClipNode (EngineService& engine,
     return clip;
 }
 
+void
+ArrangementTracksService::migrateMultiTrackSubgraph (EngineService& engine,
+                                                       const Node&    subgraph)
+{
+    if (! subgraph.isValid() || ! subgraph.isGraph()) return;
+
+    /* Defensive identifier guard -- callers (GraphEditorComponent
+     * navigation hook) should pre-filter but mis-targets here would
+     * disconnect + rewire arbitrary user subgraphs.  Hard refuse. */
+    if (subgraph.getProperty (tags::identifier).toString()
+            != juce::String (EL_NODE_ID_ARRANGEMENT_TRACKS))
+        return;
+
+    migrateExistingSubgraph (engine, subgraph);
+}
+
 Node
 ArrangementTracksService::addMidiPlayerNode (EngineService& engine,
                                               const Node&    subgraph)

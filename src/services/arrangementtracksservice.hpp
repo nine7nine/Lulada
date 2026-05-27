@@ -86,6 +86,25 @@ struct ArrangementTracksService
      *  creation failed, node add failed). */
     static bool importAudioFileAsNewLane (const juce::File& file,
                                           Services&         services);
+
+    /** Run the Multi-Track migration pass on an existing subgraph:
+     *  snap-children-to-grid + resize outer audio IO to 2N channels
+     *  + rewire all clips for 1:1 per-track direct-outs + assert
+     *  M1 MIDI sink wires.  Idempotent.
+     *
+     *  Called from GraphEditorComponent::setNode BEFORE
+     *  BlockComponents are constructed for the subgraph, so the
+     *  new positions take effect on first paint.  Without this
+     *  ordering the migration's relative-position writes get
+     *  silently overridden by the BlockComponent's cached
+     *  absolute tags::x / tags::y (block.cpp:1365 reads relative
+     *  ONCE then writes absolute).
+     *
+     *  No-op if the subgraph isn't an EL_NODE_ID_ARRANGEMENT_TRACKS
+     *  identifier (the caller's responsibility to pre-filter is
+     *  duplicated here as defensive guard). */
+    static void migrateMultiTrackSubgraph (EngineService& engine,
+                                            const Node&    subgraph);
 };
 
 } // namespace element

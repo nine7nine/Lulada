@@ -3,8 +3,10 @@
 
 #include <element/ui/popups.hpp>
 #include <element/devices.hpp>
+#include <element/engine.hpp>
 #include <element/node.hpp>
 #include <element/plugins.hpp>
+#include <element/services.hpp>
 #if ELEMENT_USE_JACK
 #include "engine/jack.hpp"
 #endif
@@ -13,6 +15,8 @@
 
 #include "engine/graphmanager.hpp"
 #include "nodes/baseprocessor.hpp"
+#include "services/arrangementtracksservice.hpp"
+#include "ui/viewhelpers.hpp"
 #include "nodes/audioprocessor.hpp"
 #include "presetmanager.hpp"
 #include "ui/datapathbrowser.hpp"
@@ -468,6 +472,29 @@ void GraphEditorComponent::setNode (const Node& n)
     {
         // properties might still need updating.
         return;
+    }
+
+    /* Multi-Track migration hook: when navigating INTO the
+     * arrangement's audio-tracks subgraph, run the snap-to-grid
+     * + rewire pass BEFORE the BlockComponents are rebuilt below.
+     * BlockComponent::updatePosition reads relativeX/Y once at
+     * construction then locks in absolute tags::x/y; if we
+     * migrate AFTER updateComponents, the new positions are
+     * silently overridden by the old absolute cache.
+     *
+     * Idempotent so re-navigating into an already-migrated
+     * subgraph is a no-op (addConnection dedupes, snap writes
+     * identical values).  No-op for any non-Multi-Track graph --
+     * the migration helper guards on identifier. */
+    if (isValid && isGraph
+        && ng.getProperty (tags::identifier).toString()
+               == juce::String (EL_NODE_ID_ARRANGEMENT_TRACKS))
+    {
+        if (auto* cc = ViewHelpers::findContentComponent (this))
+        {
+            if (auto* eng = cc->services().find<EngineService>())
+                ArrangementTracksService::migrateMultiTrackSubgraph (*eng, ng);
+        }
     }
 
     graph = ng;
