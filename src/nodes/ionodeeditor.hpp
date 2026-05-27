@@ -139,27 +139,89 @@ private:
         void updateDevices()
         {
             const bool isInput = owner.showIns;
-            heading.setText (isInput ? "Host Audio Input" : "Host Audio Output",
+
+            /* Detect whether this IO pseudo-node is on the ROOT graph
+             * (proxying the host audio device -- the legacy use case)
+             * or inside a SUB-GRAPH (proxying that subgraph's outer
+             * port face -- e.g. the Multi-Track per-track direct-out
+             * channels).  The two cases have completely different
+             * semantics:
+             *
+             *   ROOT graph IO  -> channels mirror the JACK / hardware
+             *                     device; channel count is user-config
+             *                     via the JACK port-count combo +
+             *                     persists to the audio preferences.
+             *   SUB-GRAPH IO   -> channels mirror that subgraph's
+             *                     outer port count; channel count is
+             *                     auto-managed by whatever owns the
+             *                     subgraph (e.g. ArrangementTracksService
+             *                     resizes the Multi-Track to 2N channels
+             *                     for N audio clips).  Editing host
+             *                     device settings here is wrong + made
+             *                     the panel useless for inspecting the
+             *                     per-track direct-out routing the
+             *                     Multi-Track exposes. */
+            const Node parent = owner.getNode().getParentGraph();
+            const bool onRootGraph = parent.isRootGraph();
+
+            heading.setText (isInput
+                                ? (onRootGraph ? "Host Audio Input"  : "Sub-graph Audio Input")
+                                : (onRootGraph ? "Host Audio Output" : "Sub-graph Audio Output"),
                              juce::dontSendNotification);
             channelsHeader.setText (isInput ? "Input Channels" : "Output Channels",
                                     juce::dontSendNotification);
 
-#if ELEMENT_USE_JACK
-            hint.setText ("Port count follows the JACK setting in Audio preferences. "
-                          "Changes here apply immediately and persist to the same setting.",
-                          juce::dontSendNotification);
-#else
-            hint.setText ("Channel count follows the active audio device's enabled channels.",
-                          juce::dontSendNotification);
-#endif
-
             channelLabels.clear (true);
             juce::StringArray names;
-            if (auto* device = owner.devices.getCurrentAudioDevice())
-                names = isInput ? device->getInputChannelNames() : device->getOutputChannelNames();
 
-            if (names.isEmpty())
-                names.add ("(no audio device active)");
+            if (onRootGraph)
+            {
+#if ELEMENT_USE_JACK
+                hint.setText ("Port count follows the JACK setting in Audio preferences. "
+                              "Changes here apply immediately and persist to the same setting.",
+                              juce::dontSendNotification);
+#else
+                hint.setText ("Channel count follows the active audio device's enabled channels.",
+                              juce::dontSendNotification);
+#endif
+                if (auto* device = owner.devices.getCurrentAudioDevice())
+                    names = isInput ? device->getInputChannelNames() : device->getOutputChannelNames();
+                if (names.isEmpty())
+                    names.add ("(no audio device active)");
+            }
+            else
+            {
+                hint.setText ("Port count is managed by the parent sub-graph -- typically grows "
+                              "as content is added (e.g. Multi-Track per-track direct-outs).",
+                              juce::dontSendNotification);
+
+                /* Pull the channel count directly off the IO node's
+                 * own port list.  The parent sub-graph's outer port
+                 * count drives IONode::refreshPorts which populates
+                 * the IO node's ports.  For audio.input the IO node
+                 * exposes one OUTPUT pin per outer-input channel
+                 * (and vice-versa for audio.output) -- so we count
+                 * whichever direction maps to the user-facing
+                 * channel count.  Node::getNumPorts() has no
+                 * type-filter overload; iterate + filter. */
+                const Node thisNode = owner.getNode();
+                int audioPorts = 0;
+                for (int i = 0; i < thisNode.getNumPorts(); ++i)
+                {
+                    const Port p = thisNode.getPort (i);
+                    if (p.getType() == PortType::Audio
+                        && p.isInput() == ! isInput)
+                        ++audioPorts;
+                }
+                for (int ch = 0; ch < audioPorts; ++ch)
+                {
+                    names.add ((isInput ? juce::String ("In ")
+                                         : juce::String ("Out "))
+                                  + juce::String (ch + 1));
+                }
+                if (names.isEmpty())
+                    names.add ("(no channels)");
+            }
 
             for (const auto& n : names)
             {
@@ -170,12 +232,28 @@ private:
             }
 
 #if ELEMENT_USE_JACK
-            if (auto* world = ViewHelpers::getGlobals (this))
+            if (onRootGraph)
             {
-                const auto key = isInput ? Settings::audioJackInputPortCountKey
-                                         : Settings::audioJackOutputPortCountKey;
-                const int v = world->settings().getUserSettings()->getIntValue (key, 0);
-                portCountCombo.setSelectedId (selectedIdForValue (v), juce::dontSendNotification);
+                if (auto* world = ViewHelpers::getGlobals (this))
+                {
+                    const auto key = isInput ? Settings::audioJackInputPortCountKey
+                                             : Settings::audioJackOutputPortCountKey;
+                    const int v = world->settings().getUserSettings()->getIntValue (key, 0);
+                    portCountCombo.setSelectedId (selectedIdForValue (v), juce::dontSendNotification);
+                    portCountCombo.setEnabled (true);
+                    portCountLabel.setVisible (true);
+                    portCountCombo.setVisible (true);
+                }
+            }
+            else
+            {
+                /* Sub-graph IO: hide the JACK port-count picker --
+                 * the channel count isn't user-editable from this
+                 * panel.  The owning service (ArrangementTracksService
+                 * for the Multi-Track) manages it. */
+                portCountCombo.setEnabled (false);
+                portCountLabel.setVisible (false);
+                portCountCombo.setVisible (false);
             }
 #else
             portCountCombo.setEnabled (false);
