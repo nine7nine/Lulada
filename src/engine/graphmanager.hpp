@@ -94,9 +94,26 @@ public:
 
     void savePluginStates();
 
-    /** Rebuilds the arcs model according to the GraphNode */
+    /** Rebuilds the arcs model according to the GraphNode.
+     *
+     *  During session load (`loaded == false`) the GraphNode is being
+     *  populated from the ValueTree -- arcs in the ValueTree are the
+     *  source of truth, the GraphNode has zero connections until the
+     *  arc-load loop runs at the end of setNodeModel.  Calling
+     *  processorArcsChanged() here would REBUILD the arcs ValueTree
+     *  from the empty processor + wipe the saved arcs, dropping every
+     *  saved connection silently.
+     *
+     *  This path is reached during load via NodeModelUpdater::onPortsChanged:
+     *  child IONode::refreshPorts (fired during setupNode → Node::resetPorts)
+     *  emits portsChanged → NMU sees it → calls syncArcsModel.
+     *  Guarding on `loaded` keeps post-load behaviour intact (port count
+     *  changes after load DO need to rebuild arcs to drop now-illegal
+     *  connections) while protecting the load path. */
     inline void syncArcsModel()
     {
+        if (! loaded)
+            return;
         processor.removeIllegalConnections();
         processorArcsChanged();
     }
