@@ -133,6 +133,14 @@ public:
         return midiRegions_;
     }
 
+    /** Bulk-apply a colour to every audio AND MIDI region on this
+     *  playlist.  Called from ArrangementView::rescanLaneTargets after
+     *  the lane's palette tint is (re-)assigned, so regions track the
+     *  lane's colour without per-paint resolver lookups.  Single
+     *  source of truth at lane.colour; this method maintains the
+     *  cached per-region copies. */
+    void setAllRegionColours (juce::Colour c) noexcept;
+
     /** Iterate MIDI regions whose positionBeats falls within
      *  [beatA, beatB).  Linear scan; sorted by positionBeats so the
      *  iteration can early-exit once positionBeats >= beatB. */

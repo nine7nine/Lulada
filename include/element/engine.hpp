@@ -79,6 +79,18 @@ public:
     /** Adds a plugin to a specific graph */
     Node addPlugin (const Node& graph, const juce::PluginDescription& desc);
 
+    /** Adds a plugin to a specific graph with a fixed initial position.
+     *  Equivalent to the overload above but the rx/ry are written to
+     *  the node's ValueTree BEFORE the BlockComponent is constructed,
+     *  so the placement is visible on first paint instead of having
+     *  to update the position post-spawn (which doesn't refresh the
+     *  block visually -- the BlockComponent only reads relativeX/Y
+     *  once, then locks in tags::x / tags::y).  Used by
+     *  ArrangementTracksService to grid-arrange Multi-Track children
+     *  at spawn time. */
+    Node addPlugin (const Node& graph, const juce::PluginDescription& desc,
+                     float rx, float ry);
+
     /** Adds a plugin to a specific graph and adds connections from
         a ConnectionBuilder */
     Node addPlugin (const Node& graph, const juce::PluginDescription& desc, const ConnectionBuilder& builder, const bool verified = true);

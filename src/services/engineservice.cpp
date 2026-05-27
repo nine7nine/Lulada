@@ -937,6 +937,46 @@ Node EngineService::addPlugin (const Node& graph, const PluginDescription& desc)
     return node;
 }
 
+Node EngineService::addPlugin (const Node& graph, const PluginDescription& desc,
+                                float rx, float ry)
+{
+    if (! graph.isGraph())
+        return {};
+
+    auto* controller = graphs->findGraphManagerFor (graph);
+    if (controller == nullptr)
+        return {};
+
+    /* Spawn via the rx/ry-aware GraphManager::addNode path.  The
+     * ValueTree gets tags::relativeX / relativeY set BEFORE the
+     * BlockComponent reads them at first updatePosition, so the
+     * placement is visible on initial paint -- no post-spawn fixup
+     * needed.  Plain addPlugin (graph, desc) hardcodes 0.5/0.5;
+     * this overload threads through caller-chosen coords. */
+    auto& plugins (context().plugins());
+    const auto nodeId = controller->addNode (&desc, rx, ry, 0);
+
+    if (EL_INVALID_NODE == nodeId)
+        return {};
+
+    plugins.addToKnownPlugins (desc);
+
+    const Node node (controller->getNodeModelForId (nodeId));
+    if (! node.isValid())
+    {
+        jassertfalse;   /* fatal but non-crashing */
+        return {};
+    }
+
+    if (node.getUuid().isNull())
+    {
+        ValueTree nodeData = node.data();
+        nodeData.setProperty (tags::uuid, Uuid().toString(), 0);
+    }
+
+    return node;
+}
+
 void EngineService::addPluginAsync (const Node& graph,
                                     const PluginDescription& desc,
                                     const ConnectionBuilder& builder,

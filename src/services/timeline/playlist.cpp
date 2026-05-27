@@ -323,6 +323,15 @@ juce::Uuid Playlist::splitMidiRegion (juce::Uuid regionId, double atBeat)
     return newId;
 }
 
+void Playlist::setAllRegionColours (juce::Colour c) noexcept
+{
+    for (auto& r : regions_)
+        r.colour = c;
+    for (auto& m : midiRegions_)
+        if (m != nullptr)
+            m->colour = c;
+}
+
 juce::ValueTree Playlist::toValueTree() const
 {
     juce::ValueTree v ("playlist");
