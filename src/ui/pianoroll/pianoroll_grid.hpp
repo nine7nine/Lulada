@@ -164,6 +164,13 @@ public:
      *  otherwise rounds to the nearest multiple of `snapDivision_`. */
     double snapBeat (double localBeat) const noexcept;
 
+    /** Keep-offset variant of snapBeat: snaps the DELTA between
+     *  `localBeat` and `anchorBeat` to the grid, then adds the
+     *  delta to the anchor.  Preserves the cursor's original offset
+     *  to the nearest snap point so drag gestures don't jump on the
+     *  first snap.  Matches the arranger's keep-offset semantic. */
+    double snapBeatKeepOffset (double localBeat, double anchorBeat) const noexcept;
+
     //==========================================================================
     // Selection API.
 
@@ -294,6 +301,14 @@ private:
     /** True if (x, y) is within the right-edge resize handle (3 px)
      *  of any note. */
     std::uint64_t hitTestResizeHandle (int x, int y, const MidiNoteRegion& region) const noexcept;
+
+    /** Extended hit-test that also reports which edge was hit.  Right
+     *  edge is the default (matches the legacy one-arg shape); left
+     *  edge becomes the resize anchor on tiny / sparse drags.  Used
+     *  by mouseDown to pick between NoteDragResize and
+     *  NoteDragResizeLeft. */
+    std::uint64_t hitTestResizeHandleEx (int x, int y, const MidiNoteRegion& region,
+                                          bool& outLeftEdge) const noexcept;
 
     /** Compute the visible viewport rectangle in this grid's local
      *  coords.  Drives virtualization for the paint loop. */

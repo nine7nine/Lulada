@@ -14,7 +14,10 @@ namespace element {
 
 class PianoRollView;
 
-/** Modal Quantize / Humanize / Scale dialog for the piano-roll editor.
+/** Quantize / Humanize / Scale panel for the piano-roll editor.
+ *  Embedded on the right edge of the piano-roll body (NOT a modal
+ *  popup) so the user can edit notes while watching the preview
+ *  highlight light up the affected notes live.
  *
  *  Three tabs, each driving one bulk-edit op against the current
  *  selection on the bound region:
@@ -31,14 +34,19 @@ class PianoRollView;
  *                 C..B).  No randomisation -- pitch snap is
  *                 deterministic per (scale, root) pair.
  *
- *  Buttons: Preview (always live), Apply (commit + keep open), OK
- *  (commit + close), Cancel (revert preview + close).  Live preview
- *  is on by default -- every parameter change recomputes the diff
- *  and asks the grid to paint a ghost overlay.
+ *  Buttons: Preview (always live), Apply (commit + keep open),
+ *  OK (commit + hide panel), Cancel (revert preview + hide panel).
+ *  Live preview is on by default -- every parameter change recomputes
+ *  the diff and asks the grid to paint a ghost overlay.
+ *
+ *  Visibility is owned by PianoRollView: clicking a toolbar Q / H / S
+ *  button TOGGLES the panel (or switches tab if already visible on a
+ *  different tab).  No modal blocking; closing via OK / Cancel calls
+ *  the onClose hook so the view can hide the panel.
  *
  *  Last-used parameters per tab are stored on PianoRollView so a
  *  fast-apply hotkey (Ctrl+Q) replays the most recent settings
- *  without re-opening the dialog. */
+ *  without re-opening the panel. */
 class QuantizeDialog : public juce::Component,
                        private juce::Slider::Listener,
                        private juce::ComboBox::Listener,
@@ -57,13 +65,31 @@ public:
     void paint  (juce::Graphics&) override;
     void resized() override;
 
-    /** Run when OK / Apply commits a diff.  Set by the host dialog
-     *  window so it can close itself on OK. */
-    std::function<void(bool /*closeAfter*/)> onApply;
-    std::function<void()>                     onCancel;
+    /** Fired after every Apply / OK -- the host can refresh chrome,
+     *  log "X notes affected", etc.  Receives the touched count. */
+    std::function<void (std::size_t /*touched*/)> onApplied;
 
-    static constexpr int kPreferredW = 480;
-    static constexpr int kPreferredH = 340;
+    /** Fired when the user dismisses the panel (Cancel or OK after
+     *  apply).  Host hides the panel + clears any state.  Always
+     *  fires via MessageManager::callAsync so the panel can be
+     *  removed safely from a button-callback stack. */
+    std::function<void()> onCloseRequested;
+
+    /** Programmatically switch to a tab.  Used by PianoRollView when
+     *  the user clicks a different toolbar button while the panel is
+     *  already visible. */
+    void switchTab (Tab);
+
+    Tab getActiveTab() const noexcept { return activeTab_; }
+
+    /** External hook for the host to ask the panel to re-evaluate
+     *  the live preview against the current grid state.  Used after
+     *  the bound region changes or the selection set mutates outside
+     *  the panel's own listener pumps. */
+    void refreshPreviewFromExternal() { refreshPreview(); }
+
+    static constexpr int kPreferredW = 280;   /* embedded width */
+    static constexpr int kPreferredH = 320;
 
 private:
     void buttonClicked       (juce::Button*) override;
@@ -135,30 +161,16 @@ private:
     juce::TextButton okBtn_      { "OK" };
     juce::TextButton cancelBtn_  { "Cancel" };
 
+    /** Status text shown in the footer.  Today it surfaces the "no
+     *  notes selected" warning so Apply / OK don't read as silent
+     *  no-ops; future use can reuse it for "X notes affected" after
+     *  an Apply commit. */
+    juce::Label      statusLabel_;
+
     bool             previewEnabled_ { true };
     bool             initialising_   { true };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (QuantizeDialog)
-};
-
-/** DialogWindow wrapper that hosts a QuantizeDialog.  Mirrors the
- *  SessionImportWizardDialog pattern: own a unique_ptr holder, set the
- *  content, centre + show.  Escape closes via Cancel; closing the X
- *  treats it as Cancel. */
-class QuantizeDialogWindow : public juce::DialogWindow
-{
-public:
-    QuantizeDialogWindow (std::unique_ptr<juce::Component>& holder,
-                          PianoRollView& view,
-                          QuantizeDialog::Tab initialTab);
-    ~QuantizeDialogWindow() override;
-
-    bool escapeKeyPressed() override;
-    void closeButtonPressed() override;
-
-private:
-    std::unique_ptr<juce::Component>& holder_;
-    QuantizeDialog* content_ { nullptr };
 };
 
 } // namespace element

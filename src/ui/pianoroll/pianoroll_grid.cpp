@@ -17,12 +17,34 @@
 #include <element/ui.hpp>
 
 #include <cmath>
+#include <limits>
+#include <vector>
 
 namespace element {
 
 namespace {
 
 constexpr int kResizeHandlePx = 5;   /* width of the right-edge resize hot zone */
+
+/* Static per-process piano-roll clipboard.  Notes are stored
+ * relative to the selection's minimum onBeat so paste is positionable
+ * at any anchor.  Distinct from the arrangement clipboard (which
+ * holds regions/lanes, not notes), so a user can have an
+ * arrangement copy AND a note copy on the same clipboard
+ * conceptually.  Lifetime = process; tabs / sessions reset it
+ * naturally on Element restart. */
+struct NoteClipboard
+{
+    std::vector<MidiNote> notes;   /* onBeats already rebased to 0 */
+    double                spanBeats { 0.0 };
+    bool                  empty() const noexcept { return notes.empty(); }
+};
+
+NoteClipboard& noteClipboard() noexcept
+{
+    static NoteClipboard singleton;
+    return singleton;
+}
 
 } // namespace
 
@@ -183,6 +205,20 @@ double PianoRollGrid::snapBeat (double localBeat) const noexcept
     if (! snapEnabled_ || snapDivision_ <= 0.0)
         return localBeat;
     return std::round (localBeat / snapDivision_) * snapDivision_;
+}
+
+double PianoRollGrid::snapBeatKeepOffset (double localBeat,
+                                            double anchorBeat) const noexcept
+{
+    /* Keep-offset snap (B.7 fix): preserve the cursor's offset from
+     * the nearest grid point at gesture start so the dragged element
+     * doesn't jump to the cursor on the first snap.  Matches the
+     * arranger's snap pipeline introduced in a2a18109. */
+    if (! snapEnabled_ || snapDivision_ <= 0.0)
+        return localBeat;
+    const double delta   = localBeat - anchorBeat;
+    const double snapped = std::round (delta / snapDivision_) * snapDivision_;
+    return anchorBeat + snapped;
 }
 
 void PianoRollGrid::setSnapDivision (double beats) noexcept
@@ -618,72 +654,132 @@ void PianoRollGrid::paintNotes (juce::Graphics& g, const MidiNoteRegion& region)
     const juce::Colour selWash  { 0xff'40'ff'80 };   /* kAccentGreen */
     const juce::Colour selEdge  { 0xff'cf'ff'd6 };
 
-    for (const auto& n : *snap)
+    /* Loop iterations for the paint walk.  Iteration 0 is the source
+     * content (the editable notes); iterations >= 1 are read-only
+     * ghosts the audio thread will emit when looped.  Matches the
+     * arrangement-view repeat semantic so the two surfaces show the
+     * same content at the same x-positions.  Non-looped regions and
+     * regions whose loopLengthBeats >= lengthBeats paint a single
+     * iteration as before. */
+    const double loopPeriod = (region.looped
+                                  && region.loopLengthBeats > 0.0)
+                                  ? region.loopLengthBeats
+                                  : regionLenBeats_;
+    const int iterations = (region.looped
+                               && loopPeriod > 0.0
+                               && loopPeriod < regionLenBeats_)
+        ? (int) std::ceil (regionLenBeats_ / loopPeriod)
+        : 1;
+
+    for (int iter = 0; iter < iterations; ++iter)
     {
-        if (n.pitch < lo || n.pitch > hi) continue;
+        const double iterBeatOffset = (double) iter * loopPeriod;
+        const bool   ghost          = (iter > 0);
 
-        const int xRaw = (int) std::round (n.onBeat * pxPerBeat_);
-        const int wRaw = juce::jmax (2, (int) std::round (n.lengthBeats * pxPerBeat_));
-        const int yRaw = body.getY() + (int) ((float) (hi - n.pitch) * rowH);
-        const int hRaw = juce::jmax (2, (int) rowH - 1);
-
-        const juce::Rectangle<int> rect (xRaw, yRaw, wRaw, hRaw);
-        if (! cullRect.intersects (rect)) continue;
-
-        const bool selected = isSelected (n.id);
-        const float velNorm = juce::jlimit (0.0f, 1.0f, (float) n.velocity / 127.0f);
-
-        /* Body fill (shaded/tinted) and outline (saturated tint) --
-         * timeline-region pattern.  ArrangementView's MIDI region uses
-         * sat x 0.55 / brightness x 0.45; piano-roll notes match that
-         * cap exactly but scale brightness down with velocity so soft
-         * notes still read as darker.  Selection uses the accent-green
-         * wash + bright accent edge for unambiguous read. */
-        const juce::Colour fill = selected
-            ? selWash.withMultipliedSaturation (0.85f)
-                     .withMultipliedBrightness (0.45f)
-            : baseBody.withMultipliedSaturation (0.55f)
-                       .withMultipliedBrightness (0.30f + 0.15f * velNorm);
-        const juce::Colour edge = selected ? selEdge : baseBody;
-
-        const auto rf = rect.toFloat();
-        const float corner = juce::jmin (3.0f, rf.getHeight() * 0.35f);
-
-        g.setColour (fill);
-        g.fillRoundedRectangle (rf, corner);
-
-        g.setColour (edge);
-        g.drawRoundedRectangle (rf, corner, selected ? 1.6f : 1.0f);
-
-        /* Preview-affected highlight ring.  Painted on top of the
-         * normal outline so the user can see which notes the dialog's
-         * pending op will touch.  Soft amber so it reads as "pending"
-         * rather than "selected" (which uses the accent green). */
-        if (! previewAffectedIds_.empty()
-            && previewAffectedIds_.find (n.id) != previewAffectedIds_.end())
+        for (const auto& n : *snap)
         {
-            const juce::Colour previewRing { 0xff'ff'b3'4a };
-            g.setColour (previewRing);
-            g.drawRoundedRectangle (rf.expanded (1.5f), corner + 1.0f, 1.4f);
+            if (n.pitch < lo || n.pitch > hi) continue;
+
+            /* Ghost iterations only paint notes inside [0, loopPeriod)
+             * of the source -- a note authored past the loop period
+             * would never reach the next iteration in the audio
+             * thread's emit window, so painting it as a ghost would
+             * mis-signal what will play. */
+            if (ghost && n.onBeat >= loopPeriod) continue;
+
+            const int xRaw = (int) std::round ((n.onBeat + iterBeatOffset) * pxPerBeat_);
+            const int wRaw = juce::jmax (2, (int) std::round (n.lengthBeats * pxPerBeat_));
+            const int yRaw = body.getY() + (int) ((float) (hi - n.pitch) * rowH);
+            const int hRaw = juce::jmax (2, (int) rowH - 1);
+
+            const juce::Rectangle<int> rect (xRaw, yRaw, wRaw, hRaw);
+            if (! cullRect.intersects (rect)) continue;
+
+            const bool selected = ! ghost && isSelected (n.id);
+            const float velNorm = juce::jlimit (0.0f, 1.0f, (float) n.velocity / 127.0f);
+
+            /* Body fill (shaded/tinted) and outline (saturated tint) --
+             * timeline-region pattern.  ArrangementView's MIDI region uses
+             * sat x 0.55 / brightness x 0.45; piano-roll notes match that
+             * cap exactly but scale brightness down with velocity so soft
+             * notes still read as darker.  Selection uses the accent-green
+             * wash + bright accent edge for unambiguous read.  Ghost
+             * iterations dim further so iteration 0 reads as the source
+             * of truth. */
+            juce::Colour fill = selected
+                ? selWash.withMultipliedSaturation (0.85f)
+                         .withMultipliedBrightness (0.45f)
+                : baseBody.withMultipliedSaturation (0.55f)
+                           .withMultipliedBrightness (0.30f + 0.15f * velNorm);
+            juce::Colour edge = selected ? selEdge : baseBody;
+            if (ghost)
+            {
+                fill = fill.withMultipliedAlpha (0.55f);
+                edge = edge.withMultipliedAlpha (0.55f);
+            }
+
+            const auto rf = rect.toFloat();
+            const float corner = juce::jmin (3.0f, rf.getHeight() * 0.35f);
+
+            g.setColour (fill);
+            g.fillRoundedRectangle (rf, corner);
+
+            g.setColour (edge);
+            g.drawRoundedRectangle (rf, corner, selected ? 1.6f : 1.0f);
+
+            /* Preview-affected highlight ring.  Painted on top of the
+             * normal outline so the user can see which notes the dialog's
+             * pending op will touch.  Soft amber so it reads as "pending"
+             * rather than "selected" (which uses the accent green).
+             * Ghost iterations skip the ring -- the source notes are the
+             * editable ones; the rings stay anchored there. */
+            if (! ghost
+                && ! previewAffectedIds_.empty()
+                && previewAffectedIds_.find (n.id) != previewAffectedIds_.end())
+            {
+                const juce::Colour previewRing { 0xff'ff'b3'4a };
+                g.setColour (previewRing);
+                g.drawRoundedRectangle (rf.expanded (1.5f), corner + 1.0f, 1.4f);
+            }
+
+            /* Pitch label inside wide-enough notes.  Skip for tiny rows
+             * (would clip vertically) and short notes.  Always-white text
+             * pairs cleanly with the dim shaded body across the velocity
+             * range -- no per-note brightness branch required.  Ghost
+             * iterations skip the label to keep the visual hierarchy
+             * (iteration 0 reads as primary, ghosts as background). */
+            if (! ghost && rf.getWidth() >= 40.0f && rf.getHeight() >= 12.0f)
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.90f));
+                g.setFont (monoFont (juce::jmin (10.0f, rf.getHeight() * 0.55f),
+                                      juce::Font::plain));
+                static const char* const pcs[12] = {
+                    "C", "C#", "D", "D#", "E", "F",
+                    "F#", "G", "G#", "A", "A#", "B" };
+                const int oct = (n.pitch / 12) - 1;
+                juce::String label = juce::String (pcs[n.pitch % 12]) + juce::String (oct);
+                g.drawText (label,
+                            rect.reduced (4, 1),
+                            juce::Justification::centredLeft, false);
+            }
         }
+    }
 
-        /* Pitch label inside wide-enough notes.  Skip for tiny rows
-         * (would clip vertically) and short notes.  Always-white text
-         * pairs cleanly with the dim shaded body across the velocity
-         * range -- no per-note brightness branch required. */
-        if (rf.getWidth() >= 40.0f && rf.getHeight() >= 12.0f)
+    /* Dashed loop boundary lines at each iteration boundary.  Mirrors
+     * the arrangement-view cue so the user reads "this is where the
+     * loop wraps" the same way on both surfaces. */
+    if (iterations > 1)
+    {
+        const float dashLengths[] = { 4.0f, 4.0f };
+        g.setColour (baseBody.withAlpha (0.55f));
+        for (int iter = 1; iter < iterations; ++iter)
         {
-            g.setColour (juce::Colours::white.withAlpha (0.90f));
-            g.setFont (monoFont (juce::jmin (10.0f, rf.getHeight() * 0.55f),
-                                  juce::Font::plain));
-            static const char* const pcs[12] = {
-                "C", "C#", "D", "D#", "E", "F",
-                "F#", "G", "G#", "A", "A#", "B" };
-            const int oct = (n.pitch / 12) - 1;
-            juce::String label = juce::String (pcs[n.pitch % 12]) + juce::String (oct);
-            g.drawText (label,
-                        rect.reduced (4, 1),
-                        juce::Justification::centredLeft, false);
+            const int bx = (int) std::round ((double) iter * loopPeriod * pxPerBeat_);
+            if (bx < body.getX() + 1) continue;
+            if (bx > body.getRight() - 1) break;
+            const juce::Line<float> seg ((float) bx, (float) body.getY(),
+                                           (float) bx, (float) body.getBottom());
+            g.drawDashedLine (seg, dashLengths, 2, 1.4f);
         }
     }
 }
@@ -732,6 +828,15 @@ std::uint64_t PianoRollGrid::hitTestNote (int x, int y,
 std::uint64_t PianoRollGrid::hitTestResizeHandle (int x, int y,
                                                     const MidiNoteRegion& region) const noexcept
 {
+    bool dummy = false;
+    return hitTestResizeHandleEx (x, y, region, dummy);
+}
+
+std::uint64_t PianoRollGrid::hitTestResizeHandleEx (int x, int y,
+                                                      const MidiNoteRegion& region,
+                                                      bool& outLeftEdge) const noexcept
+{
+    outLeftEdge = false;
     if (y < kRulerH) return 0;
     const auto* snap = region.loadSnapshot();
     if (snap == nullptr || snap->empty()) return 0;
@@ -753,11 +858,24 @@ std::uint64_t PianoRollGrid::hitTestResizeHandle (int x, int y,
         const int nw = juce::jmax (2, (int) std::round (n.lengthBeats * pxPerBeat_));
         const int ny = body.getY() + (int) ((float) (hi - n.pitch) * rowH);
         const int nh = juce::jmax (2, (int) rowH - 1);
-        /* Right-edge handle: within kResizeHandlePx of nx+nw, in
-         * the note's Y band. */
-        if (x >= nx + nw - kResizeHandlePx && x < nx + nw + 1
-            && y >= ny && y < ny + nh)
+        if (y < ny || y >= ny + nh) continue;
+
+        /* Right-edge handle: within kResizeHandlePx of nx+nw. */
+        if (x >= nx + nw - kResizeHandlePx && x < nx + nw + 1)
+        {
+            outLeftEdge = false;
             return n.id;
+        }
+        /* Left-edge handle: within kResizeHandlePx of nx.  Tiny notes
+         * (nw <= 2 * kResizeHandlePx) would have the two handles
+         * overlap -- preferring the right handle keeps the
+         * extend-rightward gesture intuitive on short notes. */
+        if (nw > 2 * kResizeHandlePx
+            && x >= nx && x < nx + kResizeHandlePx)
+        {
+            outLeftEdge = true;
+            return n.id;
+        }
     }
     return 0;
 }
@@ -799,16 +917,22 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
-    /* First try the resize handle hit (5 px right edge of any note)
-     * regardless of tool -- consistent affordance like all DAWs.
-     * Then fall back to body hit + branch on active tool. */
+    /* First try the resize handle hit (5 px at the right or left
+     * edge of any note) regardless of tool -- consistent affordance
+     * like all DAWs.  Right-edge resize extends the note's tail;
+     * left-edge resize trims into the head, mirroring the arranger's
+     * Slice-4 left-trim shape.  Then fall back to body hit + branch
+     * on active tool. */
     if (parent_.getActiveTool() == PianoRollView::Tool::Select)
     {
-        if (auto hitResize = hitTestResizeHandle (e.x, e.y, *region))
+        bool leftEdge = false;
+        if (auto hitResize = hitTestResizeHandleEx (e.x, e.y, *region, leftEdge))
         {
             if (! isSelected (hitResize))
                 selectOnly (hitResize);
-            activeDrag_ = NoteDrag::makeResize (*this, *region, hitResize, e);
+            activeDrag_ = leftEdge
+                ? NoteDrag::makeResizeLeft (*this, *region, hitResize, e)
+                : NoteDrag::makeResize     (*this, *region, hitResize, e);
             return;
         }
     }
@@ -1047,6 +1171,148 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
         return true;
     }
 
+    /* Ctrl+C -- copy current selection to the piano-roll clipboard,
+     * rebasing onBeats so the selection's earliest note lands at 0.
+     * Paste re-anchors against the playhead or the bound region's
+     * start.  Per-process static clipboard. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'C')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+        std::vector<MidiNote> sel;
+        double minOn = std::numeric_limits<double>::max();
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                sel.push_back (n);
+                minOn = juce::jmin (minOn, n.onBeat);
+            }
+        if (sel.empty()) return false;
+        double maxEnd = 0.0;
+        for (auto& n : sel)
+        {
+            n.onBeat -= minOn;
+            maxEnd    = juce::jmax (maxEnd, n.onBeat + n.lengthBeats);
+        }
+        auto& clip = noteClipboard();
+        clip.notes      = std::move (sel);
+        clip.spanBeats  = maxEnd;
+        return true;
+    }
+
+    /* Ctrl+X -- cut: copy then delete in one undo step. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'X')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+
+        std::vector<MidiNote> sel;
+        double minOn = std::numeric_limits<double>::max();
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                sel.push_back (n);
+                minOn = juce::jmin (minOn, n.onBeat);
+            }
+        if (sel.empty()) return false;
+        double maxEnd = 0.0;
+        auto copy = sel;
+        for (auto& n : copy)
+        {
+            n.onBeat -= minOn;
+            maxEnd    = juce::jmax (maxEnd, n.onBeat + n.lengthBeats);
+        }
+        auto& clip = noteClipboard();
+        clip.notes      = std::move (copy);
+        clip.spanBeats  = maxEnd;
+
+        /* Delete the originals.  Same undo path as Delete key. */
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            for (const auto& n : sel) cmd->recordRemove (*region, n.id);
+            juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+            cmd->onApplied = [safeView]() {
+                if (auto* v = safeView.getComponent())
+                    v->notifyRegionEdited();
+            };
+            gui->getUndoManager().beginNewTransaction ("Cut MIDI notes");
+            gui->getUndoManager().perform (cmd.release(), "Cut MIDI notes");
+        }
+        selectedNoteIds_.clear();
+        repaint();
+        return true;
+    }
+
+    /* Ctrl+V -- paste clipboard at the playhead (region-local).  Falls
+     * back to beat 0 if the transport isn't reachable.  Notes get
+     * fresh ids stamped on insert; the paste set replaces the current
+     * selection so the user can keep editing the freshly-pasted
+     * material. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'V')
+    {
+        const auto& clip = noteClipboard();
+        if (region == nullptr || clip.empty()) return false;
+
+        double anchor = 0.0;
+        if (monitor_ != nullptr && monitor_->playing.get())
+        {
+            const double transportBeat = (double) monitor_->getPositionBeats();
+            anchor = juce::jmax (0.0, transportBeat - region->positionBeats);
+        }
+        anchor = juce::jlimit (0.0,
+                                juce::jmax (0.0, region->lengthBeats - clip.spanBeats),
+                                anchor);
+
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            std::vector<MidiNote> stagedForSelect;
+            stagedForSelect.reserve (clip.notes.size());
+            for (const auto& src : clip.notes)
+            {
+                MidiNote n = src;
+                n.id     = 0;            /* fresh id stamped on add */
+                n.onBeat = src.onBeat + anchor;
+                if (n.onBeat + n.lengthBeats > region->lengthBeats)
+                    n.lengthBeats = juce::jmax (1.0 / 64.0,
+                                                  region->lengthBeats - n.onBeat);
+                cmd->recordAdd (*region, n);
+                stagedForSelect.push_back (n);
+            }
+            juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+            cmd->onApplied = [safeView]() {
+                if (auto* v = safeView.getComponent())
+                    v->notifyRegionEdited();
+            };
+            gui->getUndoManager().beginNewTransaction ("Paste MIDI notes");
+            gui->getUndoManager().perform (cmd.release(), "Paste MIDI notes");
+
+            /* Reselect the pasted notes -- their ids landed in the
+             * snapshot after perform.  Match by (pitch, onBeat ±eps)
+             * which is unique enough for the typical paste set. */
+            selectedNoteIds_.clear();
+            if (const auto* snap2 = region->loadSnapshot())
+                for (const auto& n : *snap2)
+                    for (const auto& s : stagedForSelect)
+                        if (n.pitch == s.pitch
+                            && std::abs (n.onBeat - s.onBeat) < 1e-9
+                            && n.channel == s.channel
+                            && selectedNoteIds_.find (n.id) == selectedNoteIds_.end())
+                        {
+                            selectedNoteIds_.insert (n.id);
+                            break;
+                        }
+        }
+        parent_.notifyRegionEdited();
+        repaint();
+        return true;
+    }
+
     /* Ctrl+A -- select every note in the bound region. */
     if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'A')
     {
@@ -1059,6 +1325,24 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
             repaint();
         }
         return true;
+    }
+
+    /* Shift +/- zoom in / out around the viewport centre.  Mirrors
+     * the arranger's Shift +/- shape so the editing surfaces feel
+     * uniform.  Anchor zoom (cmd / ctrl + wheel) handles its own
+     * pivot; these versions zoom around the visible centre. */
+    if (key.getModifiers().isShiftDown())
+    {
+        if (key.isKeyCode ('=') || key.isKeyCode ('+'))
+        {
+            zoomBy (1.20);
+            return true;
+        }
+        if (key.isKeyCode ('-') || key.isKeyCode ('_'))
+        {
+            zoomBy (1.0 / 1.20);
+            return true;
+        }
     }
 
     /* Ctrl+Q -- snap onsets of selected notes to the current grid
@@ -1291,78 +1575,21 @@ std::size_t applyOpAndPush (PianoRollGrid&           grid,
     return touched;
 }
 
-/* Same population walk the apply path uses, but the result is the id
- * list (not a diff command).  Used by the dialog's live preview --
- * we want to know which notes WOULD change without mutating anything.
- * Each helper mirrors the corresponding dsp::quantize op's
- * skip-when-unchanged contract so the preview ring matches what
- * Apply will actually touch. */
-std::vector<std::uint64_t> idsTouchedByQuantize (const MidiNoteRegion& region,
-                                                   const std::unordered_set<std::uint64_t>& selection,
-                                                   const dsp::quantize::QuantizeOptions& opts)
+/* Single-pass preview-id helper.  Builds a throwaway diff command
+ * with a no-op resolver, runs the SAME dsp::quantize op the apply
+ * path will run, then reads out the touched-id list directly from
+ * the command.  No duplicated compare logic -- the preview ring is
+ * guaranteed to match what Apply will commit (closes the A.3 gap
+ * from the audit doc). */
+template <typename PopulateOp>
+std::vector<std::uint64_t> idsTouchedBy (const MidiNoteRegion& region,
+                                           const std::unordered_set<std::uint64_t>& selection,
+                                           PopulateOp&& populate)
 {
-    /* Cheapest path: populate a throwaway diff cmd with a no-op
-     * resolver, then read out the updated ids.  Keeps preview /
-     * apply in lockstep with the same skip semantics. */
     MidiNoteDiffCommand cmd (juce::Uuid::null(),
                               [] (const juce::Uuid&) -> MidiNoteRegion* { return nullptr; });
-    dsp::quantize::quantizeNotes (region, selection, opts, cmd);
-    /* MidiNoteDiffCommand's updates_ is private; we can't read it
-     * directly.  Re-walk the snapshot ourselves with the same compare
-     * the op uses.  This is duplication but keeps the preview path
-     * free of friend access. */
-    std::vector<std::uint64_t> out;
-    const auto* snap = region.loadSnapshot();
-    if (snap == nullptr) return out;
-    const double lengthBeats = region.lengthBeats > 0.0 ? region.lengthBeats : 0.0;
-    if (lengthBeats <= 0.0) return out;
-    const auto points = dsp::quantize::buildQuantizePoints (opts, lengthBeats);
-    if (points.empty()) return out;
-    out.reserve (selection.size());
-    for (const auto& n : *snap)
-    {
-        if (selection.find (n.id) == selection.end()) continue;
-        double newOn = n.onBeat;
-        if (opts.adjustStart) newOn = dsp::quantize::snapBeatMixed (n.onBeat, points, opts.amount);
-        const bool changed = std::abs (newOn - n.onBeat) > 1.0e-9 || opts.adjustEnd;
-        if (changed) out.push_back (n.id);
-    }
-    return out;
-}
-
-std::vector<std::uint64_t> idsTouchedByHumanize (const MidiNoteRegion& region,
-                                                   const std::unordered_set<std::uint64_t>& selection,
-                                                   const dsp::quantize::HumanizeOptions& opts)
-{
-    /* Humanize touches every selected note with a non-zero range; the
-     * dialog can show the same set as "potentially affected". */
-    std::vector<std::uint64_t> out;
-    const auto* snap = region.loadSnapshot();
-    if (snap == nullptr) return out;
-    if (opts.velocityRange == 0 && opts.velocityBias == 0) return out;
-    out.reserve (selection.size());
-    for (const auto& n : *snap)
-        if (selection.find (n.id) != selection.end())
-            out.push_back (n.id);
-    return out;
-}
-
-std::vector<std::uint64_t> idsTouchedByScale (const MidiNoteRegion& region,
-                                                const std::unordered_set<std::uint64_t>& selection,
-                                                dsp::quantize::Scale scale,
-                                                int rootSemitone)
-{
-    std::vector<std::uint64_t> out;
-    const auto* snap = region.loadSnapshot();
-    if (snap == nullptr) return out;
-    out.reserve (selection.size());
-    for (const auto& n : *snap)
-    {
-        if (selection.find (n.id) == selection.end()) continue;
-        if (dsp::quantize::snapPitchToScale (n.pitch, scale, rootSemitone) != n.pitch)
-            out.push_back (n.id);
-    }
-    return out;
+    populate (region, selection, cmd);
+    return cmd.touchedIds();
 }
 
 } // namespace
@@ -1414,7 +1641,11 @@ PianoRollGrid::previewQuantizeIds (const dsp::quantize::QuantizeOptions& opts) c
 {
     const auto* region = const_cast<PianoRollGrid*> (this)->resolveBoundRegion();
     if (region == nullptr || selectedNoteIds_.empty()) return {};
-    return idsTouchedByQuantize (*region, selectedNoteIds_, opts);
+    return idsTouchedBy (*region, selectedNoteIds_,
+                          [&opts] (const MidiNoteRegion& r,
+                                   const std::unordered_set<std::uint64_t>& sel,
+                                   MidiNoteDiffCommand& cmd)
+                          { dsp::quantize::quantizeNotes (r, sel, opts, cmd); });
 }
 
 std::vector<std::uint64_t>
@@ -1422,7 +1653,11 @@ PianoRollGrid::previewHumanizeIds (const dsp::quantize::HumanizeOptions& opts) c
 {
     const auto* region = const_cast<PianoRollGrid*> (this)->resolveBoundRegion();
     if (region == nullptr || selectedNoteIds_.empty()) return {};
-    return idsTouchedByHumanize (*region, selectedNoteIds_, opts);
+    return idsTouchedBy (*region, selectedNoteIds_,
+                          [&opts] (const MidiNoteRegion& r,
+                                   const std::unordered_set<std::uint64_t>& sel,
+                                   MidiNoteDiffCommand& cmd)
+                          { dsp::quantize::humanizeVelocity (r, sel, opts, cmd); });
 }
 
 std::vector<std::uint64_t>
@@ -1430,7 +1665,12 @@ PianoRollGrid::previewScaleIds (dsp::quantize::Scale scale, int rootSemitone) co
 {
     const auto* region = const_cast<PianoRollGrid*> (this)->resolveBoundRegion();
     if (region == nullptr || selectedNoteIds_.empty()) return {};
-    return idsTouchedByScale (*region, selectedNoteIds_, scale, rootSemitone);
+    return idsTouchedBy (*region, selectedNoteIds_,
+                          [scale, rootSemitone]
+                          (const MidiNoteRegion& r,
+                           const std::unordered_set<std::uint64_t>& sel,
+                           MidiNoteDiffCommand& cmd)
+                          { dsp::quantize::scaleQuantize (r, sel, scale, rootSemitone, cmd); });
 }
 
 void PianoRollGrid::setPreviewAffectedNotes (std::vector<std::uint64_t> ids)

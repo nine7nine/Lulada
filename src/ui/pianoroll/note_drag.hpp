@@ -58,6 +58,14 @@ public:
                                                     MidiNoteRegion&,
                                                     std::uint64_t hitId,
                                                     const juce::MouseEvent& e);
+    /** Left-edge resize: drag advances onBeat, decreases lengthBeats
+     *  by the same delta -- mirrors the arranger's MIDI region
+     *  left-trim shape (Slice 4 of Batch A).  Lossless in beat space
+     *  (no notes dropped); right edge stays put. */
+    static std::unique_ptr<NoteDrag> makeResizeLeft (PianoRollGrid&,
+                                                       MidiNoteRegion&,
+                                                       std::uint64_t hitId,
+                                                       const juce::MouseEvent& e);
     static std::unique_ptr<NoteDrag> makeMarquee (PianoRollGrid&,
                                                     const juce::MouseEvent& e,
                                                     bool                    eraseMode);

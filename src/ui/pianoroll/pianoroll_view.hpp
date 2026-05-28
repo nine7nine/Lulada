@@ -16,6 +16,7 @@ namespace element {
 class MidiNoteRegion;
 class PianoRollKeyboard;
 class PianoRollGrid;
+class QuantizeDialog;
 class VelocityLane;
 
 /** Bottom-attached piano-roll editor dock.  Peer to TrackerSideDock
@@ -91,8 +92,8 @@ public:
     int                                   getLastScaleRoot()       const noexcept { return lastScaleRoot_; }
 
     void setLastQuantizeOptions (const dsp::quantize::QuantizeOptions& o) noexcept;
-    void setLastHumanizeOptions (const dsp::quantize::HumanizeOptions& o) noexcept { lastHumanize_ = o; lastHumanizeDirty_ = true; }
-    void setLastScale (dsp::quantize::Scale s, int root) noexcept { lastScale_ = s; lastScaleRoot_ = root; lastScaleDirty_ = true; }
+    void setLastHumanizeOptions (const dsp::quantize::HumanizeOptions& o) noexcept;
+    void setLastScale (dsp::quantize::Scale s, int root) noexcept;
 
     /** True when the user has opened the dialog at least once and
      *  adjusted the Quantize tab parameters.  Ctrl+Q uses last-used
@@ -100,10 +101,20 @@ public:
      *  current snap division. */
     bool isLastQuantizeUserAdjusted() const noexcept { return lastQuantizeDirty_; }
 
-    /** Open the quantize / humanize / scale dialog at the given tab.
-     *  No-op if a dialog is already open (button click re-focuses
-     *  rather than spawning a second instance). */
-    void openQuantizeDialog (int tabIndex);   /* 0 = Q, 1 = H, 2 = S */
+    /** Toggle the embedded Quantize / Humanize / Scale panel on the
+     *  right edge of the piano-roll body.  If the panel is hidden,
+     *  show it on the matching tab.  If it's visible on the SAME tab,
+     *  hide it (so the toolbar button acts as a toggle).  If it's
+     *  visible on a DIFFERENT tab, stay open and switch tab.  The
+     *  panel never floats -- always docked in the editor's layout. */
+    void toggleQuantizePanel (int tabIndex);   /* 0 = Q, 1 = H, 2 = S */
+
+    /** True when the quantize panel is currently visible.  Toolbar
+     *  buttons + Ctrl+Q hotkey use this to decide whether a click on
+     *  the active tab should hide vs reopen. */
+    bool isQuantizePanelVisible() const noexcept { return quantizePanelVisible_; }
+
+    static constexpr int kQuantizePanelW = 290;
 
     /** Fired after every region-mutating gesture commit (Move, Create,
      *  Resize, Erase, Delete-key) on the bound region.  StandardContent
@@ -178,10 +189,11 @@ private:
     bool                           lastHumanizeDirty_ { false };
     bool                           lastScaleDirty_    { false };
 
-    /* Modal dialog holder.  unique_ptr because juce::DialogWindow
-     * deletes itself on close via the holder reset() pattern (see
-     * SessionImportWizardDialog).  Null when no dialog is open. */
-    std::unique_ptr<juce::Component> quantizeDialog_;
+    /* Embedded quantize / humanize / scale panel.  Owned + parented
+     * by the view; visibility flips per toolbar Q/H/S click.  Never
+     * floats -- always docked on the right edge of the body. */
+    std::unique_ptr<QuantizeDialog>  quantizePanel_;
+    bool                             quantizePanelVisible_ { false };
 
     std::unique_ptr<PianoRollKeyboard>  keyboard_;
     /** juce::Viewport hosting the grid.  Horizontal scrolling only --
@@ -200,6 +212,10 @@ private:
     void refreshLabel();
     void syncToolToggles();
     void applySnapFromComboBox();
+    void hideQuantizePanel();
+    void syncToolbarTabToggles();
+    void persistLastUsedToSettings();
+    void loadLastUsedFromSettings();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PianoRollView)
 };

@@ -247,6 +247,12 @@ QuantizeDialog::QuantizeDialog (PianoRollView& view, Tab initialTab)
     previewBtn_.addListener (this);
     addAndMakeVisible (previewBtn_);
 
+    statusLabel_.setFont (juce::Font (juce::FontOptions (11.0f)));
+    statusLabel_.setColour (juce::Label::textColourId, juce::Colour (0xff'd0'a0'40));
+    statusLabel_.setJustificationType (juce::Justification::centredLeft);
+    statusLabel_.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (statusLabel_);
+
     applyBtn_.addListener (this);
     okBtn_.addListener (this);
     cancelBtn_.addListener (this);
@@ -326,13 +332,16 @@ void QuantizeDialog::resized()
 
     r.removeFromTop (kPad / 2);
 
-    /* Footer. */
+    /* Footer.  Narrower panel -- shrink button widths to fit
+     * (Preview, Apply, OK, Cancel still need to coexist) and the
+     * status label takes whatever middle slack remains. */
     auto footer = r.removeFromBottom (kFooterH).reduced (0, 4);
-    const int btnW = 80;
+    const int btnW = juce::jmin (60, footer.getWidth() / 5);
     cancelBtn_ .setBounds (footer.removeFromRight (btnW).reduced (2));
     okBtn_     .setBounds (footer.removeFromRight (btnW).reduced (2));
     applyBtn_  .setBounds (footer.removeFromRight (btnW).reduced (2));
     previewBtn_.setBounds (footer.removeFromLeft  (btnW + 18).reduced (2));
+    statusLabel_.setBounds (footer.reduced (4, 0));
 
     r.removeFromBottom (kPad / 2);
 
@@ -461,11 +470,19 @@ void QuantizeDialog::buttonClicked (juce::Button* b)
     if (b == &cancelBtn_)
     {
         clearPreview();
-        /* Defer the close: onCancel deletes the host dialog window
-         * (and us) -- can't run it on the stack we're returning into. */
-        juce::MessageManager::callAsync ([cb = onCancel]() { if (cb) cb(); });
+        /* Defer the close: onCloseRequested may hide / destroy us.
+         * Run via callAsync so the button callback can unwind first. */
+        juce::MessageManager::callAsync ([cb = onCloseRequested]() {
+            if (cb) cb();
+        });
         return;
     }
+}
+
+void QuantizeDialog::switchTab (Tab t)
+{
+    if (t == activeTab_) return;
+    setActiveTab (t);
 }
 
 void QuantizeDialog::sliderValueChanged (juce::Slider*)
@@ -522,10 +539,41 @@ void QuantizeDialog::writeBackParameters() const
 
 void QuantizeDialog::refreshPreview()
 {
-    if (! previewEnabled_) return;
-
     auto* grid = view_.getGrid();
     if (grid == nullptr) return;
+
+    /* Reflect the "is there anything to do" check in the footer so a
+     * user who opens the panel with no notes selected sees why Apply
+     * is disabled instead of clicking through to no-op (closes C.4). */
+    const bool haveSelection = grid->selection().size() > 0;
+    applyBtn_.setEnabled (haveSelection);
+    okBtn_   .setEnabled (haveSelection);
+    if (! haveSelection)
+        statusLabel_.setText ("No notes selected", juce::dontSendNotification);
+    else
+        statusLabel_.setText (juce::String(), juce::dontSendNotification);
+
+    if (! previewEnabled_) return;
+    if (! haveSelection) { clearPreview(); return; }
+
+    /* Re-tune the random-beats slider's max to half the current
+     * note-length division on the Quantize tab so the user can't
+     * dial a jitter wider than the grid spacing (closes C.3).
+     * Recomputed on every refresh because the user might have just
+     * changed the note-length or note-type combos. */
+    if (activeTab_ == Tab::Quantize)
+    {
+        const auto opts = view_.getLastQuantizeOptions();
+        const double D    = dsp::quantize::divisionBeats (opts.noteLength, opts.noteType);
+        const double cap  = std::max (0.001, D * 0.5);
+        if (std::abs (qRandomSlider_.getMaximum() - cap) > 1e-6)
+        {
+            const double held = qRandomSlider_.getValue();
+            qRandomSlider_.setRange (0.0, cap, std::max (0.001, cap / 100.0));
+            qRandomSlider_.setValue (std::min (held, cap),
+                                      juce::dontSendNotification);
+        }
+    }
 
     writeBackParameters();
 
@@ -546,7 +594,10 @@ void QuantizeDialog::applyActive (bool closeAfter)
     auto* grid = view_.getGrid();
     if (grid == nullptr)
     {
-        if (closeAfter && onApply) onApply (true);
+        if (closeAfter)
+            juce::MessageManager::callAsync ([cb = onCloseRequested]() {
+                if (cb) cb();
+            });
         return;
     }
 
@@ -560,23 +611,21 @@ void QuantizeDialog::applyActive (bool closeAfter)
     else
         touched = grid->applyScale (view_.getLastScale(), view_.getLastScaleRoot());
 
-    (void) touched;   /* future: update a "X notes affected" footer label */
+    if (onApplied) onApplied (touched);
 
-    /* Apply doesn't clear the preview ring -- the now-committed notes
-     * keep their highlight so the user sees what just changed.
-     * Cancel + close-after-OK clears it instead. */
     if (closeAfter)
     {
         clearPreview();
-        /* Defer the close hook so we don't return into a freed dialog. */
-        juce::MessageManager::callAsync ([cb = onApply]() { if (cb) cb (true); });
+        /* Defer the close hook so we don't return into a freed panel. */
+        juce::MessageManager::callAsync ([cb = onCloseRequested]() {
+            if (cb) cb();
+        });
     }
     else
     {
         /* Re-snapshot the preview now that the diff has been committed
          * (most ids will no longer trigger -- they're already on-grid). */
         refreshPreview();
-        if (onApply) onApply (false);
     }
 }
 
@@ -584,46 +633,6 @@ void QuantizeDialog::clearPreview()
 {
     if (auto* grid = view_.getGrid())
         grid->clearPreviewAffectedNotes();
-}
-
-//==============================================================================
-
-QuantizeDialogWindow::QuantizeDialogWindow (std::unique_ptr<juce::Component>& holder,
-                                              PianoRollView& view,
-                                              QuantizeDialog::Tab initialTab)
-    : DialogWindow ("Quantize", juce::Colour (0xff'1a'1a'1a), true /*escape closes*/, true),
-      holder_ (holder)
-{
-    holder_.reset (this);
-    setUsingNativeTitleBar (true);
-    setResizable (false, false);
-
-    auto* content = new QuantizeDialog (view, initialTab);
-    content_ = content;
-    content->onApply  = [this] (bool closeAfter) {
-        if (closeAfter) closeButtonPressed();
-    };
-    content->onCancel = [this]() {
-        closeButtonPressed();
-    };
-    setContentOwned (content, true);
-    setAlwaysOnTop (false);
-    centreWithSize (QuantizeDialog::kPreferredW, QuantizeDialog::kPreferredH + 28);
-    setVisible (true);
-}
-
-QuantizeDialogWindow::~QuantizeDialogWindow() = default;
-
-bool QuantizeDialogWindow::escapeKeyPressed()
-{
-    closeButtonPressed();
-    return true;
-}
-
-void QuantizeDialogWindow::closeButtonPressed()
-{
-    /* Holder reset deletes this -- match SessionImportWizardDialog. */
-    holder_.reset();
 }
 
 } // namespace element

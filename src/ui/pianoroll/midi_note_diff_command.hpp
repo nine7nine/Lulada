@@ -68,6 +68,21 @@ public:
         return adds_.empty() && removes_.empty() && updates_.empty();
     }
 
+    /** Returns the union of note ids this command would touch when
+     *  performed.  Used by the live-preview path in QuantizeDialog to
+     *  drive the affected-note highlight overlay from exactly the same
+     *  diff the apply path will commit -- no semantic drift between
+     *  what the user sees previewed and what Apply actually writes. */
+    std::vector<std::uint64_t> touchedIds() const
+    {
+        std::vector<std::uint64_t> out;
+        out.reserve (adds_.size() + removes_.size() + updates_.size());
+        for (const auto& a : adds_)    out.push_back (a.note.id);
+        for (const auto& r : removes_) out.push_back (r.note.id);
+        for (const auto& u : updates_) out.push_back (u.id);
+        return out;
+    }
+
     bool perform() override;
     bool undo()    override;
 

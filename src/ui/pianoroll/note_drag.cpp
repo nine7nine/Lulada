@@ -71,11 +71,14 @@ class NoteDragMove final : public NoteDrag
 public:
     NoteDragMove (PianoRollGrid& grid, MidiNoteRegion& region,
                    const juce::MouseEvent& e)
-        : regionId_ (juce::Uuid())   /* filled below from grid -> view */
+        : regionId_ (juce::Uuid()),   /* filled below from grid -> view */
+          copyOnCommit_ (e.mods.isAltDown())
     {
         (void) grid;
-        anchorBeat_  = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
-        anchorPitch_ = grid.pitchForY (e.y);
+        anchorBeat_   = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
+        anchorPitch_  = grid.pitchForY (e.y);
+        anchorXPx_    = e.x;
+        anchorYPx_    = e.y;
 
         /* Capture the original state of every selected note so we can
          * compute the delta and so MidiNoteDiffCommand has the
@@ -104,14 +107,43 @@ public:
         const double curBeat  = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
         const int    curPitch = grid.pitchForY (e.y);
 
-        /* Snap the BEAT delta (not the absolute position) so the
-         * gesture feels relative.  Pitch is integer so no snap
-         * needed.  When snap is off, drag is continuous. */
-        const double rawDeltaBeats = curBeat - anchorBeat_;
-        deltaBeats_ = grid.isSnapEnabled()
-            ? grid.snapBeat (rawDeltaBeats)
-            : rawDeltaBeats;
-        deltaPitch_ = curPitch - anchorPitch_;
+        /* Keep-offset snap: the drag's effective delta is the snapped
+         * change between cursor + anchor, so the dragged notes keep
+         * their original sub-grid offset under the cursor instead of
+         * jumping to the snap point on the first tick.  Matches the
+         * arranger's a2a18109 keep-offset semantic.  Pitch is integer
+         * so no snap needed.  When snap is off, drag is continuous. */
+        double dBeats = grid.isSnapEnabled()
+            ? (grid.snapBeatKeepOffset (curBeat, anchorBeat_) - anchorBeat_)
+            : (curBeat - anchorBeat_);
+        int    dPitch = curPitch - anchorPitch_;
+
+        /* Shift-held axis lock.  Mirrors the arranger's Slice-6
+         * behaviour: dominant axis (whichever has travelled further
+         * in pixels) is picked the first time Shift is sampled with
+         * a non-zero delta; subsequent drag-ticks while Shift stays
+         * down lock the other axis to zero.  Releasing Shift restores
+         * free movement; re-pressing Shift recomputes from the live
+         * cursor position. */
+        if (e.mods.isShiftDown())
+        {
+            if (axis_ == Axis::Free)
+            {
+                const int dxPx = std::abs (e.x - anchorXPx_);
+                const int dyPx = std::abs (e.y - anchorYPx_);
+                if (dxPx > 0 || dyPx > 0)
+                    axis_ = (dxPx >= dyPx) ? Axis::Horizontal : Axis::Vertical;
+            }
+            if      (axis_ == Axis::Horizontal) dPitch = 0;
+            else if (axis_ == Axis::Vertical)   dBeats = 0.0;
+        }
+        else
+        {
+            axis_ = Axis::Free;
+        }
+
+        deltaBeats_ = dBeats;
+        deltaPitch_ = dPitch;
 
         grid.repaint();
     }
@@ -125,15 +157,33 @@ public:
         if (region == nullptr) return;
 
         auto cmd = std::make_unique<MidiNoteDiffCommand> (regionId_, resolver_);
-        for (const auto& before : original_)
-        {
-            MidiNote after = before;
-            after.onBeat = juce::jmax (0.0, before.onBeat + deltaBeats_);
-            after.pitch  = juce::jlimit (0, 127, before.pitch + deltaPitch_);
-            cmd->recordUpdate (before.id, before, after);
-        }
 
-        commitDiff (grid, std::move (cmd), "Move MIDI notes");
+        if (copyOnCommit_)
+        {
+            /* Alt-drag copy: originals stay put, fresh notes land at
+             * the target.  recordAdd stamps a new id per copy.  Same
+             * pattern as ArrangementView's commitCopyMove. */
+            for (const auto& before : original_)
+            {
+                MidiNote copy = before;
+                copy.id     = 0;   /* fresh id stamped on add */
+                copy.onBeat = juce::jmax (0.0, before.onBeat + deltaBeats_);
+                copy.pitch  = juce::jlimit (0, 127, before.pitch + deltaPitch_);
+                cmd->recordAdd (*region, copy);
+            }
+            commitDiff (grid, std::move (cmd), "Copy MIDI notes");
+        }
+        else
+        {
+            for (const auto& before : original_)
+            {
+                MidiNote after = before;
+                after.onBeat = juce::jmax (0.0, before.onBeat + deltaBeats_);
+                after.pitch  = juce::jlimit (0, 127, before.pitch + deltaPitch_);
+                cmd->recordUpdate (before.id, before, after);
+            }
+            commitDiff (grid, std::move (cmd), "Move MIDI notes");
+        }
     }
 
     void paintOverlay (juce::Graphics& g, PianoRollGrid& grid) override
@@ -144,7 +194,14 @@ public:
         const int rowH = grid.rowHeight();
         const int pxb  = grid.getPxPerBeat();
 
-        g.setColour (juce::Colours::white.withAlpha (0.45f));
+        /* Copy-mode ghost is amber (matches the preview ring); move-
+         * mode ghost stays white-ish.  Reads as "the source notes
+         * will be DUPLICATED to the target" vs "the source notes
+         * will MOVE to the target". */
+        const juce::Colour ghostCol = copyOnCommit_
+            ? juce::Colour (0xff'ff'b3'4a).withAlpha (0.7f)
+            : juce::Colours::white.withAlpha (0.45f);
+        g.setColour (ghostCol);
         for (const auto& before : original_)
         {
             const double newBeat  = juce::jmax (0.0, before.onBeat + deltaBeats_);
@@ -155,16 +212,37 @@ public:
             const int h = juce::jmax (1, rowH - 1);
             g.drawRect (x, y, w, h, 2);
         }
+
+        /* For copy mode, also paint a faint trace of the originals
+         * so the user can see they're staying put. */
+        if (copyOnCommit_)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.20f));
+            for (const auto& before : original_)
+            {
+                const int x = (int) std::round (before.onBeat * pxb);
+                const int w = juce::jmax (2, (int) std::round (before.lengthBeats * pxb));
+                const int y = grid.yForPitch (before.pitch);
+                const int h = juce::jmax (1, rowH - 1);
+                g.drawRect (x, y, w, h, 1);
+            }
+        }
     }
 
 private:
+    enum class Axis { Free, Horizontal, Vertical };
+
     juce::Uuid                                regionId_;
     std::function<MidiNoteRegion* (const juce::Uuid&)> resolver_;
     std::vector<MidiNote>                     original_;
     double anchorBeat_  { 0.0 };
     int    anchorPitch_ { 60 };
+    int    anchorXPx_   { 0 };
+    int    anchorYPx_   { 0 };
     double deltaBeats_  { 0.0 };
     int    deltaPitch_  { 0 };
+    bool   copyOnCommit_ { false };
+    Axis   axis_         { Axis::Free };
 };
 
 //==============================================================================
@@ -341,6 +419,103 @@ private:
     MidiNote      before_ {};
     int           anchorX_ { 0 };
     double        liveLen_ { 0.25 };
+};
+
+//==============================================================================
+// NoteDragResizeLeft -- drag the left edge of a note.  The right edge
+// stays put; onBeat moves toward the cursor and lengthBeats shrinks
+// by the same delta.  Min length clamped to one snap-division (or
+// 1/64 beat when snap is off) so we never collapse the note to
+// invisibility.  Mirrors the arranger's LeftEdge MIDI region resize
+// from Slice 4 of Batch A (b0947371).
+
+class NoteDragResizeLeft final : public NoteDrag
+{
+public:
+    NoteDragResizeLeft (PianoRollGrid& grid, MidiNoteRegion& region,
+                          std::uint64_t hitId, const juce::MouseEvent& e)
+        : hitId_ (hitId)
+    {
+        anchorX_ = e.x;
+        const auto* snap = region.loadSnapshot();
+        if (snap != nullptr)
+        {
+            for (const auto& n : *snap)
+            {
+                if (n.id == hitId_)
+                {
+                    before_   = n;
+                    liveOn_   = n.onBeat;
+                    liveLen_  = n.lengthBeats;
+                    origEnd_  = n.onBeat + n.lengthBeats;
+                    break;
+                }
+            }
+        }
+        if (auto* view = grid.findParentComponentOfClass<PianoRollView>())
+        {
+            regionId_ = view->getBoundRegionId();
+            resolver_ = view->getRegionResolver();
+        }
+    }
+
+    void mouseDrag (const juce::MouseEvent& e, PianoRollGrid& grid) override
+    {
+        if (before_.id == 0) return;
+        const double pxb     = (double) juce::jmax (1, grid.getPxPerBeat());
+        const double rawOn   = (double) e.x / pxb;
+        const double snapped = grid.isSnapEnabled()
+            ? grid.snapBeat (rawOn)
+            : rawOn;
+
+        const double minLen  = grid.isSnapEnabled() && grid.getSnapDivision() > 0.0
+            ? grid.getSnapDivision()
+            : 1.0 / 64.0;
+        /* Clamp onBeat to [0, origEnd - minLen] so the note can't
+         * swap edges or vanish.  Lower bound 0 keeps onBeat positive
+         * (notes live in region-local beat space). */
+        const double newOn   = juce::jlimit (0.0, origEnd_ - minLen, snapped);
+        liveOn_  = newOn;
+        liveLen_ = origEnd_ - newOn;
+        grid.repaint();
+    }
+
+    void mouseUp (const juce::MouseEvent& /*e*/, PianoRollGrid& grid) override
+    {
+        if (before_.id == 0) return;
+        if (liveOn_ == before_.onBeat && liveLen_ == before_.lengthBeats) return;
+
+        MidiNote after = before_;
+        after.onBeat      = liveOn_;
+        after.lengthBeats = liveLen_;
+
+        auto cmd = std::make_unique<MidiNoteDiffCommand> (regionId_, resolver_);
+        cmd->recordUpdate (before_.id, before_, after);
+        commitDiff (grid, std::move (cmd), "Resize MIDI note");
+    }
+
+    void paintOverlay (juce::Graphics& g, PianoRollGrid& grid) override
+    {
+        if (before_.id == 0) return;
+        const int pxb  = grid.getPxPerBeat();
+        const int rowH = grid.rowHeight();
+        const int x    = (int) std::round (liveOn_ * pxb);
+        const int w    = juce::jmax (2, (int) std::round (liveLen_ * pxb));
+        const int y    = grid.yForPitch (before_.pitch);
+        const int h    = juce::jmax (1, rowH - 1);
+        g.setColour (juce::Colours::cyan.withAlpha (0.6f));
+        g.drawRect (x, y, w, h, 2);
+    }
+
+private:
+    juce::Uuid                                regionId_;
+    std::function<MidiNoteRegion* (const juce::Uuid&)> resolver_;
+    std::uint64_t hitId_  { 0 };
+    MidiNote      before_ {};
+    int           anchorX_ { 0 };
+    double        liveOn_  { 0.0 };
+    double        liveLen_ { 0.25 };
+    double        origEnd_ { 0.0 };
 };
 
 //==============================================================================
@@ -564,6 +739,14 @@ std::unique_ptr<NoteDrag> NoteDrag::makeCreate (PianoRollGrid& grid,
                                                   const juce::MouseEvent& e)
 {
     return std::make_unique<NoteDragCreate> (grid, region, e);
+}
+
+std::unique_ptr<NoteDrag> NoteDrag::makeResizeLeft (PianoRollGrid& grid,
+                                                      MidiNoteRegion& region,
+                                                      std::uint64_t hitId,
+                                                      const juce::MouseEvent& e)
+{
+    return std::make_unique<NoteDragResizeLeft> (grid, region, hitId, e);
 }
 
 std::unique_ptr<NoteDrag> NoteDrag::makeResize (PianoRollGrid& grid,
