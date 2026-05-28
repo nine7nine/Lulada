@@ -273,6 +273,28 @@ public:
             g.drawRect (hover, 2);
         }
 
+        /* Lane-header drag feedback.  Source lane gets a translucent
+         * overlay; hover lane gets a horizontal amber drop-indicator
+         * at its top or bottom edge depending on direction. */
+        if (laneDragActive_)
+        {
+            if (laneDragSource_ >= 0 && laneDragSource_ < laneCount)
+            {
+                const int y = kRulerH + laneDragSource_ * kLaneH;
+                g.setColour (juce::Colours::black.withAlpha (0.30f));
+                g.fillRect (0, y, kLabelW, kLaneH);
+            }
+            if (laneDragHoverIdx_ >= 0 && laneDragHoverIdx_ < laneCount
+                && laneDragHoverIdx_ != laneDragSource_)
+            {
+                const int y = kRulerH + laneDragHoverIdx_ * kLaneH;
+                const bool dropOnTop = (laneDragHoverIdx_ < laneDragSource_);
+                const int yLine = dropOnTop ? y : y + kLaneH - 2;
+                g.setColour (juce::Colour { 0xff'ff'a0'40 });
+                g.fillRect (0, yLine, getWidth(), 2);
+            }
+        }
+
         /* Ghost preview overlay.  Fires for:
          *   - any cross-lane Move drag (laneOffset != 0) -- sources
          *     stay at originals, ghosts mark would-be destinations.
@@ -538,6 +560,27 @@ public:
         /* Label area button hits (M/S/R) are tool-independent. */
         if (e.x < kLabelW)
         {
+            /* Right-click anywhere in the label strip opens the
+             * track-level context menu.  Tested first so it preempts
+             * the M / S / R button click handlers. */
+            if (e.mods.isPopupMenu())
+            {
+                juce::PopupMenu m;
+                m.addItem (1, "Move up",   laneIdx > 0);
+                m.addItem (2, "Move down", laneIdx < owner.lanes_.size() - 1);
+                m.addSeparator();
+                m.addItem (3, "Delete track");
+                const int r = m.showAt (
+                    juce::Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
+                switch (r)
+                {
+                    case 1: owner.moveLane   (laneIdx, -1); break;
+                    case 2: owner.moveLane   (laneIdx, +1); break;
+                    case 3: owner.removeLane (laneIdx);     break;
+                    default: break;
+                }
+                return;
+            }
             if (muteToggleRect (laneIdx).contains (e.x, e.y))
             {
                 lane.muted = ! lane.muted;
@@ -560,7 +603,15 @@ public:
                 runtime.audioClipCache->setArmed (lane.armed);
                 owner.writeLanesToSession();
                 repaintLane (laneIdx);
+                return;
             }
+
+            /* Stage a potential lane reorder.  No-op on stationary
+             * click; promoted past the drag threshold in mouseDrag. */
+            laneDragSource_   = laneIdx;
+            laneDragStart_    = juce::Point<int> (e.x, e.y);
+            laneDragActive_   = false;
+            laneDragHoverIdx_ = laneIdx;
             return;
         }
 
@@ -1355,6 +1406,26 @@ public:
             return;
         }
 
+        /* Lane-header drag -- vertical reorder.  Promoted past the
+         * drag threshold; hover-lane resolved from yToLaneIdx. */
+        if (laneDragSource_ >= 0)
+        {
+            if (! laneDragActive_)
+            {
+                if (juce::Point<int> (e.x, e.y).getDistanceFrom (laneDragStart_) < 6)
+                    return;
+                laneDragActive_ = true;
+                setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+            }
+            const int hover = yToLaneIdx (e.y);
+            if (hover != laneDragHoverIdx_)
+            {
+                laneDragHoverIdx_ = hover;
+                repaint();
+            }
+            return;
+        }
+
         if (gesture_.laneIdx < 0) return;
         if (e.getDistanceFromDragStart() < kDragThresholdPx && ! gesture_.dragActive)
             return;
@@ -1607,6 +1678,35 @@ public:
             {
                 rangeActive_ = false;
             }
+            repaint();
+            return;
+        }
+
+        /* Lane-header drag commit.  Stepwise swap from source toward
+         * hover so persistence stays coherent across multi-position
+         * moves.  Stationary click is a no-op. */
+        if (laneDragSource_ >= 0)
+        {
+            if (laneDragActive_)
+            {
+                setMouseCursor (juce::MouseCursor::NormalCursor);
+                if (laneDragHoverIdx_ >= 0
+                    && laneDragHoverIdx_ < owner.lanes_.size()
+                    && laneDragHoverIdx_ != laneDragSource_)
+                {
+                    int src = laneDragSource_;
+                    const int dst = laneDragHoverIdx_;
+                    while (src != dst)
+                    {
+                        const int step = (dst > src) ? +1 : -1;
+                        owner.moveLane (src, step);
+                        src += step;
+                    }
+                }
+            }
+            laneDragSource_   = -1;
+            laneDragActive_   = false;
+            laneDragHoverIdx_ = -1;
             repaint();
             return;
         }
@@ -5016,6 +5116,16 @@ private:
     Tool   activeTool_     = Tool::Select;
     bool   rangeActive_    = false;
     bool   rangeDragging_  = false;
+
+    /* Lane-header drag state.  Mouse-down in the label area (outside
+     * M/S/R buttons) stages a potential vertical reorder; promoted
+     * past the drag threshold; release commits via owner.moveLane
+     * one swap at a time.  Drop indicator paints as a horizontal
+     * line on the target lane boundary. */
+    int    laneDragSource_   = -1;
+    bool   laneDragActive_   = false;
+    int    laneDragHoverIdx_ = -1;
+    juce::Point<int> laneDragStart_ {};
     double rangeStart_     = 0.0;
     double rangeEnd_       = 0.0;
     double rangeAnchor_    = 0.0;
@@ -5073,7 +5183,6 @@ ArrangementView::ArrangementView()
     addAndMakeVisible (rescanBtn_);
     addAndMakeVisible (addAudioBtn_);
     addAndMakeVisible (addMidiBtn_);
-    addAndMakeVisible (loadAudioBtn_);
     addAndMakeVisible (toolSelectBtn_);
     addAndMakeVisible (toolRangeBtn_);
     addAndMakeVisible (toolSplitBtn_);
@@ -5168,7 +5277,6 @@ ArrangementView::ArrangementView()
     rescanBtn_.onClick    = [this]() { rescanLaneTargets(); };
     addAudioBtn_.onClick  = [this]() { createEmptyAudioLane (true /*stereo*/); };
     addMidiBtn_.onClick   = [this]() { createEmptyMidiLane(); };
-    loadAudioBtn_.onClick = [this]() { promptLoadAudioFile(); };
 
     /* Tool buttons: radio-group toggles; one tool active at a time.
      * Select is default + sticky on start. */
@@ -5484,8 +5592,7 @@ void ArrangementView::resized()
     auto top = r.removeFromTop (kHeaderH).reduced (4, 4);
     rescanBtn_      .setBounds (top.removeFromLeft (60)); top.removeFromLeft (4);
     addAudioBtn_    .setBounds (top.removeFromLeft (70)); top.removeFromLeft (4);
-    addMidiBtn_     .setBounds (top.removeFromLeft (60)); top.removeFromLeft (4);
-    loadAudioBtn_   .setBounds (top.removeFromLeft (60)); top.removeFromLeft (12);
+    addMidiBtn_     .setBounds (top.removeFromLeft (60)); top.removeFromLeft (12);
 
     toolSelectBtn_  .setBounds (top.removeFromLeft (76)); top.removeFromLeft (2);
     toolRangeBtn_   .setBounds (top.removeFromLeft (72)); top.removeFromLeft (2);
@@ -5705,16 +5812,30 @@ void ArrangementView::paint (Graphics& g)
 
 namespace {
 
-/** Recursive: collects every TrackerNode, AudioClipNode, AND
- *  MidiPlayerNode reachable from `graph`, including subgraphs.  Used
- *  to seed / rebind lanes against the live graph.  Output arrays are
- *  parallel: outNodes[i] -> outTrackers[i] OR outAudioClips[i] OR
- *  outMidiPlayers[i] (exactly one non-null per index). */
+/** Recursive: collects lane targets reachable from `graph`.  Output
+ *  arrays are parallel: outNodes[i] -> outTrackers[i] OR
+ *  outAudioClips[i] OR outMidiPlayers[i] (exactly one non-null per
+ *  index).
+ *
+ *  Surface ownership rules (TrackerNode-style unified model):
+ *   - TrackerNode: collected at any nesting.  One node = one
+ *     "clip source" auto-shown by BOTH session view (as a column)
+ *     AND arrangement view (as a lane).  Graph appears once; both
+ *     surfaces project onto it.
+ *   - MidiPlayerNode: same shape -- collected at any nesting.
+ *     Root-level instances spawned via "+ MIDI" from either surface
+ *     appear in both views simultaneously, matching the modular-
+ *     graph "one node per clip source" abstraction.
+ *   - AudioClipNode: still collected ONLY inside the Multi-Track
+ *     subgraph.  Audio clips need the subgraph's bus routing
+ *     infrastructure (audio sums onto the outer face); they don't
+ *     follow the unified-clip-source pattern. */
 void collectLaneTargetsFromGraph (const Node& graph,
                                   juce::Array<Node>&            outNodes,
                                   juce::Array<TrackerNode*>&    outTrackers,
                                   juce::Array<AudioClipNode*>&  outAudioClips,
-                                  juce::Array<MidiPlayerNode*>& outMidiPlayers)
+                                  juce::Array<MidiPlayerNode*>& outMidiPlayers,
+                                  bool                          insideArrangementSubgraph = false)
 {
     const int n = graph.getNumNodes();
     for (int i = 0; i < n; ++i)
@@ -5724,7 +5845,7 @@ void collectLaneTargetsFromGraph (const Node& graph,
         if (auto* proc = child.getObject())
         {
             /* TrackerNode IS-A element::Processor directly so the
-             * cast is on `proc` itself. */
+             * cast is on `proc` itself.  Collected at any nesting. */
             if (auto* t = dynamic_cast<TrackerNode*> (proc))
             {
                 outNodes.add (child);
@@ -5733,9 +5854,9 @@ void collectLaneTargetsFromGraph (const Node& graph,
                 outMidiPlayers.add (nullptr);
                 continue;
             }
-            /* MidiPlayerNode is also a Processor (subclass of
-             * MidiFilterNode like TrackerNode) so the same direct
-             * cast applies -- no getAudioProcessor() unwrap needed. */
+            /* MidiPlayerNode -- unified clip source.  Collected at
+             * any nesting; appears in BOTH session view (as a column)
+             * AND arrangement view (as a lane). */
             if (auto* mp = dynamic_cast<MidiPlayerNode*> (proc))
             {
                 outNodes.add (child);
@@ -5747,26 +5868,73 @@ void collectLaneTargetsFromGraph (const Node& graph,
             /* AudioClipNode is a juce::AudioPluginInstance wrapped by
              * element::Processor -- Node::getObject() returns the
              * wrapper, so we have to go through proc->getAudioProcessor()
-             * to reach the underlying AudioClipNode.  Mirrors
-             * resolveAudioClipByUuid's unwrap; before this helper
-             * never populated outAudioClips and audio lanes were
-             * silently sent to the orphan path. */
+             * to reach the underlying AudioClipNode.  Still scoped to
+             * Multi-Track because audio clips need the subgraph bus. */
             if (auto* ap = proc->getAudioProcessor())
             {
                 if (auto* a = dynamic_cast<AudioClipNode*> (ap))
                 {
-                    outNodes.add (child);
-                    outTrackers.add (nullptr);
-                    outAudioClips.add (a);
-                    outMidiPlayers.add (nullptr);
+                    if (insideArrangementSubgraph)
+                    {
+                        outNodes.add (child);
+                        outTrackers.add (nullptr);
+                        outAudioClips.add (a);
+                        outMidiPlayers.add (nullptr);
+                    }
                     continue;
                 }
             }
         }
         if (child.isGraph())
+        {
+            const bool nowInside = insideArrangementSubgraph
+                || child.isA (EL_NODE_FORMAT_NAME, EL_NODE_ID_ARRANGEMENT_TRACKS);
             collectLaneTargetsFromGraph (child, outNodes, outTrackers,
-                                          outAudioClips, outMidiPlayers);
+                                          outAudioClips, outMidiPlayers,
+                                          nowInside);
+        }
     }
+}
+
+/* Walk the active graph (recursing into subgraphs) collecting every
+ * node name that starts with `prefix + " "` so we can compute the
+ * lowest free integer suffix.  Mirrors the "graph is the canonical
+ * naming source" rule -- both views read node.getName() to display
+ * lane / column labels, so a unique numbered name on the node keeps
+ * the graph block + arrangement lane + session column in sync. */
+void collectUsedNumbersForPrefix (const Node&             graph,
+                                  const juce::String&     prefix,
+                                  juce::Array<int>&       outUsed)
+{
+    const int n = graph.getNumNodes();
+    for (int i = 0; i < n; ++i)
+    {
+        Node child = graph.getNode (i);
+        if (! child.isValid()) continue;
+        const auto name = child.getName();
+        if (name.startsWith (prefix + " "))
+        {
+            const auto tail = name.substring (prefix.length() + 1).trim();
+            const int  num  = tail.getIntValue();
+            if (num > 0 && tail.containsOnly ("0123456789"))
+                outUsed.add (num);
+        }
+        if (child.isGraph())
+            collectUsedNumbersForPrefix (child, prefix, outUsed);
+    }
+}
+
+/* "prefix N" where N is the lowest positive integer such that no
+ * existing graph node has that name.  Sessions tend to fewer than
+ * a dozen of each kind, so the linear scan / array contains is fine. */
+juce::String nextNumberedNodeName (const Node&         rootGraph,
+                                   const juce::String& prefix)
+{
+    juce::Array<int> used;
+    collectUsedNumbersForPrefix (rootGraph, prefix, used);
+    int n = 1;
+    while (used.contains (n)) ++n;
+    return prefix + " " + juce::String (n);
 }
 
 Node findNodeByUuid (const Node& graph, juce::Uuid target)
@@ -5894,23 +6062,59 @@ void ArrangementView::rescanLaneTargets()
         {
             const Node active = sess->getActiveGraph();
             if (active.isValid())
+            {
                 collectLaneTargetsFromGraph (active, foundNodes,
                                               foundTrackers, foundAudioClips,
                                               foundMidiPlayers);
+
+                /* Auto-rename: any clip-source node still carrying
+                 * its default factory name gets bumped to the
+                 * canonical "TrkSeq N" / "MidiSeq N" / "AudioTrk N".
+                 * Triggers ONLY on exact default match so user-
+                 * customised names are preserved. */
+                for (int i = 0; i < foundNodes.size(); ++i)
+                {
+                    Node n = foundNodes.getReference (i);
+                    const auto cur = n.getName();
+                    const juce::String prefix =
+                        (foundTrackers[i]    != nullptr) ? juce::String ("TrkSeq")
+                      : (foundMidiPlayers[i] != nullptr) ? juce::String ("MidiSeq")
+                      : (foundAudioClips[i]  != nullptr) ? juce::String ("AudioTrk")
+                      : juce::String();
+                    const bool defaultName =
+                        (cur == "Tracker"     && prefix == "TrkSeq")
+                     || (cur == "MIDI Player" && prefix == "MidiSeq")
+                     || (cur == "Audio Clip"  && prefix == "AudioTrk");
+                    if (! defaultName || prefix.isEmpty()) continue;
+                    n.setName (nextNumberedNodeName (active, prefix));
+                }
+            }
         }
     }
 
     bool mutated = false;   /* shared with the auto-fill loop below */
 
-    /* Auto-fill: tracker nodes get a default lane on first discovery.
+    /* Auto-fill: clip-source nodes (TrackerNode + MidiPlayerNode) get
+     * a default lane on first discovery.  Mirrors how session view
+     * auto-creates columns from the same nodes -- one node, two
+     * surface projections.
+     *
+     * - TrackerNodes seed the lane with one region per existing
+     *   pattern (autoFillLaneForTracker), since patterns pre-exist
+     *   on the node.
+     * - MidiPlayerNodes auto-create an empty MIDI lane; the user adds
+     *   regions via drop / paint.  No auto-seeding because new MIDI
+     *   players don't carry pre-authored content.
+     *
      * AudioClipNodes do NOT auto-fill -- they're created explicitly
      * via "+ Audio Track" or file drop, both of which create the lane
-     * inline.  MidiPlayerNodes are spawned via createEmptyMidiLane /
-     * MIDI migration above; they don't auto-fill either (their lane
-     * is created in lockstep with the node). */
+     * inline. */
     for (int i = 0; i < foundNodes.size(); ++i)
     {
-        if (foundTrackers[i] == nullptr) continue;   // skip audio clips here
+        const bool isTracker = (foundTrackers[i]   != nullptr);
+        const bool isMidi    = (foundMidiPlayers[i] != nullptr);
+        if (! isTracker && ! isMidi) continue;
+
         const juce::Uuid uuid = foundNodes.getReference (i).getUuid();
         bool alreadyBound = false;
         for (const auto& l : lanes_)
@@ -5920,10 +6124,16 @@ void ArrangementView::rescanLaneTargets()
         Lane lane;
         lane.id             = juce::Uuid();
         lane.targetNodeUuid = uuid;
+        /* Lane::Kind enum is {Audio, Midi}; tracker lanes share the
+         * Audio default + are runtime-distinguished by trackerCache
+         * in laneRuntime_ (per the enum docstring). */
+        if (isMidi) lane.kind = Lane::Kind::Midi;
         lane.name           = foundNodes.getReference (i).getName().isNotEmpty()
                                 ? foundNodes.getReference (i).getName()
-                                : juce::String ("Tracker");
-        autoFillLaneForTracker (lane, foundTrackers[i]);
+                                : (isMidi ? juce::String ("MIDI")
+                                          : juce::String ("Tracker"));
+        if (isTracker)
+            autoFillLaneForTracker (lane, foundTrackers[i]);
         lanes_.add (std::move (lane));
         mutated = true;
     }
@@ -6067,6 +6277,33 @@ void ArrangementView::rescanLaneTargets()
         }
 
         laneRuntime_.add (std::move (s));
+    }
+
+    /* Orphan-lane purge.  When the Multi-Track subgraph (or any
+     * single tracker host) is destroyed, lanes_ retains entries
+     * whose targetNodeUuid no longer resolves.  Walk the freshly-
+     * computed laneRuntime_ + drop lanes whose target is gone AND
+     * whose playlist is empty (no audio regions + no MIDI regions).
+     * Content-bearing orphan lanes are kept so the user doesn't
+     * silently lose authored regions -- they show with a "?" badge
+     * + the user can manually delete them. */
+    for (int i = lanes_.size(); --i >= 0;)
+    {
+        const auto& l = lanes_.getReference (i);
+        const auto& s = laneRuntime_.getReference (i);
+        const bool noTarget =
+            (s.trackerCache == nullptr
+             && s.audioClipCache == nullptr
+             && s.midiPlayerCache == nullptr);
+        const bool empty =
+            l.playlist.regions().empty()
+            && l.playlist.midiRegions().empty();
+        if (noTarget && empty)
+        {
+            lanes_.remove (i);
+            laneRuntime_.remove (i);
+            mutated = true;
+        }
     }
 
     /* Republish MIDI region bindings for every MIDI lane with a live
@@ -6577,16 +6814,30 @@ void ArrangementView::propagateMuteSolo()
         if (auto* proc = target.getObject())
             proc->setMuted (effMuted);
 
-        /* TrackerNode also has its own session-view mute / solo state
-         * so the SessionView grid + TrackerEditor stay in sync.
-         * Audio lanes go through Processor::setMuted only -- the
-         * AudioProcessorNode wrapper's setMuted gates the audio
-         * graph layer, which is enough. */
+        /* TrackerNode + MidiPlayerNode also expose their own
+         * session-view mute / solo state so the SessionView grid +
+         * editor popups stay in sync.  Audio lanes go through
+         * Processor::setMuted only -- the AudioProcessorNode
+         * wrapper's setMuted gates the audio graph layer, which is
+         * enough.
+         *
+         * Note: SessionView ALSO writes these flags from its own
+         * column header (toggleColumnMute / toggleColumnSolo) +
+         * reconciles effective Processor::setMuted via
+         * applyMuteAndSoloState in its 30 Hz tick.  The two writers
+         * race in the user's favour -- whichever surface they
+         * touched most recently wins -- which matches Ableton's
+         * "track header mute is a single global thing" UX. */
         const auto& rs = laneRuntime_.getReference (i);
         if (rs.isTrackerLane())
         {
             rs.trackerCache->setUserMuted (l.muted);
             rs.trackerCache->setSoloed (l.soloed);
+        }
+        else if (rs.isMidiPlayerLane())
+        {
+            rs.midiPlayerCache->setUserMuted (l.muted);
+            rs.midiPlayerCache->setSoloed (l.soloed);
         }
     }
 }
@@ -6621,19 +6872,21 @@ int ArrangementView::createEmptyAudioLane (bool stereo)
     if (! subgraph.isValid()) return -1;
 
     Node clip = ArrangementTracksService::addAudioClipNode (*engineService, subgraph, stereo);
-    juce::Logger::writeToLog (
-        juce::String ("[ArrangementView::createEmptyAudioLane] clip valid=")
-        + (clip.isValid() ? "yes" : "no")
-        + " uuid=" + (clip.isValid() ? clip.getUuid().toString() : juce::String ("(none)"))
-        + " name=" + (clip.isValid() ? clip.getName() : juce::String ("(none)"))
-        + " parentIsGraph=" + (clip.isValid() ? clip.getParentGraph().getUuid().toString() : juce::String ("(none)")));
     if (! clip.isValid()) return -1;
+
+    /* Canonical "AudioTrk N" naming -- N is lowest-free integer
+     * across the full graph so the graph block + lane label match.
+     * Scoped to the active graph (root) since AudioClipNodes live
+     * inside Multi-Track; nextNumberedNodeName recurses into it. */
+    auto activeGraph = sess->getActiveGraph();
+    const auto canonicalName = nextNumberedNodeName (activeGraph, "AudioTrk");
+    clip.setName (canonicalName);
 
     Lane lane;
     lane.id             = juce::Uuid();
     lane.kind           = Lane::Kind::Audio;
     lane.targetNodeUuid = clip.getUuid();
-    lane.name           = juce::String ("Audio ") + juce::String (lanes_.size() + 1);
+    lane.name           = canonicalName;
     lane.colour         = laneTintForIndex (lanes_.size());
     lanes_.add (std::move (lane));
 
@@ -6643,51 +6896,102 @@ int ArrangementView::createEmptyAudioLane (bool stereo)
     return lanes_.size() - 1;
 }
 
-int ArrangementView::createEmptyMidiLane()
+void ArrangementView::moveLane (int laneIdx, int delta)
 {
-    /* MIDI lane creation spawns a MidiPlayerNode inside the
-     * ArrangementTracks subgraph, mirroring createEmptyAudioLane's
-     * AudioClipNode spawn.  The node's MIDI output is left unwired;
-     * the user routes it into a Sampler / synth via the main graph
-     * (same workflow as TrackerNode).  Without a player node MIDI
-     * lanes are silent; this entry point is the only sanctioned way
-     * to create a MIDI lane. */
-    if (services_ == nullptr)
-    {
-        juce::Logger::writeToLog ("[ArrangementView::createEmptyMidiLane] services_ null");
-        return -1;
-    }
-    auto sess = services_->context().session();
-    if (sess == nullptr)
-    {
-        juce::Logger::writeToLog ("[ArrangementView::createEmptyMidiLane] session null");
-        return -1;
-    }
-    auto* engineService = services_->find<EngineService>();
-    if (engineService == nullptr)
-    {
-        juce::Logger::writeToLog ("[ArrangementView::createEmptyMidiLane] EngineService null");
-        return -1;
-    }
+    if (laneIdx < 0 || laneIdx >= lanes_.size()) return;
+    const int target = laneIdx + delta;
+    if (target < 0 || target >= lanes_.size()) return;
 
-    Node subgraph = ArrangementTracksService::findOrCreateSubgraph (*engineService, *sess);
-    if (! subgraph.isValid()) return -1;
+    /* Swap lane + runtime entries together so audio-thread emission
+     * keeps the right cache binding.  Palette tint reflows on the
+     * next rescan; for now just swap colours too so the visual order
+     * stays stable until rescan repaints. */
+    lanes_.swap (laneIdx, target);
+    laneRuntime_.swap (laneIdx, target);
 
-    Node player = ArrangementTracksService::addMidiPlayerNode (*engineService, subgraph);
-    if (! player.isValid()) return -1;
-
-    Lane lane;
-    lane.id             = juce::Uuid();
-    lane.kind           = Lane::Kind::Midi;
-    lane.targetNodeUuid = player.getUuid();
-    lane.name           = juce::String ("MIDI ") + juce::String (lanes_.size() + 1);
-    lane.colour         = laneTintForIndex (lanes_.size());
-    lanes_.add (std::move (lane));
-
-    rescanLaneTargets();   // resolves the new lane's midiPlayerCache
     writeLanesToSession();
     if (body_ != nullptr) body_->resizeForLanes();
-    return lanes_.size() - 1;
+    repaint();
+}
+
+void ArrangementView::removeLane (int laneIdx)
+{
+    if (laneIdx < 0 || laneIdx >= lanes_.size()) return;
+    if (services_ == nullptr) return;
+    auto* engine = services_->find<EngineService>();
+    if (engine == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto graph = sess->getActiveGraph();
+    if (! graph.isValid()) return;
+
+    /* Resolve the host node by uuid (stored on the lane).  If the
+     * node still exists, remove it through the engine; rescanLane-
+     * Targets + the orphan-purge pass will then drop the lane.  If
+     * the node is already gone (orphan-with-content case) we still
+     * need to drop the lane directly here so the user can manually
+     * clean up an "?" badge they no longer want. */
+    const juce::Uuid targetUuid = lanes_.getReference (laneIdx).targetNodeUuid;
+    const Node target = findNodeByUuid (graph, targetUuid);
+    if (target.isValid())
+    {
+        engine->removeNode (target.getNodeId());
+        rescanLaneTargets();   // orphan-purge drops the lane
+        return;
+    }
+
+    /* Direct lane removal for orphan lanes. */
+    lanes_.remove (laneIdx);
+    if (laneIdx < laneRuntime_.size())
+        laneRuntime_.remove (laneIdx);
+    writeLanesToSession();
+    if (body_ != nullptr) body_->resizeForLanes();
+    repaint();
+}
+
+int ArrangementView::createEmptyMidiLane()
+{
+    /* MIDI lane creation spawns a MidiPlayerNode at the ROOT graph
+     * level (NOT inside the Multi-Track subgraph -- matches the
+     * TrackerNode "clip source" pattern).  One MidiPlayerNode appears
+     * in BOTH the session view (as a column) and the arrangement
+     * view (as a lane).  The node's MIDI output is left unwired;
+     * the user routes it into a Sampler / synth via the main graph
+     * (same workflow as TrackerNode).  Lane auto-fill happens via
+     * rescanLaneTargets right after the node lands. */
+    if (services_ == nullptr) return -1;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return -1;
+    auto* engineService = services_->find<EngineService>();
+    if (engineService == nullptr) return -1;
+
+    auto graph = sess->getActiveGraph();
+    if (! graph.isValid()) return -1;
+
+    juce::PluginDescription desc;
+    desc.fileOrIdentifier = EL_NODE_ID_MIDI_PLAYER;
+    desc.pluginFormatName = EL_NODE_FORMAT_NAME;
+    desc.name             = "MIDI Player";
+
+    Node player = engineService->addPlugin (graph, desc);
+    if (! player.isValid()) return -1;
+
+    /* Rename to the canonical "MidiSeq N" form so the graph block,
+     * arrangement lane, and session column all show the same label.
+     * N = lowest free integer across the entire graph (handles
+     * deletes + reuse). */
+    player.setName (nextNumberedNodeName (graph, "MidiSeq"));
+
+    /* rescanLaneTargets auto-fills an empty MIDI lane for the new
+     * node (via the auto-fill loop covering both tracker + midi clip
+     * sources).  Find the lane by uuid afterwards to return its
+     * index. */
+    rescanLaneTargets();
+    const auto uuid = player.getUuid();
+    for (int i = 0; i < lanes_.size(); ++i)
+        if (lanes_.getReference (i).targetNodeUuid == uuid)
+            return i;
+    return -1;
 }
 
 bool ArrangementView::importAudioFileToLane (const juce::File& file,
@@ -6894,55 +7198,6 @@ void ArrangementView::publishMidiBindingsForLane (int laneIdx)
         entries.push_back (e);
     }
     runtime.midiPlayerCache->setBoundRegions (std::move (entries));
-}
-
-void ArrangementView::promptLoadAudioFile()
-{
-    /* The DiskOp Request pattern navigates to the Disk Op page via
-     * setMainView, which DESTROYS the previous ContentView (i.e.
-     * THIS ArrangementView; see standard.cpp:181 primary.reset).
-     * So the onAccept callback fires AFTER this view is gone --
-     * we cannot capture `this` or even SafePointer<ArrangementView>
-     * and expect to do work on it.
-     *
-     * Capture Services* instead (lifetime-stable; lives in Element's
-     * Context) and route through the view-independent helper
-     * ArrangementTracksService::importAudioFileAsNewLane.  That
-     * helper writes the new Lane + Region directly into the
-     * session's tags::arrangement/lanes ValueTree; the next time
-     * ArrangementView opens (or didBecomeActive is called), its
-     * loadLanesFromSession picks the lane up. */
-    if (services_ == nullptr) return;
-    auto* gui = services_->find<GuiService>();
-    if (gui == nullptr) return;
-
-    Services* svc = services_;
-    const juce::String wildcard ("*.wav;*.aiff;*.aif;*.flac;*.ogg;*.mp3;*.w64;*.au");
-    const juce::File start = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
-
-    juce::Logger::writeToLog ("[ArrangementView::promptLoadAudioFile] arming Disk Op Request");
-
-    gui->requestFile (
-        "Load audio file into arrangement",
-        wildcard,
-        start,
-        juce::String() /*initialFilename*/,
-        false /*isSave*/,
-        [svc] (const juce::File& file)
-        {
-            juce::Logger::writeToLog (
-                juce::String ("[ArrangementView::promptLoadAudioFile] callback fired: ")
-                + file.getFullPathName());
-
-            if (svc == nullptr) return;
-            if (! file.existsAsFile())
-            {
-                juce::Logger::writeToLog (" -> chosen file does not exist; abort");
-                return;
-            }
-            ArrangementTracksService::importAudioFileAsNewLane (file, *svc);
-        },
-        nullptr /*onCancel*/);
 }
 
 int ArrangementView::laneIdxFromY (int yPx) const noexcept

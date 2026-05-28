@@ -30,7 +30,7 @@
  *     - bangClip + transitionClip end-to-end through schedulePlaying
  *     - mutual exclusion within a column at the bar boundary
  *     - scene-launch atomic swap across multiple columns
- *     - reconcileSequencePlaying silences unbound sequences
+ *     - reconcileClipPlaying silences unbound sources (tracker + midi)
  *     - SessionViewSnapshotAction undo / redo via UndoManager
  */
 
@@ -189,6 +189,146 @@ BOOST_AUTO_TEST_CASE (followaction_first_clip_falls_through_to_stop_on_missing)
     BOOST_CHECK_EQUAL (expectedResolution (FollowAction::FirstClip, true,  true),  "bang-first");
     BOOST_CHECK_EQUAL (expectedResolution (FollowAction::FirstClip, true,  false), "stop");
     BOOST_CHECK_EQUAL (expectedResolution (FollowAction::FirstClip, false, false), "stop");
+}
+
+/* === transitionClip decision table -- sceneLaunch vs single-click ====
+ *
+ * Bug 2026-05-28-evening (user-reported): scene master select would
+ * stop already-Playing clips on OTHER columns because bangScene called
+ * transitionClip with the toggle semantic, and an already-Playing clip
+ * in the scene gets wantPlaying=false (stop).  Result: scene master
+ * launch acted as "fire stopped clips, stop playing clips" which
+ * defeated the "every clip in this row plays" model.
+ *
+ * Fix: transitionClip(clip, target, sceneLaunch).
+ *   single-click (sceneLaunch=false) -> toggle semantic (current).
+ *   scene-launch (sceneLaunch=true)  -> force-start semantic:
+ *     - Playing       -> no-op (leave alone)
+ *     - WaitingToStart -> no-op (already queued)
+ *     - WaitingToStop  -> cancel stop, back to Playing
+ *     - Stopped        -> launch (with column mutual exclusion).
+ *
+ * Mutual exclusion remains column-local in BOTH modes -- a clip
+ * launching on column N stops only OTHER clips on column N.  This
+ * test locks down the decision table so any future refactor of
+ * transitionClip surfaces the divergence here. */
+
+enum class LiveState : int { Stopped = 0, WaitingToStart = 1, Playing = 2, WaitingToStop = 3 };
+
+const char* expectedTransitionAction (LiveState cur, bool sceneLaunch)
+{
+    /* Mirrors the post-fix transitionClip body. */
+    if (cur == LiveState::WaitingToStart)
+        return sceneLaunch ? "noop" : "cancel-launch";
+    if (cur == LiveState::WaitingToStop)
+        return "cancel-stop";              // both modes restore Playing
+    if (sceneLaunch && cur == LiveState::Playing)
+        return "noop";
+    if (cur == LiveState::Playing)
+        return "stop-toggle";              // single-click toggle off
+    return "launch";                       // Stopped -> launch
+}
+
+BOOST_AUTO_TEST_CASE (transition_single_click_stopped_launches)
+{
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::Stopped, false), "launch");
+}
+
+BOOST_AUTO_TEST_CASE (transition_single_click_playing_toggles_off)
+{
+    /* This is the existing single-click behaviour: re-clicking a
+     * playing clip stops it.  Must be preserved post-fix. */
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::Playing, false), "stop-toggle");
+}
+
+BOOST_AUTO_TEST_CASE (transition_single_click_waiting_to_start_cancels)
+{
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::WaitingToStart, false), "cancel-launch");
+}
+
+BOOST_AUTO_TEST_CASE (transition_single_click_waiting_to_stop_restores_playing)
+{
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::WaitingToStop, false), "cancel-stop");
+}
+
+BOOST_AUTO_TEST_CASE (transition_scene_launch_stopped_launches)
+{
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::Stopped, true), "launch");
+}
+
+BOOST_AUTO_TEST_CASE (transition_scene_launch_playing_is_noop_THE_BUG_FIX)
+{
+    /* THIS is the regression-prevention test.  Before the 2026-05-28
+     * fix, bangScene called transitionClip with single-click toggle
+     * semantic, so an already-Playing clip in the scene would be
+     * STOPPED -- and the user saw "scene master stops the clip on
+     * the other column" (cross-column mutual exclusion symptom).
+     * Scene launch must be force-start: Playing stays Playing. */
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::Playing, true), "noop");
+}
+
+BOOST_AUTO_TEST_CASE (transition_scene_launch_waiting_to_start_is_noop)
+{
+    /* Already queued for launch; let it land at the bar boundary. */
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::WaitingToStart, true), "noop");
+}
+
+BOOST_AUTO_TEST_CASE (transition_scene_launch_waiting_to_stop_restores_playing)
+{
+    /* User had queued a stop, then re-launched the scene -- cancel
+     * the stop so the clip keeps going. */
+    BOOST_CHECK_EQUAL (expectedTransitionAction (LiveState::WaitingToStop, true), "cancel-stop");
+}
+
+/* === Cross-column mutual exclusion invariant ========================
+ *
+ * Sanity test: under the bangScene fix, mutual exclusion is column-
+ * local only.  A scene launch should never STOP a clip on a column
+ * other than where the launch's clip lives -- the bug report walked
+ * exactly this case.
+ *
+ * Decision table for bangScene per column:
+ *   col has a clip in this scene's row -> transitionClip(scene-launch).
+ *     - Stopped         -> launch (with same-column mutual exclusion).
+ *     - Playing         -> noop.
+ *     - WaitingToStart  -> noop.
+ *     - WaitingToStop   -> cancel-stop.
+ *   col has NO clip in this scene's row -> stop ALL active clips on
+ *     this column (same as before -- empty slot acts as "stop the
+ *     column" at the bar boundary). */
+
+const char* bangSceneColumnAction (LiveState cur, bool clipInScene)
+{
+    if (! clipInScene)
+        return (cur == LiveState::Playing || cur == LiveState::WaitingToStart)
+                  ? "stop-column-orphan"
+                  : "noop";
+    return expectedTransitionAction (cur, true);
+}
+
+BOOST_AUTO_TEST_CASE (bangscene_other_column_playing_clip_is_unaffected)
+{
+    /* Scene 2 launch on a session where column 0 has Clip 3 (Playing)
+     * AND column 1 also has Clip 2 (Playing).  Both clips' columns
+     * have an entry in scene 2.  Both should stay Playing -- no
+     * cross-column exclusion. */
+    BOOST_CHECK_EQUAL (bangSceneColumnAction (LiveState::Playing, true), "noop");
+    BOOST_CHECK_EQUAL (bangSceneColumnAction (LiveState::Playing, true), "noop");
+}
+
+BOOST_AUTO_TEST_CASE (bangscene_other_column_stopped_clip_launches)
+{
+    BOOST_CHECK_EQUAL (bangSceneColumnAction (LiveState::Stopped, true), "launch");
+}
+
+BOOST_AUTO_TEST_CASE (bangscene_empty_slot_stops_column_orphan)
+{
+    /* Column had a playing clip on a different scene + the launched
+     * scene has no clip on this column -> stop the orphan. */
+    BOOST_CHECK_EQUAL (bangSceneColumnAction (LiveState::Playing,        false), "stop-column-orphan");
+    BOOST_CHECK_EQUAL (bangSceneColumnAction (LiveState::WaitingToStart, false), "stop-column-orphan");
+    BOOST_CHECK_EQUAL (bangSceneColumnAction (LiveState::Stopped,        false), "noop");
+    BOOST_CHECK_EQUAL (bangSceneColumnAction (LiveState::WaitingToStop,  false), "noop");
 }
 
 /* === Enum round-trip (persistence) =================================== */

@@ -1856,11 +1856,26 @@ void StandardContent::showPianoRollForRegion (const juce::Uuid& regionId)
      * its empty-state hint -- harmless. */
     pianoRoll->setRegionResolver (
         [this] (const juce::Uuid& uuid) -> MidiNoteRegion* {
-            auto it = viewCache_.find (EL_VIEW_ARRANGEMENT);
-            if (it == viewCache_.end()) return nullptr;
-            auto* arr = dynamic_cast<ArrangementView*> (it->second.get());
-            if (arr == nullptr) return nullptr;
-            return arr->findMidiRegion (uuid);
+            /* Resolver probes both surfaces that own MIDI regions:
+             *  1. ArrangementView lanes (long-form MIDI regions).
+             *  2. SessionView clips (per-clip MidiNoteRegion held by
+             *     the host MidiPlayerNode).
+             * First non-null wins. */
+            auto itArr = viewCache_.find (EL_VIEW_ARRANGEMENT);
+            if (itArr != viewCache_.end())
+            {
+                if (auto* arr = dynamic_cast<ArrangementView*> (itArr->second.get()))
+                    if (auto* r = arr->findMidiRegion (uuid))
+                        return r;
+            }
+            auto itSess = viewCache_.find (EL_VIEW_SESSION_VIEW);
+            if (itSess != viewCache_.end())
+            {
+                if (auto* sv = dynamic_cast<SessionView*> (itSess->second.get()))
+                    if (auto* r = sv->findMidiClipRegion (uuid))
+                        return r;
+            }
+            return nullptr;
         });
 
     /* Region-edited callback -- piano-roll edits fire this on commit
@@ -1880,12 +1895,29 @@ void StandardContent::showPianoRollForRegion (const juce::Uuid& regionId)
      *  undo push -- the MidiNoteDiffCommand already owns this gesture's
      *  Ctrl+Z slot on the global UndoManager. */
     pianoRoll->onRegionEdited = [this]() {
-        auto it = viewCache_.find (EL_VIEW_ARRANGEMENT);
-        if (it == viewCache_.end()) return;
-        if (auto* arr = dynamic_cast<ArrangementView*> (it->second.get()))
+        /* Two persistence sinks depending on which surface owns the
+         * currently-bound region:
+         *  - ArrangementView lanes: flush the lanes ValueTree.
+         *  - SessionView clips: the underlying MidiPlayerNode owns the
+         *    region; its getState/setState round-trip happens via the
+         *    graph node state path, so just nudging Session's
+         *    dirty-mark is enough.  StandardContent doesn't know which
+         *    owns the region without re-probing the resolver -- cheap
+         *    enough to fire both. */
+        auto itArr = viewCache_.find (EL_VIEW_ARRANGEMENT);
+        if (itArr != viewCache_.end())
         {
-            arr->flushLanesToSession();
-            arr->repaint();
+            if (auto* arr = dynamic_cast<ArrangementView*> (itArr->second.get()))
+            {
+                arr->flushLanesToSession();
+                arr->repaint();
+            }
+        }
+        auto itSess = viewCache_.find (EL_VIEW_SESSION_VIEW);
+        if (itSess != viewCache_.end())
+        {
+            if (auto* sv = dynamic_cast<SessionView*> (itSess->second.get()))
+                sv->repaint();
         }
     };
 
