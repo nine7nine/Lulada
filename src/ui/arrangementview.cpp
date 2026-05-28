@@ -4535,46 +4535,51 @@ private:
                                        r, borderTint, selected);
             }
 
-            /* Loop boundary markers -- audio regions whose drawn
+            /* Loop boundary markers -- looped regions whose drawn
              * lengthBeats spans more than one source-length iteration
-             * get the same dashed-vertical-line cue as MIDI regions
-             * (see the MIDI block lower in this method).  Source
-             * length in beats is derived from the thumbnail's total
-             * seconds at the current tempo so the cue tracks what
-             * PlaybackDS actually does (wraps on source frames).
-             * Tracker regions (r.sequenceIdx >= 0) currently don't
-             * honour r.looped at playback time -- their dashed lines
-             * are gated on that wiring landing. */
-            if (r.looped && isAudio && r.sequenceIdx < 0)
+             * get a dashed-vertical-line cue at every loop boundary.
+             * Audio: source length comes from the thumbnail's total
+             * seconds at the current tempo.  Tracker: source length
+             * comes from the sequence's row count / rpb. */
+            if (r.looped && bodyRect.getHeight() > 2)
             {
-                if (auto* thumb = const_cast<Body*> (this)->getThumbnail (r.sourceId))
+                double sourceBeats = 0.0;
+                if (isAudio && r.sequenceIdx < 0)
                 {
-                    const double totalSeconds = thumb->getTotalLength();
-                    const double bpm = owner.monitor_ != nullptr
-                                          ? (double) owner.monitor_->tempo.get()
-                                          : 120.0;
-                    if (totalSeconds > 0.0 && bpm > 0.0)
+                    if (auto* thumb = const_cast<Body*> (this)->getThumbnail (r.sourceId))
                     {
-                        const double sourceBeats = totalSeconds * bpm / 60.0;
-                        if (sourceBeats > 0.0 && sourceBeats < r.lengthBeats)
-                        {
-                            const float dashTopY = (float) bodyRect.getY();
-                            const float dashBotY = (float) bodyRect.getBottom();
-                            const float dashLengths[] = { 3.0f, 3.0f };
-                            g.setColour (borderTint.withAlpha (0.6f));
-                            for (double k = sourceBeats;
-                                  k < r.lengthBeats;
-                                  k += sourceBeats)
-                            {
-                                const int bx = rect.getX()
-                                             + (int) std::round (k * kPxPerBeat);
-                                if (bx >= rect.getRight() - 2) break;
-                                if (bx <= rect.getX() + 2)     continue;
-                                const juce::Line<float> seg ((float) bx, dashTopY,
-                                                               (float) bx, dashBotY);
-                                g.drawDashedLine (seg, dashLengths, 2, 1.2f);
-                            }
-                        }
+                        const double totalSeconds = thumb->getTotalLength();
+                        const double bpm = owner.monitor_ != nullptr
+                                              ? (double) owner.monitor_->tempo.get()
+                                              : 120.0;
+                        if (totalSeconds > 0.0 && bpm > 0.0)
+                            sourceBeats = totalSeconds * bpm / 60.0;
+                    }
+                }
+                else if (! isAudio && r.sequenceIdx >= 0
+                         && runtime.trackerCache != nullptr)
+                {
+                    sourceBeats = runtime.trackerCache->getSequenceLengthBeats (
+                        r.sequenceIdx);
+                }
+
+                if (sourceBeats > 0.0 && sourceBeats < r.lengthBeats)
+                {
+                    const float dashTopY = (float) bodyRect.getY();
+                    const float dashBotY = (float) bodyRect.getBottom();
+                    const float dashLengths[] = { 3.0f, 3.0f };
+                    g.setColour (borderTint.withAlpha (0.6f));
+                    for (double k = sourceBeats;
+                          k < r.lengthBeats;
+                          k += sourceBeats)
+                    {
+                        const int bx = rect.getX()
+                                     + (int) std::round (k * kPxPerBeat);
+                        if (bx >= rect.getRight() - 2) break;
+                        if (bx <= rect.getX() + 2)     continue;
+                        const juce::Line<float> seg ((float) bx, dashTopY,
+                                                       (float) bx, dashBotY);
+                        g.drawDashedLine (seg, dashLengths, 2, 1.2f);
                     }
                 }
             }
@@ -6406,10 +6411,10 @@ void ArrangementView::dispatchAtBeat (double beat)
         const Region* active = lane.playlist.regionAt (beat);
 
         /* Case 1: playhead is outside any region.  Stop whatever was
-         * playing on this lane.  Tracker lanes don't auto-stop on
-         * gaps -- vht state persists between regions and the next
-         * region launch re-fires; audio lanes DO stop (DAW
-         * convention: gaps = silence). */
+         * playing on this lane.  Tracker lanes used to leak past the
+         * region edge (vht sequence_advance always wraps internally)
+         * so the looped flag was audibly a no-op.  Now both lane
+         * kinds schedule-stop on gap exit. */
         if (active == nullptr)
         {
             if (! runtime.lastDispatchedRegion.isNull())
@@ -6417,6 +6422,10 @@ void ArrangementView::dispatchAtBeat (double beat)
                 if (runtime.isAudioLane())
                     runtime.audioClipCache->scheduleStop (
                         runtime.lastDispatchedRegion, -1.0);
+                else if (runtime.isTrackerLane()
+                         && runtime.lastDispatchedSeqIdx >= 0)
+                    runtime.trackerCache->schedulePlaying (
+                        runtime.lastDispatchedSeqIdx, -1.0, false);
                 runtime.lastDispatchedRegion = juce::Uuid::null();
                 runtime.lastDispatchedSeqIdx = -1;
                 /* No repaintLane: per-region visual no longer differs
@@ -6454,6 +6463,29 @@ void ArrangementView::dispatchAtBeat (double beat)
                         runtime.lastDispatchedSeqIdx, -1.0, false);
                 runtime.trackerCache->schedulePlaying (
                     active->sequenceIdx, -1.0, true);
+
+                /* Non-looped tracker regions: schedule the cutoff at
+                 * positionBeats + min(lengthBeats, sequence_length_beats).
+                 * Pattern shorter than the region plays once then
+                 * silences for the remainder; pattern longer than the
+                 * region gets truncated at the region edge.  Looped
+                 * regions skip this -- vht wraps naturally and the
+                 * Case 1 gap-exit branch handles the stop on region
+                 * exit. */
+                if (! active->looped)
+                {
+                    const double seqLenBeats =
+                        runtime.trackerCache->getSequenceLengthBeats (active->sequenceIdx);
+                    if (seqLenBeats > 0.0)
+                    {
+                        const double cutoffOffset = juce::jmin (active->lengthBeats,
+                                                                seqLenBeats);
+                        runtime.trackerCache->schedulePlaying (
+                            active->sequenceIdx,
+                            active->positionBeats + cutoffOffset,
+                            false);
+                    }
+                }
             }
         }
         else if (runtime.isAudioLane())

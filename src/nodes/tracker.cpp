@@ -585,6 +585,15 @@ int TrackerNode::getSequenceLengthRows (int sequenceIdx) const noexcept
     return seq != nullptr ? seq->length : 0;
 }
 
+double TrackerNode::getSequenceLengthBeats (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return 0.0;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    if (seq == nullptr || seq->rpb <= 0 || seq->length <= 0) return 0.0;
+    return (double) seq->length / (double) seq->rpb;
+}
+
 /* === Audio-thread launch scheduler ===================================== */
 
 void TrackerNode::schedulePlaying (int sequenceIdx, double beatTarget, bool wantPlaying) noexcept

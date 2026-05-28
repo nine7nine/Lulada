@@ -110,6 +110,12 @@ public:
     double getSequencePositionRows (int sequenceIdx) const noexcept;
     int    getSequenceLengthRows   (int sequenceIdx) const noexcept;
 
+    /** Sequence length in beats = length_rows / rpb.  Returns 0.0 for
+     *  out-of-range indices or null sequences.  Used by ArrangementView
+     *  to schedule region cutoffs for non-looped tracker regions:
+     *  cutoff = min(region.lengthBeats, getSequenceLengthBeats(seqIdx)). */
+    double getSequenceLengthBeats  (int sequenceIdx) const noexcept;
+
     /** Edge-trigger: returns true once per wrap of the sequence's
      *  playhead (used for followAction at clip end).  Consumes the
      *  wrap on read — repeated calls in the same wrap window return
