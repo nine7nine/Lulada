@@ -17,14 +17,17 @@
 namespace element {
 
 class TrackerNode;
+class MidiPlayerNode;
+class MidiNoteRegion;
 
 /** Bitwig/Ableton-style clip-grid launcher view.
  *
- *  Each column maps 1:1 to a TrackerNode in the active graph.  Each
- *  scene (row) holds a sparse set of clips -- one per column at most.
- *  Clicking a clip flips its underlying vht sequence's `playing` flag
- *  via TrackerNode::setSequencePlaying.  No quantisation in Phase 3;
- *  launch is "fire on next render".
+ *  Each column maps 1:1 to a source node in the active graph -- a
+ *  TrackerNode (pattern-based) or a MidiPlayerNode (piano-roll based).
+ *  Each scene (row) holds a sparse set of clips -- one per column at
+ *  most.  Clicking a clip launches it via the source node's session-
+ *  view API (TrackerNode::schedulePlaying for pattern clips,
+ *  MidiPlayerNode::schedulePlayingClip for MIDI clips).
  *
  *  Visual language follows the existing tracker editor palette
  *  (monospaced font, dark background, track-tint bars).  Layout is
@@ -86,20 +89,38 @@ public:
      *  - FirstClip: bang the lowest-sceneRow clip on the same column. */
     enum class FollowAction : uint8_t { None, Stop, RestartClip, NextClip, FirstClip };
 
+    /* Discriminant for polymorphic clip backing.
+     *  - Tracker: vht-sequence-backed, hosted by a TrackerNode column.
+     *  - Midi:    MidiNoteRegion-backed, hosted by a MidiPlayerNode
+     *             column.  Each MIDI clip owns its own region (cloned
+     *             per clip, NOT shared with arrangement regions); edits
+     *             via the piano-roll dock affect only that clip. */
+    enum class ClipKind : uint8_t { Tracker, Midi };
+
 private:
 
     struct SessionClip {
         juce::Uuid     id;
         juce::String   name;
         juce::Colour   color { 0xff'4a'7a'b5 };
+        ClipKind       kind          { ClipKind::Tracker };
+        /* Tracker-kind binding: which TrackerNode + which sequenceIdx
+         * inside it.  Unused when kind==Midi (trackerNodeId=0). */
         juce::uint32   trackerNodeId { 0 };  // resolves via active graph
         int            sequenceIdx   { -1 }; // -1 = unbound
+        /* MIDI-kind binding: which MidiPlayerNode + which clip slot
+         * (identified by stable midiSourceId).  Unused when
+         * kind==Tracker (midiPlayerNodeId=0, midiSourceId=null). */
+        juce::uint32   midiPlayerNodeId { 0 };
+        juce::Uuid     midiSourceId     { juce::Uuid::null() };
         int            sceneRow      { 0 };
         int            columnIdx     { 0 };
         LaunchQuant    launchQuant   { LaunchQuant::Bar };
         FollowAction   followAction  { FollowAction::None };
         std::atomic<LiveState> state { LiveState::Stopped };
-        /* UI-side cached engine state for diff-gated repaint. */
+        /* UI-side cached engine state for diff-gated repaint.  Position
+         * is in rows for tracker clips, beats*100 for MIDI clips -- the
+         * value is opaque "did the visual position change" sentinel. */
         bool           lastDrawnPlaying { false };
         int            lastDrawnPosRow  { -1 };
 
@@ -123,7 +144,14 @@ private:
     struct SessionColumn {
         juce::Uuid     id;
         juce::String   name;
-        juce::uint32   trackerNodeId { 0 };
+        /* Column source-node kind.  Tracker columns bind to one
+         * TrackerNode (trackerNodeId); Midi columns bind to one
+         * MidiPlayerNode (midiPlayerNodeId).  Mixed-kind columns are
+         * not supported -- each column is locked to one kind at
+         * creation, matching one-clip-source-per-column. */
+        ClipKind       kind            { ClipKind::Tracker };
+        juce::uint32   trackerNodeId   { 0 };  // valid when kind==Tracker
+        juce::uint32   midiPlayerNodeId { 0 }; // valid when kind==Midi
     };
 
     void timerCallback() override;
@@ -137,14 +165,17 @@ private:
     void bangScene  (int sceneRow);
     void stopAllClips();
 
-    /* Belt + suspenders for the C.1 fix.  Walks each TrackerNode and
-     * forces playing=0 on every sequence not bound to a Playing /
-     * WaitingToStart SessionClip.  Called from stabilizeContent +
-     * didBecomeActive after rescanColumns so any sequence that
-     * sneaks in with a stale playing flag (legacy save, future
-     * regression, TrackerEditor experimentation) gets silenced
+    /* Belt + suspenders for the C.1 fix, generalised over both clip
+     * kinds.  For each TrackerNode column: forces playing=0 on every
+     * sequence not bound to a Playing / WaitingToStart SessionClip.
+     * For each MidiPlayerNode column: forces every clip slot whose
+     * id is not bound to a Playing / WaitingToStart SessionClip into
+     * Stopped state.  Called from stabilizeContent + didBecomeActive
+     * after rescanColumns so any source that sneaks in with a stale
+     * playing flag (legacy save, future regression, TrackerEditor
+     * experimentation, MidiPlayer record-mode debris) gets silenced
      * before the user hears unattributable MIDI. */
-    void reconcileSequencePlaying();
+    void reconcileClipPlaying();
 
     void stopColumn (int columnIdx);   // per-column stop button
     void toggleColumnMute (int columnIdx);
@@ -164,10 +195,38 @@ private:
      * a playing clip stops it. */
     void transitionClip (SessionClip&, double targetBeat, bool sceneLaunch = false);
     void applyFollowAction (SessionClip&);
-    void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
+    void addClipAt  (int sceneRow, int columnIdx);  // tracker: new vht sequence; midi: new MidiNoteRegion
     void deleteClip (SessionClip&);
     void openPatternEditor (SessionClip&);  // popup tracker editor at clip's seqIdx
     void openTrackerDockForClip (SessionClip&);  // surface clip in the right-side TrackerSideDock
+    void openPianoRollForClip (SessionClip&);    // surface MIDI clip in the bottom PianoRollView dock
+
+    /* New-column flows.  Each adds a fresh source node to the active
+     * graph at top level + rescans columns_ to pick it up.  Mirrored
+     * "+ Tracker" and "+ MIDI" toolbar buttons drive these. */
+    void addTrackerColumn();
+    void addMidiColumn();
+
+    /* Removes a column AND its underlying source node from the graph.
+     * Both surfaces' rescan auto-clean any dependent clips / lanes.
+     * Wired to the column-header right-click "Delete track" menu. */
+    void removeColumn (int columnIdx);
+
+    /* Reorder columns by swap delta (-1 left, +1 right).  Clips on the
+     * affected columns have their columnIdx remapped so they stay
+     * attached to their visual column.  Persistence rides
+     * writeToSession; the swap stays consistent across reloads even
+     * though rescanColumns walks the graph in node order, because
+     * the column array is preserved by uuid match. */
+    void moveColumn (int columnIdx, int delta);
+
+    /* Resolver helper used by StandardContent::showPianoRollForRegion:
+     * if any session clip owns a region with the supplied id, returns
+     * the live MidiNoteRegion pointer; nullptr otherwise.  Walks
+     * MidiPlayerNode columns. */
+public:
+    MidiNoteRegion* findMidiClipRegion (const juce::Uuid& sourceId) noexcept;
+private:
 
     void addScene();                  // append at end
     void insertScene (int beforeRow);
@@ -194,8 +253,9 @@ private:
     void moveClip (SessionClip&, int newSceneRow, int newColumnIdx);
     void copyClip (SessionClip&, int newSceneRow, int newColumnIdx);
 
-    TrackerNode* lookupTracker (juce::uint32 nodeId) const;
-    SessionClip* findClip (int sceneRow, int columnIdx) const;
+    TrackerNode*    lookupTracker    (juce::uint32 nodeId) const;
+    MidiPlayerNode* lookupMidiPlayer (juce::uint32 nodeId) const;
+    SessionClip*    findClip         (int sceneRow, int columnIdx) const;
 
     /* Quantisation maths.  beatsPerBar() reads tags::beatsPerBar from
      * the session (default 4).  computeTargetBeat returns -1.0 for
@@ -333,6 +393,7 @@ private:
      * pairs).  Mirrors `TrackerEditor::Toolbar` so the two views
      * share a visual vocabulary. */
     juce::TextButton stopAllBtn_, rescanBtn_;
+    juce::TextButton addTrackerBtn_, addMidiBtn_;
     juce::TextButton sceneMinusBtn_, scenePlusBtn_;
     juce::TextButton quantPrevBtn_,  quantNextBtn_;
     juce::Label scenesNameLabel_, scenesValueLabel_;
@@ -394,6 +455,16 @@ private:
     int    sceneDragSource_ = -1;
     bool   sceneDragActive_ = false;
     int    sceneDragHoverRow_ = -1;
+
+    /* Column-header drag state.  Mouse-down on a column header (outside
+     * the MUTE / SOLO buttons) stages a potential horizontal reorder;
+     * promoted past the drag threshold; release commits the swap by
+     * calling moveColumn for each step from source to drop target.
+     * Drop indicator paints as a vertical line on the nearest column
+     * boundary under the cursor. */
+    int    columnDragSource_  = -1;
+    bool   columnDragActive_  = false;
+    int    columnDragHoverCol_ = -1;
 
     /* ColourSelector popup state -- when a picker is open against a
      * clip, change broadcasts route through changeListenerCallback

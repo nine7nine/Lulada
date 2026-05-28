@@ -49,18 +49,105 @@ void MidiPlayerNode::refreshPorts()
     setPorts (newPorts);
 }
 
-void MidiPlayerNode::setState (const void*, int)
+void MidiPlayerNode::setState (const void* data, int size)
 {
-    /* Stateless on the wire -- the bound region list is rebuilt by
-     * the message thread from the lane's playlist after every
-     * session load.  Persistence lives in the Lane / Playlist /
-     * MidiNoteRegion ValueTree path; this node's only "state" is
-     * its identity (it's a singleton-per-lane). */
+    /* Arrangement-lane usage publishes its region table from the
+     * message thread on load (ArrangementView::flushLanesToSession),
+     * so the wire state here only carries session-view per-clip slot
+     * data.  Empty / absent state => no session-view clips, which is
+     * the arrangement-only case.  Wire format: XML-serialised
+     * juce::ValueTree shaped:
+     *   <midiPlayer sessionClips="...">
+     *     <sessionClip id="...">
+     *       <region .../>     <!-- MidiNoteRegion::toValueTree shape -->
+     *     </sessionClip>
+     *     ...
+     *   </midiPlayer> */
+    /* Drop existing slots -- setState is a full-restore path. */
+    for (int i = 0; i < sessionClips_.size(); ++i)
+    {
+        auto* slot = sessionClips_.getUnchecked (i);
+        slot->alive.store (false, std::memory_order_release);
+        slot->state.store (kStopped, std::memory_order_relaxed);
+    }
+    sessionClipCount_.store (0, std::memory_order_release);
+    sessionClips_.clear (true);
+
+    if (data == nullptr || size <= 0) return;
+
+    auto xml = juce::parseXML (juce::String::createStringFromData (data, size));
+    if (xml == nullptr) return;
+    auto root = juce::ValueTree::fromXml (*xml);
+    if (! root.isValid()) return;
+
+    auto clipsTree = root.getChildWithName ("sessionClips");
+    if (! clipsTree.isValid()) return;
+
+    for (int i = 0; i < clipsTree.getNumChildren(); ++i)
+    {
+        const auto sc = clipsTree.getChild (i);
+        if (sc.getType().toString() != "sessionClip") continue;
+        const juce::String idStr = sc.getProperty ("id").toString();
+        if (idStr.isEmpty()) continue;
+        const juce::Uuid clipId (idStr);
+
+        auto* slot = new SessionClipSlot();
+        slot->clipId = clipId;
+        /* Restore region from child VT.  The region tree is named
+         * after MidiNoteRegion::toValueTree's tag ("midiNoteRegion"),
+         * not "region".  If absent or malformed, build a 4-beat
+         * empty default so the slot stays playable. */
+        const auto regTree = sc.getChildWithName ("midiNoteRegion");
+        if (regTree.isValid())
+            slot->region = MidiNoteRegion::fromValueTree (regTree);
+        if (slot->region == nullptr)
+        {
+            slot->region = std::make_unique<MidiNoteRegion>();
+            slot->region->id            = juce::Uuid();
+            slot->region->positionBeats = 0.0;
+            slot->region->lengthBeats   = 4.0;
+            slot->region->looped        = true;
+        }
+        slot->state.store (kStopped, std::memory_order_relaxed);
+        slot->localBeatPos.store (0.0, std::memory_order_relaxed);
+        slot->wrappedFlag.store (false, std::memory_order_relaxed);
+        slot->held.reset();
+        slot->pending = ClipPending();
+        sessionClips_.add (slot);
+        slot->alive.store (true, std::memory_order_release);
+    }
+    sessionClipCount_.store (sessionClips_.size(), std::memory_order_release);
 }
 
 void MidiPlayerNode::getState (juce::MemoryBlock& block)
 {
+    juce::ValueTree root ("midiPlayer");
+    juce::ValueTree clipsTree ("sessionClips");
+    for (int i = 0; i < sessionClips_.size(); ++i)
+    {
+        auto* slot = sessionClips_.getUnchecked (i);
+        if (! slot->alive.load (std::memory_order_acquire)) continue;
+        if (slot->removed.load (std::memory_order_acquire)) continue;
+        juce::ValueTree sc ("sessionClip");
+        sc.setProperty ("id", slot->clipId.toString(), nullptr);
+        if (slot->region != nullptr)
+        {
+            auto rt = slot->region->toValueTree();
+            sc.appendChild (rt, nullptr);
+        }
+        clipsTree.appendChild (sc, nullptr);
+    }
+    root.appendChild (clipsTree, nullptr);
+    /* No alive slots => no state to persist; matches the prior
+     * arrangement-only contract where MidiPlayerNode emitted nothing. */
+    if (clipsTree.getNumChildren() == 0)
+    {
+        block.setSize (0);
+        return;
+    }
+    auto xml = root.toXmlString();
     block.setSize (0);
+    block.append (xml.toRawUTF8(), (size_t) xml.getNumBytesAsUTF8());
 }
 
 //==============================================================================
@@ -85,6 +172,160 @@ void MidiPlayerNode::sweepBindingsTrash() noexcept
     while (! entriesTrash_.empty()
            && entriesTrash_.front().stampEpoch < safeEpoch)
         entriesTrash_.pop_front();
+}
+
+//==============================================================================
+// Session-view per-clip API.
+
+int MidiPlayerNode::findSessionSlotIndex (const juce::Uuid& clipId) const noexcept
+{
+    const int n = sessionClips_.size();
+    for (int i = 0; i < n; ++i)
+    {
+        auto* s = sessionClips_.getUnchecked (i);
+        if (! s->alive.load (std::memory_order_acquire)) continue;
+        if (s->removed.load (std::memory_order_acquire)) continue;
+        if (s->clipId == clipId) return i;
+    }
+    return -1;
+}
+
+juce::Uuid MidiPlayerNode::createSessionClip()
+{
+    juce::Uuid newId;
+    if (createSessionClipWithId (newId))
+        return newId;
+    return juce::Uuid::null();
+}
+
+bool MidiPlayerNode::createSessionClipWithId (const juce::Uuid& id)
+{
+    if (id.isNull()) return false;
+    if (findSessionSlotIndex (id) >= 0) return false;
+
+    /* Always append a fresh slot rather than reuse tombstoned ones.
+     * Tombstone reuse would race the audio thread's held-notes flush
+     * on the prior occupant -- between the message thread issuing the
+     * stop FIFO entry and the audio thread draining it, the slot
+     * would already have been re-initialised under the new clip,
+     * leaving the old clip's held bits as ghost notes.  Bounded
+     * growth: each deleted clip leaves ~1 KB behind for the session
+     * lifetime.  Acceptable for the typical use case. */
+    auto* slot = new SessionClipSlot();
+    sessionClips_.add (slot);
+    slot->clipId = id;
+    slot->region = std::make_unique<MidiNoteRegion>();
+    slot->region->id            = juce::Uuid();
+    slot->region->positionBeats = 0.0;
+    slot->region->lengthBeats   = 4.0;   /* one bar at 4/4 default */
+    slot->region->looped        = true;
+    slot->region->name          = "MIDI clip";
+    slot->state.store (kStopped, std::memory_order_relaxed);
+    slot->localBeatPos.store (0.0, std::memory_order_relaxed);
+    slot->wrappedFlag.store (false, std::memory_order_relaxed);
+    /* Release after fields are populated so the audio thread sees a
+     * fully-initialised slot. */
+    slot->alive.store (true, std::memory_order_release);
+
+    /* sessionClipCount_ is monotonic in count, never shrinks.  It
+     * mirrors sessionClips_.size() but is the value the audio thread
+     * reads to bound its walk.  Bump after the slot fields land so a
+     * concurrent render finds a stable slot. */
+    sessionClipCount_.store (sessionClips_.size(), std::memory_order_release);
+    return true;
+}
+
+bool MidiPlayerNode::removeSessionClip (const juce::Uuid& id)
+{
+    const int idx = findSessionSlotIndex (id);
+    if (idx < 0) return false;
+
+    /* Two-phase removal:
+     *  1. Schedule an immediate stop through the FIFO so the audio
+     *     thread fires the held-notes flush + sets state=Stopped
+     *     on its next render.  Slot stays alive=true here so the
+     *     FIFO drain + applyPendingClipForBlock can find + process it.
+     *  2. Set removed=true (release).  Message-thread-visible
+     *     lookups (findSessionSlotIndex, getClipRegion) skip the
+     *     slot immediately.  Persistence (getState) also skips.
+     *     Audio thread does NOT consult `removed` -- it keeps
+     *     processing alive slots so the pending stop fires.
+     *
+     * The slot's region memory persists for the rest of the session.
+     * Bounded growth -- ~1 KB per deleted clip; acceptable. */
+    schedulePlayingClip (id, -1.0, false);
+    auto* slot = sessionClips_.getUnchecked (idx);
+    slot->removed.store (true, std::memory_order_release);
+    return true;
+}
+
+void MidiPlayerNode::schedulePlayingClip (const juce::Uuid& clipId,
+                                            double            beatTarget,
+                                            bool              wantPlaying) noexcept
+{
+    const int slotIdx = findSessionSlotIndex (clipId);
+    if (slotIdx < 0) return;
+
+    int start1, size1, start2, size2;
+    clipLaunchFifo_.prepareToWrite (1, start1, size1, start2, size2);
+    if (size1 <= 0) return;   // FIFO full -- drop silently (B.4 parity)
+    clipLaunchFifoStorage_[(size_t) start1] = {
+        slotIdx, beatTarget, wantPlaying ? (std::int8_t) 1 : (std::int8_t) 0
+    };
+    clipLaunchFifo_.finishedWrite (1);
+}
+
+bool MidiPlayerNode::isSessionClipPlaying (const juce::Uuid& clipId) const noexcept
+{
+    const int idx = findSessionSlotIndex (clipId);
+    if (idx < 0) return false;
+    return sessionClips_.getUnchecked (idx)->state.load (std::memory_order_acquire) == kPlaying;
+}
+
+double MidiPlayerNode::getSessionClipPositionBeats (const juce::Uuid& clipId) const noexcept
+{
+    const int idx = findSessionSlotIndex (clipId);
+    if (idx < 0) return 0.0;
+    return sessionClips_.getUnchecked (idx)->localBeatPos.load (std::memory_order_relaxed);
+}
+
+double MidiPlayerNode::getSessionClipLengthBeats (const juce::Uuid& clipId) const noexcept
+{
+    const int idx = findSessionSlotIndex (clipId);
+    if (idx < 0) return 0.0;
+    auto* slot = sessionClips_.getUnchecked (idx);
+    return slot->region != nullptr ? slot->region->lengthBeats : 0.0;
+}
+
+bool MidiPlayerNode::sessionClipWrappedSinceLastQuery (const juce::Uuid& clipId) noexcept
+{
+    const int idx = findSessionSlotIndex (clipId);
+    if (idx < 0) return false;
+    auto* slot = sessionClips_.getUnchecked (idx);
+    return slot->wrappedFlag.exchange (false, std::memory_order_acq_rel);
+}
+
+MidiNoteRegion* MidiPlayerNode::getClipRegion (const juce::Uuid& clipId) noexcept
+{
+    const int idx = findSessionSlotIndex (clipId);
+    if (idx < 0) return nullptr;
+    return sessionClips_.getUnchecked (idx)->region.get();
+}
+
+void MidiPlayerNode::reconcileBoundClips (const juce::Array<juce::Uuid>& boundIds) noexcept
+{
+    /* Walk slots; anything alive + non-Stopped that's NOT in boundIds
+     * gets an immediate-stop schedule.  Mirrors C.1's belt+suspenders
+     * shape for SessionView. */
+    for (int i = 0; i < sessionClips_.size(); ++i)
+    {
+        auto* slot = sessionClips_.getUnchecked (i);
+        if (! slot->alive.load (std::memory_order_acquire)) continue;
+        const auto s = slot->state.load (std::memory_order_acquire);
+        if (s == kStopped) continue;
+        if (boundIds.contains (slot->clipId)) continue;
+        schedulePlayingClip (slot->clipId, -1.0, false);
+    }
 }
 
 //==============================================================================
@@ -148,6 +389,189 @@ void MidiPlayerNode::emitAllNotesOff (juce::MidiBuffer& out,
     }
 }
 
+void MidiPlayerNode::drainClipLaunchFifo() noexcept
+{
+    /* Drain into per-slot pending action.  Latest entry per slot
+     * wins -- repeated bangs cancel prior queued actions. */
+    int start1, size1, start2, size2;
+    clipLaunchFifo_.prepareToRead (kClipLaunchFifoSize, start1, size1, start2, size2);
+    const int total = size1 + size2;
+    if (total <= 0) return;
+
+    for (int blk = 0; blk < 2; ++blk)
+    {
+        const int s = (blk == 0) ? start1 : start2;
+        const int n = (blk == 0) ? size1  : size2;
+        for (int k = 0; k < n; ++k)
+        {
+            const auto& req = clipLaunchFifoStorage_[(size_t) (s + k)];
+            if (req.slotIdx < 0 || req.slotIdx >= sessionClips_.size()) continue;
+            auto* slot = sessionClips_.getUnchecked (req.slotIdx);
+            slot->pending.beatTarget  = req.beatTarget;
+            slot->pending.wantPlaying = (req.wantPlayingI8 != 0);
+            slot->pending.valid       = true;
+        }
+    }
+    clipLaunchFifo_.finishedRead (total);
+}
+
+void MidiPlayerNode::flushSlotHeldNotes (SessionClipSlot& slot,
+                                          int               sampleOffset,
+                                          juce::MidiBuffer& out) noexcept
+{
+    if (! slot.held.any()) return;
+    const int n = (int) SessionClipSlot::kHeldBits;
+    for (int i = 0; i < n; ++i)
+    {
+        if (! slot.held.test ((std::size_t) i)) continue;
+        const int channel = (i / 128) + 1;
+        const int pitch   = i % 128;
+        out.addEvent (juce::MidiMessage::noteOff (channel, pitch), sampleOffset);
+        slot.held.reset ((std::size_t) i);
+    }
+}
+
+void MidiPlayerNode::applyPendingClipForBlock (double            blockStartBeat,
+                                                 double            blockEndBeat,
+                                                 double            samplesPerBeat,
+                                                 int               numSamples,
+                                                 juce::MidiBuffer& out) noexcept
+{
+    const int n = sessionClipCount_.load (std::memory_order_acquire);
+    for (int i = 0; i < n; ++i)
+    {
+        auto* slot = sessionClips_.getUnchecked (i);
+        if (! slot->alive.load (std::memory_order_acquire)) continue;
+        if (! slot->pending.valid) continue;
+
+        const double tgt = slot->pending.beatTarget;
+        /* Immediate (-1) OR target falls within / before the block:
+         * fire.  Otherwise leave queued for a later block.  Symmetric
+         * to TrackerNode::applyPendingForBlock. */
+        const bool fire = (tgt < 0.0) || (tgt < blockEndBeat);
+        if (! fire) continue;
+
+        /* Sub-block offset for the transition's emit edge.  Clamped
+         * to the buffer range; <0 (block start) for immediates. */
+        int sampleOff = 0;
+        if (tgt >= 0.0)
+        {
+            const double rel = juce::jmax (0.0, tgt - blockStartBeat);
+            sampleOff = juce::jlimit (0, numSamples - 1,
+                                      (int) std::round (rel * samplesPerBeat));
+        }
+
+        if (slot->pending.wantPlaying)
+        {
+            /* Launch.  Rewind playhead; clear wrap edge; flush any
+             * residual held bits at the launch edge so a freshly
+             * banged clip doesn't re-emit a NoteOn against an
+             * already-set bit (which would skip the held bookkeeping
+             * + leave a stuck note when the clip later stops). */
+            flushSlotHeldNotes (*slot, sampleOff, out);
+            slot->localBeatPos.store (0.0, std::memory_order_relaxed);
+            slot->wrappedFlag.store (false, std::memory_order_relaxed);
+            slot->state.store (kPlaying, std::memory_order_release);
+        }
+        else
+        {
+            /* Stop.  Emit NoteOff for held bits at the transition
+             * offset + clear the bitset.  State flips after the
+             * flush so any concurrent UI tick observing kStopped
+             * doesn't race the held emission. */
+            flushSlotHeldNotes (*slot, sampleOff, out);
+            slot->state.store (kStopped, std::memory_order_release);
+        }
+        slot->pending.valid = false;
+    }
+}
+
+void MidiPlayerNode::emitSessionClipInBlock (SessionClipSlot& slot,
+                                              double             blockBeats,
+                                              double             samplesPerBeat,
+                                              int                numSamples,
+                                              juce::MidiBuffer&  out) noexcept
+{
+    if (slot.region == nullptr) return;
+    const double clipLen = slot.region->lengthBeats;
+    if (clipLen <= 0.0) return;
+
+    const auto* snap = slot.region->loadSnapshot();
+    if (snap == nullptr) return;
+    slot.region->advanceAudioEpoch();
+
+    const double localStart = slot.localBeatPos.load (std::memory_order_relaxed);
+    const double localEnd   = localStart + blockBeats;
+
+    /* Emit a single source-beat window [lo, hi); window mapped
+     * to sample offsets relative to (localStart base).
+     * srcOffset is supported in MidiNoteRegion (left-edge trim
+     * for arrangement regions); for session clips the source
+     * authoring window IS the playable window so srcOffset=0. */
+    auto emitWindow = [&] (double lo, double hi, int baseSampleOffset) noexcept
+    {
+        for (const auto& n : *snap)
+        {
+            const double noteEnd = n.onBeat + n.lengthBeats;
+            if (n.onBeat >= hi) break;          // snap is sorted
+            if (noteEnd  <= lo) continue;
+
+            if (n.onBeat >= lo && n.onBeat < hi)
+            {
+                const double beatDelta = n.onBeat - lo;
+                int off = baseSampleOffset
+                        + (int) std::round (beatDelta * samplesPerBeat);
+                off = juce::jlimit (0, numSamples - 1, off);
+                out.addEvent (juce::MidiMessage::noteOn (
+                                  juce::jlimit (1, 16, n.channel),
+                                  juce::jlimit (0, 127, n.pitch),
+                                  (juce::uint8) juce::jlimit (1, 127, n.velocity)),
+                              off);
+                slot.held.set ((std::size_t) heldIndex (n.channel, n.pitch));
+            }
+
+            /* Clamp NoteOff to clip end for the last iteration's
+             * trailing notes -- the wrap path below will re-fire
+             * the NoteOn on the next iteration if the clip restarts. */
+            const double offBeat = juce::jmin (noteEnd, clipLen);
+            if (offBeat > lo && offBeat <= hi)
+            {
+                const double beatDelta = offBeat - lo;
+                int off = baseSampleOffset
+                        + (int) std::round (beatDelta * samplesPerBeat);
+                off = juce::jlimit (0, numSamples - 1, off);
+                out.addEvent (juce::MidiMessage::noteOff (
+                                  juce::jlimit (1, 16, n.channel),
+                                  juce::jlimit (0, 127, n.pitch)),
+                              off);
+                slot.held.reset ((std::size_t) heldIndex (n.channel, n.pitch));
+            }
+        }
+    };
+
+    if (localEnd <= clipLen)
+    {
+        emitWindow (localStart, localEnd, 0);
+        slot.localBeatPos.store (localEnd, std::memory_order_relaxed);
+    }
+    else
+    {
+        /* Loop wrap: emit [localStart, clipLen) then [0, localEnd-clipLen). */
+        const double tailLen = clipLen - localStart;
+        emitWindow (localStart, clipLen, 0);
+        const int wrapBaseOffset = (int) std::round (tailLen * samplesPerBeat);
+        const double wrapEnd = localEnd - clipLen;
+        /* Flush held notes from the prior loop iteration so the new
+         * iteration starts clean.  Without this, notes whose lengths
+         * extend past clipLen carry over into the next iteration's
+         * NoteOn paint without an OFF in between. */
+        flushSlotHeldNotes (slot, wrapBaseOffset, out);
+        emitWindow (0.0, wrapEnd, wrapBaseOffset);
+        slot.localBeatPos.store (wrapEnd, std::memory_order_relaxed);
+        slot.wrappedFlag.store (true, std::memory_order_release);
+    }
+}
+
 void MidiPlayerNode::render (RenderContext& rc)
 {
     if (rc.midi.getNumBuffers() <= 0) return;
@@ -173,16 +597,34 @@ void MidiPlayerNode::render (RenderContext& rc)
      * was published BEFORE the bump, so it stays valid. */
     audioEpoch_.fetch_add (1, std::memory_order_acq_rel);
 
+    /* Helper: flush held notes across all sources -- arrangement
+     * entries (held_) AND every session-clip slot.  Used on mute /
+     * transport-stop edges so downstream synth voices don't hang. */
+    auto flushAllSources = [this] (juce::MidiBuffer& dst) noexcept
+    {
+        if (held_.any())
+            emitAllNotesOff (dst, 0);
+        const int sc = sessionClipCount_.load (std::memory_order_acquire);
+        for (int i = 0; i < sc; ++i)
+        {
+            auto* slot = sessionClips_.getUnchecked (i);
+            if (! slot->alive.load (std::memory_order_acquire)) continue;
+            flushSlotHeldNotes (*slot, 0, dst);
+        }
+    };
+
     /* Mute gate.  The graph-builder mute path applies gain ramps to
      * AUDIO buffers only -- MIDI output is unaffected unless this
      * node consults isMuted() itself.  Same shape as transport stop:
      * on the mute transition, flush every held NoteOn so downstream
-     * synth voices don't hang. */
+     * synth voices don't hang.  Session-clip slot state is preserved
+     * across mute (Bitwig-style "playing but silenced"); unmuting
+     * resumes from the prior localBeatPos. */
     const bool muted = isMuted();
     if (muted)
     {
         if (! lastMutedState_)
-            emitAllNotesOff (*out, 0);
+            flushAllSources (*out);
         lastMutedState_  = true;
         lastPlayingState_ = false;
         return;
@@ -191,7 +633,9 @@ void MidiPlayerNode::render (RenderContext& rc)
 
     /* Read transport state once at the top.  No playhead / no
      * play position means "stopped" -- emit all-notes-off for any
-     * lingering held pairs and return. */
+     * lingering held pairs and return.  Session-clip slot state is
+     * preserved across transport stop; pressing play resumes Playing
+     * slots from their saved localBeatPos. */
     bool wantPlaying = false;
     if (auto* ph = getPlayHead())
     {
@@ -202,7 +646,7 @@ void MidiPlayerNode::render (RenderContext& rc)
     if (! wantPlaying)
     {
         if (lastPlayingState_)
-            emitAllNotesOff (*out, 0);
+            flushAllSources (*out);
         lastPlayingState_ = false;
         return;
     }
@@ -219,60 +663,49 @@ void MidiPlayerNode::render (RenderContext& rc)
         return;
     }
 
+    /* -------- Arrangement-side region emission -------- */
     const EntryList* entries = activeEntries_.load (std::memory_order_acquire);
-    if (entries == nullptr || entries->empty())
+    if (entries != nullptr)
     {
-        /* No bound regions but transport is playing -- if we have
-         * lingering held notes from a region that was just unbound
-         * (region delete during playback), emit a flush so the
-         * downstream synth doesn't hang.  Cheap: held_.any() is a
-         * single 256-byte scan + branch. */
-        if (held_.any())
-            emitAllNotesOff (*out, 0);
-        return;
-    }
-
-    for (const auto& entry : *entries)
-    {
-        if (entry.region == nullptr || entry.lengthBeats <= 0.0)
-            continue;
-
-        const double regionStart = entry.positionBeats;
-        const double regionEnd   = entry.positionBeats + entry.lengthBeats;
-
-        if (entry.looped)
+        for (const auto& entry : *entries)
         {
-            /* Looped: emit notes whose loop-wrapped local-beat
-             * window falls in this block. */
+            if (entry.region == nullptr || entry.lengthBeats <= 0.0)
+                continue;
+
+            const double regionStart = entry.positionBeats;
+            const double regionEnd   = entry.positionBeats + entry.lengthBeats;
+
+            if (entry.looped)
+            {
+                emitRegionInBlock (entry, blockStartBeat, blockEndBeat,
+                                   samplesPerBeat, nsamples, *out);
+                continue;
+            }
+
+            const bool blockTouchesRegion =
+                blockEndBeat > regionStart && blockStartBeat < regionEnd;
+            if (! blockTouchesRegion) continue;
+
             emitRegionInBlock (entry, blockStartBeat, blockEndBeat,
                                samplesPerBeat, nsamples, *out);
-            continue;
         }
-
-        /* Non-looped: only emit when the block intersects the
-         * region's [start, end) range.  If we've left the region
-         * since the previous block, flush any held notes for that
-         * region's channels (cheap approximation: flush all held). */
-        const bool blockTouchesRegion =
-            blockEndBeat > regionStart && blockStartBeat < regionEnd;
-
-        if (! blockTouchesRegion)
-            continue;
-
-        emitRegionInBlock (entry, blockStartBeat, blockEndBeat,
-                           samplesPerBeat, nsamples, *out);
     }
 
-    /* Transport-cross-region tidy-up: if the block straddles the
-     * tail end of a region and notes are still held, emit
-     * matching offs at the region's end-sample.  Simpler scheme
-     * for v1: rely on per-note NoteOff emission via the snapshot
-     * walk in emitRegionInBlock.  If a note's lengthBeats extends
-     * past the region's lengthBeats AND we're inside the region's
-     * tail block, the NoteOff still fires at the calculated
-     * end-beat.  Notes whose lengthBeats overshoots regionEnd are
-     * clamped to regionEnd inside emitRegionInBlock.  This keeps
-     * the render path branch-free at block boundaries. */
+    /* -------- Session-view per-clip emission -------- */
+    drainClipLaunchFifo();
+    applyPendingClipForBlock (blockStartBeat, blockEndBeat,
+                              samplesPerBeat, nsamples, *out);
+
+    const double blockBeats = blockEndBeat - blockStartBeat;
+    const int sclips = sessionClipCount_.load (std::memory_order_acquire);
+    for (int i = 0; i < sclips; ++i)
+    {
+        auto* slot = sessionClips_.getUnchecked (i);
+        if (! slot->alive.load (std::memory_order_acquire)) continue;
+        if (slot->state.load (std::memory_order_acquire) != kPlaying) continue;
+        emitSessionClipInBlock (*slot, blockBeats, samplesPerBeat,
+                                nsamples, *out);
+    }
 }
 
 void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,

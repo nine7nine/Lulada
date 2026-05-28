@@ -30,7 +30,7 @@
  *     - bangClip + transitionClip end-to-end through schedulePlaying
  *     - mutual exclusion within a column at the bar boundary
  *     - scene-launch atomic swap across multiple columns
- *     - reconcileSequencePlaying silences unbound sequences
+ *     - reconcileClipPlaying silences unbound sources (tracker + midi)
  *     - SessionViewSnapshotAction undo / redo via UndoManager
  */
 

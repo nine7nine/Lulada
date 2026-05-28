@@ -16,9 +16,13 @@
 #include "ui/viewhelpers.hpp"
 
 #include "nodes/tracker.hpp"
+#include "nodes/midiplayer.hpp"
+#include "services/timeline/midi_note_region.hpp"
 #include "ui/fontcache.hpp"
 #include "nodes/trackereditor.hpp"
 #include "tempo.hpp"   // BeatType::fromDivisor for scene sig overrides
+#include <element/engine.hpp>
+#include <element/node.h>
 
 namespace element {
 
@@ -67,12 +71,21 @@ inline Colour columnTint (int idx)
 }
 
 /* Walk the active graph (recursing into subgraphs) collecting every
- * TrackerNode + its display name.  Mirrors the pattern used by
- * arrangementview.cpp::collectTrackersFromGraph. */
-void collectTrackerNodes (const Node& graph,
-                          juce::Array<TrackerNode*>& outTrackers,
-                          juce::Array<juce::uint32>& outNodeIds,
-                          juce::Array<String>& outNames)
+ * column-bindable source node -- TrackerNode or MidiPlayerNode -- with
+ * its kind tag, display name, and node id.  Mirrors the pattern used
+ * by arrangementview.cpp::collectTrackersFromGraph.  MidiPlayerNodes
+ * that live inside an ArrangementTracks subgraph are skipped: they
+ * belong to the arrangement, not the session view.  Top-level
+ * MidiPlayerNodes are session-view column sources.  Detection: a node
+ * whose parent graph's name matches the arrangement subgraph
+ * convention is filtered out; we approximate via "child of root graph
+ * only" by NOT recursing into subgraphs.  TrackerNodes are picked up
+ * regardless of nesting (matches today's behaviour). */
+void collectColumnSourceNodes (const Node&                            graph,
+                                juce::Array<juce::uint32>&            outNodeIds,
+                                juce::Array<String>&                  outNames,
+                                juce::Array<SessionView::ClipKind>&   outKinds,
+                                bool                                  isRootLevel = true)
 {
     const int n = graph.getNumNodes();
     for (int i = 0; i < n; ++i)
@@ -81,18 +94,68 @@ void collectTrackerNodes (const Node& graph,
         if (! child.isValid()) continue;
         if (auto* proc = child.getObject())
         {
-            if (auto* t = dynamic_cast<TrackerNode*> (proc))
+            if (dynamic_cast<TrackerNode*> (proc) != nullptr)
             {
-                outTrackers.add (t);
                 outNodeIds.add (child.getNodeId());
                 outNames.add (child.getName().isNotEmpty() ? child.getName()
                                                            : String ("Tracker"));
+                outKinds.add (SessionView::ClipKind::Tracker);
+                continue;
+            }
+            /* Only root-level MidiPlayerNodes count as session-view
+             * columns.  ArrangementView spawns MidiPlayerNodes inside
+             * the ArrangementTracks subgraph -- those belong to the
+             * arrangement and must not show up as session-view
+             * columns. */
+            if (isRootLevel && dynamic_cast<MidiPlayerNode*> (proc) != nullptr)
+            {
+                outNodeIds.add (child.getNodeId());
+                outNames.add (child.getName().isNotEmpty() ? child.getName()
+                                                           : String ("MIDI"));
+                outKinds.add (SessionView::ClipKind::Midi);
                 continue;
             }
         }
         if (child.isGraph())
-            collectTrackerNodes (child, outTrackers, outNodeIds, outNames);
+            collectColumnSourceNodes (child, outNodeIds, outNames, outKinds, false);
     }
+}
+
+/* Walk the graph recursively + collect every used "prefix N" suffix
+ * so we can pick the lowest-free integer for a fresh node.  Mirrors
+ * the arrangement-side helper -- one canonical naming scheme across
+ * both views so the graph block label matches the column / lane
+ * label everywhere. */
+void collectUsedNumbersForPrefix (const Node&             graph,
+                                  const juce::String&     prefix,
+                                  juce::Array<int>&       outUsed)
+{
+    const int n = graph.getNumNodes();
+    for (int i = 0; i < n; ++i)
+    {
+        Node child = graph.getNode (i);
+        if (! child.isValid()) continue;
+        const auto name = child.getName();
+        if (name.startsWith (prefix + " "))
+        {
+            const auto tail = name.substring (prefix.length() + 1).trim();
+            const int  num  = tail.getIntValue();
+            if (num > 0 && tail.containsOnly ("0123456789"))
+                outUsed.add (num);
+        }
+        if (child.isGraph())
+            collectUsedNumbersForPrefix (child, prefix, outUsed);
+    }
+}
+
+juce::String nextNumberedNodeName (const Node&         rootGraph,
+                                   const juce::String& prefix)
+{
+    juce::Array<int> used;
+    collectUsedNumbersForPrefix (rootGraph, prefix, used);
+    int n = 1;
+    while (used.contains (n)) ++n;
+    return prefix + " " + juce::String (n);
 }
 
 } // anonymous
@@ -122,6 +185,10 @@ SessionView::SessionView()
                             [this] { cycleDefaultQuant ( 1); });
     configureToolbarButton (rescanBtn_,      "RESCAN",
                             [this] { rescanColumns(); });
+    configureToolbarButton (addTrackerBtn_,  "+ TRACKER",
+                            [this] { addTrackerColumn(); });
+    configureToolbarButton (addMidiBtn_,     "+ MIDI",
+                            [this] { addMidiColumn(); });
 
     configureToolbarLabel  (scenesNameLabel_,  "SCENES", false);
     configureToolbarLabel  (scenesValueLabel_, "8",      true);    // editable
@@ -296,7 +363,7 @@ void SessionView::initializeView (Services& s)
 void SessionView::didBecomeActive()
 {
     rescanColumns();
-    reconcileSequencePlaying();
+    reconcileClipPlaying();
     startTimerHz (30);
 }
 
@@ -317,38 +384,65 @@ void SessionView::willBeRemoved()
 void SessionView::stabilizeContent()
 {
     rescanColumns();
-    reconcileSequencePlaying();
+    reconcileClipPlaying();
 }
 
-void SessionView::reconcileSequencePlaying()
+void SessionView::reconcileClipPlaying()
 {
-    /* For each TrackerNode column, force any sequence not bound to a
-     * Playing / WaitingToStart SessionClip to playing=0.  This silences
-     * the rogue emit case where a sequence's playing flag was set
-     * without a session-view launch (e.g. legacy saves, future
-     * regressions, TrackerEditor experimentation).
+    /* For each column, force any source slot not bound to a Playing /
+     * WaitingToStart SessionClip to "not playing":
+     *   - Tracker column: walk sequences, force playing=0.
+     *   - Midi column: walk clip slots, force schedule-stop.
      *
-     * Cost: O(columns x sequences x clips) per call, but only called
-     * on view activate + stabilize -- not in the 30 Hz tick. */
+     * This silences the rogue emit case where a source's playing flag
+     * was set without a session-view launch (e.g. legacy saves, future
+     * regressions, TrackerEditor experimentation).  Cost: O(columns x
+     * sources x clips) per call, but only called on view activate +
+     * stabilize -- not in the 30 Hz tick. */
     for (const auto& col : columns_)
     {
-        auto* trk = lookupTracker (col.trackerNodeId);
-        if (trk == nullptr) continue;
-        const int nseq = trk->numPatterns();
-        for (int seqIdx = 0; seqIdx < nseq; ++seqIdx)
+        if (col.kind == ClipKind::Tracker)
         {
-            bool bound = false;
-            for (const auto* c : clips_)
+            auto* trk = lookupTracker (col.trackerNodeId);
+            if (trk == nullptr) continue;
+            const int nseq = trk->numPatterns();
+            for (int seqIdx = 0; seqIdx < nseq; ++seqIdx)
             {
-                if (c->trackerNodeId != col.trackerNodeId) continue;
-                if (c->sequenceIdx   != seqIdx)            continue;
-                const LiveState s = c->state.load (std::memory_order_relaxed);
-                if (s == LiveState::Playing || s == LiveState::WaitingToStart)
-                    { bound = true; break; }
+                bool bound = false;
+                for (const auto* c : clips_)
+                {
+                    if (c->kind != ClipKind::Tracker)          continue;
+                    if (c->trackerNodeId != col.trackerNodeId) continue;
+                    if (c->sequenceIdx   != seqIdx)            continue;
+                    const LiveState s = c->state.load (std::memory_order_relaxed);
+                    if (s == LiveState::Playing || s == LiveState::WaitingToStart)
+                        { bound = true; break; }
+                }
+                if (! bound && trk->isSequencePlaying (seqIdx))
+                    trk->setSequencePlaying (seqIdx, false);
             }
-            if (! bound && trk->isSequencePlaying (seqIdx))
-                trk->setSequencePlaying (seqIdx, false);
+            continue;
         }
+
+        /* Midi column. */
+        auto* mp = lookupMidiPlayer (col.midiPlayerNodeId);
+        if (mp == nullptr) continue;
+        /* MidiPlayerNode's session API exposes a stop-all-unbound entry
+         * point: it walks its own slots + drives any not-bound-to-a-
+         * launch state back to Stopped.  Slot-side semantics live on
+         * the node so the audio thread can observe a consistent state
+         * without the message thread enumerating slot indices.  See
+         * MidiPlayerNode::reconcileBoundClips. */
+        juce::Array<juce::Uuid> boundIds;
+        for (const auto* c : clips_)
+        {
+            if (c->kind != ClipKind::Midi)              continue;
+            if (c->midiPlayerNodeId != col.midiPlayerNodeId) continue;
+            const LiveState s = c->state.load (std::memory_order_relaxed);
+            if (s == LiveState::Playing || s == LiveState::WaitingToStart)
+                boundIds.add (c->midiSourceId);
+        }
+        mp->reconcileBoundClips (boundIds);
     }
 }
 
@@ -389,7 +483,11 @@ void SessionView::resized()
     place (quantNextBtn_,     btnW);
     x += sep;
 
-    place (rescanBtn_, 64);
+    place (rescanBtn_,     64);
+    x += sep;
+
+    place (addTrackerBtn_, 92);
+    place (addMidiBtn_,    72);
 }
 
 /* === Geometry ========================================================== */
@@ -761,6 +859,28 @@ void SessionView::paint (Graphics& g)
         g.drawText ("SOLO", soloR, juce::Justification::centred);
     }
 
+    /* Column drag visual feedback.  Source column gets a translucent
+     * overlay; hover column gets a vertical amber drop-indicator at
+     * its left edge so the user sees where the release will land. */
+    if (columnDragActive_)
+    {
+        if (columnDragSource_ >= 0 && columnDragSource_ < columns_.size())
+        {
+            const auto src = columnHeaderBounds (columnDragSource_);
+            g.setColour (juce::Colours::black.withAlpha (0.35f));
+            g.fillRect (src);
+        }
+        if (columnDragHoverCol_ >= 0 && columnDragHoverCol_ < columns_.size()
+            && columnDragHoverCol_ != columnDragSource_)
+        {
+            const auto h = columnHeaderBounds (columnDragHoverCol_);
+            const bool dropOnLeft = (columnDragHoverCol_ < columnDragSource_);
+            const int xLine = dropOnLeft ? h.getX() : h.getRight() - 2;
+            g.setColour (kPlayheadAccent);
+            g.fillRect (xLine, header.getY(), 2, header.getHeight());
+        }
+    }
+
     /* Everything from here through the cell loop draws inside the
      * scrollable strip (scene labels + grid body + master column).
      * Clip to that union so scroll-shifted rows can't bleed into
@@ -925,16 +1045,34 @@ void SessionView::paint (Graphics& g)
             /* Position bar across the bottom when playing. */
             if (playing)
             {
-                if (auto* trk = lookupTracker (clip->trackerNodeId))
+                double frac = 0.0;
+                bool haveFrac = false;
+                if (clip->kind == ClipKind::Tracker)
                 {
-                    const int   total = juce::jmax (1, trk->getSequenceLengthRows (clip->sequenceIdx));
-                    const double pos  = trk->getSequencePositionRows (clip->sequenceIdx);
-                    const float frac  = (float) juce::jlimit (0.0, 1.0, pos / (double) total);
+                    if (auto* trk = lookupTracker (clip->trackerNodeId))
+                    {
+                        const int    total = juce::jmax (1, trk->getSequenceLengthRows (clip->sequenceIdx));
+                        const double pos   = trk->getSequencePositionRows (clip->sequenceIdx);
+                        frac = juce::jlimit (0.0, 1.0, pos / (double) total);
+                        haveFrac = true;
+                    }
+                }
+                else
+                {
+                    if (auto* mp = lookupMidiPlayer (clip->midiPlayerNodeId))
+                    {
+                        const double total = juce::jmax (1.0e-6,
+                                                         mp->getSessionClipLengthBeats (clip->midiSourceId));
+                        const double pos   = mp->getSessionClipPositionBeats (clip->midiSourceId);
+                        frac = juce::jlimit (0.0, 1.0, pos / total);
+                        haveFrac = true;
+                    }
+                }
+                if (haveFrac)
+                {
                     const int barW    = juce::jmax (1, (int) (frac * cb.getWidth()));
                     /* Translucent track underneath so the playhead reads
-                     * as a moving fill on a dim runway -- easier to spot
-                     * at a glance than a bare 3 px line over the cell
-                     * colour. */
+                     * as a moving fill on a dim runway. */
                     g.setColour (juce::Colours::black.withAlpha (0.30f));
                     g.fillRect (cb.getX() + 2,
                                 cb.getBottom() - 5,
@@ -989,9 +1127,22 @@ void SessionView::paint (Graphics& g)
         {
             const auto target = cellBounds (dragHoverRow_, dragHoverCol_);
             const bool empty  = (findClip (dragHoverRow_, dragHoverCol_) == nullptr);
-            const bool sameTracker = (dragHoverCol_ < columns_.size()
-                && columns_.getReference (dragHoverCol_).trackerNodeId
-                   == dragSource_->trackerNodeId);
+            /* Same-host check: drop is only valid within the source's
+             * own column (cross-host migration is deferred for both
+             * tracker + midi kinds).  Branch on the drag source's
+             * kind. */
+            bool sameTracker = false;
+            if (dragHoverCol_ < columns_.size())
+            {
+                const auto& hc = columns_.getReference (dragHoverCol_);
+                if (hc.kind == dragSource_->kind)
+                {
+                    if (dragSource_->kind == ClipKind::Tracker)
+                        sameTracker = (hc.trackerNodeId == dragSource_->trackerNodeId);
+                    else
+                        sameTracker = (hc.midiPlayerNodeId == dragSource_->midiPlayerNodeId);
+                }
+            }
             const Colour outline = (empty && sameTracker)
                 ? kPlayheadAccent.withAlpha (0.95f)
                 : Colour { 0xff'e0'40'40 }.withAlpha (0.85f);
@@ -1232,6 +1383,29 @@ void SessionView::mouseDown (const MouseEvent& e)
 
     if (e.mods.isPopupMenu())
     {
+        /* Column header right-click -- track-level actions.  Tested
+         * before the cell hit so a click on the header strip never
+         * falls through to the per-clip context menu. */
+        for (int hc = 0; hc < columns_.size(); ++hc)
+        {
+            if (! columnHeaderBounds (hc).contains (e.getPosition())) continue;
+
+            juce::PopupMenu m;
+            m.addItem (1, "Move left",  hc > 0);
+            m.addItem (2, "Move right", hc < columns_.size() - 1);
+            m.addSeparator();
+            m.addItem (3, "Delete track");
+            const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
+            switch (r)
+            {
+                case 1: moveColumn   (hc, -1); break;
+                case 2: moveColumn   (hc, +1); break;
+                case 3: removeColumn (hc);     break;
+                default: break;
+            }
+            return;
+        }
+
         /* Master column right-click -- scene transport overrides. */
         if (hitTestMasterCell (e.getPosition(), row))
         {
@@ -1282,27 +1456,39 @@ void SessionView::mouseDown (const MouseEvent& e)
             }
             else if (col < columns_.size())
             {
-                auto* trk = lookupTracker (columns_.getReference (col).trackerNodeId);
-                if (trk == nullptr) return;
-
-                juce::PopupMenu assign;
-                const int patternCount = trk->numPatterns();
-                for (int i = 0; i < patternCount; ++i)
+                const auto& column = columns_.getReference (col);
+                if (column.kind == ClipKind::Tracker)
                 {
-                    /* Item id 100+i so it never collides with the
-                     * fixed top-level items below. */
-                    assign.addItem (100 + i, "Pattern " + String (i + 1));
+                    auto* trk = lookupTracker (column.trackerNodeId);
+                    if (trk == nullptr) return;
+
+                    juce::PopupMenu assign;
+                    const int patternCount = trk->numPatterns();
+                    for (int i = 0; i < patternCount; ++i)
+                    {
+                        /* Item id 100+i so it never collides with the
+                         * fixed top-level items below. */
+                        assign.addItem (100 + i, "Pattern " + String (i + 1));
+                    }
+
+                    juce::PopupMenu m;
+                    m.addItem (1, "Add new pattern");
+                    if (patternCount > 0)
+                        m.addSubMenu ("Assign existing pattern", assign);
+
+                    const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
+                    if (r == 1) addClipAt (row, col);
+                    else if (r >= 100 && r < 100 + patternCount)
+                        assignExistingPattern (row, col, r - 100);
                 }
+                else /* Midi column -- only "Add new MIDI clip" */
+                {
+                    juce::PopupMenu m;
+                    m.addItem (1, "Add new MIDI clip");
 
-                juce::PopupMenu m;
-                m.addItem (1, "Add new pattern");
-                if (patternCount > 0)
-                    m.addSubMenu ("Assign existing pattern", assign);
-
-                const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
-                if (r == 1) addClipAt (row, col);
-                else if (r >= 100 && r < 100 + patternCount)
-                    assignExistingPattern (row, col, r - 100);
+                    const int r = m.showAt (Rectangle<int> (e.getScreenX(), e.getScreenY(), 1, 1));
+                    if (r == 1) addClipAt (row, col);
+                }
             }
             return;
         }
@@ -1348,6 +1534,19 @@ void SessionView::mouseDown (const MouseEvent& e)
         return;
     }
 
+    /* Column-header drag staging.  Tested AFTER M/S so direct button
+     * clicks still fire.  Activates only past the drag threshold in
+     * mouseDrag; a stationary click is a no-op. */
+    for (int hc = 0; hc < columns_.size(); ++hc)
+    {
+        if (! columnHeaderBounds (hc).contains (e.getPosition())) continue;
+        columnDragSource_   = hc;
+        dragStart_          = e.getPosition();
+        columnDragActive_   = false;
+        columnDragHoverCol_ = hc;
+        return;
+    }
+
     /* Master column launch button -> bang scene.
      * Master column tempo/sig fields -> click-to-edit prompts. */
     if (hitTestMasterLaunch (e.getPosition(), row))
@@ -1379,7 +1578,10 @@ void SessionView::mouseDown (const MouseEvent& e)
     {
         if (auto* clip = findClip (row, col))
         {
-            openTrackerDockForClip (*clip);
+            if (clip->kind == ClipKind::Midi)
+                openPianoRollForClip (*clip);
+            else
+                openTrackerDockForClip (*clip);
             return;
         }
     }
@@ -1466,6 +1668,32 @@ void SessionView::mouseDrag (const MouseEvent& e)
             sceneDragHoverRow_ = row;
             repaint (sceneLabelStripBounds());
         }
+        return;
+    }
+
+    /* --- Column-header drag --- */
+    if (columnDragSource_ >= 0)
+    {
+        if (! columnDragActive_)
+        {
+            if (e.getPosition().getDistanceFrom (dragStart_) < 6) return;
+            columnDragActive_ = true;
+            setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+        }
+
+        /* Resolve hover column under cursor.  Use the cursor's x
+         * against each column's header bounds; -1 if none. */
+        int hoverCol = -1;
+        for (int c = 0; c < columns_.size(); ++c)
+        {
+            if (columnHeaderBounds (c).contains (e.getPosition()))
+                { hoverCol = c; break; }
+        }
+        if (hoverCol != columnDragHoverCol_)
+        {
+            columnDragHoverCol_ = hoverCol;
+            repaint (headerRowBounds());
+        }
     }
 }
 
@@ -1528,6 +1756,38 @@ void SessionView::mouseUp (const MouseEvent& e)
         sceneDragActive_   = false;
         sceneDragHoverRow_ = -1;
         repaint();
+        return;
+    }
+
+    /* --- Column-header drag drop --- */
+    if (columnDragSource_ >= 0)
+    {
+        if (columnDragActive_)
+        {
+            setMouseCursor (juce::MouseCursor::NormalCursor);
+
+            if (columnDragHoverCol_ >= 0
+                && columnDragHoverCol_ < columns_.size()
+                && columnDragHoverCol_ != columnDragSource_)
+            {
+                /* Step the column source toward the hover target one
+                 * swap at a time so clip columnIdx remapping stays
+                 * coherent across multi-position moves. */
+                int src = columnDragSource_;
+                const int dst = columnDragHoverCol_;
+                while (src != dst)
+                {
+                    const int step = (dst > src) ? +1 : -1;
+                    moveColumn (src, step);
+                    src += step;
+                }
+            }
+        }
+
+        columnDragSource_   = -1;
+        columnDragActive_   = false;
+        columnDragHoverCol_ = -1;
+        repaint (headerRowBounds());
     }
 }
 
@@ -1559,11 +1819,14 @@ void SessionView::mouseDoubleClick (const MouseEvent& e)
              && ! editButtonBounds (row, col).contains (e.getPosition()))
             {
                 /* Default double-click action: open the clip in the
-                 * tracker side dock (matches edit-button + graph-
-                 * block + arrangement-clip double-click affordances).
-                 * Clip-properties / floating popup variants live in
-                 * the right-click context menu. */
-                openTrackerDockForClip (*clip);
+                 * matching editor dock.  Tracker -> right-side tracker
+                 * dock.  Midi -> bottom-attached piano-roll dock.
+                 * Mirrors the edit-button affordance + arrangement-
+                 * clip double-click behaviour. */
+                if (clip->kind == ClipKind::Midi)
+                    openPianoRollForClip (*clip);
+                else
+                    openTrackerDockForClip (*clip);
                 return;
             }
         }
@@ -1594,6 +1857,32 @@ TrackerNode* SessionView::lookupTracker (juce::uint32 nodeId) const
     Node n = graph.getNodeById (nodeId);
     if (! n.isValid()) return nullptr;
     return dynamic_cast<TrackerNode*> (n.getObject());
+}
+
+MidiPlayerNode* SessionView::lookupMidiPlayer (juce::uint32 nodeId) const
+{
+    if (services_ == nullptr) return nullptr;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return nullptr;
+    auto graph = sess->getActiveGraph();
+    if (! graph.isValid()) return nullptr;
+    Node n = graph.getNodeById (nodeId);
+    if (! n.isValid()) return nullptr;
+    return dynamic_cast<MidiPlayerNode*> (n.getObject());
+}
+
+MidiNoteRegion* SessionView::findMidiClipRegion (const juce::Uuid& sourceId) noexcept
+{
+    if (sourceId.isNull()) return nullptr;
+    for (const auto* c : clips_)
+    {
+        if (c->kind != ClipKind::Midi)   continue;
+        if (c->midiSourceId != sourceId) continue;
+        if (auto* mp = lookupMidiPlayer (c->midiPlayerNodeId))
+            return mp->getClipRegion (sourceId);
+        return nullptr;
+    }
+    return nullptr;
 }
 
 int SessionView::beatsPerBar() const
@@ -1633,16 +1922,39 @@ double SessionView::computeTargetBeat (double curBeat, LaunchQuant q) const
 
 void SessionView::transitionClip (SessionClip& clip, double targetBeat, bool sceneLaunch)
 {
-    auto* trk = lookupTracker (clip.trackerNodeId);
-    if (trk == nullptr || clip.sequenceIdx < 0) return;
+    /* Validate the clip's binding against the live host node.  Stale
+     * bindings (saved session whose source got removed / shrunk) silently
+     * decline to schedule; the visual state stays Stopped. */
+    TrackerNode*    trk = nullptr;
+    MidiPlayerNode* mp  = nullptr;
+    if (clip.kind == ClipKind::Tracker)
+    {
+        trk = lookupTracker (clip.trackerNodeId);
+        if (trk == nullptr || clip.sequenceIdx < 0) return;
+        /* B.4 + E.4: validate the clip's sequenceIdx against the live
+         * tracker pattern count.  Stale clips from a saved session whose
+         * tracker has fewer sequences than at save time would otherwise
+         * write a valid=true slot in pendingActions_ that never drains. */
+        if (clip.sequenceIdx >= trk->numPatterns()) return;
+    }
+    else /* ClipKind::Midi */
+    {
+        mp = lookupMidiPlayer (clip.midiPlayerNodeId);
+        if (mp == nullptr) return;
+        if (clip.midiSourceId.isNull()) return;
+        /* Validate the slot still exists on the player.  A user could
+         * have undone the clip-add or the node could have setState'd
+         * to a different region inventory. */
+        if (mp->getClipRegion (clip.midiSourceId) == nullptr) return;
+    }
 
-    /* B.4 + E.4: validate the clip's sequenceIdx against the live
-     * tracker pattern count.  Stale clips from a saved session whose
-     * tracker has fewer sequences than at save time would otherwise
-     * write a valid=true slot in pendingActions_ that never drains
-     * (applyPendingForBlock caps iteration at mod_->nseq) and would
-     * misfire on a future re-added sequence at the same index. */
-    if (clip.sequenceIdx >= trk->numPatterns()) return;
+    /* Per-kind launch primitive -- captures the right node + key. */
+    auto schedule = [&] (double beat, bool on) {
+        if (clip.kind == ClipKind::Tracker)
+            trk->schedulePlaying (clip.sequenceIdx, beat, on);
+        else
+            mp->schedulePlayingClip (clip.midiSourceId, beat, on);
+    };
 
     const LiveState cur = clip.state.load (std::memory_order_relaxed);
 
@@ -1652,7 +1964,7 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat, bool sce
     if (cur == LiveState::WaitingToStart)
     {
         if (sceneLaunch) return;
-        trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
+        schedule (-1.0, false);
         clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
         repaint (cellBounds (clip.sceneRow, clip.columnIdx));
         return;
@@ -1662,41 +1974,60 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat, bool sce
      * click want it to stay playing -- cancel the queued stop. */
     if (cur == LiveState::WaitingToStop)
     {
-        trk->schedulePlaying (clip.sequenceIdx, -1.0, true);
+        schedule (-1.0, true);
         clip.state.store (LiveState::Playing, std::memory_order_relaxed);
         repaint (cellBounds (clip.sceneRow, clip.columnIdx));
         return;
     }
 
     /* Playing -> sceneLaunch leaves it playing (force-start semantic);
-     * single click toggles it off (toggle semantic).  This is the
-     * core fix for the "scene master stops already-playing clips on
-     * other columns" bug -- mutual exclusion must be column-local,
-     * never cross-column. */
+     * single click toggles it off (toggle semantic).  Mutual exclusion
+     * stays column-local. */
     if (sceneLaunch && cur == LiveState::Playing) return;
 
     const bool wantPlaying = (cur != LiveState::Playing);
 
     /* Same-column mutual exclusion at the shared targetBeat -- A->stop
      * and B->start hit the audio thread in the same render block, so
-     * the flip is atomic.  Skip self.  Also skip clips that point at
-     * the SAME underlying sequence as us: two clips sharing a
-     * sequence are functionally one engine-level voice, so banging
-     * one should not stop the other (would cause "stuck WaitingTo*"
-     * states from contradictory FIFO requests). */
+     * the flip is atomic.  Skip self.  For tracker clips, also skip
+     * clips that point at the SAME underlying sequence as us: two
+     * clips sharing a sequence are functionally one engine-level
+     * voice.  For MIDI clips, every clip has a unique midiSourceId
+     * (no sharing) so the same-source-skip never fires; the column-
+     * scoped sibling stop applies unconditionally. */
     if (wantPlaying)
     {
         for (auto* other : clips_)
         {
             if (other == &clip) continue;
-            if (other->columnIdx     != clip.columnIdx)     continue;
-            if (other->trackerNodeId != clip.trackerNodeId) continue;
-            if (other->sequenceIdx   == clip.sequenceIdx)   continue;
+            if (other->columnIdx != clip.columnIdx) continue;
+            /* Same kind only -- one-kind-per-column means this is
+             * always true; defensive against rescanColumns races. */
+            if (other->kind != clip.kind) continue;
+            if (clip.kind == ClipKind::Tracker)
+            {
+                if (other->trackerNodeId != clip.trackerNodeId) continue;
+                if (other->sequenceIdx   == clip.sequenceIdx)   continue;
+            }
+            else
+            {
+                if (other->midiPlayerNodeId != clip.midiPlayerNodeId) continue;
+                /* MIDI clips don't share sources -- siblings always
+                 * have different midiSourceId.  No equivalent skip. */
+            }
             const LiveState os = other->state.load (std::memory_order_relaxed);
             if (os != LiveState::Playing && os != LiveState::WaitingToStart) continue;
 
-            if (auto* otrk = lookupTracker (other->trackerNodeId))
-                otrk->schedulePlaying (other->sequenceIdx, targetBeat, false);
+            if (clip.kind == ClipKind::Tracker)
+            {
+                if (auto* otrk = lookupTracker (other->trackerNodeId))
+                    otrk->schedulePlaying (other->sequenceIdx, targetBeat, false);
+            }
+            else
+            {
+                if (auto* omp = lookupMidiPlayer (other->midiPlayerNodeId))
+                    omp->schedulePlayingClip (other->midiSourceId, targetBeat, false);
+            }
 
             other->state.store (targetBeat < 0.0 ? LiveState::Stopped
                                                  : LiveState::WaitingToStop,
@@ -1705,7 +2036,7 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat, bool sce
         }
     }
 
-    trk->schedulePlaying (clip.sequenceIdx, targetBeat, wantPlaying);
+    schedule (targetBeat, wantPlaying);
 
     const LiveState next = (targetBeat < 0.0)
         ? (wantPlaying ? LiveState::Playing       : LiveState::Stopped)
@@ -1747,8 +2078,36 @@ void SessionView::applyFollowAction (SessionClip& clip)
     /* Called from the UI timer when a playing clip wraps past its
      * end.  The actions schedule through the audio-thread FIFO; no
      * direct engine mutation here. */
-    auto* trk = lookupTracker (clip.trackerNodeId);
-    if (trk == nullptr) return;
+    auto stopImmediate = [this, &clip] () {
+        if (clip.kind == ClipKind::Tracker)
+        {
+            if (auto* t = lookupTracker (clip.trackerNodeId))
+                t->schedulePlaying (clip.sequenceIdx, -1.0, false);
+        }
+        else
+        {
+            if (auto* mp = lookupMidiPlayer (clip.midiPlayerNodeId))
+                mp->schedulePlayingClip (clip.midiSourceId, -1.0, false);
+        }
+        clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
+        repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+    };
+
+    auto restartClip = [this, &clip] () {
+        /* For tracker: schedulePlaying(_, true) rewinds pos to 0 even
+         * when already playing.  For MIDI: schedulePlayingClip(_, true)
+         * applies the same rewind via applyPendingClipForBlock. */
+        if (clip.kind == ClipKind::Tracker)
+        {
+            if (auto* t = lookupTracker (clip.trackerNodeId))
+                t->schedulePlaying (clip.sequenceIdx, -1.0, true);
+        }
+        else
+        {
+            if (auto* mp = lookupMidiPlayer (clip.midiPlayerNodeId))
+                mp->schedulePlayingClip (clip.midiSourceId, -1.0, true);
+        }
+    };
 
     switch (clip.followAction)
     {
@@ -1756,16 +2115,11 @@ void SessionView::applyFollowAction (SessionClip& clip)
             break;
 
         case FollowAction::Stop:
-            trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
-            clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
-            repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+            stopImmediate();
             break;
 
         case FollowAction::RestartClip:
-            /* schedulePlaying(_, true) rewinds pos to 0 even when the
-             * sequence is already playing -- see applyPendingForBlock
-             * in tracker.cpp.  Effectively a re-trigger on wrap. */
-            trk->schedulePlaying (clip.sequenceIdx, -1.0, true);
+            restartClip();
             break;
 
         case FollowAction::NextClip:
@@ -1782,12 +2136,7 @@ void SessionView::applyFollowAction (SessionClip& clip)
             if (nextClip != nullptr)
                 bangClip (*nextClip);   // mutual-exclusion stops this one
             else
-            {
-                /* No further clip -- fall through to Stop. */
-                trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
-                clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
-                repaint (cellBounds (clip.sceneRow, clip.columnIdx));
-            }
+                stopImmediate();        // no further clip -- fall through to Stop
             break;
         }
 
@@ -1805,15 +2154,7 @@ void SessionView::applyFollowAction (SessionClip& clip)
             if (firstClip != nullptr)
                 bangClip (*firstClip);
             else
-            {
-                /* C.4: mirror NextClip's behaviour -- if no firstClip
-                 * exists on this column, fall through to Stop so the
-                 * clip doesn't keep playing past wrap.  Previously a
-                 * silent no-op left the clip looping. */
-                trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
-                clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
-                repaint (cellBounds (clip.sceneRow, clip.columnIdx));
-            }
+                stopImmediate();        // C.4: same fall-through as NextClip
             break;
         }
     }
@@ -1884,14 +2225,23 @@ void SessionView::bangScene (int sceneRow)
         }
 
         /* Empty slot -- stop active clips on this column at the
-         * same targetBeat so the switch is atomic in one block. */
+         * same targetBeat so the switch is atomic in one block.
+         * Both clip kinds share this empty-launch-stop semantic. */
         for (auto* c : clips_)
         {
             if (c->columnIdx != col) continue;
             const LiveState s = c->state.load (std::memory_order_relaxed);
             if (s != LiveState::Playing && s != LiveState::WaitingToStart) continue;
-            if (auto* trk = lookupTracker (c->trackerNodeId))
-                trk->schedulePlaying (c->sequenceIdx, targetBeat, false);
+            if (c->kind == ClipKind::Tracker)
+            {
+                if (auto* trk = lookupTracker (c->trackerNodeId))
+                    trk->schedulePlaying (c->sequenceIdx, targetBeat, false);
+            }
+            else
+            {
+                if (auto* mp = lookupMidiPlayer (c->midiPlayerNodeId))
+                    mp->schedulePlayingClip (c->midiSourceId, targetBeat, false);
+            }
             c->state.store (targetBeat < 0.0 ? LiveState::Stopped
                                              : LiveState::WaitingToStop,
                             std::memory_order_relaxed);
@@ -2138,13 +2488,20 @@ void SessionView::stopAllClips()
      * straight away; UI tick will confirm.
      *
      * C.3: skip clips already at Stopped to avoid burning FIFO slots
-     * on redundant stops.  The 64-slot FIFO would otherwise overflow
-     * on sessions with > 64 clips when the user hits STOP ALL. */
+     * on redundant stops. */
     for (auto* c : clips_)
     {
         if (c->state.load (std::memory_order_relaxed) == LiveState::Stopped) continue;
-        if (auto* trk = lookupTracker (c->trackerNodeId))
-            trk->schedulePlaying (c->sequenceIdx, -1.0, false);
+        if (c->kind == ClipKind::Tracker)
+        {
+            if (auto* trk = lookupTracker (c->trackerNodeId))
+                trk->schedulePlaying (c->sequenceIdx, -1.0, false);
+        }
+        else
+        {
+            if (auto* mp = lookupMidiPlayer (c->midiPlayerNodeId))
+                mp->schedulePlayingClip (c->midiSourceId, -1.0, false);
+        }
         c->state.store (LiveState::Stopped, std::memory_order_relaxed);
     }
     repaint();
@@ -2160,8 +2517,16 @@ void SessionView::stopColumn (int columnIdx)
         if (c->columnIdx != columnIdx) continue;
         const LiveState s = c->state.load (std::memory_order_relaxed);
         if (s == LiveState::Stopped) continue;
-        if (auto* trk = lookupTracker (c->trackerNodeId))
-            trk->schedulePlaying (c->sequenceIdx, -1.0, false);
+        if (c->kind == ClipKind::Tracker)
+        {
+            if (auto* trk = lookupTracker (c->trackerNodeId))
+                trk->schedulePlaying (c->sequenceIdx, -1.0, false);
+        }
+        else
+        {
+            if (auto* mp = lookupMidiPlayer (c->midiPlayerNodeId))
+                mp->schedulePlayingClip (c->midiSourceId, -1.0, false);
+        }
         c->state.store (LiveState::Stopped, std::memory_order_relaxed);
     }
     repaint();
@@ -2170,43 +2535,80 @@ void SessionView::stopColumn (int columnIdx)
 bool SessionView::isColumnMuted (int columnIdx) const noexcept
 {
     /* Returns USER-asserted mute (the explicit press), not the
-     * effective engine state.  Lives on the TrackerNode so the
-     * tracker editor popup queries the same state. */
+     * effective engine state.  Lives on the source node so the
+     * tracker / piano-roll editor popups query the same state. */
     if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
-    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        return trk->getUserMuted();
+    const auto& col = columns_.getReference (columnIdx);
+    if (col.kind == ClipKind::Tracker)
+    {
+        if (auto* trk = lookupTracker (col.trackerNodeId)) return trk->getUserMuted();
+    }
+    else
+    {
+        if (auto* mp = lookupMidiPlayer (col.midiPlayerNodeId)) return mp->getUserMuted();
+    }
     return false;
 }
 
 bool SessionView::isColumnSoloed (int columnIdx) const noexcept
 {
     if (columnIdx < 0 || columnIdx >= columns_.size()) return false;
-    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        return trk->getSoloed();
+    const auto& col = columns_.getReference (columnIdx);
+    if (col.kind == ClipKind::Tracker)
+    {
+        if (auto* trk = lookupTracker (col.trackerNodeId)) return trk->getSoloed();
+    }
+    else
+    {
+        if (auto* mp = lookupMidiPlayer (col.midiPlayerNodeId)) return mp->getSoloed();
+    }
     return false;
 }
 
 void SessionView::applyMuteAndSoloState()
 {
-    /* Scan TrackerNodes via the columns array, decide if any are
-     * soloed, then reconcile each tracker's Processor::isMuted from
+    /* Scan source nodes via the columns array, decide if any are
+     * soloed, then reconcile each node's effective mute from
      * (any-solo ? !this-soloed : userMuted).  Engine mute is the
      * EFFECTIVE state; user-intent flags live on the node. */
     bool anySolo = false;
     for (int i = 0; i < columns_.size(); ++i)
     {
-        if (auto* trk = lookupTracker (columns_.getReference (i).trackerNodeId))
-            if (trk->getSoloed()) { anySolo = true; break; }
+        const auto& col = columns_.getReference (i);
+        if (col.kind == ClipKind::Tracker)
+        {
+            if (auto* trk = lookupTracker (col.trackerNodeId))
+                if (trk->getSoloed()) { anySolo = true; break; }
+        }
+        else
+        {
+            if (auto* mp = lookupMidiPlayer (col.midiPlayerNodeId))
+                if (mp->getSoloed()) { anySolo = true; break; }
+        }
     }
 
     for (int c = 0; c < columns_.size(); ++c)
     {
-        if (auto* trk = lookupTracker (columns_.getReference (c).trackerNodeId))
+        const auto& col = columns_.getReference (c);
+        if (col.kind == ClipKind::Tracker)
         {
-            const bool effectiveMute = anySolo ? ! trk->getSoloed()
-                                               : trk->getUserMuted();
-            if (trk->isMuted() != effectiveMute)
-                trk->setMuted (effectiveMute);
+            if (auto* trk = lookupTracker (col.trackerNodeId))
+            {
+                const bool effectiveMute = anySolo ? ! trk->getSoloed()
+                                                   : trk->getUserMuted();
+                if (trk->isMuted() != effectiveMute)
+                    trk->setMuted (effectiveMute);
+            }
+        }
+        else
+        {
+            if (auto* mp = lookupMidiPlayer (col.midiPlayerNodeId))
+            {
+                const bool effectiveMute = anySolo ? ! mp->getSoloed()
+                                                   : mp->getUserMuted();
+                if (mp->isMuted() != effectiveMute)
+                    mp->setMuted (effectiveMute);
+            }
         }
     }
 }
@@ -2214,8 +2616,17 @@ void SessionView::applyMuteAndSoloState()
 void SessionView::toggleColumnMute (int columnIdx)
 {
     if (columnIdx < 0 || columnIdx >= columns_.size()) return;
-    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        trk->setUserMuted (! trk->getUserMuted());
+    const auto& col = columns_.getReference (columnIdx);
+    if (col.kind == ClipKind::Tracker)
+    {
+        if (auto* trk = lookupTracker (col.trackerNodeId))
+            trk->setUserMuted (! trk->getUserMuted());
+    }
+    else
+    {
+        if (auto* mp = lookupMidiPlayer (col.midiPlayerNodeId))
+            mp->setUserMuted (! mp->getUserMuted());
+    }
     applyMuteAndSoloState();
     repaint (headerRowBounds());
 }
@@ -2223,8 +2634,17 @@ void SessionView::toggleColumnMute (int columnIdx)
 void SessionView::toggleColumnSolo (int columnIdx)
 {
     if (columnIdx < 0 || columnIdx >= columns_.size()) return;
-    if (auto* trk = lookupTracker (columns_.getReference (columnIdx).trackerNodeId))
-        trk->setSoloed (! trk->getSoloed());
+    const auto& col = columns_.getReference (columnIdx);
+    if (col.kind == ClipKind::Tracker)
+    {
+        if (auto* trk = lookupTracker (col.trackerNodeId))
+            trk->setSoloed (! trk->getSoloed());
+    }
+    else
+    {
+        if (auto* mp = lookupMidiPlayer (col.midiPlayerNodeId))
+            mp->setSoloed (! mp->getSoloed());
+    }
     applyMuteAndSoloState();
     repaint (headerRowBounds());
 }
@@ -2324,16 +2744,23 @@ void SessionView::moveClip (SessionClip& clip, int newSceneRow, int newColumnIdx
     if (newColumnIdx < 0 || newColumnIdx >= columns_.size()) return;
     if (findClip (newSceneRow, newColumnIdx) != nullptr) return;  // target busy
 
-    const auto targetTrackerId = columns_.getReference (newColumnIdx).trackerNodeId;
-
-    /* Cross-tracker migration would require re-parenting a vht
-     * `sequence` (changing its `clt` + back-pointer to a different
-     * `module`); deferred until a dedicated adoptSequence API lands.
-     * v1: silently reject cross-tracker drops.  In practice columns
-     * are 1:1 with TrackerNodes today, so cross-column ==> cross-
-     * tracker; same-column drag inside a single column is the only
-     * case that actually fires. */
-    if (targetTrackerId != clip.trackerNodeId) return;
+    const auto& targetCol = columns_.getReference (newColumnIdx);
+    /* Reject cross-kind moves: a tracker clip can't land on a MIDI
+     * column and vice versa.  The source data shapes are not
+     * interchangeable. */
+    if (targetCol.kind != clip.kind) return;
+    if (clip.kind == ClipKind::Tracker)
+    {
+        /* Cross-tracker migration would require re-parenting a vht
+         * sequence; deferred.  v1: silently reject cross-tracker drops. */
+        if (targetCol.trackerNodeId != clip.trackerNodeId) return;
+    }
+    else
+    {
+        /* Cross-MidiPlayer move would require re-parenting the
+         * MidiNoteRegion to a different player; deferred. */
+        if (targetCol.midiPlayerNodeId != clip.midiPlayerNodeId) return;
+    }
 
     const int oldRow = clip.sceneRow;
     const int oldCol = clip.columnIdx;
@@ -2350,25 +2777,63 @@ void SessionView::copyClip (SessionClip& src, int newSceneRow, int newColumnIdx)
     if (newSceneRow < 0 || newSceneRow >= scenes_.size()) return;
     if (newColumnIdx < 0 || newColumnIdx >= columns_.size()) return;
     if (findClip (newSceneRow, newColumnIdx) != nullptr) return;
-    if (columns_.getReference (newColumnIdx).trackerNodeId != src.trackerNodeId)
-        return;   // cross-tracker copy needs deferred adoptSequence API
 
-    auto* trk = lookupTracker (src.trackerNodeId);
-    if (trk == nullptr) return;
-
-    const int newIdx = trk->cloneSequence (src.sequenceIdx);
-    if (newIdx < 0) return;
+    const auto& targetCol = columns_.getReference (newColumnIdx);
+    if (targetCol.kind != src.kind) return;
 
     auto* clip = new SessionClip();
     clip->id            = juce::Uuid();
     clip->name          = src.name;
     clip->color         = src.color;
-    clip->trackerNodeId = src.trackerNodeId;
-    clip->sequenceIdx   = newIdx;
+    clip->kind          = src.kind;
     clip->sceneRow      = newSceneRow;
     clip->columnIdx     = newColumnIdx;
     clip->launchQuant   = src.launchQuant;
     clip->followAction  = src.followAction;
+
+    if (src.kind == ClipKind::Tracker)
+    {
+        /* Cross-tracker copy needs deferred adoptSequence API. */
+        if (targetCol.trackerNodeId != src.trackerNodeId) { delete clip; return; }
+        auto* trk = lookupTracker (src.trackerNodeId);
+        if (trk == nullptr) { delete clip; return; }
+        const int newIdx = trk->cloneSequence (src.sequenceIdx);
+        if (newIdx < 0) { delete clip; return; }
+        clip->trackerNodeId = src.trackerNodeId;
+        clip->sequenceIdx   = newIdx;
+    }
+    else
+    {
+        /* Cross-player copy needs region adoption; deferred. */
+        if (targetCol.midiPlayerNodeId != src.midiPlayerNodeId)
+            { delete clip; return; }
+        auto* mp = lookupMidiPlayer (src.midiPlayerNodeId);
+        if (mp == nullptr) { delete clip; return; }
+        /* Create a fresh slot, then deep-clone the source region's
+         * notes into it.  MidiNoteRegion::clone() preserves the
+         * region id; we want a NEW id for the new clip, so we copy
+         * notes via setNotes after creating. */
+        const Uuid newId = mp->createSessionClip();
+        if (newId.isNull()) { delete clip; return; }
+        if (auto* dst = mp->getClipRegion (newId))
+        {
+            if (auto* sr = mp->getClipRegion (src.midiSourceId))
+            {
+                dst->positionBeats   = sr->positionBeats;
+                dst->lengthBeats     = sr->lengthBeats;
+                dst->startBeats      = sr->startBeats;
+                dst->looped          = sr->looped;
+                dst->loopLengthBeats = sr->loopLengthBeats;
+                dst->colour          = sr->colour;
+                dst->name            = sr->name;
+                if (const auto* snap = sr->loadSnapshot())
+                    dst->setNotes (MidiNoteRegion::NoteList (*snap));
+            }
+        }
+        clip->midiPlayerNodeId = src.midiPlayerNodeId;
+        clip->midiSourceId     = newId;
+    }
+
     clips_.add (clip);
 
     writeToSession();
@@ -2512,22 +2977,35 @@ void SessionView::addClipAt (int sceneRow, int columnIdx)
     if (findClip (sceneRow, columnIdx) != nullptr)     return;  // already populated
 
     auto& col = columns_.getReference (columnIdx);
-    auto* trk = lookupTracker (col.trackerNodeId);
-    if (trk == nullptr) return;
-
-    const int seqIdx = trk->createSequence (16);
-    if (seqIdx < 0) return;
-
     auto* clip = new SessionClip();
     clip->id   = Uuid();
     clip->name = "Clip " + String (sceneRow + 1);
     clip->color = columnTint (columnIdx).withMultipliedSaturation (0.6f)
                                         .withMultipliedBrightness (0.85f);
-    clip->trackerNodeId = col.trackerNodeId;
-    clip->sequenceIdx   = seqIdx;
+    clip->kind          = col.kind;
     clip->sceneRow      = sceneRow;
     clip->columnIdx     = columnIdx;
     clip->launchQuant   = defaultLaunchQuant_;
+
+    if (col.kind == ClipKind::Tracker)
+    {
+        auto* trk = lookupTracker (col.trackerNodeId);
+        if (trk == nullptr) { delete clip; return; }
+        const int seqIdx = trk->createSequence (16);
+        if (seqIdx < 0) { delete clip; return; }
+        clip->trackerNodeId = col.trackerNodeId;
+        clip->sequenceIdx   = seqIdx;
+    }
+    else /* Midi */
+    {
+        auto* mp = lookupMidiPlayer (col.midiPlayerNodeId);
+        if (mp == nullptr) { delete clip; return; }
+        const Uuid clipSourceId = mp->createSessionClip();
+        if (clipSourceId.isNull()) { delete clip; return; }
+        clip->midiPlayerNodeId = col.midiPlayerNodeId;
+        clip->midiSourceId     = clipSourceId;
+    }
+
     clips_.add (clip);
 
     writeToSession();
@@ -3166,15 +3644,134 @@ void SessionView::openPatternEditor (SessionClip& clip)
     juce::ignoreUnused (win);   // self-deletes on close
 }
 
+void SessionView::addTrackerColumn()
+{
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto graph = sess->getActiveGraph();
+    if (! graph.isValid()) return;
+    auto* engine = services_->find<EngineService>();
+    if (engine == nullptr) return;
+
+    juce::PluginDescription desc;
+    desc.fileOrIdentifier = EL_NODE_ID_MIDI_SEQUENCER;   // TrackerNode id
+    desc.pluginFormatName = EL_NODE_FORMAT_NAME;
+    desc.name             = "Tracker";
+
+    /* addPlugin(graph, desc) lands the node on the supplied graph at
+     * a default position.  rescanColumns will pick it up + create the
+     * matching column on the next call (from our timer / activate). */
+    Node node = engine->addPlugin (graph, desc);
+    if (node.isValid())
+        node.setName (nextNumberedNodeName (graph, "TrkSeq"));
+    rescanColumns();
+}
+
+void SessionView::moveColumn (int columnIdx, int delta)
+{
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return;
+    const int target = columnIdx + delta;
+    if (target < 0 || target >= columns_.size()) return;
+    if (target == columnIdx) return;
+
+    columns_.swap (columnIdx, target);
+    /* Remap clips that referenced either swapped column. */
+    for (auto* c : clips_)
+    {
+        if      (c->columnIdx == columnIdx) c->columnIdx = target;
+        else if (c->columnIdx == target)    c->columnIdx = columnIdx;
+    }
+
+    writeToSession();
+    repaint();
+}
+
+void SessionView::removeColumn (int columnIdx)
+{
+    if (columnIdx < 0 || columnIdx >= columns_.size()) return;
+    if (services_ == nullptr) return;
+    auto* engine = services_->find<EngineService>();
+    if (engine == nullptr) return;
+
+    /* Resolve the host node uuid first.  removeNode by uint32 nodeId
+     * is the public surface; convert via the active graph lookup. */
+    const auto& col = columns_.getReference (columnIdx);
+    const juce::uint32 nodeId = (col.kind == ClipKind::Midi)
+        ? col.midiPlayerNodeId
+        : col.trackerNodeId;
+    if (nodeId == 0) return;
+
+    /* Schedule-stop any clips on this column before tearing down the
+     * host node, so the audio thread emits proper NoteOffs before the
+     * node disappears.  stopColumn dispatches the per-kind FIFO stop;
+     * the audio thread drains + flushes held notes on its next render. */
+    stopColumn (columnIdx);
+
+    /* Remove the graph node.  Both ArrangementView's rescanLaneTargets
+     * + SessionView's rescanColumns will pick up the absence on their
+     * next pass + auto-drop column / lane bindings in lockstep. */
+    engine->removeNode (nodeId);
+
+    rescanColumns();
+    repaint();
+}
+
+void SessionView::addMidiColumn()
+{
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto graph = sess->getActiveGraph();
+    if (! graph.isValid()) return;
+    auto* engine = services_->find<EngineService>();
+    if (engine == nullptr) return;
+
+    juce::PluginDescription desc;
+    desc.fileOrIdentifier = EL_NODE_ID_MIDI_PLAYER;
+    desc.pluginFormatName = EL_NODE_FORMAT_NAME;
+    desc.name             = "MIDI Player";
+
+    Node node = engine->addPlugin (graph, desc);
+    if (node.isValid())
+        node.setName (nextNumberedNodeName (graph, "MidiSeq"));
+    rescanColumns();
+}
+
+void SessionView::openPianoRollForClip (SessionClip& clip)
+{
+    /* Route MIDI clip into the bottom-attached PianoRollView dock.
+     * StandardContent::showPianoRollForRegion installs the resolver
+     * that walks ArrangementView; for session-view clips we want the
+     * resolver to also probe SessionView::findMidiClipRegion.  The
+     * dock-installed resolver is patched in StandardContent. */
+    if (clip.kind != ClipKind::Midi)        return;
+    if (clip.midiSourceId.isNull())         return;
+    if (services_ == nullptr)               return;
+    if (auto* sc = dynamic_cast<StandardContent*> (
+            ViewHelpers::findContentComponent (this)))
+        sc->showPianoRollForRegion (clip.midiSourceId);
+}
+
 void SessionView::deleteClip (SessionClip& clip)
 {
-    if (auto* trk = lookupTracker (clip.trackerNodeId))
-        trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
-
-    /* Note: we do NOT call trk->removeSequence() -- the underlying vht
-     * sequence may be referenced by other clips or by the arrangement
-     * view.  Phase 3 keeps the sequence behind; Phase 7+ adds a
-     * "delete unreferenced sequences" sweep. */
+    if (clip.kind == ClipKind::Tracker)
+    {
+        if (auto* trk = lookupTracker (clip.trackerNodeId))
+            trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
+        /* Note: we do NOT call trk->removeSequence() -- the underlying
+         * vht sequence may be referenced by other clips or by the
+         * arrangement view.  Phase 7+ adds a "delete unreferenced
+         * sequences" sweep. */
+    }
+    else /* Midi */
+    {
+        if (auto* mp = lookupMidiPlayer (clip.midiPlayerNodeId))
+            mp->removeSessionClip (clip.midiSourceId);
+        /* Unlike tracker sequences, MIDI clip regions are NOT shared
+         * (each clip owns its region), so removeSessionClip both
+         * tombstones the slot AND schedules the held-notes flush. */
+    }
 
     const int row = clip.sceneRow;
     const int col = clip.columnIdx;
@@ -3207,12 +3804,40 @@ void SessionView::rescanColumns()
     auto graph = sess->getActiveGraph();
     if (! graph.isValid()) return;
 
-    juce::Array<TrackerNode*>  trackers;
     juce::Array<juce::uint32>  nodeIds;
     juce::Array<String>        names;
-    collectTrackerNodes (graph, trackers, nodeIds, names);
+    juce::Array<ClipKind>      kinds;
+    collectColumnSourceNodes (graph, nodeIds, names, kinds);
 
-    /* Build a fresh column list keyed by trackerNodeId.  Preserve any
+    /* Auto-rename: any clip-source node still wearing its default
+     * factory name ("Tracker" or "MIDI Player") gets bumped to the
+     * canonical "TrkSeq N" / "MidiSeq N" so the graph block + column
+     * label both read consistently.  User-customised names are
+     * preserved -- the rename triggers ONLY on exact default match. */
+    for (int i = 0; i < nodeIds.size(); ++i)
+    {
+        const auto& nm = names.getReference (i);
+        const bool needsRename =
+            (kinds[i] == ClipKind::Tracker && nm == "Tracker")
+         || (kinds[i] == ClipKind::Midi    && nm == "MIDI Player");
+        if (! needsRename) continue;
+        Node n = graph.getNodeById (nodeIds[i]);
+        if (! n.isValid()) continue;
+        const auto canonical = nextNumberedNodeName (graph,
+            kinds[i] == ClipKind::Midi ? "MidiSeq" : "TrkSeq");
+        n.setName (canonical);
+        names.set (i, canonical);
+    }
+
+    /* Resolve a column to its identifying node id, accounting for
+     * kind.  Tracker columns use trackerNodeId; Midi columns use
+     * midiPlayerNodeId.  Returns 0 if the kind / id pair is invalid. */
+    auto columnNodeId = [] (const SessionColumn& c) -> juce::uint32 {
+        return c.kind == ClipKind::Midi ? c.midiPlayerNodeId
+                                        : c.trackerNodeId;
+    };
+
+    /* Build a fresh column list keyed by (kind, nodeId).  Preserve any
      * persisted column ordering for nodes that still exist; append
      * new ones at the end. */
     juce::Array<SessionColumn> fresh;
@@ -3220,14 +3845,15 @@ void SessionView::rescanColumns()
 
     for (const auto& existing : columns_)
     {
-        if (nodeIds.contains (existing.trackerNodeId))
+        const auto existingId = columnNodeId (existing);
+        const int idx = nodeIds.indexOf (existingId);
+        /* Only carry the column over if a node with that id exists
+         * AND its kind matches what the column was persisted as. */
+        if (idx >= 0 && kinds[idx] == existing.kind)
         {
             fresh.add (existing);
-            seen.add (existing.trackerNodeId);
-            /* Refresh name in case the node was renamed. */
-            const int idx = nodeIds.indexOf (existing.trackerNodeId);
-            if (idx >= 0)
-                fresh.getReference (fresh.size() - 1).name = names[idx];
+            seen.add (existingId);
+            fresh.getReference (fresh.size() - 1).name = names[idx];
         }
     }
 
@@ -3237,27 +3863,52 @@ void SessionView::rescanColumns()
         SessionColumn col;
         col.id   = Uuid();
         col.name = names[i];
-        col.trackerNodeId = nodeIds[i];
+        col.kind = kinds[i];
+        if (col.kind == ClipKind::Midi)
+            col.midiPlayerNodeId = nodeIds[i];
+        else
+            col.trackerNodeId    = nodeIds[i];
         fresh.add (col);
     }
 
     bool changed = (fresh.size() != columns_.size());
     if (! changed)
         for (int i = 0; i < fresh.size(); ++i)
-            if (fresh.getReference (i).trackerNodeId != columns_.getReference (i).trackerNodeId
-                || fresh.getReference (i).name      != columns_.getReference (i).name)
+        {
+            const auto& a = fresh.getReference (i);
+            const auto& b = columns_.getReference (i);
+            if (a.kind != b.kind
+                || columnNodeId (a) != columnNodeId (b)
+                || a.name != b.name)
                 { changed = true; break; }
+        }
 
     if (changed)
     {
         /* Drop clips whose column went away.  Rebind columnIdx for
-         * clips whose column was reordered. */
+         * clips whose column was reordered.  Match clips by kind +
+         * kind-specific host node id. */
         for (int i = clips_.size(); --i >= 0;)
         {
             int newCol = -1;
+            const auto* clip = clips_[i];
             for (int j = 0; j < fresh.size(); ++j)
-                if (fresh.getReference (j).trackerNodeId == clips_[i]->trackerNodeId)
-                    { newCol = j; break; }
+            {
+                const auto& fc = fresh.getReference (j);
+                if (fc.kind != clip->kind) continue;
+                if (clip->kind == ClipKind::Midi)
+                {
+                    if (fc.midiPlayerNodeId != 0
+                     && fc.midiPlayerNodeId == clip->midiPlayerNodeId)
+                        { newCol = j; break; }
+                }
+                else
+                {
+                    if (fc.trackerNodeId != 0
+                     && fc.trackerNodeId == clip->trackerNodeId)
+                        { newCol = j; break; }
+                }
+            }
             if (newCol < 0)
                 clips_.remove (i);
             else
@@ -3304,7 +3955,14 @@ void SessionView::readFromSession()
             SessionColumn col;
             col.id            = Uuid (cn.getProperty ("id").toString());
             col.name          = cn.getProperty ("name", String());
-            col.trackerNodeId = (juce::uint32) (juce::int64) cn.getProperty ("trackerNodeId", 0);
+            /* `kind` defaults to "tracker" so existing sessions
+             * deserialise unchanged.  Unknown kinds fall back to
+             * tracker too -- the column will detach from any node
+             * on the next rescanColumns (no matching kind found). */
+            const String kindStr = cn.getProperty ("kind", "tracker").toString();
+            col.kind          = (kindStr == "midi") ? ClipKind::Midi : ClipKind::Tracker;
+            col.trackerNodeId    = (juce::uint32) (juce::int64) cn.getProperty ("trackerNodeId", 0);
+            col.midiPlayerNodeId = (juce::uint32) (juce::int64) cn.getProperty ("midiPlayerNodeId", 0);
             columns_.add (col);
         }
     }
@@ -3328,8 +3986,9 @@ void SessionView::readFromSession()
         }
     }
 
-    /* Clips.  Absent `kind` attribute means tracker (see
-     * project_session_view_polymorphic_clip_sources memory). */
+    /* Clips.  Absent `kind` attribute means tracker so pre-MIDI
+     * sessions deserialise unchanged.  Unknown kinds are skipped --
+     * forward-compat for any future fourth clip kind. */
     clips_.clearQuick (true);
     const auto clipsTree = tree.getChildWithName ("clips");
     if (clipsTree.isValid())
@@ -3337,15 +3996,23 @@ void SessionView::readFromSession()
         for (int i = 0; i < clipsTree.getNumChildren(); ++i)
         {
             const auto cn = clipsTree.getChild (i);
-            const String kind = cn.getProperty ("kind", "tracker").toString();
-            if (kind != "tracker") continue;   // forward-compat: ignore unknown kinds
+            const String kindStr = cn.getProperty ("kind", "tracker").toString();
+            ClipKind kind;
+            if      (kindStr == "tracker") kind = ClipKind::Tracker;
+            else if (kindStr == "midi")    kind = ClipKind::Midi;
+            else                           continue;   // unknown -- skip
 
             auto* clip = new SessionClip();
+            clip->kind          = kind;
             clip->id            = Uuid (cn.getProperty ("id").toString());
             clip->name          = cn.getProperty ("name", String ("Clip"));
             clip->color         = Colour::fromString (cn.getProperty ("color", "ff4a7ab5").toString());
-            clip->trackerNodeId = (juce::uint32) (juce::int64) cn.getProperty ("trackerNodeId", 0);
-            clip->sequenceIdx   = (int) cn.getProperty ("sequenceIdx", -1);
+            clip->trackerNodeId    = (juce::uint32) (juce::int64) cn.getProperty ("trackerNodeId", 0);
+            clip->sequenceIdx      = (int) cn.getProperty ("sequenceIdx", -1);
+            clip->midiPlayerNodeId = (juce::uint32) (juce::int64) cn.getProperty ("midiPlayerNodeId", 0);
+            const String midiSrc   = cn.getProperty ("midiSourceId", String()).toString();
+            clip->midiSourceId     = midiSrc.isNotEmpty() ? Uuid (midiSrc)
+                                                          : Uuid::null();
             clip->sceneRow      = (int) cn.getProperty ("sceneRow", 0);
             clip->columnIdx     = (int) cn.getProperty ("columnIdx", 0);
             clip->launchQuant   = static_cast<LaunchQuant> (
@@ -3421,7 +4088,17 @@ void SessionView::writeToSession()
         juce::ValueTree cn ("column");
         cn.setProperty ("id",            c.id.toString(),               nullptr);
         cn.setProperty ("name",          c.name,                        nullptr);
-        cn.setProperty ("trackerNodeId", (juce::int64) c.trackerNodeId, nullptr);
+        cn.setProperty ("kind",
+            c.kind == ClipKind::Midi ? String ("midi") : String ("tracker"),
+            nullptr);
+        /* Sparse-write the host node id: only the field relevant to
+         * this column's kind survives.  Keeps the XML diff readable
+         * and prevents stale id ghosts from leaking across kind
+         * changes (which shouldn't happen, but defence in depth). */
+        if (c.kind == ClipKind::Midi)
+            cn.setProperty ("midiPlayerNodeId", (juce::int64) c.midiPlayerNodeId, nullptr);
+        else
+            cn.setProperty ("trackerNodeId",    (juce::int64) c.trackerNodeId,    nullptr);
         colsTree.appendChild (cn, nullptr);
     }
     tree.appendChild (colsTree, nullptr);
@@ -3449,8 +4126,22 @@ void SessionView::writeToSession()
         cn.setProperty ("id",            clip->id.toString(),              nullptr);
         cn.setProperty ("name",          clip->name,                       nullptr);
         cn.setProperty ("color",         clip->color.toString(),           nullptr);
-        cn.setProperty ("trackerNodeId", (juce::int64) clip->trackerNodeId, nullptr);
-        cn.setProperty ("sequenceIdx",   clip->sequenceIdx,                nullptr);
+        /* Sparse-write `kind` -- omit when tracker so existing saves
+         * stay byte-identical for the dominant case.  Readers default
+         * to tracker on the missing attribute. */
+        if (clip->kind == ClipKind::Midi)
+        {
+            cn.setProperty ("kind", "midi", nullptr);
+            cn.setProperty ("midiPlayerNodeId",
+                            (juce::int64) clip->midiPlayerNodeId, nullptr);
+            cn.setProperty ("midiSourceId",
+                            clip->midiSourceId.toString(), nullptr);
+        }
+        else
+        {
+            cn.setProperty ("trackerNodeId", (juce::int64) clip->trackerNodeId, nullptr);
+            cn.setProperty ("sequenceIdx",   clip->sequenceIdx,                 nullptr);
+        }
         cn.setProperty ("sceneRow",      clip->sceneRow,                   nullptr);
         cn.setProperty ("columnIdx",     clip->columnIdx,                  nullptr);
         cn.setProperty ("launchQuant",   (int) clip->launchQuant,          nullptr);
@@ -3555,11 +4246,25 @@ void SessionView::timerCallback()
 
     for (auto* clip : clips_)
     {
-        if (clip->sequenceIdx < 0) continue;
-        auto* trk = lookupTracker (clip->trackerNodeId);
-        if (trk == nullptr) continue;
-
-        const bool enginePlaying = trk->isSequencePlaying (clip->sequenceIdx);
+        /* Per-kind binding validity + per-kind engine-playing probe.
+         * Both tracker and midi clips publish "is the audio thread
+         * currently emitting this clip" through the same boolean
+         * shape; downstream reconciliation logic is kind-agnostic. */
+        bool enginePlaying = false;
+        if (clip->kind == ClipKind::Tracker)
+        {
+            if (clip->sequenceIdx < 0) continue;
+            auto* trk = lookupTracker (clip->trackerNodeId);
+            if (trk == nullptr) continue;
+            enginePlaying = trk->isSequencePlaying (clip->sequenceIdx);
+        }
+        else
+        {
+            if (clip->midiSourceId.isNull()) continue;
+            auto* mp = lookupMidiPlayer (clip->midiPlayerNodeId);
+            if (mp == nullptr) continue;
+            enginePlaying = mp->isSessionClipPlaying (clip->midiSourceId);
+        }
         const LiveState cur = clip->state.load (std::memory_order_relaxed);
 
         /* State reconciliation -- SessionClip.state is authoritative
@@ -3600,9 +4305,25 @@ void SessionView::timerCallback()
                 break;
         }
 
-        const int posRow = enginePlaying
-            ? (int) trk->getSequencePositionRows (clip->sequenceIdx)
-            : -1;
+        int posRow = -1;
+        if (enginePlaying)
+        {
+            if (clip->kind == ClipKind::Tracker)
+            {
+                if (auto* trk = lookupTracker (clip->trackerNodeId))
+                    posRow = (int) trk->getSequencePositionRows (clip->sequenceIdx);
+            }
+            else
+            {
+                /* For MIDI clips we sentinel-translate localBeatPos
+                 * to a row-ish int (beats * 100, truncated).  The
+                 * diff-gate paint logic only cares about "did the
+                 * value change", not its absolute scale. */
+                if (auto* mp = lookupMidiPlayer (clip->midiPlayerNodeId))
+                    posRow = (int) (mp->getSessionClipPositionBeats (clip->midiSourceId)
+                                    * 100.0);
+            }
+        }
 
         /* Repaint conditions: state change, position bar moved while
          * playing, OR clip is in a WaitingTo* state (so the pulsing
@@ -3653,14 +4374,23 @@ void SessionView::timerCallback()
 
         /* Follow-action edge: only check after state reconciliation
          * so a freshly-launched clip doesn't immediately fire its
-         * follow action on the first poll.  sequenceWrappedSinceLastQuery
+         * follow action on the first poll.  ...WrappedSinceLastQuery
          * consumes the wrap edge -- repeated calls in the same wrap
          * window return false. */
-        if (next == LiveState::Playing
-            && clip->followAction != FollowAction::None
-            && trk->sequenceWrappedSinceLastQuery (clip->sequenceIdx))
+        if (next == LiveState::Playing && clip->followAction != FollowAction::None)
         {
-            applyFollowAction (*clip);
+            bool wrapped = false;
+            if (clip->kind == ClipKind::Tracker)
+            {
+                if (auto* trk = lookupTracker (clip->trackerNodeId))
+                    wrapped = trk->sequenceWrappedSinceLastQuery (clip->sequenceIdx);
+            }
+            else
+            {
+                if (auto* mp = lookupMidiPlayer (clip->midiPlayerNodeId))
+                    wrapped = mp->sessionClipWrappedSinceLastQuery (clip->midiSourceId);
+            }
+            if (wrapped) applyFollowAction (*clip);
         }
     }
 }

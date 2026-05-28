@@ -280,6 +280,20 @@ private:
      *  failure.  Sets lane.kind = Lane::Kind::Midi. */
     int createEmptyMidiLane();
 
+    /** Remove the lane at `laneIdx` AND tear down its underlying
+     *  graph source node (TrackerNode / MidiPlayerNode / AudioClipNode
+     *  -- whichever the lane was bound to).  Subsequent rescan in the
+     *  arrangement + session views drops the orphan column / lane in
+     *  lockstep.  Wired to the lane-header right-click "Delete track"
+     *  menu. */
+    void removeLane (int laneIdx);
+
+    /** Reorder lanes by swap delta (-1 up, +1 down).  Lane runtime
+     *  binding swaps in lockstep so audio-thread emission keeps the
+     *  right cache.  Wired to the lane-header right-click "Move up /
+     *  Move down" menu items. */
+    void moveLane (int laneIdx, int delta);
+
     /** Common path for file-drop and create-from-disk:
      *   - Opens `file` via libsndfile (metadata: sr, channels, length)
      *   - Registers as AudioFileSource via SourceRegistry
@@ -311,18 +325,10 @@ private:
 
     void timerCallback() override;
 
-    /** Audio file import via the Disk Op picker -- arms a Request on
-     *  DiskOpService, navigates to the Disk Op page, callback fires
-     *  back on accept and dispatches to importAudioFileToLane.
-     *  Established Element-NSPA pattern (juce::FileChooser is broken
-     *  under winelib; see [[diskop-request-pattern-validated]]). */
-    void promptLoadAudioFile();
-
     Services* services_ = nullptr;
     BlockToolButton rescanBtn_     { "Rescan" };
     BlockToolButton addAudioBtn_   { "+ Audio" };
     BlockToolButton addMidiBtn_    { "+ MIDI" };
-    BlockToolButton loadAudioBtn_  { "Load..." };
     BlockToolButton snapBtn_       { "Snap" };
     /* Snap auxiliary toggles -- short labels because the toolbar is
      * already wide.  "Evt" = snap-to-events (trigger snap); "Off" =

@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <memory>
 
 namespace element {
 
@@ -155,6 +156,105 @@ public:
      *  any non-audio thread.  Idempotent. */
     void sweepBindingsTrash() noexcept;
 
+    //==========================================================================
+    // Session-view API.  Parallel to TrackerNode's session-view API.
+    // Each SessionClipSlot carries one MidiNoteRegion + per-clip
+    // launch state machine + per-clip held-notes bitset.  Audio thread
+    // walks active slots on every render block in addition to the
+    // arrangement entry table -- both surfaces coexist on a single
+    // MidiPlayerNode instance, though in practice ArrangementView and
+    // SessionView each spawn their own.
+    //
+    // RT-safety contract mirrors TrackerNode B.1-B.4:
+    //  - sessionClips_ grows monotonically; the audio thread reads
+    //    via std::atomic<int> sessionClipCount_ (release-stored after
+    //    a slot's contents are populated).
+    //  - Per-slot `alive` flag is the visible discriminant; the audio
+    //    thread acquire-loads it before reading any of the slot's
+    //    other fields.
+    //  - schedulePlayingClip pushes a LaunchReq through an SPSC FIFO;
+    //    the audio thread drains under no lock at block start.
+    //  - Slot state transitions on the audio thread are sequenced:
+    //    drain FIFO -> apply pending for block beats -> emit notes.
+
+    /** Allocate (or reuse a tombstoned) slot for a fresh MIDI clip.
+     *  Returns the new clip's stable Uuid; subsequent session-view
+     *  API calls key on this id.  Default region: empty notes, 4-beat
+     *  length, looped=true (session clip semantic).
+     *
+     *  Message thread only.  Adding a new clip while the audio thread
+     *  is running is safe: the slot's `alive` flag is published
+     *  release-after the slot's other fields are populated, so the
+     *  audio thread either sees the fully-initialised slot or skips it. */
+    juce::Uuid createSessionClip();
+
+    /** Same but with a caller-supplied stable Uuid + default region
+     *  shape.  Used by setState's restore path.  Returns false if a
+     *  slot for this id already exists. */
+    bool createSessionClipWithId (const juce::Uuid& id);
+
+    /** Tombstone the slot for the given clip id + flush any held notes
+     *  to the output (via the SPSC FIFO so the audio thread observes
+     *  the kill at a block boundary).  Returns false if no slot has
+     *  this id.  After this call, isSessionClipPlaying / getClip... return
+     *  defaults; getClipRegion returns nullptr. */
+    bool removeSessionClip (const juce::Uuid& id);
+
+    /** Schedule a future state flip for the named clip slot.
+     *  beatTarget < 0 means "immediate" (fires at the start of the
+     *  next render block).  beatTarget >= 0 is a transport-beat
+     *  position; the flip fires inside the render block whose beat
+     *  range contains it -- sample-accurate to +/-1 audio block.
+     *
+     *  When wantPlaying=true, the slot's local playhead rewinds to 0
+     *  on launch (Bitwig/Ableton "launch restarts from start").
+     *  Latest request per slot wins -- repeated bangs cancel prior
+     *  queued actions.  No-op (drops silently) if the id is unknown
+     *  or the FIFO is full. */
+    void schedulePlayingClip (const juce::Uuid& clipId,
+                              double            beatTarget,
+                              bool              wantPlaying) noexcept;
+
+    /** True if the slot is in Playing state (audio thread has fired
+     *  the launch).  WaitingToStart slots return false.  Used by the
+     *  session-view UI tick to reconcile the SessionClip's
+     *  message-thread state. */
+    bool   isSessionClipPlaying       (const juce::Uuid& clipId) const noexcept;
+
+    /** Slot's current local playhead in beats.  Wraps modulo the
+     *  clip's region length each loop.  Returns 0.0 for unknown ids. */
+    double getSessionClipPositionBeats (const juce::Uuid& clipId) const noexcept;
+
+    /** Clip's region length in beats (the loop period).  Returns 0.0
+     *  for unknown ids.  Used by the UI for cosmetic progress bars. */
+    double getSessionClipLengthBeats  (const juce::Uuid& clipId) const noexcept;
+
+    /** Edge-trigger: returns true once per local-playhead wrap (used
+     *  for followAction at clip end).  Consumes the wrap on read.
+     *  Returns false for unknown ids. */
+    bool   sessionClipWrappedSinceLastQuery (const juce::Uuid& clipId) noexcept;
+
+    /** Live MidiNoteRegion pointer for the named clip.  Message-thread
+     *  only -- the audio thread reads the region via the slot pointer
+     *  it caches in render().  Returns nullptr for unknown ids. */
+    MidiNoteRegion* getClipRegion (const juce::Uuid& clipId) noexcept;
+
+    /** Reconcile slot states against a list of clip ids that
+     *  SessionView still considers Playing or WaitingToStart.  Any
+     *  slot not in `boundIds` and currently in a non-Stopped state
+     *  is scheduled immediately stopped.  Called from
+     *  SessionView::reconcileClipPlaying as the C.1 belt+suspenders
+     *  silencer.  Message-thread only. */
+    void reconcileBoundClips (const juce::Array<juce::Uuid>& boundIds) noexcept;
+
+    //==========================================================================
+    // Session-view mute / solo (parity with TrackerNode).
+
+    bool getUserMuted() const noexcept { return userMuted_; }
+    void setUserMuted (bool b) noexcept { userMuted_ = b; }
+    bool getSoloed()    const noexcept { return soloed_; }
+    void setSoloed    (bool b) noexcept { soloed_ = b; }
+
 private:
     bool                createdPorts_   { false };
 
@@ -210,6 +310,137 @@ private:
                               double             samplesPerBeat,
                               int                numSamples,
                               juce::MidiBuffer&  out) noexcept;
+
+    //==========================================================================
+    // Session-view per-clip state.
+
+    /** State machine values mirror SessionView::LiveState int order.
+     *  Stored as int8 atomic so the audio thread can RMW without a
+     *  C++ atomic<enum> reinterpret. */
+    enum SlotState : std::int8_t
+    {
+        kStopped         = 0,
+        kWaitingToStart  = 1,
+        kPlaying         = 2,
+        kWaitingToStop   = 3,
+    };
+
+    struct ClipPending
+    {
+        double beatTarget   = 0.0;
+        bool   wantPlaying  = false;
+        bool   valid        = false;
+    };
+
+    /** Per-slot session-clip state.  Allocated by the message thread on
+     *  createSessionClip; never destroyed until the node is destroyed
+     *  (tombstoned via `alive=false` instead so the audio thread can
+     *  see a stable pointer).  Slot reuse: createSessionClip looks for
+     *  a tombstoned slot before appending a new one, reinitialising
+     *  fields in-place. */
+    struct SessionClipSlot
+    {
+        juce::Uuid                       clipId;
+        std::unique_ptr<MidiNoteRegion>  region;
+        std::atomic<std::int8_t>         state         { kStopped };
+        /** alive: audio thread should process this slot (drain pending,
+         *  emit notes, flush held bits).  Stays true after
+         *  removeSessionClip so the stop / held-notes-flush completes;
+         *  the slot just sits in Stopped state forever after. */
+        std::atomic<bool>                alive         { false };
+        /** removed: message-thread-visible "deleted" marker.  Lookups
+         *  (findSessionSlotIndex, getClipRegion) + persistence
+         *  (getState) skip removed slots.  Audio thread ignores this
+         *  flag -- it only consults alive. */
+        std::atomic<bool>                removed       { false };
+        /** Local playhead in source-beats, audio-thread-owned.  Stored
+         *  atomic so the UI tick can read without UB; relaxed loads
+         *  are fine for cosmetic progress display. */
+        std::atomic<double>              localBeatPos  { 0.0 };
+        /** Edge-trigger wrap flag.  Audio thread sets true on each
+         *  modulo wrap; UI consumes on read. */
+        std::atomic<bool>                wrappedFlag   { false };
+        /** Per-clip held-notes bitset (1 bit per (channel,pitch)).
+         *  Audio-thread-owned; mirrors MidiPlayerNode::held_'s shape.
+         *  When the slot stops or is removed, we walk the set bits and
+         *  emit matching NoteOff events. */
+        static constexpr int kHeldBits = 16 * 128;
+        std::bitset<kHeldBits>           held;
+        /** Pending state-flip request, applied at block beat boundary
+         *  by applyPendingClipForBlock.  drainClipLaunchFifo writes
+         *  this; applyPendingClipForBlock clears `valid` once fired. */
+        ClipPending                      pending;
+    };
+
+    /** OwnedArray of slot pointers.  Stable backing -- the audio
+     *  thread loads `sessionClipCount_` (release-acquire) and walks
+     *  slots [0, count).  Slot pointers themselves never move (the
+     *  unique_ptr stays inside the OwnedArray entry for the lifetime
+     *  of the node), so the audio thread can cache them across the
+     *  block without a swap-out hazard. */
+    juce::OwnedArray<SessionClipSlot> sessionClips_;
+    std::atomic<int>                  sessionClipCount_ { 0 };
+
+    /** SPSC launch FIFO: message thread pushes (slotIdx, beatTarget,
+     *  wantPlaying); audio thread drains under no lock at block start.
+     *  Latest request per slot wins -- drainClipLaunchFifo overwrites
+     *  slot.pending on every drained entry. */
+    struct ClipLaunchReq
+    {
+        int    slotIdx;
+        double beatTarget;
+        std::int8_t wantPlayingI8;
+    };
+
+    static constexpr int kClipLaunchFifoSize = 128;
+    std::array<ClipLaunchReq, (size_t) kClipLaunchFifoSize> clipLaunchFifoStorage_ {};
+    juce::AbstractFifo clipLaunchFifo_ { kClipLaunchFifoSize };
+
+    /** Session-view user mute + solo.  Read + written by SessionView;
+     *  not used by render() directly.  applyMuteAndSoloState reconciles
+     *  effective Processor::setMuted from these. */
+    bool userMuted_ = false;
+    bool soloed_    = false;
+
+    /** Audio-thread helper: drain the SPSC FIFO into per-slot pending
+     *  actions.  Called once at the start of render() before the
+     *  per-clip emit walk. */
+    void drainClipLaunchFifo() noexcept;
+
+    /** Audio-thread helper: walk each slot, apply any pending action
+     *  whose beatTarget falls in the block's beat range, mutate
+     *  state + rewind playhead on launch, emit NoteOff for held
+     *  bits on stop.  No-op for slots without a valid pending
+     *  action.  Sub-block sample offset for stop NoteOffs derived
+     *  from (beatTarget - blockStartBeat) when beatTarget>=0; 0 for
+     *  immediate (-1) targets. */
+    void applyPendingClipForBlock (double            blockStartBeat,
+                                   double            blockEndBeat,
+                                   double            samplesPerBeat,
+                                   int               numSamples,
+                                   juce::MidiBuffer& out) noexcept;
+
+    /** Audio-thread helper: per-Playing-slot emission for the block.
+     *  Walks the slot's MidiNoteRegion snapshot in the local-beat
+     *  window [localBeatPos, localBeatPos+blockBeats) MOD clipLen and
+     *  emits NoteOn / NoteOff at sample-accurate offsets.  Advances
+     *  the slot's localBeatPos.  Sets wrappedFlag on the wrap edge. */
+    void emitSessionClipInBlock (SessionClipSlot& slot,
+                                  double             blockBeats,
+                                  double             samplesPerBeat,
+                                  int                numSamples,
+                                  juce::MidiBuffer&  out) noexcept;
+
+    /** Audio-thread helper: emit NoteOff for every held bit on `slot`
+     *  at the supplied sample offset.  Clears the slot's held bitset. */
+    void flushSlotHeldNotes (SessionClipSlot& slot,
+                              int              sampleOffset,
+                              juce::MidiBuffer& out) noexcept;
+
+    /** Message-thread helper: find the index of a slot by clip id,
+     *  or -1 if not found.  Linear scan over the count -- slot counts
+     *  are small (~tens). */
+    int findSessionSlotIndex (const juce::Uuid& clipId) const noexcept;
 
 protected:
     void refreshPorts() override;
