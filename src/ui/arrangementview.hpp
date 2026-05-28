@@ -321,6 +321,13 @@ private:
     BlockToolButton addMidiBtn_    { "+ MIDI" };
     BlockToolButton loadAudioBtn_  { "Load..." };
     BlockToolButton snapBtn_       { "Snap" };
+    /* Snap auxiliary toggles -- short labels because the toolbar is
+     * already wide.  "Evt" = snap-to-events (trigger snap); "Off" =
+     * keep-offset (preserve the original's fractional offset within
+     * the grid).  Roadmap Q3 / Zrythm SnapGrid.snapToEvents +
+     * keepOffset. */
+    BlockToolButton snapEventsBtn_ { "Evt" };
+    BlockToolButton snapOffsetBtn_ { "Off" };
     BlockToolButton toolSelectBtn_   { "Select" };
     BlockToolButton toolRangeBtn_    { "Range" };
     BlockToolButton toolSplitBtn_    { "Split" };
@@ -378,8 +385,18 @@ private:
      *  snapDivision_ is in beats (1.0 = whole beat, 0.25 = 16th,
      *  0.5 = 8th, 4.0 = bar at 4/4).  Set via snapBox_; persisted
      *  in the session arrangement tree on change. */
-    bool   snapEnabled_  = true;
-    double snapDivision_ = 1.0;
+    bool   snapEnabled_     = true;
+    double snapDivision_    = 1.0;
+    /* When true, the snap helper also samples region edges + picks
+     * whichever is nearest to the cursor (grid candidate vs trigger
+     * candidate).  Dragged regions are excluded from the candidate
+     * pool so a drag doesn't snap to its own current edge. */
+    bool   snapToEvents_    = false;
+    /* When true, the snap helper preserves the dragged region's
+     * fractional offset within the grid division -- so a region
+     * starting at 2.3 beats with division 1.0 keeps the .3 fractional
+     * after snap.  Useful for nudging off-grid material in step. */
+    bool   snapKeepOffset_  = false;
 
     juce::Array<Lane>              lanes_;
     juce::Array<LaneRuntimeState>  laneRuntime_;
