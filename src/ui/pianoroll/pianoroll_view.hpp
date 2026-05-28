@@ -119,6 +119,13 @@ private:
     BlockToolButton                     brushBtn_       { "Brush"  };
     BlockToolButton                     snapBtn_        { "Snap" };
     juce::ComboBox                      snapBox_;
+    /* Bulk-edit ops.  Toolbar entry points for the quantize / humanize
+     * helpers in dsp/quantize_ops.hpp -- the same code paths Ctrl+Q
+     * exercises.  Surfacing these as buttons (vs hotkey-only) keeps the
+     * MIDI editor's editing surface discoverable; the C.2 dialog (still
+     * pending) will subsume both buttons + add the scale-snap tab. */
+    BlockToolButton                     quantizeBtn_    { "Q" };
+    BlockToolButton                     humanizeBtn_    { "H" };
     BlockToolButton                     zoomOutBtn_     { "-" };
     BlockToolButton                     zoomInBtn_      { "+" };
     BlockToolButton                     zoomFitBtn_     { "Fit" };

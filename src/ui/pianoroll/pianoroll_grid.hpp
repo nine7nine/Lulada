@@ -190,6 +190,24 @@ public:
      *  PianoRollGrid. */
     Services& getServices() const noexcept { return services_; }
 
+    //==========================================================================
+    // Bulk edit ops.  Build a MidiNoteDiffCommand from the current
+    // selection + push through the global UndoManager (same path as
+    // Ctrl+A / Ctrl+D / nudge).  Toolbar buttons in PianoRollView call
+    // these directly so the dsp/quantize_options.hpp dependency stays
+    // confined to the .cpp.
+
+    /** Snap each selected note's onset to the current snap-division
+     *  grid (start-only, full amount, no swing / random).  No-op when
+     *  selection is empty.  Each invocation is one undo step. */
+    void quantizeSelection();
+
+    /** Jitter each selected note's velocity within +/- 10 (range
+     *  documented in HumanizeOptions default; deterministic per
+     *  selection set so repeat-invocation reproducibility is stable).
+     *  No-op when selection is empty. */
+    void humanizeSelection();
+
 private:
     PianoRollView&  parent_;
     Services&       services_;

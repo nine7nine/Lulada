@@ -231,6 +231,77 @@ PianoRollView::PianoRollView (Services& services)
                          juce::Colour (0xff'a0'a0'a0));
     addAndMakeVisible (snapBox_);
 
+    /* Bulk-edit ops -- Quantize + Humanize.  These run the dsp ops
+     * engine against the current selection on the bound region; the
+     * selection / region / undo lookup all live on PianoRollGrid so
+     * the buttons just delegate.  Hotkey alias for Quantize is
+     * Ctrl+Q (PianoRollGrid::keyPressed handles it). */
+    quantizeBtn_.setTooltip ("Quantize selected notes to the snap grid (Ctrl+Q)");
+    quantizeBtn_.setActiveTint (kActiveTint);
+    quantizeBtn_.onClick = [this]() {
+        if (grid_ != nullptr)
+        {
+            grid_->quantizeSelection();
+            grid_->grabKeyboardFocus();
+        }
+    };
+    quantizeBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Stepped staircase glyph -- reads as "snap to grid":
+             * three rising right-angle steps. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float pad = juce::jmin (w, h) * 0.18f;
+            const float x0 = b.getX() + pad;
+            const float x3 = b.getRight() - pad;
+            const float y0 = b.getBottom() - pad;
+            const float y3 = b.getY() + pad;
+            const float stepW = (x3 - x0) / 3.0f;
+            const float stepH = (y0 - y3) / 3.0f;
+            juce::Path p;
+            p.startNewSubPath (x0,                y0);
+            p.lineTo          (x0 + stepW,        y0);
+            p.lineTo          (x0 + stepW,        y0 - stepH);
+            p.lineTo          (x0 + 2.0f * stepW, y0 - stepH);
+            p.lineTo          (x0 + 2.0f * stepW, y0 - 2.0f * stepH);
+            p.lineTo          (x3,                y0 - 2.0f * stepH);
+            p.lineTo          (x3,                y3);
+            g.setColour (fg);
+            g.strokePath (p, juce::PathStrokeType (1.6f));
+        });
+    addAndMakeVisible (quantizeBtn_);
+
+    humanizeBtn_.setTooltip ("Humanize selected notes' velocities");
+    humanizeBtn_.setActiveTint (kActiveTint);
+    humanizeBtn_.onClick = [this]() {
+        if (grid_ != nullptr)
+        {
+            grid_->humanizeSelection();
+            grid_->grabKeyboardFocus();
+        }
+    };
+    humanizeBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Uneven-height bar glyph -- reads as "varied velocities":
+             * four vertical bars with different heights. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float pad   = juce::jmin (w, h) * 0.18f;
+            const float baseY = b.getBottom() - pad;
+            const float topY  = b.getY() + pad;
+            const float totalW = b.getWidth() - 2.0f * pad;
+            const float barW   = totalW / 7.0f;            /* 4 bars + 3 gaps */
+            const float heights[] = { 0.55f, 0.85f, 0.40f, 0.70f };
+            g.setColour (fg);
+            for (int i = 0; i < 4; ++i)
+            {
+                const float x = b.getX() + pad + barW * (2.0f * i);
+                const float y = baseY - (baseY - topY) * heights[i];
+                g.fillRect (x, y, barW, baseY - y);
+            }
+        });
+    addAndMakeVisible (humanizeBtn_);
+
     /* Zoom controls -- X axis (beat span).  Mirrors ArrangementView's
      * [- + Fit] triplet. */
     zoomOutBtn_.onClick = [this]() { if (grid_) grid_->zoomBy (1.0 / 1.20); };
@@ -422,6 +493,12 @@ void PianoRollView::resized()
 
     layoutLeftBtn (snapBtn_,   kToolBtnW);
     layoutLeftBtn (snapBox_,   kSnapBoxW, 12);
+
+    /* Bulk-edit ops: Q (Quantize), H (Humanize).  Compact -- the
+     * dialog (C.2) will subsume the discoverable surface, these are
+     * fast-trigger entry points. */
+    layoutLeftBtn (quantizeBtn_, kZoomBtnW);
+    layoutLeftBtn (humanizeBtn_, kZoomBtnW, 12);
 
     layoutLeftBtn (zoomOutBtn_, kZoomBtnW);
     layoutLeftBtn (zoomInBtn_,  kZoomBtnW);

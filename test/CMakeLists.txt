@@ -56,6 +56,7 @@ add_test(NAME "OversamplerTests" COMMAND test_element --run_test=OversamplerTest
 add_test(NAME "PluginManagerTests" COMMAND test_element --run_test=PluginManagerTests)
 add_test(NAME "PortListTests" COMMAND test_element --run_test=PortListTests)
 add_test(NAME "PortTypeTests" COMMAND test_element --run_test=PortTypeTests)
+add_test(NAME "QuantizeTests" COMMAND test_element --run_test=QuantizeTests)
 add_test(NAME "RootGraphTests" COMMAND test_element --run_test=RootGraphTests)
 add_test(NAME "ScriptInfoTest" COMMAND test_element --run_test=ScriptInfoTest)
 add_test(NAME "ScriptLoaderTest" COMMAND test_element --run_test=ScriptLoaderTest)

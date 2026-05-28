@@ -9,6 +9,8 @@
 #include "ui/fontcache.hpp"
 #include "services/timeline/midi_note_region.hpp"
 #include "services/timeline/midi_note.hpp"
+#include "dsp/quantize_options.hpp"
+#include "dsp/quantize_ops.hpp"
 
 #include <element/audioengine.hpp>
 #include <element/context.hpp>
@@ -1040,6 +1042,19 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
         return true;
     }
 
+    /* Ctrl+Q -- snap onsets of selected notes to the current grid
+     * division.  Primary trigger surface is the toolbar's Q button on
+     * the piano-roll header; this hotkey is the power-user alias.
+     * Routed through quantizeSelection() so the toolbar + hotkey share
+     * one implementation and stay in lockstep with future ops engine
+     * changes. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'Q')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        quantizeSelection();
+        return true;
+    }
+
     /* Ctrl+D -- duplicate selection one snap-division to the right.
      * Each duplicate gets a fresh id; final selection contains the
      * duplicates so subsequent edits operate on the new notes. */
@@ -1171,6 +1186,115 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
     }
 
     return false;
+}
+
+namespace {
+
+/* Convert the grid's snapDivision (a beats double set by
+ * PianoRollView::applySnapFromComboBox) back to the (NoteLength,
+ * NoteType) pair the quantize ops engine consumes.  The mapping is the
+ * inverse of the snapBox id table -- each unique snapDivision value
+ * lines up with exactly one (NoteLength, NoteType) pair.  Falls back
+ * to (Sixteenth, Normal) when the division doesn't match a known
+ * preset (e.g. a future custom division). */
+std::pair<dsp::quantize::NoteLength, dsp::quantize::NoteType>
+divisionToNoteShape (double divisionBeats) noexcept
+{
+    using L = dsp::quantize::NoteLength;
+    using T = dsp::quantize::NoteType;
+    constexpr double eps = 1.0e-6;
+    auto near = [eps] (double a, double b) { return std::abs (a - b) < eps; };
+
+    if (near (divisionBeats, 4.0))         return { L::Whole,        T::Normal  };
+    if (near (divisionBeats, 2.0))         return { L::Half,         T::Normal  };
+    if (near (divisionBeats, 1.0))         return { L::Quarter,      T::Normal  };
+    if (near (divisionBeats, 0.5))         return { L::Eighth,       T::Normal  };
+    if (near (divisionBeats, 0.25))        return { L::Sixteenth,    T::Normal  };
+    if (near (divisionBeats, 0.125))       return { L::ThirtySecond, T::Normal  };
+    if (near (divisionBeats, 2.0 / 3.0))   return { L::Quarter,      T::Triplet };
+    if (near (divisionBeats, 1.0 / 3.0))   return { L::Eighth,       T::Triplet };
+    if (near (divisionBeats, 1.0 / 6.0))   return { L::Sixteenth,    T::Triplet };
+    return { L::Sixteenth, T::Normal };
+}
+
+} // namespace
+
+void PianoRollGrid::quantizeSelection()
+{
+    auto* region = resolveBoundRegion();
+    if (region == nullptr || selectedNoteIds_.empty()) return;
+
+    /* Build options from the current snap division.  Toolbar quantize
+     * is the "no parameter choice required" entry point -- the user's
+     * grid pick is the quantize grid.  Dialog (C.2) will offer the
+     * full parameter set. */
+    dsp::quantize::QuantizeOptions opts;
+    const auto shape = divisionToNoteShape (snapDivision_);
+    opts.noteLength  = shape.first;
+    opts.noteType    = shape.second;
+    opts.amount      = 1.0;
+    opts.adjustStart = true;
+    opts.adjustEnd   = false;
+
+    if (auto* gui = services_.find<GuiService>())
+    {
+        auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                            parent_.getRegionResolver());
+        const std::size_t touched
+            = dsp::quantize::quantizeNotes (*region, selectedNoteIds_, opts, *cmd);
+        if (touched == 0 || cmd->isEmpty()) return;
+
+        juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+        cmd->onApplied = [safeView]() {
+            if (auto* v = safeView.getComponent())
+                v->notifyRegionEdited();
+        };
+        gui->getUndoManager().perform (cmd.release(), "Quantize MIDI notes");
+    }
+    else
+    {
+        /* No undo manager available -- apply directly.  Mirrors the
+         * delete-key / nudge fallback in keyPressed. */
+        MidiNoteDiffCommand cmd (parent_.getBoundRegionId(),
+                                  parent_.getRegionResolver());
+        dsp::quantize::quantizeNotes (*region, selectedNoteIds_, opts, cmd);
+        cmd.perform();
+        parent_.notifyRegionEdited();
+    }
+    repaint();
+}
+
+void PianoRollGrid::humanizeSelection()
+{
+    auto* region = resolveBoundRegion();
+    if (region == nullptr || selectedNoteIds_.empty()) return;
+
+    dsp::quantize::HumanizeOptions opts;   /* defaults: range = 10, bias = 0 */
+
+    if (auto* gui = services_.find<GuiService>())
+    {
+        auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                            parent_.getRegionResolver());
+        const std::size_t touched
+            = dsp::quantize::humanizeVelocity (*region, selectedNoteIds_, opts, *cmd);
+        if (touched == 0 || cmd->isEmpty()) return;
+
+        juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+        cmd->onApplied = [safeView]() {
+            if (auto* v = safeView.getComponent())
+                v->notifyRegionEdited();
+        };
+        gui->getUndoManager().perform (cmd.release(), "Humanize MIDI velocities");
+    }
+    else
+    {
+        MidiNoteDiffCommand cmd (parent_.getBoundRegionId(),
+                                  parent_.getRegionResolver());
+        dsp::quantize::humanizeVelocity (*region, selectedNoteIds_, opts, cmd);
+        cmd.perform();
+        parent_.notifyRegionEdited();
+    }
+    repaint();
 }
 
 } // namespace element
