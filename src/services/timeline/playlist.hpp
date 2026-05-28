@@ -106,6 +106,37 @@ public:
      *  present. */
     bool removeMidiRegion (juce::Uuid regionId);
 
+    /** Detach the MIDI region with this id from the playlist and
+     *  return ownership.  Returns nullptr if not present.  Used by the
+     *  arrangement-view cross-lane drag commit + MIDI displace path
+     *  (paste/duplicate) to migrate a region between playlists without
+     *  the deep-copy overhead of clone() + removeMidiRegion. */
+    std::unique_ptr<MidiNoteRegion> extractMidiRegion (juce::Uuid regionId);
+
+    /** Trim / split / delete every MIDI region whose [position,
+     *  position+length) span overlaps the given absolute beat range,
+     *  so the range becomes free of MIDI content.  Mirrors Ableton +
+     *  Bitwig's displacement semantics (paste / duplicate on top of
+     *  existing MIDI clips never silently rejects -- it makes room).
+     *
+     *  Cases (E = existing region, N = new span):
+     *   - E fully inside N      -> E deleted.
+     *   - E starts before N,
+     *     ends inside N         -> E trimmed (right edge moves to N.start).
+     *   - E starts inside N,
+     *     ends after N          -> E shifted (start moves to N.end,
+     *                              notes inside the cut are dropped).
+     *   - N fully inside E      -> E split at N.start AND N.end; the
+     *                              middle is deleted, head + tail are
+     *                              kept as two regions.
+     *
+     *  Returns the ids of every region that was modified, deleted, or
+     *  created.  splitMidiRegion's note-partitioning handles the
+     *  re-basing of MIDI events across the cut seams.  No-op when
+     *  newEnd <= newStart. */
+    std::vector<juce::Uuid> displaceMidiRegionsForSpan (double newStart,
+                                                        double newEnd);
+
     /** Cleave the MIDI region at the given absolute beat into two.
      *  The left half keeps the original id + positionBeats; the right
      *  half gets a fresh uuid + positionBeats = original.positionBeats

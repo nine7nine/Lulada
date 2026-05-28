@@ -38,7 +38,13 @@ class VelocityLane;
 class PianoRollView : public juce::Component
 {
 public:
-    enum class Tool : int { Select = 0, Pencil = 1, Erase = 2 };
+    /** Brush: drag paints fresh notes as the cursor sweeps cells.
+     *  Distinct from Pencil (single-click + drag-resize one note);
+     *  brush emits one snap-division-length note per visited
+     *  (beat-cell, pitch) pair, then commits the lot as a single
+     *  MidiNoteDiffCommand on mouseUp.  B17 in
+     *  midi-implementation-audit-20260526.md. */
+    enum class Tool : int { Select = 0, Pencil = 1, Erase = 2, Brush = 3 };
 
     PianoRollView (Services& services);
     ~PianoRollView() override;
@@ -110,6 +116,7 @@ private:
     BlockToolButton                     selectBtn_      { "Select" };
     BlockToolButton                     pencilBtn_      { "Pencil" };
     BlockToolButton                     eraseBtn_       { "Erase" };
+    BlockToolButton                     brushBtn_       { "Brush"  };
     BlockToolButton                     snapBtn_        { "Snap" };
     juce::ComboBox                      snapBox_;
     BlockToolButton                     zoomOutBtn_     { "-" };

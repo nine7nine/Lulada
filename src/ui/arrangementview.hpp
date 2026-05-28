@@ -20,6 +20,7 @@
 
 #include "services/timeline/audiolaneadapter.hpp"
 #include "services/timeline/lane.hpp"
+#include "services/timeline/marker_track.hpp"
 
 #define EL_VIEW_ARRANGEMENT "ArrangementView"
 
@@ -206,6 +207,8 @@ private:
 
     void loadLanesFromSession();
     void writeLanesToSession();
+    void writeMarkersToSessionTree (juce::ValueTree& arrTree);
+    void writeMarkersOnly();
 
 public:
     /** Flush the current lanes_ snapshot to the session ValueTree
@@ -321,6 +324,13 @@ private:
     BlockToolButton addMidiBtn_    { "+ MIDI" };
     BlockToolButton loadAudioBtn_  { "Load..." };
     BlockToolButton snapBtn_       { "Snap" };
+    /* Snap auxiliary toggles -- short labels because the toolbar is
+     * already wide.  "Evt" = snap-to-events (trigger snap); "Off" =
+     * keep-offset (preserve the original's fractional offset within
+     * the grid).  Roadmap Q3 / Zrythm SnapGrid.snapToEvents +
+     * keepOffset. */
+    BlockToolButton snapEventsBtn_ { "Evt" };
+    BlockToolButton snapOffsetBtn_ { "Off" };
     BlockToolButton toolSelectBtn_   { "Select" };
     BlockToolButton toolRangeBtn_    { "Range" };
     BlockToolButton toolSplitBtn_    { "Split" };
@@ -345,11 +355,11 @@ private:
     {
         ArrangementView& owner;
         PersistingViewport (ArrangementView& o) : owner (o) {}
-        void visibleAreaChanged (const juce::Rectangle<int>&) override
-        {
-            if (owner.body_ != nullptr)
-                owner.writeViewStateToSession();
-        }
+        /* Defined in arrangementview.cpp so the implementation can
+         * reference Body::kRulerH directly (Body is only forward-
+         * declared in this header). */
+        void visibleAreaChanged (const juce::Rectangle<int>& newVisibleArea) override;
+        int lastScrollY_ { 0 };
     };
     PersistingViewport viewport_ { *this };
     std::unique_ptr<Body> body_;
@@ -378,11 +388,27 @@ private:
      *  snapDivision_ is in beats (1.0 = whole beat, 0.25 = 16th,
      *  0.5 = 8th, 4.0 = bar at 4/4).  Set via snapBox_; persisted
      *  in the session arrangement tree on change. */
-    bool   snapEnabled_  = true;
-    double snapDivision_ = 1.0;
+    bool   snapEnabled_     = true;
+    double snapDivision_    = 1.0;
+    /* When true, the snap helper also samples region edges + picks
+     * whichever is nearest to the cursor (grid candidate vs trigger
+     * candidate).  Dragged regions are excluded from the candidate
+     * pool so a drag doesn't snap to its own current edge. */
+    bool   snapToEvents_    = false;
+    /* When true, the snap helper preserves the dragged region's
+     * fractional offset within the grid division -- so a region
+     * starting at 2.3 beats with division 1.0 keeps the .3 fractional
+     * after snap.  Useful for nudging off-grid material in step. */
+    bool   snapKeepOffset_  = false;
 
     juce::Array<Lane>              lanes_;
     juce::Array<LaneRuntimeState>  laneRuntime_;
+
+    /** Named cue points on the timeline.  Painted by Body inside the
+     *  ruler (triangle) + as a vertical hairline down the lane area;
+     *  jump-to via Numpad 1-9 (in sorted order).  Sibling to <lanes>
+     *  under tags::arrangement; loaded + written together. */
+    MarkerTrack                    markerTrack_;
 
     bool lanesLoadedFromSession_ = false;
 

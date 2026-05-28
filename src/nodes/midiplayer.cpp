@@ -292,9 +292,12 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
     const double regionStart = entry.positionBeats;
     const double regionLen   = entry.lengthBeats;
     const double regionEnd   = regionStart + regionLen;
+    const double srcOffset   = entry.startBeats;
 
     /* Map the block's transport beat range into the region's local
-     * beat coordinates.  For looped regions, modulo into [0, len). */
+     * beat coordinates.  For looped regions, modulo into [0, len).
+     * srcOffset is applied AFTER the modulo so the loop wraps the
+     * audible slice [srcOffset, srcOffset+regionLen) of the source. */
     auto toLocal = [regionStart, regionLen, looped = entry.looped]
                    (double beat) noexcept -> double {
         const double lb = beat - regionStart;
@@ -305,9 +308,12 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
         return m;
     };
 
-    /* For the non-looped path, clamp the local-beat window to
-     * [0, regionLen) -- the audio thread is inside the region's
-     * span so events past lengthBeats don't fire. */
+    /* localStart / localEnd are in TIMELINE-LOCAL beats (i.e. distance
+     * from regionStart on the timeline).  The note list is in SOURCE
+     * coordinates, so when comparing a note's onBeat we add srcOffset
+     * to localStart / localEnd before the compare.  Sample-offset for
+     * an emitted event then uses (note.onBeat - srcLocalStart) where
+     * srcLocalStart = localStart + srcOffset. */
     double localStart, localEnd;
     if (entry.looped)
     {
@@ -320,16 +326,19 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
         if (localEnd > regionLen)
         {
             const double tailLen = regionLen - localStart;
-            /* First chunk: [localStart, regionLen). */
+
+            /* First chunk: timeline-local [localStart, regionLen).
+             * Source-local: [srcOffset + localStart, srcOffset + regionLen). */
+            const double srcLo1 = srcOffset + localStart;
+            const double srcHi1 = srcOffset + regionLen;
             for (const auto& n : *snap)
             {
                 const double noteEnd = n.onBeat + n.lengthBeats;
-                if (n.onBeat >= regionLen || noteEnd <= 0.0) continue;
+                if (n.onBeat >= srcHi1 || noteEnd <= srcOffset) continue;
 
-                /* NoteOn falls in [localStart, regionLen). */
-                if (n.onBeat >= localStart && n.onBeat < regionLen)
+                if (n.onBeat >= srcLo1 && n.onBeat < srcHi1)
                 {
-                    const double beatDelta = n.onBeat - localStart;
+                    const double beatDelta = n.onBeat - srcLo1;
                     int sampleOffset = (int) std::round (beatDelta * samplesPerBeat);
                     sampleOffset = juce::jlimit (0, numSamples - 1, sampleOffset);
                     out.addEvent (juce::MidiMessage::noteOn (
@@ -340,10 +349,9 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
                     held_.set ((std::size_t) heldIndex (n.channel, n.pitch));
                 }
 
-                /* NoteOff falls in [localStart, regionLen). */
-                if (noteEnd > localStart && noteEnd <= regionLen)
+                if (noteEnd > srcLo1 && noteEnd <= srcHi1)
                 {
-                    const double beatDelta = noteEnd - localStart;
+                    const double beatDelta = noteEnd - srcLo1;
                     int sampleOffset = (int) std::round (beatDelta * samplesPerBeat);
                     sampleOffset = juce::jlimit (0, numSamples - 1, sampleOffset);
                     out.addEvent (juce::MidiMessage::noteOff (
@@ -354,19 +362,22 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
                 }
             }
 
-            /* Second chunk: wrap window [0, localEnd-regionLen).
+            /* Second chunk: timeline-local [0, localEnd-regionLen).
+             * Source-local: [srcOffset, srcOffset + (localEnd-regionLen)).
              * Sample offset begins at tailLen-into-the-block. */
             const double wrapEnd = localEnd - regionLen;
+            const double srcLo2  = srcOffset;
+            const double srcHi2  = srcOffset + wrapEnd;
             const int wrapBaseOffset =
                 (int) std::round (tailLen * samplesPerBeat);
             for (const auto& n : *snap)
             {
                 const double noteEnd = n.onBeat + n.lengthBeats;
-                if (noteEnd <= 0.0) continue;
+                if (noteEnd <= srcLo2) continue;
 
-                if (n.onBeat >= 0.0 && n.onBeat < wrapEnd)
+                if (n.onBeat >= srcLo2 && n.onBeat < srcHi2)
                 {
-                    const double beatDelta = n.onBeat;
+                    const double beatDelta = n.onBeat - srcLo2;
                     int sampleOffset = wrapBaseOffset
                                      + (int) std::round (beatDelta * samplesPerBeat);
                     sampleOffset = juce::jlimit (0, numSamples - 1, sampleOffset);
@@ -378,9 +389,9 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
                     held_.set ((std::size_t) heldIndex (n.channel, n.pitch));
                 }
 
-                if (noteEnd > 0.0 && noteEnd < wrapEnd)
+                if (noteEnd > srcLo2 && noteEnd < srcHi2)
                 {
-                    const double beatDelta = noteEnd;
+                    const double beatDelta = noteEnd - srcLo2;
                     int sampleOffset = wrapBaseOffset
                                      + (int) std::round (beatDelta * samplesPerBeat);
                     sampleOffset = juce::jlimit (0, numSamples - 1, sampleOffset);
@@ -399,27 +410,29 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
     {
         localStart = blockStartBeat - regionStart;
         localEnd   = blockEndBeat   - regionStart;
-        /* Clamp the window to the region.  Negative localStart means
-         * the region begins inside the block -- handled by skipping
-         * notes whose onBeat < 0. */
         if (localEnd <= 0.0) return;
     }
 
-    /* Common emission for non-looped + looped-no-wrap.  Notes are
-     * sorted by (onBeat, pitch) so an early-exit on onBeat >= localEnd
-     * is safe. */
+    /* Common emission for non-looped + looped-no-wrap.  Translate the
+     * timeline-local window to source-local for comparison against
+     * note onBeats.  Notes are sorted by (onBeat, pitch) so the early
+     * break on onBeat >= srcLocalEnd remains correct. */
+    const double srcLocalStart = srcOffset + localStart;
+    const double srcLocalEnd   = srcOffset + localEnd;
+    const double srcRegionEnd  = srcOffset + regionLen;
+
     for (const auto& n : *snap)
     {
         const double noteEnd = n.onBeat + n.lengthBeats;
-        if (n.onBeat >= localEnd) break;
-        if (noteEnd  <= localStart) continue;
+        if (n.onBeat >= srcLocalEnd) break;
+        if (noteEnd  <= srcLocalStart) continue;
 
-        /* NoteOn lies in [localStart, localEnd) AND inside region. */
-        if (n.onBeat >= localStart
-            && n.onBeat <  localEnd
-            && n.onBeat <  regionLen)
+        if (n.onBeat >= srcLocalStart
+            && n.onBeat <  srcLocalEnd
+            && n.onBeat >= srcOffset
+            && n.onBeat <  srcRegionEnd)
         {
-            const double beatDelta = n.onBeat - localStart;
+            const double beatDelta = n.onBeat - srcLocalStart;
             int sampleOffset = (int) std::round (beatDelta * samplesPerBeat);
             sampleOffset = juce::jlimit (0, numSamples - 1, sampleOffset);
             out.addEvent (juce::MidiMessage::noteOn (
@@ -430,17 +443,14 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
             held_.set ((std::size_t) heldIndex (n.channel, n.pitch));
         }
 
-        /* NoteOff lies in [localStart, localEnd).  Clamp to regionLen
-         * for non-looped regions so notes extending past the region
-         * end fire their NoteOff at region end (not at the note's
-         * raw end -- the region's container defines the playable
-         * span). */
+        /* NoteOff clamped to the region's source-end so notes extending
+         * past the trimmed right edge fire off at the edge (non-looped). */
         const double offBeat = entry.looped
             ? noteEnd
-            : juce::jmin (noteEnd, regionLen);
-        if (offBeat > localStart && offBeat <= localEnd)
+            : juce::jmin (noteEnd, srcRegionEnd);
+        if (offBeat > srcLocalStart && offBeat <= srcLocalEnd)
         {
-            const double beatDelta = offBeat - localStart;
+            const double beatDelta = offBeat - srcLocalStart;
             int sampleOffset = (int) std::round (beatDelta * samplesPerBeat);
             sampleOffset = juce::jlimit (0, numSamples - 1, sampleOffset);
             out.addEvent (juce::MidiMessage::noteOff (

@@ -216,6 +216,89 @@ bool Playlist::removeMidiRegion (juce::Uuid regionId)
     return midiRegions_.size() != before;
 }
 
+std::vector<juce::Uuid> Playlist::displaceMidiRegionsForSpan (double newStart,
+                                                              double newEnd)
+{
+    std::vector<juce::Uuid> touched;
+    if (newEnd <= newStart) return touched;
+
+    /* Snapshot ids BEFORE displacement.  splitMidiRegion appends fresh
+     * regions to midiRegions_; reprocessing those would double-cut. */
+    std::vector<juce::Uuid> originalIds;
+    originalIds.reserve (midiRegions_.size());
+    for (const auto& m : midiRegions_)
+        if (m != nullptr) originalIds.push_back (m->id);
+
+    for (auto id : originalIds)
+    {
+        const auto* eConst = findMidiRegion (id);
+        if (eConst == nullptr) continue;   /* already removed this pass */
+
+        const double eStart = eConst->positionBeats;
+        const double eEnd   = eStart + eConst->lengthBeats;
+        if (eEnd <= newStart || eStart >= newEnd) continue;   /* no overlap */
+
+        const bool startsBeforeNew = eStart < newStart;
+        const bool endsAfterNew    = eEnd   > newEnd;
+
+        if (! startsBeforeNew && ! endsAfterNew)
+        {
+            /* E fully inside N -- delete. */
+            removeMidiRegion (id);
+            touched.push_back (id);
+        }
+        else if (startsBeforeNew && ! endsAfterNew)
+        {
+            /* Trim E's right edge: split at newStart, delete tail. */
+            const auto tailId = splitMidiRegion (id, newStart);
+            if (! tailId.isNull())
+                removeMidiRegion (tailId);
+            else
+                removeMidiRegion (id);   /* split too tight -- drop whole */
+            touched.push_back (id);
+        }
+        else if (! startsBeforeNew && endsAfterNew)
+        {
+            /* Shift E's start to newEnd: split at newEnd, delete head. */
+            const auto tailId = splitMidiRegion (id, newEnd);
+            removeMidiRegion (id);
+            touched.push_back (id);
+            if (! tailId.isNull()) touched.push_back (tailId);
+        }
+        else
+        {
+            /* N fully inside E -- split twice, delete the middle. */
+            const auto midId = splitMidiRegion (id, newStart);
+            if (midId.isNull())
+            {
+                removeMidiRegion (id);
+                touched.push_back (id);
+                continue;
+            }
+            const auto rightId = splitMidiRegion (midId, newEnd);
+            removeMidiRegion (midId);
+            touched.push_back (id);
+            touched.push_back (midId);
+            if (! rightId.isNull()) touched.push_back (rightId);
+        }
+    }
+    return touched;
+}
+
+std::unique_ptr<MidiNoteRegion> Playlist::extractMidiRegion (juce::Uuid regionId)
+{
+    for (auto it = midiRegions_.begin(); it != midiRegions_.end(); ++it)
+    {
+        if (*it != nullptr && (*it)->id == regionId)
+        {
+            auto detached = std::move (*it);
+            midiRegions_.erase (it);
+            return detached;
+        }
+    }
+    return {};
+}
+
 MidiNoteRegion* Playlist::findMidiRegion (juce::Uuid regionId) noexcept
 {
     for (auto& m : midiRegions_)
@@ -257,13 +340,19 @@ juce::Uuid Playlist::splitMidiRegion (juce::Uuid regionId, double atBeat)
     if (atBeat <= leftStart + 1e-9)  return juce::Uuid::null();
     if (atBeat >= leftEnd   - 1e-9)  return juce::Uuid::null();
 
-    const double cutLocal = atBeat - leftStart;   /* offset into left region */
+    const double cutLocal      = atBeat - leftStart;   /* timeline distance into left region */
+    const double leftStartBeats = left->startBeats;
+    const double cutSrc        = leftStartBeats + cutLocal; /* cut point in left's source coords */
 
     /* Snapshot the left region's note list, partition into stays /
-     * moves.  Notes whose onBeat falls before the cut stay; notes at
-     * or after the cut migrate.  Notes that STRADDLE the cut (start
-     * before, end after) are TRUNCATED at the cut on the left half
-     * and not duplicated into the right -- matches Ableton + Bitwig. */
+     * moves.  Notes whose source-onBeat falls before the cut stay;
+     * notes at or after the cut migrate (shifted into the right half's
+     * own zero-based source coordinates).  Notes that STRADDLE the cut
+     * are TRUNCATED at the cut on the left half and not duplicated
+     * into the right.  Notes whose source-onBeat is below the left's
+     * startBeats (i.e. already hidden by a prior left-trim) are
+     * preserved in the left half's pristine list -- they remain hidden
+     * by startBeats but survive the split for any future drag-back. */
     auto leftNotes  = MidiNoteRegion::NoteList{};
     auto rightNotes = MidiNoteRegion::NoteList{};
 
@@ -273,40 +362,50 @@ juce::Uuid Playlist::splitMidiRegion (juce::Uuid regionId, double atBeat)
         rightNotes.reserve (snap->size());
         for (const auto& n : *snap)
         {
-            if (n.onBeat >= cutLocal)
+            if (n.onBeat >= cutSrc)
             {
                 MidiNote r = n;
-                r.onBeat -= cutLocal;
+                r.onBeat -= cutSrc;
                 rightNotes.push_back (r);
             }
             else
             {
                 MidiNote l = n;
-                /* Truncate at the cut if the note extends past it. */
-                const double localEnd = l.onBeat + l.lengthBeats;
-                if (localEnd > cutLocal)
-                    l.lengthBeats = cutLocal - l.onBeat;
+                /* Truncate any audible note whose tail extends past
+                 * the cut.  Hidden notes (onBeat < leftStartBeats) are
+                 * passed through untouched -- they're already not
+                 * playing, and rewriting their lengthBeats would corrupt
+                 * the pristine snapshot the user may drag back into. */
+                if (l.onBeat >= leftStartBeats)
+                {
+                    const double localEnd = l.onBeat + l.lengthBeats;
+                    if (localEnd > cutSrc)
+                        l.lengthBeats = cutSrc - l.onBeat;
+                }
                 leftNotes.push_back (l);
             }
         }
     }
 
     /* Mutate the left half in place: shrink lengthBeats + publish the
-     * truncated note set.  ID + positionBeats + sourceId untouched. */
+     * truncated note set.  ID + positionBeats + sourceId + startBeats
+     * untouched (left still references its original source slice). */
     left->lengthBeats = cutLocal;
     left->setNotes (std::move (leftNotes));
 
     /* Build the right half.  Fresh uuid + positionBeats placed at the
      * cut.  Inherit name / colour / looped / sourceId from the left
      * (sourceId is shared if the original was imported; both halves
-     * trace back to the same SMF blob).  Note ids are stamped fresh
-     * by setNotesAssigningIds so the right half's piano-roll
-     * selection has clean identities. */
+     * trace back to the same SMF blob).  The right half's notes were
+     * just shifted to start at source-beat 0, so startBeats = 0.  Note
+     * ids are stamped fresh by setNotesAssigningIds so the right half's
+     * piano-roll selection has clean identities. */
     auto right = std::make_unique<MidiNoteRegion>();
     right->id            = juce::Uuid();
     right->sourceId      = left->sourceId;
     right->positionBeats = atBeat;
     right->lengthBeats   = leftEnd - atBeat;
+    right->startBeats    = 0.0;
     right->looped        = left->looped;
     right->colour        = left->colour;
     right->name          = left->name;

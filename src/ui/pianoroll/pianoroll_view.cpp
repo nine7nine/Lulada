@@ -120,6 +120,7 @@ PianoRollView::PianoRollView (Services& services)
     initToolBtn (selectBtn_, Tool::Select);
     initToolBtn (pencilBtn_, Tool::Pencil);
     initToolBtn (eraseBtn_,  Tool::Erase);
+    initToolBtn (brushBtn_,  Tool::Brush);
 
     /* Vector tool icons -- same drawing style as ArrangementView's tool
      * row so the user reads them as siblings. */
@@ -167,6 +168,25 @@ PianoRollView::PianoRollView (Services& services)
                         b.getRight() - pad, b.getBottom() - pad, 1.6f);
             g.drawLine (b.getRight() - pad, b.getY() + pad,
                         b.getX() + pad, b.getBottom() - pad, 1.6f);
+        });
+    brushBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Stylised brush: angled handle + wider bristle tip. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float x0 = b.getX() + w * 0.22f;
+            const float y0 = b.getY() + h * 0.85f;
+            const float x1 = b.getX() + w * 0.72f;
+            const float y1 = b.getY() + h * 0.30f;
+            g.setColour (fg);
+            g.drawLine (x0, y0, x1, y1, 1.6f);
+            juce::Path tip;
+            tip.startNewSubPath (x1 - w * 0.08f, y1 + h * 0.04f);
+            tip.lineTo          (x1 + w * 0.10f, y1 - h * 0.12f);
+            tip.lineTo          (x1 + w * 0.22f, y1 + h * 0.06f);
+            tip.lineTo          (x1 + w * 0.04f, y1 + h * 0.22f);
+            tip.closeSubPath();
+            g.fillPath (tip);
         });
 
     syncToolToggles();
@@ -302,6 +322,7 @@ void PianoRollView::syncToolToggles()
     selectBtn_.setToggleState (activeTool_ == Tool::Select, juce::dontSendNotification);
     pencilBtn_.setToggleState (activeTool_ == Tool::Pencil, juce::dontSendNotification);
     eraseBtn_ .setToggleState (activeTool_ == Tool::Erase,  juce::dontSendNotification);
+    brushBtn_ .setToggleState (activeTool_ == Tool::Brush,  juce::dontSendNotification);
 }
 
 void PianoRollView::applySnapFromComboBox()
@@ -396,7 +417,8 @@ void PianoRollView::resized()
 
     layoutLeftBtn (selectBtn_, kToolBtnW);
     layoutLeftBtn (pencilBtn_, kToolBtnW);
-    layoutLeftBtn (eraseBtn_,  kToolBtnW, 12);
+    layoutLeftBtn (eraseBtn_,  kToolBtnW);
+    layoutLeftBtn (brushBtn_,  kToolBtnW, 12);
 
     layoutLeftBtn (snapBtn_,   kToolBtnW);
     layoutLeftBtn (snapBox_,   kSnapBoxW, 12);

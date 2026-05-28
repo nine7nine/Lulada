@@ -197,11 +197,6 @@ public:
     {
         g.fillAll (Colors::contentBackgroundColor);
 
-        /* Ruler at the top, ahead of any lanes; matches tracker
-         * gutter colour for visual continuity with the rest of
-         * Element's timeline-style views. */
-        paintRuler (g);
-
         const int laneCount = owner.lanes_.size();
         /* Viewport-clip skip: at high lane counts + zoomed-in vertical
          * extent, the dirty rect from a scroll / playhead / zoom only
@@ -230,13 +225,14 @@ public:
 
         /* Range overlay -- drawn over all lanes so it reads as a
          * timeline-wide selection.  Loop-armed range gets a brighter
-         * outline + tinted fill; plain range gets a softer wash. */
+         * outline + tinted fill; plain range gets a softer wash.  The
+         * ruler-row band + LOOP badge are painted by paintRuler so
+         * they follow the sticky ruler's vertical position. */
         if (rangeActive_ && rangeEnd_ > rangeStart_)
         {
             const int xs = kLabelW + (int) (rangeStart_ * kPxPerBeat);
             const int xe = kLabelW + (int) (rangeEnd_   * kPxPerBeat);
             const int w  = juce::jmax (1, xe - xs);
-            const int yTop  = 0;
             const int yLanes = kRulerH + juce::jmax (1, laneCount) * kLaneH;
 
             const juce::Colour fillCol = loopActive_
@@ -246,32 +242,23 @@ public:
                 ? juce::Colour::fromRGB (110, 220, 130)
                 : juce::Colour::fromRGB (170, 200, 240);
 
-            /* Ruler-row band (brighter, marks the range as a loop
-             * marker when looping is on). */
-            g.setColour (loopActive_
-                            ? juce::Colour::fromRGBA (90, 200, 110, 130)
-                            : juce::Colour::fromRGBA (140, 170, 210, 100));
-            g.fillRect (xs, yTop, w, kRulerH);
-
             /* Lane-area wash. */
             g.setColour (fillCol);
             g.fillRect (xs, kRulerH, w, juce::jmax (0, yLanes - kRulerH));
 
-            /* Edges -- 1 px vertical lines at start + end. */
+            /* Edges -- 1 px vertical lines at start + end across the
+             * lane area; the ruler paints its own band edges so they
+             * track the sticky scroll offset. */
             g.setColour (edgeCol);
-            g.drawVerticalLine (xs,        (float) yTop, (float) yLanes);
-            g.drawVerticalLine (xe - 1,    (float) yTop, (float) yLanes);
-
-            /* Loop badge in the ruler row when loop is on. */
-            if (loopActive_)
-            {
-                g.setColour (juce::Colours::black);
-                g.setFont (monoFont (
-                                              9.0f, juce::Font::bold));
-                g.drawText ("LOOP", xs + 4, 2, juce::jmin (40, w - 8), kRulerH - 4,
-                            juce::Justification::centredLeft, false);
-            }
+            g.drawVerticalLine (xs,        (float) kRulerH, (float) yLanes);
+            g.drawVerticalLine (xe - 1,    (float) kRulerH, (float) yLanes);
         }
+
+        /* Marker hairlines down the lane area.  Drawn AFTER the range
+         * overlay so a range outline doesn't obscure a coincident
+         * marker, but BEFORE ghosts / marquee / sticky ruler so drag
+         * overlays read on top. */
+        paintMarkerHairlines (g);
 
         if (dropHover_)
         {
@@ -285,6 +272,69 @@ public:
             g.setColour (Colours::limegreen);
             g.drawRect (hover, 2);
         }
+
+        /* Ghost preview overlay.  Fires for:
+         *   - any cross-lane Move drag (laneOffset != 0) -- sources
+         *     stay at originals, ghosts mark would-be destinations.
+         *   - any copy-drag Move (copyOnCommit, in-lane or cross-lane)
+         *     -- sources stay put, ghosts mark where copies will land.
+         *   - same-lane Move WITHOUT copy live-mutates the originals
+         *     so their painted positions ARE the preview -- no ghost.
+         * Colours: green = valid drop; red = refused (wrong-kind dest
+         * lane, out of bounds, or MIDI overlap). */
+        const bool showGhost = gesture_.laneIdx >= 0
+                             && gesture_.dragActive
+                             && gesture_.mode == Gesture::Move
+                             && ! gesture_.members.empty()
+                             && (gesture_.laneOffset != 0
+                                 || gesture_.copyOnCommit);
+        if (showGhost)
+        {
+            const juce::Colour fillCol = gesture_.crossLaneInvalid
+                ? juce::Colour::fromRGBA (220, 80, 80, 70)
+                : juce::Colour::fromRGBA (110, 200, 130, 70);
+            const juce::Colour edgeCol = gesture_.crossLaneInvalid
+                ? juce::Colour::fromRGB (220, 80, 80)
+                : juce::Colour::fromRGB (110, 220, 130);
+
+            for (const auto& mb : gesture_.members)
+            {
+                const int destLaneIdx = mb.laneIdx + gesture_.laneOffset;
+                if (destLaneIdx < 0 || destLaneIdx >= laneCount) continue;
+
+                const double newPos = juce::jmax (0.0, mb.originalPos + gesture_.appliedDelta);
+                const int xs = kLabelW + (int) (newPos * kPxPerBeat);
+                const int xe = kLabelW + (int) ((newPos + mb.originalLen) * kPxPerBeat);
+                const int yT = kRulerH + destLaneIdx * kLaneH + 4;
+                const Rectangle<int> ghost (xs, yT, juce::jmax (2, xe - xs), kLaneH - 8);
+
+                g.setColour (fillCol);
+                g.fillRect (ghost);
+                g.setColour (edgeCol);
+                g.drawRect (ghost, 2);
+            }
+        }
+
+        /* Marquee overlay.  Translucent white wash + 1-px outline,
+         * painted over lanes + ghost so the user can see WHICH ones
+         * the rect will touch.  Skipped sub-threshold (dragActive
+         * still false) so an aborted click doesn't flash a stray
+         * 1x1 marquee.  Goes under the sticky ruler so it doesn't
+         * paint over the LCD strip when the marquee crosses up. */
+        if (gesture_.mode == Gesture::Marquee && gesture_.dragActive)
+        {
+            const auto rect = currentMarqueeRect();
+            g.setColour (juce::Colours::white.withAlpha (0.10f));
+            g.fillRect (rect);
+            g.setColour (juce::Colours::white.withAlpha (0.75f));
+            g.drawRect (rect, 1);
+        }
+
+        /* Sticky ruler.  Painted LAST so it overlays whatever lane
+         * content sits under it once the viewport scrolls down.
+         * paintRuler offsets the LCD strip by the viewport's vertical
+         * scroll so it always reads at the visible top of the body. */
+        paintRuler (g, owner.viewport_.getViewPositionY());
     }
 
     //==========================================================================
@@ -451,12 +501,20 @@ public:
 
     void mouseDown (const MouseEvent& e) override
     {
-        /* Ruler clicks (the bars:beats strip at the top): seek
-         * transport to the clicked beat; if a drag follows, redefine
-         * the range from the click point.  Mirrors Ardour/Bitwig
-         * convention: ruler = locator + range surface. */
+        /* Ruler clicks (the bars:beats strip at the top).  Right-click
+         * routes to the marker context menu (per-marker if the click
+         * hits a triangle; "Add marker here" otherwise).  Left-click
+         * seeks transport to the clicked beat; if a drag follows,
+         * redefines the range from the click point.  Mirrors Ardour /
+         * Bitwig convention: ruler = locator + range + marker surface. */
         if (e.y < kRulerH && e.x >= kLabelW)
         {
+            if (e.mods.isPopupMenu())
+            {
+                showRulerContextMenu (e.x, e.y);
+                return;
+            }
+
             const double beat = juce::jmax (0.0,
                 (double) (e.x - kLabelW) / (double) kPxPerBeat);
             owner.seekToBeat (beat);
@@ -659,28 +717,68 @@ public:
 
             /* Select + Trim tools start a gesture; the mode differs:
              * - Select: edge hit = Resize, body = Move
-             * - Trim:   anywhere on the region = Resize */
+             * - Trim:   anywhere on the region = Resize (right edge) */
+            gesture_                 = Gesture {};
             gesture_.laneIdx         = laneIdx;
             gesture_.regionId        = r.id;
             gesture_.originalPos     = r.positionBeats;
             gesture_.originalLen     = r.lengthBeats;
+            gesture_.originalStart   = r.startBeats;
             gesture_.mouseDownXBeats = beat;
+            gesture_.mouseDownYPx    = e.y;
+            gesture_.kind            = Gesture::Audio;
             gesture_.dragActive      = false;
 
-            const int regionEndX = kLabelW + (int) (r.endBeats() * kPxPerBeat);
+            const int regionStartX = kLabelW + (int) (r.positionBeats * kPxPerBeat);
+            const int regionEndX   = kLabelW + (int) (r.endBeats() * kPxPerBeat);
             const bool overRightEdge =
                 (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX);
+            /* Left-edge takes precedence ONLY when not also over right --
+             * tiny regions (<2*kEdgeHandlePx wide) keep right-edge
+             * resize so the user can always grow them rightward. */
+            const bool overLeftEdge = ! overRightEdge
+                && (e.x >= regionStartX && e.x <= regionStartX + kEdgeHandlePx);
 
-            gesture_.mode = (activeTool_ == Tool::Trim || overRightEdge)
-                              ? Gesture::Resize
-                              : Gesture::Move;
+            if (activeTool_ == Tool::Trim || overRightEdge)
+            {
+                gesture_.mode = Gesture::Resize;
+                gesture_.edge = Gesture::RightEdge;
+            }
+            else if (overLeftEdge)
+            {
+                gesture_.mode = Gesture::Resize;
+                gesture_.edge = Gesture::LeftEdge;
+            }
+            else
+            {
+                gesture_.mode = Gesture::Move;
+            }
 
-            /* No-modifier click collapses to single-selection.  Multi-
-             * region drag-to-move is a future enhancement; today the
-             * gesture path moves only gesture_.regionId, so leaving
-             * multiple regions visibly selected after a click on one
-             * of them would mislead the user about what drag affects. */
-            setPrimarySelection (laneIdx, r.id);
+            /* Alt-drag = copy-drag.  Only applies to Move (Resize is
+             * in-place; copying an edge-grab doesn't have a sensible
+             * meaning).  Mirrors Zrythm v1 MovingCopy.  Q8a. */
+            if (gesture_.mode == Gesture::Move && e.mods.isAltDown())
+                gesture_.copyOnCommit = true;
+
+            /* Click-on-already-selected region in a multi-selection
+             * PRESERVES the selection and queues every selected region
+             * for the drag.  Otherwise (click on a region outside the
+             * current selection, or no multi-selection) collapse to
+             * single-selection -- same shape as before the multi-drag
+             * landed.  Resize gestures stay anchor-only per roadmap
+             * S1.1 (selection-wide resize is awkward + rarely
+             * wanted). */
+            if (gesture_.mode == Gesture::Move
+                && isSelected (laneIdx, r.id)
+                && selected_.size() > 1)
+            {
+                buildGestureMembersForMove();
+            }
+            else
+            {
+                setPrimarySelection (laneIdx, r.id);
+                seedSingleGestureMember();
+            }
 
             grabKeyboardFocus();
             repaintLane (laneIdx);
@@ -754,36 +852,95 @@ public:
                 return;
             }
 
+            gesture_                 = Gesture {};
             gesture_.laneIdx         = laneIdx;
             gesture_.regionId        = m.id;
             gesture_.originalPos     = m.positionBeats;
             gesture_.originalLen     = m.lengthBeats;
+            gesture_.originalStart   = m.startBeats;
             gesture_.mouseDownXBeats = beat;
+            gesture_.mouseDownYPx    = e.y;
             gesture_.kind            = Gesture::Midi;
             gesture_.dragActive      = false;
 
-            const int regionEndX = kLabelW + (int) (endBeat * kPxPerBeat);
+            const int regionStartX = kLabelW + (int) (m.positionBeats * kPxPerBeat);
+            const int regionEndX   = kLabelW + (int) (endBeat         * kPxPerBeat);
             const bool overRightEdge =
                 (e.x >= regionEndX - kEdgeHandlePx && e.x <= regionEndX);
+            const bool overLeftEdge = ! overRightEdge
+                && (e.x >= regionStartX && e.x <= regionStartX + kEdgeHandlePx);
 
-            gesture_.mode = (activeTool_ == Tool::Trim || overRightEdge)
-                              ? Gesture::Resize
-                              : Gesture::Move;
+            if (activeTool_ == Tool::Trim || overRightEdge)
+            {
+                gesture_.mode = Gesture::Resize;
+                gesture_.edge = Gesture::RightEdge;
+            }
+            else if (overLeftEdge)
+            {
+                gesture_.mode = Gesture::Resize;
+                gesture_.edge = Gesture::LeftEdge;
+            }
+            else
+            {
+                gesture_.mode = Gesture::Move;
+            }
 
-            setPrimarySelection (laneIdx, m.id);
+            /* Alt-drag copy on MIDI -- see audio branch above. */
+            if (gesture_.mode == Gesture::Move && e.mods.isAltDown())
+                gesture_.copyOnCommit = true;
+
+            /* See audio branch above for multi-selection drag rules. */
+            if (gesture_.mode == Gesture::Move
+                && isSelected (laneIdx, m.id)
+                && selected_.size() > 1)
+            {
+                buildGestureMembersForMove();
+            }
+            else
+            {
+                setPrimarySelection (laneIdx, m.id);
+                seedSingleGestureMember();
+            }
+
             grabKeyboardFocus();
             repaintLane (laneIdx);
             return;
         }
 
-        /* Empty strip area.  Right-click here brings up the paste-only
-         * context menu (no region target).  Plain click clears the
-         * selection so the user sees the click registered as "select
-         * nothing". */
+        /* Empty strip area.  Right-click opens the paste-only context
+         * menu (no region target).  Select-tool drag starts a marquee
+         * (rubber-band).  Other tools fall through to the legacy
+         * clearSelection on plain click. */
         lastInteractedLane_ = laneIdx;
         if (e.mods.isPopupMenu())
         {
             showEmptyStripContextMenu (laneIdx, beat);
+            return;
+        }
+        if (activeTool_ == Tool::Select)
+        {
+            /* Start a Marquee gesture.  laneIdx is set so the gesture
+             * passes the `gesture_.laneIdx < 0 return` guards
+             * elsewhere; the marquee itself spans all lanes (laneIdx
+             * isn't a constraint, just a no-op-passing value). */
+            const auto mode = marqueeModeFromMods (e.mods);
+            gesture_                  = Gesture {};
+            gesture_.laneIdx          = laneIdx;
+            gesture_.mode             = Gesture::Marquee;
+            gesture_.mouseDownXBeats  = beat;
+            gesture_.mouseDownYPx     = e.y;
+            gesture_.marqueeStartXPx  = e.x;
+            gesture_.marqueeStartYPx  = e.y;
+            gesture_.marqueeEndXPx    = e.x;
+            gesture_.marqueeEndYPx    = e.y;
+            gesture_.marqueeMode      = mode;
+            gesture_.dragActive       = false;   /* set true after threshold */
+            /* Replace mode previews intent immediately by clearing
+             * the existing selection; Add / Toggle keep it. */
+            if (mode == Gesture::Replace)
+                clearSelection();
+            grabKeyboardFocus();
+            repaint();
             return;
         }
         clearSelection();
@@ -1204,75 +1361,205 @@ public:
         gesture_.dragActive = true;
 
         if (gesture_.laneIdx >= owner.lanes_.size()) return;
-        auto& lane = owner.lanes_.getReference (gesture_.laneIdx);
+
+        /* Marquee gesture: live-update the rect bounds + repaint.
+         * Hit-test + selection update happen at mouseUp.  Clamping
+         * keeps the rect inside the body so an off-edge drag doesn't
+         * leak past the visible strip area. */
+        if (gesture_.mode == Gesture::Marquee)
+        {
+            gesture_.marqueeEndXPx = juce::jlimit (kLabelW, getWidth(),  e.x);
+            gesture_.marqueeEndYPx = juce::jlimit (kRulerH, getHeight(), e.y);
+            repaint();
+            return;
+        }
 
         const double mouseBeat = juce::jmax (0.0,
             (double) (e.x - kLabelW) / (double) kPxPerBeat);
 
-        /* Snap the cursor's beat-position to the configured grid
-         * before computing the new region pos/length.  Snap to the
-         * nearest division so the user can drag PAST a grid line a
-         * little and still land cleanly.  When snap is disabled
-         * (toggle off) we use the raw beat. */
-        auto snap = [this] (double beats) noexcept -> double
+        /* Build the trigger-snap exclusion set for this gesture --
+         * dragged regions are skipped so the snap doesn't latch onto
+         * the very edges being moved.  For Move we exclude every
+         * member; for Resize the single anchor. */
+        juce::Array<juce::Uuid> snapExclude;
+        if (gesture_.mode == Gesture::Move)
         {
-            if (! owner.snapEnabled_ || owner.snapDivision_ <= 0.0)
-                return beats;
-            return std::round (beats / owner.snapDivision_) * owner.snapDivision_;
-        };
-
-        if (gesture_.kind == Gesture::Audio)
-        {
-            auto* r = lane.playlist.findRegion (gesture_.regionId);
-            if (r == nullptr) return;
-
-            if (gesture_.mode == Gesture::Move)
-            {
-                const double delta  = mouseBeat - gesture_.mouseDownXBeats;
-                const double target = juce::jmax (0.0,
-                    snap (gesture_.originalPos + delta));
-
-                /* moveRegion enforces no-overlap; if the target collides,
-                 * snap to the latest non-overlapping position before it.
-                 * For v1 we just attempt; failure leaves the region in
-                 * place. */
-                lane.playlist.moveRegion (gesture_.regionId, target);
-            }
-            else /* Resize */
-            {
-                const double snappedEnd = snap (mouseBeat);
-                const double newLength  = juce::jmax (kMinRegionBeats,
-                    snappedEnd - gesture_.originalPos);
-                lane.playlist.resizeRegion (gesture_.regionId, newLength);
-            }
+            for (const auto& mb : gesture_.members)
+                snapExclude.add (mb.regionId);
         }
-        else /* Gesture::Midi */
+        else
         {
-            auto* m = lane.playlist.findMidiRegion (gesture_.regionId);
-            if (m == nullptr) return;
-
-            if (gesture_.mode == Gesture::Move)
-            {
-                const double delta  = mouseBeat - gesture_.mouseDownXBeats;
-                const double target = juce::jmax (0.0,
-                    snap (gesture_.originalPos + delta));
-                m->positionBeats = target;
-            }
-            else /* Resize */
-            {
-                const double snappedEnd = snap (mouseBeat);
-                const double newLength  = juce::jmax (kMinRegionBeats,
-                    snappedEnd - gesture_.originalPos);
-                m->lengthBeats = newLength;
-            }
-            /* Republish bindings during the drag so the audio thread
-             * picks up the new position/length on the next render
-             * block.  Cheap: 1 atomic ptr swap + ~32 entries copied. */
-            owner.publishMidiBindingsForLane (gesture_.laneIdx);
+            snapExclude.add (gesture_.regionId);
         }
 
+        /* Resize gestures stay anchor-only -- selection-wide resize is
+         * awkward + rarely wanted (roadmap S1.1).  Mutate the anchor's
+         * playlist directly; mouseUp persists.  Edge determines which
+         * boundary the drag moves -- RightEdge mutates lengthBeats only;
+         * LeftEdge also shifts positionBeats + advances startBeats
+         * (source offset) for both audio + MIDI -- the note list /
+         * audio source is preserved and only the playable window
+         * shifts, so dragging the left edge out and back recovers the
+         * original content.  Snap uses the EDGE's original position as
+         * the keep-offset anchor (right edge for RightEdge, left for
+         * LeftEdge). */
+        if (gesture_.mode == Gesture::Resize)
+        {
+            auto& lane = owner.lanes_.getReference (gesture_.laneIdx);
+            if (gesture_.edge == Gesture::RightEdge)
+            {
+                const double origEnd    = gesture_.originalPos + gesture_.originalLen;
+                const double snappedEnd = snapBeat (mouseBeat, origEnd, snapExclude);
+                const double newLength  = juce::jmax (kMinRegionBeats,
+                    snappedEnd - gesture_.originalPos);
+                if (gesture_.kind == Gesture::Audio)
+                {
+                    lane.playlist.resizeRegion (gesture_.regionId, newLength);
+                }
+                else
+                {
+                    if (auto* m = lane.playlist.findMidiRegion (gesture_.regionId))
+                    {
+                        m->lengthBeats = newLength;
+                        owner.publishMidiBindingsForLane (gesture_.laneIdx);
+                    }
+                }
+            }
+            else /* LeftEdge */
+            {
+                const double origEnd  = gesture_.originalPos + gesture_.originalLen;
+                const double maxStart = origEnd - kMinRegionBeats;
+                /* Lower bound on newPos: the source offset must stay
+                 * >= 0 for both kinds.  Audio: can't extend past the
+                 * start of the underlying file.  MIDI (Q5): same shape
+                 * -- can't extend past source-beat 0 in the pristine
+                 * note list. */
+                const double lowerBound =
+                    juce::jmax (0.0, gesture_.originalPos - gesture_.originalStart);
+                const double snapped = juce::jlimit (lowerBound, maxStart,
+                                          snapBeat (mouseBeat,
+                                                    gesture_.originalPos,
+                                                    snapExclude));
+                const double delta   = snapped - gesture_.originalPos;
+                const double newPos  = snapped;
+                const double newLen  = gesture_.originalLen - delta;
+                if (gesture_.kind == Gesture::Audio)
+                {
+                    if (auto* r = lane.playlist.findRegion (gesture_.regionId))
+                    {
+                        r->positionBeats = newPos;
+                        r->lengthBeats   = newLen;
+                        r->startBeats    = gesture_.originalStart + delta;
+                    }
+                }
+                else
+                {
+                    /* MIDI left-trim mirrors the audio source-offset
+                     * pattern: advance startBeats by the trim delta
+                     * INSTEAD of rewriting the note list.  Notes hidden
+                     * by the trim survive in the pristine snapshot and
+                     * reappear when the user drags the edge back. */
+                    if (auto* m = lane.playlist.findMidiRegion (gesture_.regionId))
+                    {
+                        m->positionBeats = newPos;
+                        m->lengthBeats   = newLen;
+                        m->startBeats    = gesture_.originalStart + delta;
+                        owner.publishMidiBindingsForLane (gesture_.laneIdx);
+                    }
+                }
+            }
+            if (body_resizeNeeded()) resizeForLanes();
+            else                     repaintLane (gesture_.laneIdx);
+            return;
+        }
+
+        /* Move: multi-member path.  Anchor's originalPos drives the
+         * delta-and-snap; every other member shifts by the same snapped
+         * delta so intra-selection spacing is preserved.  Cross-lane
+         * drags are PREVIEW-ONLY -- ghost overlay paints the would-be
+         * destinations, commit happens at mouseUp (extract + transfer
+         * each member's region).  Same-lane drags live-mutate every
+         * tick so the user sees the drag in place. */
+        const double rawDeltaBeats = mouseBeat - gesture_.mouseDownXBeats;
+        const double rawTarget     = snapBeat (gesture_.originalPos + rawDeltaBeats,
+                                                gesture_.originalPos,
+                                                snapExclude);
+        double       deltaBeats    = rawTarget - gesture_.originalPos;
+
+        const int rawTargetLane = yToLaneIdx (e.y);
+        int newLaneOffset = (rawTargetLane >= 0)
+            ? rawTargetLane - gesture_.laneIdx
+            : gesture_.laneOffset;   /* keep last valid offset when cursor strays */
+
+        /* Shift = axis lock.  First Shift-detection during a Move
+         * picks the dominant axis (whichever has travelled further in
+         * pixels) and locks the drag to it.  Released Shift restores
+         * free movement; if the user re-presses Shift, the dominant
+         * axis is recomputed from the live cursor offset.  Matches the
+         * Ableton / Bitwig convention; B18. */
+        if (e.mods.isShiftDown())
+        {
+            if (gesture_.axis == Gesture::AxisFree)
+            {
+                const int dxPx = std::abs ((int) ((deltaBeats) * kPxPerBeat));
+                const int dyPx = std::abs (e.y - gesture_.mouseDownYPx);
+                gesture_.axis = (dxPx >= dyPx) ? Gesture::AxisHorizontal
+                                               : Gesture::AxisVertical;
+            }
+            if (gesture_.axis == Gesture::AxisHorizontal)
+                newLaneOffset = 0;
+            else /* AxisVertical */
+                deltaBeats = 0.0;
+        }
+        else
+        {
+            gesture_.axis = Gesture::AxisFree;
+        }
+
+        gesture_.appliedDelta = deltaBeats;
+
+        if (newLaneOffset == 0)
+        {
+            /* Same-lane case.
+             *   Move: live-mutate every member (intuitive in-lane drag).
+             *   Copy: preview-only via ghost overlay so the source
+             *         regions stay visible at their original positions
+             *         and the copies-to-be render where they'll land. */
+            const bool wasCrossLane = gesture_.laneOffset != 0;
+            gesture_.laneOffset       = 0;
+            gesture_.crossLaneInvalid = false;
+            if (gesture_.copyOnCommit)
+            {
+                /* Same-lane copy: no mutation; whole-body repaint to
+                 * render the ghost overlay (extended to cover this
+                 * case in paint()). */
+                if (body_resizeNeeded()) resizeForLanes();
+                else                     repaint();
+            }
+            else
+            {
+                const auto touched = applySameLaneMoveTick (deltaBeats);
+                if (body_resizeNeeded()) resizeForLanes();
+                else if (wasCrossLane)   repaint();    /* clear ghost overlay */
+                else
+                {
+                    for (int li : touched) repaintLane (li);
+                }
+            }
+            return;
+        }
+
+        /* Cross-lane preview.  Transitioning from same-lane requires
+         * a restore tick so the source-lane strips show the regions in
+         * their original positions while the ghost shows the preview.
+         * Skipped for copy gestures since copy never mutated sources. */
+        if (gesture_.laneOffset == 0 && ! gesture_.copyOnCommit)
+            applySameLaneMoveTick (0.0);
+
+        gesture_.laneOffset = newLaneOffset;
+        validateCrossLaneMove (newLaneOffset, deltaBeats);
         if (body_resizeNeeded()) resizeForLanes();
-        else                     repaintLane (gesture_.laneIdx);
+        else                     repaint();    /* whole-body for ghost overlay */
     }
 
     void mouseUp (const MouseEvent& e) override
@@ -1326,73 +1613,73 @@ public:
 
         if (gesture_.laneIdx < 0) return;
 
-        const int   laneIdx     = gesture_.laneIdx;
-        const bool  wasDragged  = gesture_.dragActive;
-        const auto  gestureMode = gesture_.mode;
-        const auto  gestureKind = gesture_.kind;
-        const auto  regionId    = gesture_.regionId;
-
-        gesture_ = Gesture {};
-
-        if (laneIdx < 0 || laneIdx >= owner.lanes_.size()) return;
-        auto& lane    = owner.lanes_.getReference (laneIdx);
-        auto& runtime = owner.laneRuntime_.getReference (laneIdx);
-
-        /* MIDI region branch: a drag was already applied + republished
-         * each mouseDrag tick.  On mouseUp persist + repaint so the
-         * session XML + arrangement body strip catch up.  Click
-         * without drag opens the piano-roll dock bound to this region
-         * (mirrors the existing double-click affordance -- single
-         * click = preview the region in the editor; consistent with
-         * Bitwig/Ableton arrangement -> clip-detail handoff). */
-        if (gestureKind == Gesture::Midi)
+        /* Marquee commit.  Computed BEFORE the gesture reset so
+         * regionsInMarquee() can read the live rect state.  No-drag
+         * marquee (just a click on empty area) is a no-op here -- the
+         * Replace-mode clearSelection already fired in mouseDown. */
+        if (gesture_.mode == Gesture::Marquee)
         {
-            if (wasDragged)
+            const bool wasMarqueeDragged = gesture_.dragActive;
+            const auto mqMode            = gesture_.marqueeMode;
+            if (wasMarqueeDragged)
             {
-                /* Re-sort the MIDI region list now that positionBeats
-                 * may have changed during the drag.  Direct-field
-                 * mutation on MidiNoteRegion (which the drag handler
-                 * does) bypasses Playlist's addMidiRegion sort -- so
-                 * we restore the invariant here.  Cheap O(N log N)
-                 * on a list with maybe ~32 entries at most. */
-                lane.playlist.rebuildMidiOrder();
-                owner.writeLanesToSession();
-                /* Repaint full body so any region rendered past the
-                 * trimmed/moved bounds clears. */
-                if (body_resizeNeeded()) resizeForLanes();
-                else                     repaint();
+                const auto hits = regionsInMarquee();
+                applyMarqueeSelection (hits, mqMode);
             }
-            else
-            {
-                if (auto* sc = findParentComponentOfClass<StandardContent>())
-                    sc->showPianoRollForRegion (regionId);
-            }
+            gesture_ = Gesture {};
+            repaint();
             return;
         }
 
+        const int    anchorLane    = gesture_.laneIdx;
+        const auto   anchorRegion  = gesture_.regionId;
+        const bool   wasDragged    = gesture_.dragActive;
+        const auto   gestureMode   = gesture_.mode;
+        const auto   gestureKind   = gesture_.kind;
+        const int    finalOffset   = gesture_.laneOffset;
+        const double finalDelta    = gesture_.appliedDelta;
+        const bool   invalidCross  = gesture_.crossLaneInvalid;
+        const bool   copyOnCommit  = gesture_.copyOnCommit;
+        const auto   members       = gesture_.members;   /* copy before reset */
+
+        gesture_ = Gesture {};
+
+        if (anchorLane < 0 || anchorLane >= owner.lanes_.size()) return;
+        auto& anchorLaneRef = owner.lanes_.getReference (anchorLane);
+        auto& anchorRuntime = owner.laneRuntime_.getReference (anchorLane);
+
+        /* Click without drag.  For MIDI the click opens the piano-roll
+         * dock bound to the anchor region (mirrors double-click);
+         * for AUDIO/tracker the click launches the anchor region.
+         * Multi-selection visibility is preserved -- this click
+         * neither extends nor reduces it. */
         if (! wasDragged)
         {
-            /* Click without drag = launch the region.  Existing
-             * behaviour preserved. */
-            const auto* r = lane.playlist.findRegion (regionId);
+            if (gestureKind == Gesture::Midi)
+            {
+                if (auto* sc = findParentComponentOfClass<StandardContent>())
+                    sc->showPianoRollForRegion (anchorRegion);
+                return;
+            }
+            const auto* r = anchorLaneRef.playlist.findRegion (anchorRegion);
             if (r == nullptr) return;
 
-            if (runtime.isTrackerLane() && r->sequenceIdx >= 0)
+            if (anchorRuntime.isTrackerLane() && r->sequenceIdx >= 0)
             {
-                if (runtime.lastDispatchedSeqIdx >= 0
-                    && runtime.lastDispatchedSeqIdx != r->sequenceIdx)
-                    runtime.trackerCache->schedulePlaying (
-                        runtime.lastDispatchedSeqIdx, -1.0, false);
-                runtime.trackerCache->schedulePlaying (r->sequenceIdx, -1.0, true);
+                if (anchorRuntime.lastDispatchedSeqIdx >= 0
+                    && anchorRuntime.lastDispatchedSeqIdx != r->sequenceIdx)
+                    anchorRuntime.trackerCache->schedulePlaying (
+                        anchorRuntime.lastDispatchedSeqIdx, -1.0, false);
+                anchorRuntime.trackerCache->schedulePlaying (r->sequenceIdx, -1.0, true);
             }
-            else if (runtime.isAudioLane())
+            else if (anchorRuntime.isAudioLane())
             {
                 const double bpm = owner.monitor_ != nullptr
                     ? (double) owner.monitor_->tempo.get() : 120.0;
                 const double sessionSR = owner.monitor_ != nullptr
                     ? (double) owner.monitor_->sampleRate.get() : 48000.0;
                 const double secsPerBeat = bpm > 0.0 ? 60.0 / bpm : 0.5;
-                runtime.audioClipCache->schedulePlay (
+                anchorRuntime.audioClipCache->schedulePlay (
                     r->id, r->sourceId, -1.0, 0, r->looped,
                     r->gainDb,
                     (juce::int64) (r->fadeInBeats  * secsPerBeat * sessionSR),
@@ -1400,18 +1687,114 @@ public:
                     (juce::int64) (r->lengthBeats  * secsPerBeat * sessionSR),
                     r->fadeInCurve, r->fadeOutCurve);
             }
-            runtime.lastDispatchedRegion = r->id;
-            runtime.lastDispatchedSeqIdx = r->sequenceIdx;
-            repaintLane (laneIdx);
+            anchorRuntime.lastDispatchedRegion = r->id;
+            anchorRuntime.lastDispatchedSeqIdx = r->sequenceIdx;
+            repaintLane (anchorLane);
             juce::ignoreUnused (e, gestureMode);
             return;
         }
 
-        /* Drag/resize finished -- persist + invalidate cached
-         * dispatch state so the new position fires next pass. */
-        runtime.lastDispatchedRegion = juce::Uuid::null();
+        /* Resize finished -- single region.  Length was mutated each
+         * tick by mouseDrag's Resize branch; persist + invalidate
+         * dispatch cache. */
+        if (gestureMode == Gesture::Resize)
+        {
+            if (gestureKind == Gesture::Midi)
+                anchorLaneRef.playlist.rebuildMidiOrder();
+            anchorRuntime.lastDispatchedRegion = juce::Uuid::null();
+            owner.writeLanesToSession();
+            if (body_resizeNeeded()) resizeForLanes();
+            else                     repaint();
+            return;
+        }
+
+        /* Move finished.  Commit shapes branch on (finalOffset != 0)
+         * and (copyOnCommit):
+         *   - same-lane move: positions were live-mutated each tick;
+         *     just persist + rebuild MIDI sort on touched lanes.
+         *   - same-lane copy: source never mutated; clone each member
+         *     in-lane at the dragged position via commitCopyMove.
+         *   - cross-lane refuse (invalidCross): wrong-kind dest, OOB,
+         *     or MIDI dest overlap.  Move snap-back is a no-op (drag
+         *     handler restored sources).  Copy snap-back is also a
+         *     no-op (copy never mutated sources).
+         *   - cross-lane move: extract each member + insert at dest.
+         *   - cross-lane copy: clone each member + insert at dest;
+         *     source stays put. */
+        std::set<int> midiLanesNeedingSort;
+        std::set<int> runtimesToInvalidate;
+        auto gatherMidiSort = [&] (int lane) {
+            if (lane < 0 || lane >= owner.lanes_.size()) return;
+            if (owner.lanes_.getReference (lane).kind == Lane::Kind::Midi)
+                midiLanesNeedingSort.insert (lane);
+        };
+
+        if (finalOffset == 0)
+        {
+            if (copyOnCommit)
+            {
+                /* Same-lane copy commit -- clone each member in-lane
+                 * at the dragged position.  commitCopyMove handles
+                 * displace-on-overlap for MIDI. */
+                commitCopyMove (members, anchorLane, 0, finalDelta);
+                for (const auto& mb : members)
+                {
+                    runtimesToInvalidate.insert (mb.laneIdx);
+                    if (mb.kind == Gesture::Midi)
+                        gatherMidiSort (mb.laneIdx);
+                }
+            }
+            else
+            {
+                /* Same-lane move was live-applied; just persist. */
+                for (const auto& mb : members)
+                {
+                    runtimesToInvalidate.insert (mb.laneIdx);
+                    if (mb.kind == Gesture::Midi)
+                        gatherMidiSort (mb.laneIdx);
+                }
+            }
+        }
+        else if (invalidCross)
+        {
+            /* Snap-back is a no-op for both move + copy -- move
+             * restored sources on the cross-lane-transition tick;
+             * copy never mutated sources to begin with.  Invalidate
+             * dispatch cache on the anchor + repaint to clear the
+             * ghost overlay. */
+            anchorRuntime.lastDispatchedRegion = juce::Uuid::null();
+            if (body_resizeNeeded()) resizeForLanes();
+            else                     repaint();
+            return;
+        }
+        else
+        {
+            if (copyOnCommit)
+                commitCopyMove      (members, anchorLane, finalOffset, finalDelta);
+            else
+                commitCrossLaneMove (members, anchorLane, finalOffset, finalDelta);
+            for (const auto& mb : members)
+            {
+                runtimesToInvalidate.insert (mb.laneIdx);
+                runtimesToInvalidate.insert (mb.laneIdx + finalOffset);
+                if (mb.kind == Gesture::Midi)
+                {
+                    gatherMidiSort (mb.laneIdx);
+                    gatherMidiSort (mb.laneIdx + finalOffset);
+                }
+            }
+        }
+
+        for (int li : midiLanesNeedingSort)
+            owner.lanes_.getReference (li).playlist.rebuildMidiOrder();
+
+        for (int li : runtimesToInvalidate)
+            if (li >= 0 && li < owner.laneRuntime_.size())
+                owner.laneRuntime_.getReference (li).lastDispatchedRegion = juce::Uuid::null();
+
         owner.writeLanesToSession();
-        resizeForLanes();
+        if (body_resizeNeeded()) resizeForLanes();
+        else                     repaint();
     }
 
     void mouseMove (const MouseEvent& e) override
@@ -1649,6 +2032,681 @@ public:
     }
 
     //==========================================================================
+    // Marker-track helpers -- ruler right-click + per-marker context
+    // menu (rename / recolour / delete).  Marker mutations persist via
+    // owner.writeMarkersOnly() so they skip the lanes_ undo snapshot.
+
+    static const juce::Colour* markerPalette() noexcept
+    {
+        static const juce::Colour palette[] = {
+            juce::Colour { 0xff'e0'c0'70 }, // amber (default)
+            juce::Colour { 0xff'c5'5a'5a }, // red
+            juce::Colour { 0xff'c5'8a'4a }, // orange
+            juce::Colour { 0xff'6a'b5'5a }, // green
+            juce::Colour { 0xff'4a'a5'b5 }, // cyan
+            juce::Colour { 0xff'5a'7a'c5 }, // blue
+            juce::Colour { 0xff'9a'5a'c5 }, // purple
+            juce::Colour { 0xff'c5'5a'9a }  // pink
+        };
+        return palette;
+    }
+    static constexpr int kMarkerPaletteSize = 8;
+
+    void addMarkerAtBeat (double atBeat)
+    {
+        owner.markerTrack_.addMarker (juce::jmax (0.0, atBeat), juce::String());
+        owner.writeMarkersOnly();
+        repaint();
+    }
+
+    void renameMarker (const juce::Uuid& markerId)
+    {
+        const auto* m = owner.markerTrack_.findMarker (markerId);
+        if (m == nullptr) return;
+        auto* aw = new juce::AlertWindow ("Rename marker",
+                                           "New name for marker:",
+                                           juce::AlertWindow::NoIcon);
+        aw->addTextEditor ("name", m->name);
+        aw->addButton ("OK",     1, juce::KeyPress (juce::KeyPress::returnKey));
+        aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+        juce::Component::SafePointer<Body> safe (this);
+        const juce::Uuid id = markerId;
+        aw->enterModalState (true,
+            juce::ModalCallbackFunction::create (
+                [safe, id, aw] (int result)
+                {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr) return;
+                    if (result == 1)
+                    {
+                        const auto newName = aw->getTextEditorContents ("name").trim();
+                        if (self->owner.markerTrack_.renameMarker (id, newName))
+                        {
+                            self->owner.writeMarkersOnly();
+                            self->repaint();
+                        }
+                    }
+                }),
+            true);
+    }
+
+    void cycleMarkerColour (const juce::Uuid& markerId)
+    {
+        const auto* m = owner.markerTrack_.findMarker (markerId);
+        if (m == nullptr) return;
+        const auto* palette = markerPalette();
+        int curIdx = -1;
+        for (int i = 0; i < kMarkerPaletteSize; ++i)
+            if (palette[i].getARGB() == m->colour.getARGB()) { curIdx = i; break; }
+        const int nextIdx = (curIdx + 1) % kMarkerPaletteSize;
+        owner.markerTrack_.setMarkerColour (markerId, palette[nextIdx]);
+        owner.writeMarkersOnly();
+        repaint();
+    }
+
+    void deleteMarker (const juce::Uuid& markerId)
+    {
+        if (owner.markerTrack_.removeMarker (markerId))
+        {
+            owner.writeMarkersOnly();
+            repaint();
+        }
+    }
+
+    /** Ruler right-click router.  Hits a marker triangle -> per-marker
+     *  menu; empty ruler area -> "Add marker here". */
+    void showRulerContextMenu (int x, int y)
+    {
+        const double atBeat = juce::jmax (0.0,
+            (double) (x - kLabelW) / (double) kPxPerBeat);
+
+        const juce::Uuid hit = markerAtRulerPx (x, y);
+        juce::Component::SafePointer<Body> safe (this);
+
+        if (! hit.isNull())
+        {
+            enum { ItemRename = 1, ItemColour, ItemDelete };
+            juce::PopupMenu menu;
+            menu.addItem (ItemRename, "Rename marker...");
+            menu.addItem (ItemColour, "Cycle colour");
+            menu.addSeparator();
+            menu.addItem (ItemDelete, "Delete marker");
+            menu.showMenuAsync (juce::PopupMenu::Options(),
+                [safe, hit] (int result)
+                {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr || result == 0) return;
+                    switch (result)
+                    {
+                        case ItemRename: self->renameMarker      (hit); break;
+                        case ItemColour: self->cycleMarkerColour (hit); break;
+                        case ItemDelete: self->deleteMarker      (hit); break;
+                        default: break;
+                    }
+                });
+            return;
+        }
+
+        enum { ItemAdd = 1 };
+        juce::PopupMenu menu;
+        menu.addItem (ItemAdd, "Add marker here");
+        menu.showMenuAsync (juce::PopupMenu::Options(),
+            [safe, atBeat] (int result)
+            {
+                auto* self = safe.getComponent();
+                if (self == nullptr || result == 0) return;
+                if (result == ItemAdd) self->addMarkerAtBeat (atBeat);
+            });
+    }
+
+    //==========================================================================
+    // Active gesture (move / resize) data.  Declared HERE -- above the
+    // Multi-region gesture helpers -- because those helpers reference
+    // Gesture::Member + Gesture::Kind in their function signatures;
+    // ordinary lookup demands the type be visible at signature time
+    // (only method BODIES get deferred class-scope lookup).  Keep the
+    // rest of the class data section at the bottom.
+    //==========================================================================
+
+    /* Anchor fields describe the region that was clicked; members
+     * describes the full set of regions being moved together (single-
+     * region drag = 1 entry = anchor only; multi-region drag = anchor
+     * + every other selected region).  Resize gestures stay anchor-only
+     * (roadmap S1.1 decision: selection-wide resize is awkward + rarely
+     * wanted).  laneIdx < 0 means no active gesture. */
+    struct Gesture {
+        /* Marquee: rubber-band select.  Started by a drag on empty
+         * lane area; commit hit-tests every region against the live
+         * rect on mouseUp. */
+        enum Mode { Move, Resize, Marquee };
+        enum Kind { Audio, Midi };
+        /* Marquee selection-set semantic decided at mouseDown from
+         * modifiers (no-mod = Replace, Shift = Add, Ctrl = Toggle).
+         * Mirrors Zrythm v1's shift_held/ctrl_held branches. */
+        enum MarqueeMode { Replace, Add, Toggle };
+        /* Resize gestures track which edge was grabbed.  Right (default)
+         * mutates lengthBeats; Left also shifts positionBeats + advances
+         * startBeats (source offset) for both audio + MIDI -- notes /
+         * audio source survive the trim and reappear on drag-back. */
+        enum Edge { RightEdge, LeftEdge };
+        /* Shift-axis constrain on Move.  Locks the drag to either
+         * horizontal (time) or vertical (lane) once Shift is first
+         * detected; cleared when Shift is released.  Decision is sticky
+         * for the duration of the Shift hold so a small mouse jitter
+         * doesn't flip the lock.  B18. */
+        enum Axis { AxisFree, AxisHorizontal, AxisVertical };
+
+        struct Member {
+            int        laneIdx       = -1;
+            juce::Uuid regionId;
+            double     originalPos   = 0.0;
+            double     originalLen   = 0.0;
+            double     originalStart = 0.0;   /* source offset (Region.startBeats / MidiNoteRegion.startBeats) */
+            Kind       kind          = Audio;
+        };
+
+        int        laneIdx         = -1;      /* anchor */
+        juce::Uuid regionId;                   /* anchor */
+        double     originalPos     = 0.0;     /* anchor */
+        double     originalLen     = 0.0;     /* anchor */
+        double     originalStart   = 0.0;     /* anchor source offset (audio + MIDI) */
+        double     mouseDownXBeats = 0.0;
+        int        mouseDownYPx    = 0;       /* anchor pixel y for axis lock */
+        Mode       mode            = Move;
+        Edge       edge            = RightEdge;
+        Kind       kind            = Audio;   /* anchor */
+        bool       dragActive      = false;
+
+        /* Multi-region drag.  Populated on mouseDown.  Empty == not
+         * a Move gesture (Resize) or anchor wasn't part of an active
+         * multi-selection.  When populated, the Move path iterates
+         * this list instead of the single-region anchor fields. */
+        std::vector<Member> members;
+
+        /* Live cross-lane state, recomputed every mouseDrag tick.
+         * laneOffset = current target lane delta (anchor's destLane -
+         * anchor's source lane).  crossLaneInvalid = at least one
+         * member would land out-of-bounds, on a wrong-kind lane, OR
+         * (MIDI only) on an overlapping span; ghost paint tints red
+         * and mouseUp refuses + snaps back. */
+        int    laneOffset       = 0;
+        bool   crossLaneInvalid = false;
+        double appliedDelta     = 0.0;        /* snapped beat delta */
+        Axis   axis             = AxisFree;
+
+        /* Alt-drag copy.  Set on mouseDown when Alt held + click hits
+         * a region in the current selection.  When true, the Move
+         * gesture NEVER live-mutates the originals (ghost overlay
+         * shows the preview just like cross-lane) and mouseUp clones
+         * each member at its target instead of moving the source.
+         * Roadmap Q8a / Zrythm UiOverlayAction::MovingCopy. */
+        bool copyOnCommit = false;
+
+        /* Marquee bounds in body-coord pixels.  start{X,Y}Px set on
+         * mouseDown, end{X,Y}Px updated every mouseDrag. */
+        int  marqueeStartXPx = 0;
+        int  marqueeStartYPx = 0;
+        int  marqueeEndXPx   = 0;
+        int  marqueeEndYPx   = 0;
+        MarqueeMode marqueeMode = Replace;
+    };
+    Gesture gesture_;
+
+    //==========================================================================
+    // Multi-region gesture helpers.  Members are populated on mouseDown;
+    // mouseDrag (Move) iterates them, mouseUp commits.  Single-region
+    // drag is the 1-member case so the Move path doesn't fork.
+    //==========================================================================
+
+    /** Lane index at vertical pixel `y`, or -1 if outside the lane
+     *  strips (above the ruler or past the last lane). */
+    int yToLaneIdx (int y) const noexcept
+    {
+        if (y < kRulerH) return -1;
+        const int idx = (y - kRulerH) / kLaneH;
+        if (idx < 0 || idx >= owner.lanes_.size()) return -1;
+        return idx;
+    }
+
+    /** Populate gesture_.members with just the anchor.  Used when the
+     *  click did NOT land on an already-selected region in a
+     *  multi-selection (i.e. the single-region drag case). */
+    void seedSingleGestureMember()
+    {
+        gesture_.members.clear();
+        Gesture::Member m;
+        m.laneIdx       = gesture_.laneIdx;
+        m.regionId      = gesture_.regionId;
+        m.originalPos   = gesture_.originalPos;
+        m.originalLen   = gesture_.originalLen;
+        m.originalStart = gesture_.originalStart;
+        m.kind          = gesture_.kind;
+        gesture_.members.push_back (m);
+    }
+
+    /** Populate gesture_.members from the current multi-selection.
+     *  Skips entries whose lane/region is no longer resolvable.  The
+     *  anchor is included (it must already be in selected_ for this
+     *  helper to be called).  Each member captures its ORIGINAL
+     *  position + length so mouseDrag can apply a uniform delta no
+     *  matter how the live values drift during the drag. */
+    void buildGestureMembersForMove()
+    {
+        gesture_.members.clear();
+        for (const auto& s : selected_)
+        {
+            if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
+            auto& l = owner.lanes_.getReference (s.first);
+            if (const auto* r = l.playlist.findRegion (s.second))
+            {
+                Gesture::Member m;
+                m.laneIdx       = s.first;
+                m.regionId      = s.second;
+                m.originalPos   = r->positionBeats;
+                m.originalLen   = r->lengthBeats;
+                m.originalStart = r->startBeats;
+                m.kind          = Gesture::Audio;
+                gesture_.members.push_back (m);
+            }
+            else if (const auto* mr = l.playlist.findMidiRegion (s.second))
+            {
+                Gesture::Member m;
+                m.laneIdx       = s.first;
+                m.regionId      = s.second;
+                m.originalPos   = mr->positionBeats;
+                m.originalLen   = mr->lengthBeats;
+                m.originalStart = mr->startBeats;
+                m.kind          = Gesture::Midi;
+                gesture_.members.push_back (m);
+            }
+        }
+    }
+
+    /** Returns the Lane::Kind that a member's destination lane must be
+     *  for the drag to land.  Audio regions need Audio lanes; MIDI
+     *  regions need MIDI lanes. */
+    Lane::Kind requiredLaneKindFor (Gesture::Kind k) const noexcept
+    {
+        return k == Gesture::Audio ? Lane::Kind::Audio : Lane::Kind::Midi;
+    }
+
+    /** Apply a same-lane multi-region Move tick.  Every member's
+     *  positionBeats is shifted by the same snapped delta computed
+     *  against the anchor.  For MIDI members we mutate the field
+     *  directly (matches the single-region path); republish bindings
+     *  for every touched MIDI lane so the audio thread sees the new
+     *  start positions on the next render block.  Returns the set of
+     *  touched lanes for the caller to repaint. */
+    std::set<int> applySameLaneMoveTick (double deltaBeats)
+    {
+        std::set<int> touched;
+        std::set<int> midiTouched;
+        for (const auto& m : gesture_.members)
+        {
+            if (m.laneIdx < 0 || m.laneIdx >= owner.lanes_.size()) continue;
+            auto& lane = owner.lanes_.getReference (m.laneIdx);
+            const double newPos = juce::jmax (0.0, m.originalPos + deltaBeats);
+            if (m.kind == Gesture::Audio)
+            {
+                if (lane.playlist.moveRegion (m.regionId, newPos))
+                    touched.insert (m.laneIdx);
+            }
+            else
+            {
+                if (auto* mr = lane.playlist.findMidiRegion (m.regionId))
+                {
+                    mr->positionBeats = newPos;
+                    midiTouched.insert (m.laneIdx);
+                    touched.insert (m.laneIdx);
+                }
+            }
+        }
+        for (int li : midiTouched)
+            owner.publishMidiBindingsForLane (li);
+        return touched;
+    }
+
+    /** Validate a cross-lane move against bounds + kind + (MIDI only)
+     *  destination overlap.  Sets gesture_.crossLaneInvalid as a side
+     *  effect so paint can tint the ghost.  Returns true only when
+     *  every member would land cleanly. */
+    bool validateCrossLaneMove (int laneOffset, double deltaBeats)
+    {
+        gesture_.crossLaneInvalid = false;
+        for (const auto& m : gesture_.members)
+        {
+            const int destLaneIdx = m.laneIdx + laneOffset;
+            if (destLaneIdx < 0 || destLaneIdx >= owner.lanes_.size())
+            {
+                gesture_.crossLaneInvalid = true;
+                return false;
+            }
+            const auto& destLane = owner.lanes_.getReference (destLaneIdx);
+            if (destLane.kind != requiredLaneKindFor (m.kind))
+            {
+                gesture_.crossLaneInvalid = true;
+                return false;
+            }
+            if (m.kind == Gesture::Midi)
+            {
+                /* MIDI dest must have no overlap with the would-be
+                 * span.  Slice 2's displace policy may relax this for
+                 * drop later. */
+                const double newPos = juce::jmax (0.0, m.originalPos + deltaBeats);
+                const double newEnd = newPos + m.originalLen;
+                for (const auto& other : destLane.playlist.midiRegions())
+                {
+                    if (other == nullptr) continue;
+                    if (other->id == m.regionId) continue;   /* skip self if same lane somehow */
+                    const double otherEnd = other->positionBeats + other->lengthBeats;
+                    if (newPos < otherEnd && newEnd > other->positionBeats)
+                    {
+                        gesture_.crossLaneInvalid = true;
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Commit a cross-lane move at mouseUp.  Caller has already
+     *  validated, but we re-check MIDI overlap before extracting from
+     *  source -- addMidiRegion takes its argument by value, so a
+     *  late-failing add would LOSE the moved-from unique_ptr.  Touched
+     *  MIDI lanes get their bindings republished after the bulk move.
+     *  Members are passed explicitly so the caller can have already
+     *  cleared gesture_ (mouseUp resets gesture state before commit
+     *  so any re-entrancy via repaint sees a clean state). */
+    void commitCrossLaneMove (const std::vector<Gesture::Member>& members,
+                              int origAnchorLane,
+                              int laneOffset,
+                              double deltaBeats)
+    {
+        std::set<int> midiTouched;
+        for (const auto& m : members)
+        {
+            const int srcIdx  = m.laneIdx;
+            const int destIdx = m.laneIdx + laneOffset;
+            if (srcIdx  < 0 || srcIdx  >= owner.lanes_.size()) continue;
+            if (destIdx < 0 || destIdx >= owner.lanes_.size()) continue;
+            auto& srcLane  = owner.lanes_.getReference (srcIdx);
+            auto& destLane = owner.lanes_.getReference (destIdx);
+            const double newPos = juce::jmax (0.0, m.originalPos + deltaBeats);
+
+            if (m.kind == Gesture::Audio)
+            {
+                const auto* r = srcLane.playlist.findRegion (m.regionId);
+                if (r == nullptr) continue;
+                Region copy        = *r;
+                copy.positionBeats = newPos;
+                copy.colour        = destLane.colour;
+                srcLane.playlist.removeRegion (m.regionId);
+                destLane.playlist.addRegion (std::move (copy));
+            }
+            else
+            {
+                /* Pre-check overlap on dest before extracting -- a late
+                 * addMidiRegion rejection would destroy the moved-from
+                 * unique_ptr.  validateCrossLaneMove already screens
+                 * this, but doing it twice keeps the destructive
+                 * extract atomic with success. */
+                const double newEnd = newPos + m.originalLen;
+                bool overlapHit = false;
+                for (const auto& other : destLane.playlist.midiRegions())
+                {
+                    if (other == nullptr) continue;
+                    if (other->id == m.regionId) continue;
+                    const double oEnd = other->positionBeats + other->lengthBeats;
+                    if (newPos < oEnd && newEnd > other->positionBeats)
+                    {
+                        overlapHit = true;
+                        break;
+                    }
+                }
+                if (overlapHit) continue;     /* leave in source */
+
+                auto detached = srcLane.playlist.extractMidiRegion (m.regionId);
+                if (detached == nullptr) continue;
+                detached->positionBeats = newPos;
+                detached->colour        = destLane.colour;
+                midiTouched.insert (srcIdx);
+                midiTouched.insert (destIdx);
+                destLane.playlist.addMidiRegion (std::move (detached));
+            }
+        }
+        /* Update selected_ to track the migrated regions on their new
+         * lanes.  Region ids are stable across transfer so we just
+         * rebind the laneIdx column. */
+        for (auto& s : selected_)
+        {
+            for (const auto& m : members)
+            {
+                if (s.second == m.regionId)
+                {
+                    s.first = m.laneIdx + laneOffset;
+                    break;
+                }
+            }
+        }
+        if (selectedLane_ == origAnchorLane)
+            selectedLane_ = origAnchorLane + laneOffset;
+
+        for (int li : midiTouched)
+            owner.publishMidiBindingsForLane (li);
+    }
+
+    /** Commit Alt-drag copy at mouseUp.  For each member, CLONE the
+     *  source region (audio: copy-by-value; MIDI: clone()) and insert
+     *  the clone at the target lane + position.  Originals stay put.
+     *  Handles same-lane (laneOffset==0) and cross-lane (laneOffset!=0)
+     *  uniformly.  MIDI clones that would overlap on the destination
+     *  use displaceMidiRegionsForSpan to make room -- consistent with
+     *  paste/duplicate.  Touched MIDI lanes get bindings republished.
+     *  Selection is rebuilt to the freshly-created clones so the user
+     *  can immediately drag/copy them again (matches paste). */
+    void commitCopyMove (const std::vector<Gesture::Member>& members,
+                         int origAnchorLane,
+                         int laneOffset,
+                         double deltaBeats)
+    {
+        std::set<int> midiTouched;
+        juce::Array<std::pair<int, juce::Uuid>> newSelection;
+        for (const auto& m : members)
+        {
+            const int srcIdx  = m.laneIdx;
+            const int destIdx = m.laneIdx + laneOffset;
+            if (srcIdx  < 0 || srcIdx  >= owner.lanes_.size()) continue;
+            if (destIdx < 0 || destIdx >= owner.lanes_.size()) continue;
+            auto& srcLane  = owner.lanes_.getReference (srcIdx);
+            auto& destLane = owner.lanes_.getReference (destIdx);
+            /* Per-kind sanity: dest must be same kind as source.
+             * Cross-lane wrong-kind drops are screened by
+             * validateCrossLaneMove during drag; this check guards
+             * the race-free message-thread commit. */
+            if (destLane.kind != requiredLaneKindFor (m.kind)) continue;
+            const double newPos = juce::jmax (0.0, m.originalPos + deltaBeats);
+
+            if (m.kind == Gesture::Audio)
+            {
+                const auto* r = srcLane.playlist.findRegion (m.regionId);
+                if (r == nullptr) continue;
+                Region copy        = *r;
+                copy.id            = juce::Uuid();            /* fresh id */
+                copy.positionBeats = newPos;
+                copy.colour        = destLane.colour;
+                const juce::Uuid newId = copy.id;
+                if (destLane.playlist.addRegion (std::move (copy)))
+                    newSelection.add ({ destIdx, newId });
+            }
+            else
+            {
+                const auto* mr = srcLane.playlist.findMidiRegion (m.regionId);
+                if (mr == nullptr) continue;
+                auto clone           = mr->clone();
+                clone->id            = juce::Uuid();          /* fresh id */
+                clone->positionBeats = newPos;
+                clone->colour        = destLane.colour;
+                const juce::Uuid newId  = clone->id;
+                const double     newEnd = newPos + clone->lengthBeats;
+                /* Displace MIDI dest overlaps so the copy lands cleanly
+                 * (matches paste / duplicate semantic from Slice 2). */
+                const auto displaced = destLane.playlist
+                    .displaceMidiRegionsForSpan (newPos, newEnd);
+                if (! displaced.empty())
+                    midiTouched.insert (destIdx);
+                if (destLane.playlist.addMidiRegion (std::move (clone)))
+                {
+                    newSelection.add ({ destIdx, newId });
+                    midiTouched.insert (destIdx);
+                }
+            }
+        }
+        if (! newSelection.isEmpty())
+        {
+            selected_       = newSelection;
+            const auto& back = selected_.getLast();
+            selectedLane_   = back.first;
+            selectedRegion_ = back.second;
+        }
+        juce::ignoreUnused (origAnchorLane);
+        for (int li : midiTouched)
+            owner.publishMidiBindingsForLane (li);
+    }
+
+    //==========================================================================
+    // Marquee (rubber-band) selection helpers.  Started on mouseDown
+    // when the Select tool is active + click hits empty lane area.
+    // mouseDrag updates the rect; mouseUp hit-tests every region on
+    // every lane against the rect + applies the marqueeMode
+    // (Replace / Add / Toggle).  Roadmap Q2 / Zrythm v1
+    // UiOverlayAction::SELECTING.
+    //==========================================================================
+
+    /** Choose marquee mode from modifier state at mouseDown.  Shift =
+     *  Add (union with current selection), Ctrl/Cmd = Toggle (xor),
+     *  no modifier = Replace.  Shift wins over Ctrl when both are
+     *  held (matches GTK + JUCE convention). */
+    Gesture::MarqueeMode marqueeModeFromMods (const juce::ModifierKeys& mods) const noexcept
+    {
+        if (mods.isShiftDown())                          return Gesture::Add;
+        if (mods.isCommandDown() || mods.isCtrlDown())   return Gesture::Toggle;
+        return Gesture::Replace;
+    }
+
+    /** Normalised marquee rect from start/end pixel pairs.  Always
+     *  returns positive width/height regardless of drag direction. */
+    Rectangle<int> currentMarqueeRect() const noexcept
+    {
+        return Rectangle<int>::leftTopRightBottom (
+            juce::jmin (gesture_.marqueeStartXPx, gesture_.marqueeEndXPx),
+            juce::jmin (gesture_.marqueeStartYPx, gesture_.marqueeEndYPx),
+            juce::jmax (gesture_.marqueeStartXPx, gesture_.marqueeEndXPx),
+            juce::jmax (gesture_.marqueeStartYPx, gesture_.marqueeEndYPx));
+    }
+
+    /** Return every (laneIdx, regionId) pair whose painted body rect
+     *  intersects the marquee.  Walks audio + MIDI regions across all
+     *  lanes.  Bounded by the rect's beat range so unrelated lanes
+     *  are skipped cheaply (Y-range filter). */
+    juce::Array<std::pair<int, juce::Uuid>> regionsInMarquee() const
+    {
+        juce::Array<std::pair<int, juce::Uuid>> hits;
+        const auto rect = currentMarqueeRect();
+        if (rect.isEmpty()) return hits;
+
+        const double beatLo = juce::jmax (0.0,
+            (double) (rect.getX()     - kLabelW) / (double) kPxPerBeat);
+        const double beatHi = juce::jmax (0.0,
+            (double) (rect.getRight() - kLabelW) / (double) kPxPerBeat);
+        const int laneLo = juce::jmax (0,
+            (rect.getY()      - kRulerH) / kLaneH);
+        const int laneHi = juce::jmin (owner.lanes_.size() - 1,
+            (rect.getBottom() - kRulerH) / kLaneH);
+
+        for (int li = laneLo; li <= laneHi; ++li)
+        {
+            const auto& l = owner.lanes_.getReference (li);
+            for (const auto& r : l.playlist.regions())
+            {
+                if (r.endBeats()      <= beatLo) continue;
+                if (r.positionBeats   >= beatHi) continue;
+                hits.add ({ li, r.id });
+            }
+            for (const auto& mp : l.playlist.midiRegions())
+            {
+                if (mp == nullptr) continue;
+                const double end = mp->positionBeats + mp->lengthBeats;
+                if (end                <= beatLo) continue;
+                if (mp->positionBeats  >= beatHi) continue;
+                hits.add ({ li, mp->id });
+            }
+        }
+        return hits;
+    }
+
+    /** Apply a marquee selection to selected_ based on marqueeMode.
+     *  - Replace: selected_ = hits.
+     *  - Add:     selected_ unions hits (no duplicates).
+     *  - Toggle:  hits already-selected ones are removed; missing ones
+     *             are added (xor).
+     *  Primary anchor updates to the last hit; if no hits + Replace,
+     *  selection clears (mirrors empty-click). */
+    void applyMarqueeSelection (const juce::Array<std::pair<int, juce::Uuid>>& hits,
+                                Gesture::MarqueeMode mode)
+    {
+        auto containsId = [] (const juce::Array<std::pair<int, juce::Uuid>>& arr,
+                              const std::pair<int, juce::Uuid>& key)
+        {
+            for (const auto& s : arr)
+                if (s.first == key.first && s.second == key.second) return true;
+            return false;
+        };
+
+        if (mode == Gesture::Replace)
+        {
+            selected_.clearQuick();
+            for (const auto& h : hits) selected_.add (h);
+        }
+        else if (mode == Gesture::Add)
+        {
+            for (const auto& h : hits)
+                if (! containsId (selected_, h)) selected_.add (h);
+        }
+        else /* Toggle */
+        {
+            for (const auto& h : hits)
+            {
+                bool removed = false;
+                for (int i = 0; i < selected_.size(); ++i)
+                {
+                    const auto& s = selected_.getReference (i);
+                    if (s.first == h.first && s.second == h.second)
+                    {
+                        selected_.remove (i);
+                        removed = true;
+                        break;
+                    }
+                }
+                if (! removed) selected_.add (h);
+            }
+        }
+
+        if (selected_.isEmpty())
+        {
+            selectedLane_   = -1;
+            selectedRegion_ = juce::Uuid::null();
+        }
+        else
+        {
+            const auto& back = selected_.getLast();
+            selectedLane_   = back.first;
+            selectedRegion_ = back.second;
+        }
+    }
+
+    //==========================================================================
     // Multi-selection helpers.
     //==========================================================================
 
@@ -1756,37 +2814,50 @@ public:
     // Clipboard ops.
     //==========================================================================
 
-    /** Snapshot every selected region into clipboard_.  Anchor =
-     *  earliest (laneIdx, beat) across the selection; offsets are
-     *  stored relative so paste at any (lane, beat) reconstructs the
-     *  spatial structure.  Empty selection -> no-op. */
-    void copySelectionToClipboard()
+    /** Return every region (audio + MIDI, across every lane) whose
+     *  [positionBeats, endBeats) span overlaps [rangeStart_, rangeEnd_).
+     *  Pro Tools / Reaper convention: a region only partially in the
+     *  range is included WHOLE (no trim).  Empty when no range is
+     *  active or it's degenerate. */
+    juce::Array<std::pair<int, juce::Uuid>> regionsIntersectingRange() const
     {
-        if (selected_.isEmpty()) return;
+        juce::Array<std::pair<int, juce::Uuid>> hits;
+        if (! rangeActive_ || rangeEnd_ <= rangeStart_) return hits;
 
-        int anchorLane = INT_MAX;
-        double anchorBeat = std::numeric_limits<double>::infinity();
-        for (const auto& s : selected_)
+        const double lo = rangeStart_;
+        const double hi = rangeEnd_;
+        for (int laneIdx = 0; laneIdx < owner.lanes_.size(); ++laneIdx)
         {
-            if (s.first >= owner.lanes_.size()) continue;
-            auto& l = owner.lanes_.getReference (s.first);
-            if (const auto* r = l.playlist.findRegion (s.second))
+            const auto& l = owner.lanes_.getReference (laneIdx);
+            for (const auto& r : l.playlist.regions())
             {
-                anchorLane = juce::jmin (anchorLane, s.first);
-                anchorBeat = juce::jmin (anchorBeat, r->positionBeats);
+                if (r.endBeats() <= lo || r.positionBeats >= hi) continue;
+                hits.add ({ laneIdx, r.id });
             }
-            else if (const auto* m = l.playlist.findMidiRegion (s.second))
+            for (const auto& mp : l.playlist.midiRegions())
             {
-                anchorLane = juce::jmin (anchorLane, s.first);
-                anchorBeat = juce::jmin (anchorBeat, m->positionBeats);
+                if (mp == nullptr) continue;
+                const double end = mp->positionBeats + mp->lengthBeats;
+                if (end <= lo || mp->positionBeats >= hi) continue;
+                hits.add ({ laneIdx, mp->id });
             }
         }
-        if (anchorLane == INT_MAX) return;
+        return hits;
+    }
 
+    /** Snapshot every region in `source` into clipboard_.  anchorBeat
+     *  is the clipboard's time origin (paste rebuilds positions
+     *  relative to it).  anchorLane is the topmost lane index in the
+     *  source.  Empty source -> no-op. */
+    void copyRegionsToClipboard (const juce::Array<std::pair<int, juce::Uuid>>& source,
+                                 int anchorLane,
+                                 double anchorBeat)
+    {
+        if (source.isEmpty()) return;
         clipboard_.clear();
-        for (const auto& s : selected_)
+        for (const auto& s : source)
         {
-            if (s.first >= owner.lanes_.size()) continue;
+            if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
             auto& l = owner.lanes_.getReference (s.first);
             if (const auto* r = l.playlist.findRegion (s.second))
             {
@@ -1811,16 +2882,62 @@ public:
         }
     }
 
-    /** Cut = copy + delete every selected region.  Touched lanes get
-     *  their MIDI bindings republished after the bulk delete so the
-     *  audio thread drops stale entries before any held NoteOff. */
+    /** Range-priority copy.  When rangeActive_ + non-degenerate, the
+     *  clipboard sources from regions intersecting the range with
+     *  rangeStart_ as the beat anchor.  Otherwise falls back to the
+     *  selected_ set with min-beat anchor (legacy behaviour). */
+    void copySelectionToClipboard()
+    {
+        if (rangeActive_ && rangeEnd_ > rangeStart_)
+        {
+            const auto source = regionsIntersectingRange();
+            if (source.isEmpty()) return;
+            int anchorLane = INT_MAX;
+            for (const auto& s : source) anchorLane = juce::jmin (anchorLane, s.first);
+            if (anchorLane == INT_MAX) return;
+            copyRegionsToClipboard (source, anchorLane, rangeStart_);
+            return;
+        }
+
+        if (selected_.isEmpty()) return;
+        int anchorLane = INT_MAX;
+        double anchorBeat = std::numeric_limits<double>::infinity();
+        for (const auto& s : selected_)
+        {
+            if (s.first >= owner.lanes_.size()) continue;
+            auto& l = owner.lanes_.getReference (s.first);
+            if (const auto* r = l.playlist.findRegion (s.second))
+            {
+                anchorLane = juce::jmin (anchorLane, s.first);
+                anchorBeat = juce::jmin (anchorBeat, r->positionBeats);
+            }
+            else if (const auto* m = l.playlist.findMidiRegion (s.second))
+            {
+                anchorLane = juce::jmin (anchorLane, s.first);
+                anchorBeat = juce::jmin (anchorBeat, m->positionBeats);
+            }
+        }
+        if (anchorLane == INT_MAX) return;
+        copyRegionsToClipboard (selected_, anchorLane, anchorBeat);
+    }
+
+    /** Cut = copy + delete every region in the source set.  Range mode
+     *  uses the range-intersecting set; selection mode uses selected_.
+     *  Touched MIDI lanes get their bindings republished after the
+     *  bulk delete so the audio thread drops stale entries before any
+     *  held NoteOff. */
     void cutSelectionToClipboard()
     {
-        if (selected_.isEmpty()) return;
+        juce::Array<std::pair<int, juce::Uuid>> victims;
+        if (rangeActive_ && rangeEnd_ > rangeStart_)
+            victims = regionsIntersectingRange();
+        else
+            victims = selected_;
+        if (victims.isEmpty()) return;
+
         copySelectionToClipboard();
 
         std::set<int> midiLanesTouched;
-        const auto victims = selected_;        /* iterate a copy */
         for (const auto& s : victims)
         {
             if (s.first < 0 || s.first >= owner.lanes_.size()) continue;
@@ -1879,11 +2996,29 @@ public:
                 clone->id            = juce::Uuid();
                 clone->positionBeats = destBeat;
                 clone->colour        = destLane.colour;
-                const juce::Uuid newId = clone->id;
+                const juce::Uuid newId   = clone->id;
+                const double     newEnd  = destBeat + clone->lengthBeats;
+                /* Ableton/Bitwig parity: paste DISPLACES overlapping
+                 * regions instead of silently dropping the paste.
+                 * displace runs in the same writeLanesToSession scope
+                 * so undo treats it as a single gesture. */
+                const auto displaced = destLane.playlist
+                    .displaceMidiRegionsForSpan (destBeat, newEnd);
+                if (! displaced.empty())
+                    midiLanesTouched.insert (destLaneIdx);
                 if (destLane.playlist.addMidiRegion (std::move (clone)))
                 {
                     newSelection.add ({ destLaneIdx, newId });
                     midiLanesTouched.insert (destLaneIdx);
+                    /* Selected_ may carry now-stale ids that displace
+                     * removed.  Strip them so the new selection only
+                     * contains the freshly-pasted clones. */
+                    for (auto did : displaced)
+                        for (int i = 0; i < selected_.size(); )
+                            if (selected_.getReference (i).second == did)
+                                selected_.remove (i);
+                            else
+                                ++i;
                 }
             }
         }
@@ -1931,7 +3066,15 @@ public:
                 auto clone           = m->clone();
                 clone->id            = juce::Uuid();
                 clone->positionBeats = m->positionBeats + m->lengthBeats;
-                const juce::Uuid newId = clone->id;
+                const juce::Uuid newId  = clone->id;
+                const double     newPos = clone->positionBeats;
+                const double     newEnd = newPos + clone->lengthBeats;
+                /* Same displacement policy as paste -- no silent drop
+                 * when the duplicated span overlaps existing MIDI. */
+                const auto displaced = lane.playlist
+                    .displaceMidiRegionsForSpan (newPos, newEnd);
+                if (! displaced.empty())
+                    midiLanesTouched.insert (s.first);
                 if (lane.playlist.addMidiRegion (std::move (clone)))
                 {
                     newSelection.add ({ s.first, newId });
@@ -2002,6 +3145,26 @@ public:
 
     bool keyPressed (const juce::KeyPress& key) override
     {
+        /* Numpad 1-9 -- jump to marker N (1-indexed against the
+         * position-sorted marker list).  Handled before the modifier
+         * branches so an unmodified numpad press works the way DAW
+         * users expect.  Numpad 0 left free for a future "next/prev"
+         * pair or zoom-to-fit shortcut. */
+        for (int i = 1; i <= 9; ++i)
+        {
+            const int numPad = juce::KeyPress::numberPad0 + i;
+            if (key.getKeyCode() == numPad)
+            {
+                if (const auto* m = owner.markerTrack_.markerAt ((std::size_t) (i - 1)))
+                {
+                    owner.seekToBeat (m->positionBeats);
+                    repaint();
+                    return true;
+                }
+                return false;
+            }
+        }
+
         /* Ctrl/Cmd shortcuts -- handled before the legacy Delete /
          * zoom branches so the modifier-bearing keys don't fall
          * through to a parent's command dispatcher. */
@@ -2190,6 +3353,120 @@ public:
     //==========================================================================
     // Layout helpers
 
+    /** Beat at which the live recording placeholder currently ends.
+     *  Used by resizeForLanes + body_resizeNeeded so the body width
+     *  grows in real time as the playhead extends past the previous
+     *  edge -- otherwise the ruler / placeholder freeze at the old
+     *  size until the AudioClipNode commit hands back a finalised
+     *  Region.  Returns 0.0 unless transport is recording AND at
+     *  least one audio lane is armed. */
+    double liveRecordingEnd() const noexcept
+    {
+        if (owner.monitor_ == nullptr) return 0.0;
+        if (! owner.monitor_->recording.get()) return 0.0;
+        bool anyArmed = false;
+        for (int i = 0; i < owner.lanes_.size(); ++i)
+        {
+            if (i >= owner.laneRuntime_.size()) break;
+            const auto& l  = owner.lanes_.getReference (i);
+            const auto& rs = owner.laneRuntime_.getReference (i);
+            if (rs.isAudioLane() && l.armed) { anyArmed = true; break; }
+        }
+        if (! anyArmed) return 0.0;
+        return juce::jmax (0.0, owner.lastBeat_);
+    }
+
+    /** Snap a target beat to the configured grid, optionally with
+     *  trigger snap (region edges) + keep-offset (preserve the
+     *  anchor's fractional offset within the grid division).
+     *
+     *  @param target    Raw target beat (post-delta for Move, raw
+     *                   cursor beat for Resize).
+     *  @param anchorBeat Reference for keep-offset semantics -- the
+     *                   ORIGINAL beat position of the edge being
+     *                   moved (Move = originalPos; RightEdge resize
+     *                   = originalPos + originalLen; LeftEdge resize
+     *                   = originalPos).  Ignored when keep-offset
+     *                   is off.
+     *  @param excludeIds Region ids to skip during trigger-snap so a
+     *                   drag doesn't snap to its own edges.
+     *  @returns Snapped beat (non-negative); raw target when snap is
+     *           disabled OR division <= 0.
+     *
+     *  Roadmap Q3 / mirrors Zrythm SnapGrid.snap. */
+    double snapBeat (double target,
+                     double anchorBeat = 0.0,
+                     const juce::Array<juce::Uuid>& excludeIds = {}) const
+    {
+        if (! owner.snapEnabled_ || owner.snapDivision_ <= 0.0)
+            return juce::jmax (0.0, target);
+
+        const double div = owner.snapDivision_;
+
+        /* Grid candidate.  KeepOffset preserves the anchor's
+         * fractional remainder within the grid division so an off-grid
+         * region stays off-grid after snap (nudges in step). */
+        double gridCand = 0.0;
+        if (owner.snapKeepOffset_)
+        {
+            const double offset = anchorBeat - std::floor (anchorBeat / div) * div;
+            gridCand = std::round ((target - offset) / div) * div + offset;
+        }
+        else
+        {
+            gridCand = std::round (target / div) * div;
+        }
+        gridCand = juce::jmax (0.0, gridCand);
+
+        if (! owner.snapToEvents_)
+            return gridCand;
+
+        /* Trigger-snap candidate: nearest region edge within +/- div
+         * of the raw target.  Exclude any dragged-region ids so a
+         * drag doesn't snap to its own current edge. */
+        const double radius = div;
+        double bestEvent = 0.0;
+        double bestEventDist = radius + 1.0;
+
+        auto consider = [&] (double cand)
+        {
+            const double d = std::abs (cand - target);
+            if (d < bestEventDist)
+            {
+                bestEventDist = d;
+                bestEvent     = juce::jmax (0.0, cand);
+            }
+        };
+
+        auto excluded = [&] (juce::Uuid id) -> bool
+        {
+            for (const auto& x : excludeIds)
+                if (x == id) return true;
+            return false;
+        };
+
+        for (const auto& l : owner.lanes_)
+        {
+            for (const auto& r : l.playlist.regions())
+            {
+                if (excluded (r.id)) continue;
+                consider (r.positionBeats);
+                consider (r.endBeats());
+            }
+            for (const auto& mp : l.playlist.midiRegions())
+            {
+                if (mp == nullptr) continue;
+                if (excluded (mp->id)) continue;
+                consider (mp->positionBeats);
+                consider (mp->positionBeats + mp->lengthBeats);
+            }
+        }
+
+        /* Pick the closer of grid vs event. */
+        const double gridDist = std::abs (gridCand - target);
+        return (bestEventDist < gridDist) ? bestEvent : gridCand;
+    }
+
     void resizeForLanes()
     {
         /* Floor + per-lane padding tuned to keep the strip flush with
@@ -2216,8 +3493,23 @@ public:
             const int needed = (int) end + kFitPaddingBeats;
             if (needed > maxBeats) maxBeats = needed;
         }
+        /* Live recording end overrides the static region scan -- the
+         * placeholder grows past the last committed region. */
+        const double recEnd = liveRecordingEnd();
+        if (recEnd > 0.0)
+        {
+            const int recNeeded = (int) recEnd + kFitPaddingBeats;
+            if (recNeeded > maxBeats) maxBeats = recNeeded;
+        }
         const int w = kLabelW + maxBeats * kPxPerBeat;
-        const int h = kRulerH + juce::jmax (kLaneH, owner.lanes_.size() * kLaneH);
+        /* Sticky ruler reserves an extra kRulerH at the bottom so the
+         * user can scroll the last lane fully into view without the
+         * sticky overlay clipping its top.  Without this padding, the
+         * lane at the very bottom never reaches a position where its
+         * top edge is below the sticky ruler band. */
+        const int h = kRulerH
+                       + juce::jmax (kLaneH, owner.lanes_.size() * kLaneH)
+                       + kRulerH;
         if (w != getWidth() || h != getHeight())
             setSize (w, h);
         else
@@ -2281,14 +3573,21 @@ public:
     static constexpr int kThumbnailCacheEntries    = 256;
 
 private:
-    /** Paint the bars:beats ruler row at the top of the strip area.
+    /** Paint the bars:beats ruler row.  rulerY is the body-coord Y
+     *  origin -- the caller passes viewport_.getViewPositionY() so the
+     *  ruler always lands at the visible top of the body, regardless
+     *  of vertical scroll.  Lane content under [rulerY, rulerY+kRulerH]
+     *  is occluded by the LCD strip; the body height reserves an
+     *  extra kRulerH bottom margin so the last lane can still be
+     *  scrolled fully into view.
+     *
      *  LCD-style faceplate matching TransportBar + MainDisplayPanel
      *  (matte-black bezel + cool-grey vertical gradient inside), bar
      *  numbers + ticks in LCD digit blue so the ruler reads as a
      *  hardware-style display flush with the transport cluster.  Bar
      *  count derives from the session's beatsPerBar (default 4 in
      *  4/4). */
-    void paintRuler (Graphics& g)
+    void paintRuler (Graphics& g, int rulerY)
     {
         /* LCD palette: matches the digit blue used in MainDisplayPanel
          * (content.cpp BPM / POS displays) so the ruler + transport
@@ -2303,7 +3602,7 @@ private:
         const juce::Colour kLcdBlueMid  { 0xff'6f'b0'e0 };  // beat tick -- mid
         const juce::Colour kLcdBlueDim  { 0xff'4a'7c'a0 };  // sub-beat tick -- dim
 
-        const Rectangle<int> rulerArea (0, 0, getWidth(), kRulerH);
+        const Rectangle<int> rulerArea (0, rulerY, getWidth(), kRulerH);
 
         /* Outer matte-black bezel, then cool-grey vertical gradient
          * inset by 2 px so the bezel band is visible top + bottom.
@@ -2324,13 +3623,13 @@ private:
 
         /* Hairline below the ruler against the lane bodies. */
         g.setColour (kBezelEdge);
-        g.drawHorizontalLine (kRulerH - 1, 0.0f, (float) getWidth());
+        g.drawHorizontalLine (rulerY + kRulerH - 1, 0.0f, (float) getWidth());
 
         /* Label column header: "Bars:Beats" in LCD blue. */
         g.setColour (kLcdBlue);
         g.setFont (monoFont (10.0f, juce::Font::bold));
         g.drawText ("Bars:Beats",
-                    Rectangle<int> (6, 0, kLabelW - 12, kRulerH),
+                    Rectangle<int> (6, rulerY, kLabelW - 12, kRulerH),
                     juce::Justification::centredLeft, true);
 
         /* Determine beats per bar from the session monitor; fall back
@@ -2390,30 +3689,147 @@ private:
              *   sub  -> short stub at bottom, dim LCD blue */
             int tickTop;
             juce::Colour tickCol;
-            if (atBar)        { tickTop = 3;            tickCol = kLcdBlue;    }
-            else if (atBeat)  { tickTop = kRulerH - 12; tickCol = kLcdBlueMid; }
-            else              { tickTop = kRulerH - 6;  tickCol = kLcdBlueDim; }
+            if (atBar)        { tickTop = rulerY + 3;            tickCol = kLcdBlue;    }
+            else if (atBeat)  { tickTop = rulerY + kRulerH - 12; tickCol = kLcdBlueMid; }
+            else              { tickTop = rulerY + kRulerH - 6;  tickCol = kLcdBlueDim; }
 
             g.setColour (tickCol);
-            g.drawVerticalLine (x, (float) tickTop, (float) (kRulerH - 2));
+            g.drawVerticalLine (x, (float) tickTop, (float) (rulerY + kRulerH - 2));
 
             if (atBar)
             {
                 const int barNum = beat / beatsPerBar + 1;
                 g.setColour (kLcdBlue);
                 g.drawText (juce::String (barNum),
-                            x + 3, 1, 28, kRulerH - 4,
+                            x + 3, rulerY + 1, 28, kRulerH - 4,
                             juce::Justification::topLeft);
             }
         }
+
+        /* Range overlay band + LOOP badge -- painted inside the ruler
+         * so it tracks the sticky vertical scroll instead of staying
+         * fixed at body.y=0 (which would scroll off with the lanes). */
+        if (rangeActive_ && rangeEnd_ > rangeStart_)
+        {
+            const int rxs = kLabelW + (int) (rangeStart_ * kPxPerBeat);
+            const int rxe = kLabelW + (int) (rangeEnd_   * kPxPerBeat);
+            const int rw  = juce::jmax (1, rxe - rxs);
+            g.setColour (loopActive_
+                            ? juce::Colour::fromRGBA (90, 200, 110, 130)
+                            : juce::Colour::fromRGBA (140, 170, 210, 100));
+            g.fillRect (rxs, rulerY, rw, kRulerH);
+            if (loopActive_)
+            {
+                g.setColour (juce::Colours::black);
+                g.setFont (monoFont (9.0f, juce::Font::bold));
+                g.drawText ("LOOP", rxs + 4, rulerY + 2,
+                            juce::jmin (40, rw - 8), kRulerH - 4,
+                            juce::Justification::centredLeft, false);
+            }
+        }
+
+        /* Marker triangles + names on the ruler.  Painted between the
+         * range band and the playhead so the playhead's vertical line
+         * stays on top.  Triangle sits in the LOWER half of the ruler
+         * (where the beat ticks are), 6 px wide pointing down; the
+         * name (if any) prints to the right of the triangle in the
+         * remaining ruler space, clipped to ~6 chars to avoid clutter. */
+        paintMarkersOnRuler (g, rulerY);
 
         /* Playhead overlay on the ruler. */
         const int phx = stripX + (int) (owner.lastBeat_ * kPxPerBeat);
         if (phx >= stripX && phx < getWidth())
         {
             g.setColour (Colours::limegreen);
-            g.drawVerticalLine (phx, 0.0f, (float) kRulerH);
+            g.drawVerticalLine (phx, (float) rulerY, (float) (rulerY + kRulerH));
         }
+    }
+
+    /** Marker triangle on the ruler row.  Called from paintRuler so the
+     *  triangles stick to the visible top during vertical scroll. */
+    void paintMarkersOnRuler (juce::Graphics& g, int rulerY)
+    {
+        const auto& markers = owner.markerTrack_.markers();
+        if (markers.empty()) return;
+
+        const auto clip = g.getClipBounds();
+        const int rulerLeft  = clip.getX();
+        const int rulerRight = clip.getRight();
+
+        g.setFont (monoFont (9.0f, juce::Font::bold));
+        for (const auto& m : markers)
+        {
+            const int mx = kLabelW + (int) (m.positionBeats * kPxPerBeat);
+            if (mx < rulerLeft - 64 || mx > rulerRight + 8) continue;
+            if (mx < kLabelW) continue;
+
+            /* Triangle 6 px wide, 7 px tall, base at rulerY+2, apex
+             * pointing DOWN to rulerY+9 -- sits over the bar-tick zone
+             * without obscuring the LCD bar-number text. */
+            juce::Path tri;
+            tri.startNewSubPath ((float) (mx - 3), (float) (rulerY + 2));
+            tri.lineTo          ((float) (mx + 3), (float) (rulerY + 2));
+            tri.lineTo          ((float) mx,       (float) (rulerY + 9));
+            tri.closeSubPath();
+            g.setColour (m.colour);
+            g.fillPath (tri);
+            g.setColour (m.colour.darker (0.4f));
+            g.strokePath (tri, juce::PathStrokeType (1.0f));
+
+            if (m.name.isNotEmpty())
+            {
+                g.setColour (m.colour.brighter (0.2f));
+                g.drawText (m.name,
+                            mx + 5, rulerY + 1, 60, kRulerH - 4,
+                            juce::Justification::topLeft, true);
+            }
+        }
+    }
+
+    /** Vertical hairline through the lane area at each marker's X.
+     *  Called from Body::paint after the lanes + range overlay but
+     *  before the ghost / marquee / sticky ruler so drag overlays read
+     *  on top of decorations. */
+    void paintMarkerHairlines (juce::Graphics& g)
+    {
+        const auto& markers = owner.markerTrack_.markers();
+        if (markers.empty()) return;
+
+        const int laneCount = owner.lanes_.size();
+        const int yTop      = kRulerH;
+        const int yBot      = kRulerH + juce::jmax (1, laneCount) * kLaneH;
+
+        const auto clip = g.getClipBounds();
+        if (clip.getBottom() <= yTop) return;
+
+        for (const auto& m : markers)
+        {
+            const int mx = kLabelW + (int) (m.positionBeats * kPxPerBeat);
+            if (mx < clip.getX() - 1 || mx > clip.getRight() + 1) continue;
+            if (mx < kLabelW) continue;
+            g.setColour (m.colour.withAlpha (0.35f));
+            g.drawVerticalLine (mx, (float) yTop, (float) yBot);
+        }
+    }
+
+    /** Hit-test the ruler band against the marker triangles.  Returns
+     *  the marker id under (x, y) in BODY coordinates, or null if none.
+     *  Used by ruler right-click to open the per-marker menu (rename /
+     *  colour / delete). */
+    juce::Uuid markerAtRulerPx (int x, int y) const noexcept
+    {
+        const int rulerY = owner.viewport_.getViewPositionY();
+        if (y < rulerY || y >= rulerY + kRulerH) return {};
+        const auto& markers = owner.markerTrack_.markers();
+        /* Triangle hit zone: +/- 5 px around the X; full ruler height
+         * so the entire triangle column is clickable. */
+        for (const auto& m : markers)
+        {
+            const int mx = kLabelW + (int) (m.positionBeats * kPxPerBeat);
+            if (mx < kLabelW) continue;
+            if (std::abs (x - mx) <= 5) return m.id;
+        }
+        return {};
     }
 
     /** ARM / MUTE / SOLO button stack lives on the right side of
@@ -3349,9 +4765,13 @@ private:
         }
     }
 
+public:
     /** Returns true if the body's current size doesn't fit the
      *  current lane content extent (e.g. resize pushed a region past
-     *  the existing total width).  resizeForLanes() recomputes. */
+     *  the existing total width, or live recording grew past it).
+     *  resizeForLanes() recomputes.  Public so ArrangementView's
+     *  timerCallback can gate its growth check on this without
+     *  forcing a full body repaint on every 30 Hz tick. */
     bool body_resizeNeeded() const noexcept
     {
         double maxEnd = 0.0;
@@ -3363,11 +4783,15 @@ private:
                 if (m != nullptr)
                     maxEnd = juce::jmax (maxEnd, m->positionBeats + m->lengthBeats);
         }
-        const int needW = kLabelW + ((int) maxEnd + 8) * kPxPerBeat;
-        const int needH = juce::jmax (kLaneH, owner.lanes_.size() * kLaneH);
+        maxEnd = juce::jmax (maxEnd, liveRecordingEnd());
+        const int needW = kLabelW + ((int) maxEnd + kFitPaddingBeats) * kPxPerBeat;
+        const int needH = kRulerH
+                           + juce::jmax (kLaneH, owner.lanes_.size() * kLaneH)
+                           + kRulerH;
         return needW != getWidth() || needH != getHeight();
     }
 
+private:
     /** Lookup or lazily-create the juce::AudioThumbnail for the given
      *  AudioFileSource uuid.  Returns nullptr if the source isn't
      *  registered (region might point at a missing source, e.g.
@@ -3439,22 +4863,6 @@ private:
     };
     std::vector<ClipboardEntry> clipboard_;
 
-    /* Active gesture (move / resize) -- valid between mouseDown and
-     * mouseUp.  laneIdx < 0 means no gesture. */
-    struct Gesture {
-        enum Mode { Move, Resize };
-        enum Kind { Audio, Midi };
-        int        laneIdx         = -1;
-        juce::Uuid regionId;
-        double     originalPos     = 0.0;
-        double     originalLen     = 0.0;
-        double     mouseDownXBeats = 0.0;
-        Mode       mode            = Move;
-        Kind       kind            = Audio;
-        bool       dragActive      = false;
-    };
-    Gesture gesture_;
-
     /** Live drag of an envelope breakpoint.  Set in mouseDown when
      *  the cursor lands on a breakpoint dot; updated in mouseDrag;
      *  cleared in mouseUp.  Decoupled from the region-Gesture so a
@@ -3516,6 +4924,29 @@ private:
 
 /* ===================================================================== */
 
+/* Sticky-ruler scroll follow.  PersistingViewport's visibleAreaChanged
+ * lives here (out of the inline hpp body) so it can repaint the body's
+ * old + new ruler strips by referencing Body::kRulerH directly.  Each
+ * vertical-scroll event invalidates two narrow body regions: the body-
+ * coord row where the LCD strip used to sit (so the lane underneath
+ * paints back through) and the new row (so the LCD strip paints over
+ * the freshly-revealed lane content).  Horizontal-only scrolls bypass
+ * this entirely. */
+void ArrangementView::PersistingViewport::visibleAreaChanged (const juce::Rectangle<int>& newVisibleArea)
+{
+    if (owner.body_ == nullptr) return;
+    owner.writeViewStateToSession();
+    const int newY = newVisibleArea.getY();
+    if (newY != lastScrollY_)
+    {
+        const int w = owner.body_->getWidth();
+        const int h = ArrangementView::Body::kRulerH;
+        owner.body_->repaint (0, lastScrollY_, w, h);
+        owner.body_->repaint (0, newY,         w, h);
+        lastScrollY_ = newY;
+    }
+}
+
 ArrangementView::ArrangementView()
 {
     setName (EL_VIEW_ARRANGEMENT);
@@ -3532,6 +4963,8 @@ ArrangementView::ArrangementView()
     addAndMakeVisible (loopBtn_);
     addAndMakeVisible (snapBtn_);
     addAndMakeVisible (snapBox_);
+    addAndMakeVisible (snapEventsBtn_);
+    addAndMakeVisible (snapOffsetBtn_);
     addAndMakeVisible (zoomOutBtn_);
     addAndMakeVisible (zoomInBtn_);
     addAndMakeVisible (zoomFitBtn_);
@@ -3556,25 +4989,57 @@ ArrangementView::ArrangementView()
         snapBox_.setEnabled (snapEnabled_);
     };
 
-    snapBox_.addItem ("1/16",  1);
-    snapBox_.addItem ("1/8",   2);
-    snapBox_.addItem ("1/4",   3);
-    snapBox_.addItem ("Beat",  4);
-    snapBox_.addItem ("1/2",   5);
-    snapBox_.addItem ("Bar",   6);
+    /* Snap divisions.  Triplet entries use exact fractions (1/3, 2/3,
+     * 1/6 of a beat) -- piano-roll uses the same lookup so the two
+     * pickers stay consistent.  Dotted entries are 1.5x their parent
+     * note value.  Ids are stable across versions so persisted picks
+     * survive future additions. */
+    snapBox_.addItem ("1/32",   7);
+    snapBox_.addItem ("1/16",   1);
+    snapBox_.addItem ("1/16d",  8);
+    snapBox_.addItem ("1/16T",  9);
+    snapBox_.addItem ("1/8",    2);
+    snapBox_.addItem ("1/8d",  10);
+    snapBox_.addItem ("1/8T",  11);
+    snapBox_.addItem ("1/4",    3);
+    snapBox_.addItem ("1/4T",  12);
+    snapBox_.addItem ("Beat",   4);
+    snapBox_.addItem ("1/2",    5);
+    snapBox_.addItem ("Bar",    6);
     snapBox_.setSelectedId (4, juce::dontSendNotification);   // Beat default
     snapBox_.onChange = [this]()
     {
         switch (snapBox_.getSelectedId())
         {
-            case 1: snapDivision_ = 0.25; break;
-            case 2: snapDivision_ = 0.5;  break;
-            case 3: snapDivision_ = 1.0;  break;
-            case 4: snapDivision_ = 1.0;  break;
-            case 5: snapDivision_ = 2.0;  break;
-            case 6: snapDivision_ = 4.0;  break;
+            case 7:  snapDivision_ = 0.125;            break;   // 1/32
+            case 1:  snapDivision_ = 0.25;             break;   // 1/16
+            case 8:  snapDivision_ = 0.375;            break;   // 1/16 dotted
+            case 9:  snapDivision_ = 1.0 / 6.0;        break;   // 1/16 triplet
+            case 2:  snapDivision_ = 0.5;              break;   // 1/8
+            case 10: snapDivision_ = 0.75;             break;   // 1/8 dotted
+            case 11: snapDivision_ = 1.0 / 3.0;        break;   // 1/8 triplet
+            case 3:  snapDivision_ = 1.0;              break;   // 1/4
+            case 12: snapDivision_ = 2.0 / 3.0;        break;   // 1/4 triplet
+            case 4:  snapDivision_ = 1.0;              break;   // Beat (alias)
+            case 5:  snapDivision_ = 2.0;              break;   // 1/2
+            case 6:  snapDivision_ = 4.0;              break;   // Bar (4/4)
             default: break;
         }
+    };
+
+    snapEventsBtn_.setClickingTogglesState (true);
+    snapEventsBtn_.setToggleState (snapToEvents_, juce::dontSendNotification);
+    snapEventsBtn_.setTooltip ("Snap to nearby region edges (trigger snap)");
+    snapEventsBtn_.onClick = [this]()
+    {
+        snapToEvents_ = snapEventsBtn_.getToggleState();
+    };
+    snapOffsetBtn_.setClickingTogglesState (true);
+    snapOffsetBtn_.setToggleState (snapKeepOffset_, juce::dontSendNotification);
+    snapOffsetBtn_.setTooltip ("Keep original offset within snap division");
+    snapOffsetBtn_.onClick = [this]()
+    {
+        snapKeepOffset_ = snapOffsetBtn_.getToggleState();
     };
 
     body_ = std::make_unique<Body> (*this);
@@ -3615,6 +5080,8 @@ ArrangementView::ArrangementView()
     toolAuditionBtn_.setActiveTint (kActiveTint);
     loopBtn_        .setActiveTint (kActiveTint);
     snapBtn_        .setActiveTint (kActiveTint);
+    snapEventsBtn_  .setActiveTint (kActiveTint);
+    snapOffsetBtn_  .setActiveTint (kActiveTint);
 
     /* Tool icons (vector paths, foreground-coloured so they pop in
      * both active + idle states).  Drawn in a square chunk on the
@@ -3910,7 +5377,9 @@ void ArrangementView::resized()
     loopBtn_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (12);
 
     snapBtn_        .setBounds (top.removeFromLeft (52)); top.removeFromLeft (4);
-    snapBox_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (12);
+    snapBox_        .setBounds (top.removeFromLeft (64)); top.removeFromLeft (4);
+    snapEventsBtn_  .setBounds (top.removeFromLeft (40)); top.removeFromLeft (2);
+    snapOffsetBtn_  .setBounds (top.removeFromLeft (40)); top.removeFromLeft (12);
 
     /* Zoom cluster -- LCD-framed group of three buttons.  Inner
      * geometry: [ -  +  Fit ] with 2 px between buttons + 4 px
@@ -4504,6 +5973,7 @@ void ArrangementView::rescanLaneTargets()
 void ArrangementView::loadLanesFromSession()
 {
     lanes_.clearQuick();
+    markerTrack_.clear();
     if (services_ == nullptr) return;
     auto sess = services_->context().session();
     if (sess == nullptr) return;
@@ -4511,14 +5981,22 @@ void ArrangementView::loadLanesFromSession()
     auto tree = sess->data().getChildWithName (tags::arrangement);
     if (! tree.isValid()) return;
     auto lanesTree = tree.getChildWithName ("lanes");
-    if (! lanesTree.isValid()) return;
-
-    for (int i = 0; i < lanesTree.getNumChildren(); ++i)
+    if (lanesTree.isValid())
     {
-        const auto laneTree = lanesTree.getChild (i);
-        if (laneTree.getType() != juce::Identifier ("lane")) continue;
-        lanes_.add (Lane::fromValueTree (laneTree));
+        for (int i = 0; i < lanesTree.getNumChildren(); ++i)
+        {
+            const auto laneTree = lanesTree.getChild (i);
+            if (laneTree.getType() != juce::Identifier ("lane")) continue;
+            lanes_.add (Lane::fromValueTree (laneTree));
+        }
     }
+
+    /* Markers sit beside <lanes> under <arrangement>.  Older sessions
+     * predating Q6 simply have no <markers> child; loadFromValueTree
+     * leaves the in-memory list empty in that case. */
+    auto markersTree = tree.getChildWithName ("markers");
+    if (markersTree.isValid())
+        markerTrack_.loadFromValueTree (markersTree);
 }
 
 /* Undoable snapshot action for ArrangementView mutations.  Stored
@@ -4601,6 +6079,8 @@ void ArrangementView::writeLanesToSession()
     lanesTree.removeAllChildren (nullptr);
     for (const auto& l : lanes_)
         lanesTree.appendChild (l.toValueTree(), nullptr);
+
+    writeMarkersToSessionTree (tree);
 }
 
 void ArrangementView::flushLanesToSession()
@@ -4622,7 +6102,38 @@ void ArrangementView::flushLanesToSession()
     for (const auto& l : lanes_)
         lanesTree.appendChild (l.toValueTree(), nullptr);
 
+    writeMarkersToSessionTree (tree);
+
     lastCommittedSnapshot_ = lanes_;
+}
+
+void ArrangementView::writeMarkersToSessionTree (juce::ValueTree& arrTree)
+{
+    /* Mirror the lanes-tree shape: clear + rebuild the <markers>
+     * child every write so deletions / renames flush cleanly.  Marker
+     * mutations themselves (add/rename/recolour/delete) go through
+     * writeMarkersOnly so a marker edit doesn't accidentally push an
+     * ArrangementSnapshotAction for the unchanged lanes_. */
+    for (int i = arrTree.getNumChildren() - 1; i >= 0; --i)
+    {
+        const auto child = arrTree.getChild (i);
+        if (child.hasType (juce::Identifier ("markers")))
+            arrTree.removeChild (i, nullptr);
+    }
+    if (! markerTrack_.markers().empty())
+        arrTree.appendChild (markerTrack_.toValueTree(), nullptr);
+}
+
+void ArrangementView::writeMarkersOnly()
+{
+    /* Marker mutations skip the lanes_ undo snapshot.  Markers ride
+     * outside the per-action undo system for v1 -- they're cheap to
+     * recreate manually and not in the hot lane-edit loop. */
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
+    writeMarkersToSessionTree (tree);
 }
 
 void ArrangementView::applyLaneSnapshot (const juce::Array<Lane>& snap)
@@ -5231,6 +6742,7 @@ void ArrangementView::publishMidiBindingsForLane (int laneIdx)
         e.region        = mp.get();
         e.positionBeats = mp->positionBeats;
         e.lengthBeats   = mp->lengthBeats;
+        e.startBeats    = mp->startBeats;
         e.looped        = mp->looped;
         entries.push_back (e);
     }
@@ -5388,6 +6900,15 @@ void ArrangementView::timerCallback()
     {
         if (body_ != nullptr)
         {
+            /* Grow the body when the live recording crosses the
+             * current right edge so the ruler + placeholder keep
+             * drawing past the previous extent.  Without this, the
+             * timeline freezes at the last-region width and the
+             * placeholder gets clipped until commit on stop.
+             * body_resizeNeeded gates the call so non-growth ticks
+             * (30 Hz) don't trigger a full-body repaint. */
+            if (recording && body_->body_resizeNeeded())
+                body_->resizeForLanes();
             for (int i = 0; i < lanes_.size(); ++i)
             {
                 const auto& l = lanes_.getReference (i);

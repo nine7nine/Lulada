@@ -59,8 +59,49 @@ BOOST_AUTO_TEST_CASE (default_fields_match_documented_defaults)
     MidiNoteRegion r;
     BOOST_CHECK_EQUAL (r.positionBeats, 0.0);
     BOOST_CHECK_EQUAL (r.lengthBeats,   0.0);
+    BOOST_CHECK_EQUAL (r.startBeats,    0.0);
     BOOST_CHECK (! r.looped);
     BOOST_CHECK (r.sourceId.isNull());
+}
+
+BOOST_AUTO_TEST_CASE (start_beats_round_trips_through_value_tree)
+{
+    MidiNoteRegion r;
+    r.id            = juce::Uuid();
+    r.positionBeats = 4.0;
+    r.lengthBeats   = 2.0;
+    r.startBeats    = 0.75;
+    r.setNotes ({ makeNote (60, 0.0), makeNote (62, 1.0), makeNote (64, 1.5) });
+
+    const auto vt = r.toValueTree();
+    auto restored = MidiNoteRegion::fromValueTree (vt);
+    BOOST_REQUIRE (restored != nullptr);
+    BOOST_CHECK_EQUAL (restored->startBeats,    0.75);
+    BOOST_CHECK_EQUAL (restored->positionBeats, 4.0);
+    BOOST_CHECK_EQUAL (restored->lengthBeats,   2.0);
+    BOOST_CHECK_EQUAL (restored->noteCount(),   (size_t) 3);
+}
+
+BOOST_AUTO_TEST_CASE (start_beats_omitted_when_zero)
+{
+    /* Sparse-write contract: default startBeats stays out of the
+     * serialised tree so older sessions and freshly authored regions
+     * don't bloat. */
+    MidiNoteRegion r;
+    r.id            = juce::Uuid();
+    r.positionBeats = 1.0;
+    r.lengthBeats   = 1.0;
+    const auto vt = r.toValueTree();
+    BOOST_CHECK (! vt.hasProperty (juce::Identifier ("start")));
+}
+
+BOOST_AUTO_TEST_CASE (clone_propagates_start_beats)
+{
+    MidiNoteRegion r;
+    r.startBeats = 1.25;
+    auto c = r.clone();
+    BOOST_REQUIRE (c != nullptr);
+    BOOST_CHECK_EQUAL (c->startBeats, 1.25);
 }
 
 /* ---------- setNotes ---------- */
