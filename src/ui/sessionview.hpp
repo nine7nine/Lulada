@@ -156,7 +156,13 @@ private:
      * soloed, every non-soloed column is muted regardless of user
      * intent; when no solo is active, mute follows user intent. */
     void applyMuteAndSoloState();
-    void transitionClip (SessionClip&, double targetBeat);  // internal, shared by bang*
+    /* sceneLaunch=true: force-start semantic used by bangScene.  An
+     * already-Playing clip stays playing (no toggle-stop), a Stopped
+     * clip launches, a WaitingToStop is reverted to Playing, a
+     * WaitingToStart is left queued.  sceneLaunch=false (default):
+     * toggle semantic used by bangClip's single-click flow -- pressing
+     * a playing clip stops it. */
+    void transitionClip (SessionClip&, double targetBeat, bool sceneLaunch = false);
     void applyFollowAction (SessionClip&);
     void addClipAt  (int sceneRow, int columnIdx);  // creates new vht sequence
     void deleteClip (SessionClip&);

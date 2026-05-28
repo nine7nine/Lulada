@@ -1631,7 +1631,7 @@ double SessionView::computeTargetBeat (double curBeat, LaunchQuant q) const
     return std::ceil ((curBeat + kEps) / qb) * qb;
 }
 
-void SessionView::transitionClip (SessionClip& clip, double targetBeat)
+void SessionView::transitionClip (SessionClip& clip, double targetBeat, bool sceneLaunch)
 {
     auto* trk = lookupTracker (clip.trackerNodeId);
     if (trk == nullptr || clip.sequenceIdx < 0) return;
@@ -1646,14 +1646,20 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
 
     const LiveState cur = clip.state.load (std::memory_order_relaxed);
 
-    /* === Cancel rules: re-banging a queued clip un-queues it. */
+    /* WaitingToStart: queued for launch.
+     *   - sceneLaunch: already going to be on; leave alone.
+     *   - single click: cancel the queued launch (toggle semantic). */
     if (cur == LiveState::WaitingToStart)
     {
+        if (sceneLaunch) return;
         trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
         clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
         repaint (cellBounds (clip.sceneRow, clip.columnIdx));
         return;
     }
+
+    /* WaitingToStop: queued for stop.  Both scene launch and single
+     * click want it to stay playing -- cancel the queued stop. */
     if (cur == LiveState::WaitingToStop)
     {
         trk->schedulePlaying (clip.sequenceIdx, -1.0, true);
@@ -1661,6 +1667,13 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
         repaint (cellBounds (clip.sceneRow, clip.columnIdx));
         return;
     }
+
+    /* Playing -> sceneLaunch leaves it playing (force-start semantic);
+     * single click toggles it off (toggle semantic).  This is the
+     * core fix for the "scene master stops already-playing clips on
+     * other columns" bug -- mutual exclusion must be column-local,
+     * never cross-column. */
+    if (sceneLaunch && cur == LiveState::Playing) return;
 
     const bool wantPlaying = (cur != LiveState::Playing);
 
@@ -1863,7 +1876,10 @@ void SessionView::bangScene (int sceneRow)
     {
         if (auto* newClip = findClip (sceneRow, col))
         {
-            transitionClip (*newClip, targetBeat);
+            /* sceneLaunch=true: force-start semantic.  An already-
+             * Playing clip in this scene stays playing -- without
+             * this gate the toggle semantic would stop it. */
+            transitionClip (*newClip, targetBeat, true);
             continue;
         }
 
