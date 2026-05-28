@@ -295,6 +295,14 @@ private:
      *  of any note. */
     std::uint64_t hitTestResizeHandle (int x, int y, const MidiNoteRegion& region) const noexcept;
 
+    /** Extended hit-test that also reports which edge was hit.  Right
+     *  edge is the default (matches the legacy one-arg shape); left
+     *  edge becomes the resize anchor on tiny / sparse drags.  Used
+     *  by mouseDown to pick between NoteDragResize and
+     *  NoteDragResizeLeft. */
+    std::uint64_t hitTestResizeHandleEx (int x, int y, const MidiNoteRegion& region,
+                                          bool& outLeftEdge) const noexcept;
+
     /** Compute the visible viewport rectangle in this grid's local
      *  coords.  Drives virtualization for the paint loop. */
     juce::Rectangle<int> visibleRect() const noexcept;

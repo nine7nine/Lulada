@@ -732,6 +732,15 @@ std::uint64_t PianoRollGrid::hitTestNote (int x, int y,
 std::uint64_t PianoRollGrid::hitTestResizeHandle (int x, int y,
                                                     const MidiNoteRegion& region) const noexcept
 {
+    bool dummy = false;
+    return hitTestResizeHandleEx (x, y, region, dummy);
+}
+
+std::uint64_t PianoRollGrid::hitTestResizeHandleEx (int x, int y,
+                                                      const MidiNoteRegion& region,
+                                                      bool& outLeftEdge) const noexcept
+{
+    outLeftEdge = false;
     if (y < kRulerH) return 0;
     const auto* snap = region.loadSnapshot();
     if (snap == nullptr || snap->empty()) return 0;
@@ -753,11 +762,24 @@ std::uint64_t PianoRollGrid::hitTestResizeHandle (int x, int y,
         const int nw = juce::jmax (2, (int) std::round (n.lengthBeats * pxPerBeat_));
         const int ny = body.getY() + (int) ((float) (hi - n.pitch) * rowH);
         const int nh = juce::jmax (2, (int) rowH - 1);
-        /* Right-edge handle: within kResizeHandlePx of nx+nw, in
-         * the note's Y band. */
-        if (x >= nx + nw - kResizeHandlePx && x < nx + nw + 1
-            && y >= ny && y < ny + nh)
+        if (y < ny || y >= ny + nh) continue;
+
+        /* Right-edge handle: within kResizeHandlePx of nx+nw. */
+        if (x >= nx + nw - kResizeHandlePx && x < nx + nw + 1)
+        {
+            outLeftEdge = false;
             return n.id;
+        }
+        /* Left-edge handle: within kResizeHandlePx of nx.  Tiny notes
+         * (nw <= 2 * kResizeHandlePx) would have the two handles
+         * overlap -- preferring the right handle keeps the
+         * extend-rightward gesture intuitive on short notes. */
+        if (nw > 2 * kResizeHandlePx
+            && x >= nx && x < nx + kResizeHandlePx)
+        {
+            outLeftEdge = true;
+            return n.id;
+        }
     }
     return 0;
 }
@@ -799,16 +821,22 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
-    /* First try the resize handle hit (5 px right edge of any note)
-     * regardless of tool -- consistent affordance like all DAWs.
-     * Then fall back to body hit + branch on active tool. */
+    /* First try the resize handle hit (5 px at the right or left
+     * edge of any note) regardless of tool -- consistent affordance
+     * like all DAWs.  Right-edge resize extends the note's tail;
+     * left-edge resize trims into the head, mirroring the arranger's
+     * Slice-4 left-trim shape.  Then fall back to body hit + branch
+     * on active tool. */
     if (parent_.getActiveTool() == PianoRollView::Tool::Select)
     {
-        if (auto hitResize = hitTestResizeHandle (e.x, e.y, *region))
+        bool leftEdge = false;
+        if (auto hitResize = hitTestResizeHandleEx (e.x, e.y, *region, leftEdge))
         {
             if (! isSelected (hitResize))
                 selectOnly (hitResize);
-            activeDrag_ = NoteDrag::makeResize (*this, *region, hitResize, e);
+            activeDrag_ = leftEdge
+                ? NoteDrag::makeResizeLeft (*this, *region, hitResize, e)
+                : NoteDrag::makeResize     (*this, *region, hitResize, e);
             return;
         }
     }
