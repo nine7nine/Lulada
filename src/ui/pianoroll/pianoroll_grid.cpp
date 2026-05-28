@@ -654,72 +654,132 @@ void PianoRollGrid::paintNotes (juce::Graphics& g, const MidiNoteRegion& region)
     const juce::Colour selWash  { 0xff'40'ff'80 };   /* kAccentGreen */
     const juce::Colour selEdge  { 0xff'cf'ff'd6 };
 
-    for (const auto& n : *snap)
+    /* Loop iterations for the paint walk.  Iteration 0 is the source
+     * content (the editable notes); iterations >= 1 are read-only
+     * ghosts the audio thread will emit when looped.  Matches the
+     * arrangement-view repeat semantic so the two surfaces show the
+     * same content at the same x-positions.  Non-looped regions and
+     * regions whose loopLengthBeats >= lengthBeats paint a single
+     * iteration as before. */
+    const double loopPeriod = (region.looped
+                                  && region.loopLengthBeats > 0.0)
+                                  ? region.loopLengthBeats
+                                  : regionLenBeats_;
+    const int iterations = (region.looped
+                               && loopPeriod > 0.0
+                               && loopPeriod < regionLenBeats_)
+        ? (int) std::ceil (regionLenBeats_ / loopPeriod)
+        : 1;
+
+    for (int iter = 0; iter < iterations; ++iter)
     {
-        if (n.pitch < lo || n.pitch > hi) continue;
+        const double iterBeatOffset = (double) iter * loopPeriod;
+        const bool   ghost          = (iter > 0);
 
-        const int xRaw = (int) std::round (n.onBeat * pxPerBeat_);
-        const int wRaw = juce::jmax (2, (int) std::round (n.lengthBeats * pxPerBeat_));
-        const int yRaw = body.getY() + (int) ((float) (hi - n.pitch) * rowH);
-        const int hRaw = juce::jmax (2, (int) rowH - 1);
-
-        const juce::Rectangle<int> rect (xRaw, yRaw, wRaw, hRaw);
-        if (! cullRect.intersects (rect)) continue;
-
-        const bool selected = isSelected (n.id);
-        const float velNorm = juce::jlimit (0.0f, 1.0f, (float) n.velocity / 127.0f);
-
-        /* Body fill (shaded/tinted) and outline (saturated tint) --
-         * timeline-region pattern.  ArrangementView's MIDI region uses
-         * sat x 0.55 / brightness x 0.45; piano-roll notes match that
-         * cap exactly but scale brightness down with velocity so soft
-         * notes still read as darker.  Selection uses the accent-green
-         * wash + bright accent edge for unambiguous read. */
-        const juce::Colour fill = selected
-            ? selWash.withMultipliedSaturation (0.85f)
-                     .withMultipliedBrightness (0.45f)
-            : baseBody.withMultipliedSaturation (0.55f)
-                       .withMultipliedBrightness (0.30f + 0.15f * velNorm);
-        const juce::Colour edge = selected ? selEdge : baseBody;
-
-        const auto rf = rect.toFloat();
-        const float corner = juce::jmin (3.0f, rf.getHeight() * 0.35f);
-
-        g.setColour (fill);
-        g.fillRoundedRectangle (rf, corner);
-
-        g.setColour (edge);
-        g.drawRoundedRectangle (rf, corner, selected ? 1.6f : 1.0f);
-
-        /* Preview-affected highlight ring.  Painted on top of the
-         * normal outline so the user can see which notes the dialog's
-         * pending op will touch.  Soft amber so it reads as "pending"
-         * rather than "selected" (which uses the accent green). */
-        if (! previewAffectedIds_.empty()
-            && previewAffectedIds_.find (n.id) != previewAffectedIds_.end())
+        for (const auto& n : *snap)
         {
-            const juce::Colour previewRing { 0xff'ff'b3'4a };
-            g.setColour (previewRing);
-            g.drawRoundedRectangle (rf.expanded (1.5f), corner + 1.0f, 1.4f);
+            if (n.pitch < lo || n.pitch > hi) continue;
+
+            /* Ghost iterations only paint notes inside [0, loopPeriod)
+             * of the source -- a note authored past the loop period
+             * would never reach the next iteration in the audio
+             * thread's emit window, so painting it as a ghost would
+             * mis-signal what will play. */
+            if (ghost && n.onBeat >= loopPeriod) continue;
+
+            const int xRaw = (int) std::round ((n.onBeat + iterBeatOffset) * pxPerBeat_);
+            const int wRaw = juce::jmax (2, (int) std::round (n.lengthBeats * pxPerBeat_));
+            const int yRaw = body.getY() + (int) ((float) (hi - n.pitch) * rowH);
+            const int hRaw = juce::jmax (2, (int) rowH - 1);
+
+            const juce::Rectangle<int> rect (xRaw, yRaw, wRaw, hRaw);
+            if (! cullRect.intersects (rect)) continue;
+
+            const bool selected = ! ghost && isSelected (n.id);
+            const float velNorm = juce::jlimit (0.0f, 1.0f, (float) n.velocity / 127.0f);
+
+            /* Body fill (shaded/tinted) and outline (saturated tint) --
+             * timeline-region pattern.  ArrangementView's MIDI region uses
+             * sat x 0.55 / brightness x 0.45; piano-roll notes match that
+             * cap exactly but scale brightness down with velocity so soft
+             * notes still read as darker.  Selection uses the accent-green
+             * wash + bright accent edge for unambiguous read.  Ghost
+             * iterations dim further so iteration 0 reads as the source
+             * of truth. */
+            juce::Colour fill = selected
+                ? selWash.withMultipliedSaturation (0.85f)
+                         .withMultipliedBrightness (0.45f)
+                : baseBody.withMultipliedSaturation (0.55f)
+                           .withMultipliedBrightness (0.30f + 0.15f * velNorm);
+            juce::Colour edge = selected ? selEdge : baseBody;
+            if (ghost)
+            {
+                fill = fill.withMultipliedAlpha (0.55f);
+                edge = edge.withMultipliedAlpha (0.55f);
+            }
+
+            const auto rf = rect.toFloat();
+            const float corner = juce::jmin (3.0f, rf.getHeight() * 0.35f);
+
+            g.setColour (fill);
+            g.fillRoundedRectangle (rf, corner);
+
+            g.setColour (edge);
+            g.drawRoundedRectangle (rf, corner, selected ? 1.6f : 1.0f);
+
+            /* Preview-affected highlight ring.  Painted on top of the
+             * normal outline so the user can see which notes the dialog's
+             * pending op will touch.  Soft amber so it reads as "pending"
+             * rather than "selected" (which uses the accent green).
+             * Ghost iterations skip the ring -- the source notes are the
+             * editable ones; the rings stay anchored there. */
+            if (! ghost
+                && ! previewAffectedIds_.empty()
+                && previewAffectedIds_.find (n.id) != previewAffectedIds_.end())
+            {
+                const juce::Colour previewRing { 0xff'ff'b3'4a };
+                g.setColour (previewRing);
+                g.drawRoundedRectangle (rf.expanded (1.5f), corner + 1.0f, 1.4f);
+            }
+
+            /* Pitch label inside wide-enough notes.  Skip for tiny rows
+             * (would clip vertically) and short notes.  Always-white text
+             * pairs cleanly with the dim shaded body across the velocity
+             * range -- no per-note brightness branch required.  Ghost
+             * iterations skip the label to keep the visual hierarchy
+             * (iteration 0 reads as primary, ghosts as background). */
+            if (! ghost && rf.getWidth() >= 40.0f && rf.getHeight() >= 12.0f)
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.90f));
+                g.setFont (monoFont (juce::jmin (10.0f, rf.getHeight() * 0.55f),
+                                      juce::Font::plain));
+                static const char* const pcs[12] = {
+                    "C", "C#", "D", "D#", "E", "F",
+                    "F#", "G", "G#", "A", "A#", "B" };
+                const int oct = (n.pitch / 12) - 1;
+                juce::String label = juce::String (pcs[n.pitch % 12]) + juce::String (oct);
+                g.drawText (label,
+                            rect.reduced (4, 1),
+                            juce::Justification::centredLeft, false);
+            }
         }
+    }
 
-        /* Pitch label inside wide-enough notes.  Skip for tiny rows
-         * (would clip vertically) and short notes.  Always-white text
-         * pairs cleanly with the dim shaded body across the velocity
-         * range -- no per-note brightness branch required. */
-        if (rf.getWidth() >= 40.0f && rf.getHeight() >= 12.0f)
+    /* Dashed loop boundary lines at each iteration boundary.  Mirrors
+     * the arrangement-view cue so the user reads "this is where the
+     * loop wraps" the same way on both surfaces. */
+    if (iterations > 1)
+    {
+        const float dashLengths[] = { 4.0f, 4.0f };
+        g.setColour (baseBody.withAlpha (0.55f));
+        for (int iter = 1; iter < iterations; ++iter)
         {
-            g.setColour (juce::Colours::white.withAlpha (0.90f));
-            g.setFont (monoFont (juce::jmin (10.0f, rf.getHeight() * 0.55f),
-                                  juce::Font::plain));
-            static const char* const pcs[12] = {
-                "C", "C#", "D", "D#", "E", "F",
-                "F#", "G", "G#", "A", "A#", "B" };
-            const int oct = (n.pitch / 12) - 1;
-            juce::String label = juce::String (pcs[n.pitch % 12]) + juce::String (oct);
-            g.drawText (label,
-                        rect.reduced (4, 1),
-                        juce::Justification::centredLeft, false);
+            const int bx = (int) std::round ((double) iter * loopPeriod * pxPerBeat_);
+            if (bx < body.getX() + 1) continue;
+            if (bx > body.getRight() - 1) break;
+            const juce::Line<float> seg ((float) bx, (float) body.getY(),
+                                           (float) bx, (float) body.getBottom());
+            g.drawDashedLine (seg, dashLengths, 2, 1.4f);
         }
     }
 }
