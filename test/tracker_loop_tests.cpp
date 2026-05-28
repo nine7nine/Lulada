@@ -68,4 +68,83 @@ BOOST_AUTO_TEST_CASE (length_beats_created_sequence_reports_rows_over_rpb)
     BOOST_CHECK_CLOSE (node.getSequenceLengthBeats (2), 2.0, 1e-9);
 }
 
+/* C.1 -- no rogue emit: every sequence starts with playing=0 so the
+ * user must explicitly launch via session view or arrangement.
+ * Closes the bug where vht's installDefaultPattern set the curr_seq
+ * to playing=1, causing MIDI to flow without any user action. */
+
+BOOST_AUTO_TEST_CASE (no_rogue_emit_after_prepare)
+{
+    TrackerNode node;
+    node.prepareToRender (48000.0, 1024);
+
+    /* installDefaultPattern adds one sequence -- it must NOT be
+     * playing.  This is the core C.1 invariant. */
+    BOOST_REQUIRE_EQUAL (node.numPatterns(), 1);
+    BOOST_CHECK (! node.isSequencePlaying (0));
+}
+
+BOOST_AUTO_TEST_CASE (no_rogue_emit_after_create_sequence)
+{
+    TrackerNode node;
+    node.prepareToRender (48000.0, 1024);
+
+    const int idx = node.createSequence (16);
+    BOOST_REQUIRE_EQUAL (idx, 1);
+    BOOST_CHECK (! node.isSequencePlaying (0));
+    BOOST_CHECK (! node.isSequencePlaying (1));
+}
+
+BOOST_AUTO_TEST_CASE (no_rogue_emit_after_clone_sequence)
+{
+    TrackerNode node;
+    node.prepareToRender (48000.0, 1024);
+
+    const int idx = node.cloneSequence (0);
+    BOOST_REQUIRE_EQUAL (idx, 1);
+    BOOST_CHECK (! node.isSequencePlaying (0));
+    BOOST_CHECK (! node.isSequencePlaying (1));
+}
+
+BOOST_AUTO_TEST_CASE (no_rogue_emit_after_setstate_round_trip)
+{
+    /* Round-trip via getState / setState (used by session save/load).
+     * After setState, no sequences should be playing -- previously
+     * setState explicitly set curr_seq's playing=1 after zeroing all. */
+    TrackerNode src;
+    src.prepareToRender (48000.0, 1024);
+    src.createSequence (8);
+    src.createSequence (32);
+    BOOST_REQUIRE_EQUAL (src.numPatterns(), 3);
+
+    juce::MemoryBlock blob;
+    src.getState (blob);
+
+    TrackerNode restored;
+    restored.prepareToRender (48000.0, 1024);
+    restored.setState (blob.getData(), (int) blob.getSize());
+    BOOST_REQUIRE_EQUAL (restored.numPatterns(), 3);
+
+    BOOST_CHECK (! restored.isSequencePlaying (0));
+    BOOST_CHECK (! restored.isSequencePlaying (1));
+    BOOST_CHECK (! restored.isSequencePlaying (2));
+}
+
+BOOST_AUTO_TEST_CASE (setSequencePlaying_drives_engine_explicitly)
+{
+    /* User-initiated launch flow: SessionView calls schedulePlaying;
+     * the audio thread applies it via applyPendingForBlock which
+     * calls sequence_set_playing.  Verify the basic primitive
+     * setSequencePlaying still toggles the flag (the session-view
+     * launch path depends on this). */
+    TrackerNode node;
+    node.prepareToRender (48000.0, 1024);
+
+    BOOST_CHECK (! node.isSequencePlaying (0));
+    node.setSequencePlaying (0, true);
+    BOOST_CHECK (node.isSequencePlaying (0));
+    node.setSequencePlaying (0, false);
+    BOOST_CHECK (! node.isSequencePlaying (0));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

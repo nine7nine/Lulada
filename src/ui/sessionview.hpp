@@ -136,6 +136,16 @@ private:
     void bangClip   (SessionClip&);
     void bangScene  (int sceneRow);
     void stopAllClips();
+
+    /* Belt + suspenders for the C.1 fix.  Walks each TrackerNode and
+     * forces playing=0 on every sequence not bound to a Playing /
+     * WaitingToStart SessionClip.  Called from stabilizeContent +
+     * didBecomeActive after rescanColumns so any sequence that
+     * sneaks in with a stale playing flag (legacy save, future
+     * regression, TrackerEditor experimentation) gets silenced
+     * before the user hears unattributable MIDI. */
+    void reconcileSequencePlaying();
+
     void stopColumn (int columnIdx);   // per-column stop button
     void toggleColumnMute (int columnIdx);
     void toggleColumnSolo (int columnIdx);

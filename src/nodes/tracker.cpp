@@ -264,10 +264,14 @@ void TrackerNode::installDefaultPattern()
     mod_->curr_seq = seq;
     mod_->bpm = 120.0f;
 
-    /* sequence_new() defaults seq->playing = 0. Without this,
-     * sequence_advance() runs but skips track_advance(), so no MIDI
-     * is emitted even when module->playing is set. */
-    sequence_set_playing (seq, 1);
+    /* C.1: leave seq->playing = 0 (sequence_new default).  Previously
+     * this set playing=1 so a fresh TrackerNode emitted MIDI from the
+     * default pattern without any user action -- which under the
+     * session-view clip-launcher model meant rogue notes once any
+     * other clip was banged on the same tracker (both seq[0] and the
+     * banged seq[N] would emit concurrently).  Under the cleaner
+     * multi-surface model the user explicitly launches what they
+     * want to hear via session view or arrangement. */
 }
 
 void TrackerNode::refreshPorts()
@@ -833,14 +837,15 @@ void TrackerNode::setState (const void* data, int size)
         module_add_sequence (mod_, seq);
     }
 
-    /* Activate curr_seq, pause others (one-pattern-at-a-time semantics). */
+    /* Restore curr_seq as the editing focus, but leave every sequence
+     * with playing=0 (C.1).  The user explicitly launches via session
+     * view or arrangement -- no rogue emit on session load. */
     if (mod_->nseq > 0)
     {
         const int idx = juce::jlimit (0, mod_->nseq - 1, currIdx);
         for (int i = 0; i < mod_->nseq; ++i)
             sequence_set_playing (mod_->seq[i], 0);
         mod_->curr_seq = mod_->seq[idx];
-        sequence_set_playing (mod_->curr_seq, 1);
     }
     mod_->bpm = bpm;
 
