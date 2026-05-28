@@ -1791,6 +1791,16 @@ void SessionView::applyFollowAction (SessionClip& clip)
             }
             if (firstClip != nullptr)
                 bangClip (*firstClip);
+            else
+            {
+                /* C.4: mirror NextClip's behaviour -- if no firstClip
+                 * exists on this column, fall through to Stop so the
+                 * clip doesn't keep playing past wrap.  Previously a
+                 * silent no-op left the clip looping. */
+                trk->schedulePlaying (clip.sequenceIdx, -1.0, false);
+                clip.state.store (LiveState::Stopped, std::memory_order_relaxed);
+                repaint (cellBounds (clip.sceneRow, clip.columnIdx));
+            }
             break;
         }
     }
@@ -2109,9 +2119,14 @@ void SessionView::stopAllClips()
     /* Immediate stop -- bypass quantisation.  Schedules through the
      * audio-thread FIFO with beatTarget=-1 so every clip stops on
      * the next render block.  Resets message-thread state to Stopped
-     * straight away; UI tick will confirm. */
+     * straight away; UI tick will confirm.
+     *
+     * C.3: skip clips already at Stopped to avoid burning FIFO slots
+     * on redundant stops.  The 64-slot FIFO would otherwise overflow
+     * on sessions with > 64 clips when the user hits STOP ALL. */
     for (auto* c : clips_)
     {
+        if (c->state.load (std::memory_order_relaxed) == LiveState::Stopped) continue;
         if (auto* trk = lookupTracker (c->trackerNodeId))
             trk->schedulePlaying (c->sequenceIdx, -1.0, false);
         c->state.store (LiveState::Stopped, std::memory_order_relaxed);
@@ -3253,10 +3268,13 @@ void SessionView::readFromSession()
     const auto tree = getOrCreateSessionViewTree();
     if (! tree.isValid()) return;
 
-    /* Toolbar prefs at the sessionView root. */
+    /* Toolbar prefs at the sessionView root.  C.6: use enum-max
+     * sentinel so adding a sixth enum value tomorrow doesn't
+     * silently truncate fresh saves through this clamp. */
     defaultLaunchQuant_ = static_cast<LaunchQuant> (
-        juce::jlimit (0, 4, (int) tree.getProperty ("defaultLaunchQuant",
-                                                    (int) LaunchQuant::Bar)));
+        juce::jlimit (0, (int) LaunchQuant::FourBars,
+                      (int) tree.getProperty ("defaultLaunchQuant",
+                                              (int) LaunchQuant::Bar)));
     refreshToolbarLabels();
 
     /* Columns. */
@@ -3315,11 +3333,13 @@ void SessionView::readFromSession()
             clip->sceneRow      = (int) cn.getProperty ("sceneRow", 0);
             clip->columnIdx     = (int) cn.getProperty ("columnIdx", 0);
             clip->launchQuant   = static_cast<LaunchQuant> (
-                juce::jlimit (0, 4, (int) cn.getProperty ("launchQuant",
-                                                          (int) LaunchQuant::Bar)));
+                juce::jlimit (0, (int) LaunchQuant::FourBars,
+                              (int) cn.getProperty ("launchQuant",
+                                                    (int) LaunchQuant::Bar)));
             clip->followAction  = static_cast<FollowAction> (
-                juce::jlimit (0, 4, (int) cn.getProperty ("followAction",
-                                                          (int) FollowAction::None)));
+                juce::jlimit (0, (int) FollowAction::FirstClip,
+                              (int) cn.getProperty ("followAction",
+                                                    (int) FollowAction::None)));
             clips_.add (clip);
         }
     }
