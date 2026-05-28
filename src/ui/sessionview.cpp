@@ -1636,6 +1636,14 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
     auto* trk = lookupTracker (clip.trackerNodeId);
     if (trk == nullptr || clip.sequenceIdx < 0) return;
 
+    /* B.4 + E.4: validate the clip's sequenceIdx against the live
+     * tracker pattern count.  Stale clips from a saved session whose
+     * tracker has fewer sequences than at save time would otherwise
+     * write a valid=true slot in pendingActions_ that never drains
+     * (applyPendingForBlock caps iteration at mod_->nseq) and would
+     * misfire on a future re-added sequence at the same index. */
+    if (clip.sequenceIdx >= trk->numPatterns()) return;
+
     const LiveState cur = clip.state.load (std::memory_order_relaxed);
 
     /* === Cancel rules: re-banging a queued clip un-queues it. */
