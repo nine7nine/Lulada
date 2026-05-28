@@ -93,6 +93,20 @@ public:
     juce::Uuid    sourceId { juce::Uuid::null() };
     double        positionBeats { 0.0 };
     double        lengthBeats   { 0.0 };
+
+    /** Offset INTO the source note list at which playback begins, in
+     *  beats.  Mirrors Region::startBeats (the audio kind).  Default 0
+     *  means "play from the beginning of the source", which matches
+     *  pre-Q5 behaviour.
+     *
+     *  Left-edge trim advances startBeats by the trim delta INSTEAD of
+     *  rewriting the note list -- so notes hidden by the trim survive
+     *  the gesture and reappear if the user drags the left edge back.
+     *  Notes whose onBeat falls outside [startBeats, startBeats +
+     *  lengthBeats) are PRESERVED but never played; the audio thread
+     *  uses startBeats to gate the emit window. */
+    double        startBeats    { 0.0 };
+
     bool          looped        { false };
     juce::Colour  colour        { 0xff'5a'8a'5a }; // muted green; distinct from audio (blue) + tracker (orange)
     juce::String  name;

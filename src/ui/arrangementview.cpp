@@ -843,6 +843,7 @@ public:
             gesture_.regionId        = m.id;
             gesture_.originalPos     = m.positionBeats;
             gesture_.originalLen     = m.lengthBeats;
+            gesture_.originalStart   = m.startBeats;
             gesture_.mouseDownXBeats = beat;
             gesture_.mouseDownYPx    = e.y;
             gesture_.kind            = Gesture::Midi;
@@ -864,11 +865,6 @@ public:
             {
                 gesture_.mode = Gesture::Resize;
                 gesture_.edge = Gesture::LeftEdge;
-                /* Capture the pristine MIDI snapshot for re-base
-                 * iteration -- see the LeftEdge resize block in
-                 * mouseDrag for why the live snapshot won't do. */
-                if (const auto* snapshot = m.loadSnapshot())
-                    gesture_.originalMidiNotes = *snapshot;
             }
             else
             {
@@ -1387,9 +1383,12 @@ public:
          * playlist directly; mouseUp persists.  Edge determines which
          * boundary the drag moves -- RightEdge mutates lengthBeats only;
          * LeftEdge also shifts positionBeats + advances startBeats
-         * (audio) OR re-bases the note list (MIDI).  Snap uses the
-         * EDGE's original position as the keep-offset anchor (right
-         * edge for RightEdge, left for LeftEdge). */
+         * (source offset) for both audio + MIDI -- the note list /
+         * audio source is preserved and only the playable window
+         * shifts, so dragging the left edge out and back recovers the
+         * original content.  Snap uses the EDGE's original position as
+         * the keep-offset anchor (right edge for RightEdge, left for
+         * LeftEdge). */
         if (gesture_.mode == Gesture::Resize)
         {
             auto& lane = owner.lanes_.getReference (gesture_.laneIdx);
@@ -1416,12 +1415,13 @@ public:
             {
                 const double origEnd  = gesture_.originalPos + gesture_.originalLen;
                 const double maxStart = origEnd - kMinRegionBeats;
-                /* Lower bound on newPos: for audio the source offset
-                 * must stay >= 0 (can't extend past the start of the
-                 * underlying file); for MIDI just clamp at beat 0. */
-                const double lowerBound = (gesture_.kind == Gesture::Audio)
-                    ? juce::jmax (0.0, gesture_.originalPos - gesture_.originalStart)
-                    : 0.0;
+                /* Lower bound on newPos: the source offset must stay
+                 * >= 0 for both kinds.  Audio: can't extend past the
+                 * start of the underlying file.  MIDI (Q5): same shape
+                 * -- can't extend past source-beat 0 in the pristine
+                 * note list. */
+                const double lowerBound =
+                    juce::jmax (0.0, gesture_.originalPos - gesture_.originalStart);
                 const double snapped = juce::jlimit (lowerBound, maxStart,
                                           snapBeat (mouseBeat,
                                                     gesture_.originalPos,
@@ -1440,32 +1440,16 @@ public:
                 }
                 else
                 {
+                    /* MIDI left-trim mirrors the audio source-offset
+                     * pattern: advance startBeats by the trim delta
+                     * INSTEAD of rewriting the note list.  Notes hidden
+                     * by the trim survive in the pristine snapshot and
+                     * reappear when the user drags the edge back. */
                     if (auto* m = lane.playlist.findMidiRegion (gesture_.regionId))
                     {
                         m->positionBeats = newPos;
                         m->lengthBeats   = newLen;
-                        /* Re-base notes against the PRISTINE snapshot
-                         * captured at mouseDown.  Iterating the live
-                         * (mutated) snapshot would lose notes that were
-                         * dropped on a prior tick even when the user
-                         * drags back; the original copy is the only
-                         * source of truth for "would this note be in
-                         * the new region?" */
-                        MidiNoteRegion::NoteList kept;
-                        kept.reserve (gesture_.originalMidiNotes.size());
-                        for (const auto& note : gesture_.originalMidiNotes)
-                        {
-                            const double rebased = note.onBeat - delta;
-                            if (rebased < 0.0) continue;
-                            if (rebased >= newLen) continue;
-                            MidiNote copy = note;
-                            copy.onBeat = rebased;
-                            const double maxLen = newLen - rebased;
-                            if (copy.lengthBeats > maxLen)
-                                copy.lengthBeats = maxLen;
-                            kept.push_back (copy);
-                        }
-                        m->setNotes (std::move (kept));
+                        m->startBeats    = gesture_.originalStart + delta;
                         owner.publishMidiBindingsForLane (gesture_.laneIdx);
                     }
                 }
@@ -2075,7 +2059,7 @@ public:
             juce::Uuid regionId;
             double     originalPos   = 0.0;
             double     originalLen   = 0.0;
-            double     originalStart = 0.0;   /* audio source offset (Region.startBeats) */
+            double     originalStart = 0.0;   /* source offset (Region.startBeats / MidiNoteRegion.startBeats) */
             Kind       kind          = Audio;
         };
 
@@ -2083,7 +2067,7 @@ public:
         juce::Uuid regionId;                   /* anchor */
         double     originalPos     = 0.0;     /* anchor */
         double     originalLen     = 0.0;     /* anchor */
-        double     originalStart   = 0.0;     /* anchor audio source offset */
+        double     originalStart   = 0.0;     /* anchor source offset (audio + MIDI) */
         double     mouseDownXBeats = 0.0;
         int        mouseDownYPx    = 0;       /* anchor pixel y for axis lock */
         Mode       mode            = Move;
@@ -2107,13 +2091,6 @@ public:
         bool   crossLaneInvalid = false;
         double appliedDelta     = 0.0;        /* snapped beat delta */
         Axis   axis             = AxisFree;
-
-        /* LeftEdge MIDI resize: pristine note snapshot captured at
-         * mouseDown.  Each drag tick filters + shifts from this list
-         * and publishes -- otherwise notes dropped in tick N stay
-         * dropped on tick N+1 even when the user drags back toward
-         * the original start. */
-        std::vector<MidiNote> originalMidiNotes;
 
         /* Alt-drag copy.  Set on mouseDown when Alt held + click hits
          * a region in the current selection.  When true, the Move
@@ -2196,6 +2173,7 @@ public:
                 m.regionId      = s.second;
                 m.originalPos   = mr->positionBeats;
                 m.originalLen   = mr->lengthBeats;
+                m.originalStart = mr->startBeats;
                 m.kind          = Gesture::Midi;
                 gesture_.members.push_back (m);
             }
@@ -6464,6 +6442,7 @@ void ArrangementView::publishMidiBindingsForLane (int laneIdx)
         e.region        = mp.get();
         e.positionBeats = mp->positionBeats;
         e.lengthBeats   = mp->lengthBeats;
+        e.startBeats    = mp->startBeats;
         e.looped        = mp->looped;
         entries.push_back (e);
     }

@@ -127,6 +127,12 @@ public:
         MidiNoteRegion* region        { nullptr };
         double          positionBeats { 0.0 };
         double          lengthBeats   { 0.0 };
+        /** Source-offset into the region's note list -- mirrors
+         *  MidiNoteRegion::startBeats.  Cached on the entry so the
+         *  audio thread reads a consistent (position, length, start,
+         *  looped) tuple without touching the region's mutable fields
+         *  (which the UI thread may be racing through during a drag). */
+        double          startBeats    { 0.0 };
         bool            looped        { false };
     };
 

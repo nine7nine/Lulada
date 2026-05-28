@@ -17,6 +17,7 @@ const juce::Identifier kIdAttr        { "id" };
 const juce::Identifier kSourceAttr    { "src" };
 const juce::Identifier kPositionAttr  { "pos" };
 const juce::Identifier kLengthAttr    { "len" };
+const juce::Identifier kStartAttr     { "start" };
 const juce::Identifier kLoopedAttr    { "loop" };
 const juce::Identifier kColourAttr    { "col" };
 const juce::Identifier kNameAttr      { "name" };
@@ -71,6 +72,7 @@ std::unique_ptr<MidiNoteRegion> MidiNoteRegion::clone() const
     out->sourceId      = sourceId;
     out->positionBeats = positionBeats;
     out->lengthBeats   = lengthBeats;
+    out->startBeats    = startBeats;
     out->looped        = looped;
     out->colour        = colour;
     out->name          = name;
@@ -232,6 +234,7 @@ juce::ValueTree MidiNoteRegion::toValueTree() const
         v.setProperty (kSourceAttr, sourceId.toString(), nullptr);
     if (positionBeats != 0.0) v.setProperty (kPositionAttr, positionBeats, nullptr);
     if (lengthBeats   != 0.0) v.setProperty (kLengthAttr,   lengthBeats,   nullptr);
+    if (startBeats    != 0.0) v.setProperty (kStartAttr,    startBeats,    nullptr);
     if (looped)               v.setProperty (kLoopedAttr,   true,          nullptr);
     /* Default colour matches the ctor; only persist when overridden. */
     if (colour.getARGB() != juce::Colour (0xff'5a'8a'5a).getARGB())
@@ -269,6 +272,7 @@ std::unique_ptr<MidiNoteRegion> MidiNoteRegion::fromValueTree (const juce::Value
         r->sourceId = juce::Uuid (v.getProperty (kSourceAttr).toString());
     r->positionBeats = (double) v.getProperty (kPositionAttr, 0.0);
     r->lengthBeats   = (double) v.getProperty (kLengthAttr,   0.0);
+    r->startBeats    = (double) v.getProperty (kStartAttr,    0.0);
     r->looped        = (bool)   v.getProperty (kLoopedAttr,   false);
     if (v.hasProperty (kColourAttr))
         r->colour = juce::Colour ((juce::uint32) (juce::int64) v.getProperty (kColourAttr));
