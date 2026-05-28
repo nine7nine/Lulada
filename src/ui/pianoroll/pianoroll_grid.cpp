@@ -17,12 +17,34 @@
 #include <element/ui.hpp>
 
 #include <cmath>
+#include <limits>
+#include <vector>
 
 namespace element {
 
 namespace {
 
 constexpr int kResizeHandlePx = 5;   /* width of the right-edge resize hot zone */
+
+/* Static per-process piano-roll clipboard.  Notes are stored
+ * relative to the selection's minimum onBeat so paste is positionable
+ * at any anchor.  Distinct from the arrangement clipboard (which
+ * holds regions/lanes, not notes), so a user can have an
+ * arrangement copy AND a note copy on the same clipboard
+ * conceptually.  Lifetime = process; tabs / sessions reset it
+ * naturally on Element restart. */
+struct NoteClipboard
+{
+    std::vector<MidiNote> notes;   /* onBeats already rebased to 0 */
+    double                spanBeats { 0.0 };
+    bool                  empty() const noexcept { return notes.empty(); }
+};
+
+NoteClipboard& noteClipboard() noexcept
+{
+    static NoteClipboard singleton;
+    return singleton;
+}
 
 } // namespace
 
@@ -1085,6 +1107,148 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
             parent_.notifyRegionEdited();
         }
         selectedNoteIds_.clear();
+        repaint();
+        return true;
+    }
+
+    /* Ctrl+C -- copy current selection to the piano-roll clipboard,
+     * rebasing onBeats so the selection's earliest note lands at 0.
+     * Paste re-anchors against the playhead or the bound region's
+     * start.  Per-process static clipboard. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'C')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+        std::vector<MidiNote> sel;
+        double minOn = std::numeric_limits<double>::max();
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                sel.push_back (n);
+                minOn = juce::jmin (minOn, n.onBeat);
+            }
+        if (sel.empty()) return false;
+        double maxEnd = 0.0;
+        for (auto& n : sel)
+        {
+            n.onBeat -= minOn;
+            maxEnd    = juce::jmax (maxEnd, n.onBeat + n.lengthBeats);
+        }
+        auto& clip = noteClipboard();
+        clip.notes      = std::move (sel);
+        clip.spanBeats  = maxEnd;
+        return true;
+    }
+
+    /* Ctrl+X -- cut: copy then delete in one undo step. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'X')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        const auto* snap = region->loadSnapshot();
+        if (snap == nullptr) return false;
+
+        std::vector<MidiNote> sel;
+        double minOn = std::numeric_limits<double>::max();
+        for (const auto& n : *snap)
+            if (isSelected (n.id))
+            {
+                sel.push_back (n);
+                minOn = juce::jmin (minOn, n.onBeat);
+            }
+        if (sel.empty()) return false;
+        double maxEnd = 0.0;
+        auto copy = sel;
+        for (auto& n : copy)
+        {
+            n.onBeat -= minOn;
+            maxEnd    = juce::jmax (maxEnd, n.onBeat + n.lengthBeats);
+        }
+        auto& clip = noteClipboard();
+        clip.notes      = std::move (copy);
+        clip.spanBeats  = maxEnd;
+
+        /* Delete the originals.  Same undo path as Delete key. */
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            for (const auto& n : sel) cmd->recordRemove (*region, n.id);
+            juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+            cmd->onApplied = [safeView]() {
+                if (auto* v = safeView.getComponent())
+                    v->notifyRegionEdited();
+            };
+            gui->getUndoManager().beginNewTransaction ("Cut MIDI notes");
+            gui->getUndoManager().perform (cmd.release(), "Cut MIDI notes");
+        }
+        selectedNoteIds_.clear();
+        repaint();
+        return true;
+    }
+
+    /* Ctrl+V -- paste clipboard at the playhead (region-local).  Falls
+     * back to beat 0 if the transport isn't reachable.  Notes get
+     * fresh ids stamped on insert; the paste set replaces the current
+     * selection so the user can keep editing the freshly-pasted
+     * material. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'V')
+    {
+        const auto& clip = noteClipboard();
+        if (region == nullptr || clip.empty()) return false;
+
+        double anchor = 0.0;
+        if (monitor_ != nullptr && monitor_->playing.get())
+        {
+            const double transportBeat = (double) monitor_->getPositionBeats();
+            anchor = juce::jmax (0.0, transportBeat - region->positionBeats);
+        }
+        anchor = juce::jlimit (0.0,
+                                juce::jmax (0.0, region->lengthBeats - clip.spanBeats),
+                                anchor);
+
+        if (auto* gui = services_.find<GuiService>())
+        {
+            auto cmd = std::make_unique<MidiNoteDiffCommand> (parent_.getBoundRegionId(),
+                                                                parent_.getRegionResolver());
+            std::vector<MidiNote> stagedForSelect;
+            stagedForSelect.reserve (clip.notes.size());
+            for (const auto& src : clip.notes)
+            {
+                MidiNote n = src;
+                n.id     = 0;            /* fresh id stamped on add */
+                n.onBeat = src.onBeat + anchor;
+                if (n.onBeat + n.lengthBeats > region->lengthBeats)
+                    n.lengthBeats = juce::jmax (1.0 / 64.0,
+                                                  region->lengthBeats - n.onBeat);
+                cmd->recordAdd (*region, n);
+                stagedForSelect.push_back (n);
+            }
+            juce::Component::SafePointer<PianoRollView> safeView (&parent_);
+            cmd->onApplied = [safeView]() {
+                if (auto* v = safeView.getComponent())
+                    v->notifyRegionEdited();
+            };
+            gui->getUndoManager().beginNewTransaction ("Paste MIDI notes");
+            gui->getUndoManager().perform (cmd.release(), "Paste MIDI notes");
+
+            /* Reselect the pasted notes -- their ids landed in the
+             * snapshot after perform.  Match by (pitch, onBeat ±eps)
+             * which is unique enough for the typical paste set. */
+            selectedNoteIds_.clear();
+            if (const auto* snap2 = region->loadSnapshot())
+                for (const auto& n : *snap2)
+                    for (const auto& s : stagedForSelect)
+                        if (n.pitch == s.pitch
+                            && std::abs (n.onBeat - s.onBeat) < 1e-9
+                            && n.channel == s.channel
+                            && selectedNoteIds_.find (n.id) == selectedNoteIds_.end())
+                        {
+                            selectedNoteIds_.insert (n.id);
+                            break;
+                        }
+        }
+        parent_.notifyRegionEdited();
         repaint();
         return true;
     }

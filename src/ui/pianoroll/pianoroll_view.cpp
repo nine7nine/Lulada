@@ -567,23 +567,27 @@ void PianoRollView::resized()
      * first note row.  The dock paints the corner above the keyboard
      * with the same colour as the grid's ruler strip so the gap reads
      * as intentional. */
-    /* Reserve kVelocityLaneH at the BOTTOM of the body for the
-     * velocity strip.  Lane spans the same horizontal extent as the
-     * grid viewport (NOT the keyboard column) so its lollipops line
-     * up with the notes above; horizontal scroll is mirrored from the
-     * viewport via the ScrollBar listener installed in the ctor. */
-    juce::Rectangle<int> velLaneArea;
-    if (velocityLane_ != nullptr && velocityLane_->isVisible())
-        velLaneArea = r.removeFromBottom (kVelocityLaneH);
-
-    /* Quantize/Humanize/Scale panel docks on the RIGHT edge of the
-     * body when visible.  Reserved first so the grid viewport gets
-     * what's left between the keyboard column and the panel. */
+    /* Quantize / Humanize / Scale panel docks on the RIGHT edge of
+     * the body when visible -- claims the FULL body height (above
+     * the velocity lane reservation so the panel + velocity lane
+     * never leave an empty cell beneath the panel).  Reserved first
+     * so the grid viewport gets what's left between the keyboard
+     * column and the panel. */
     if (quantizePanel_ != nullptr && quantizePanelVisible_)
     {
         const int panelW = juce::jmin (r.getWidth() / 2, kQuantizePanelW);
         quantizePanel_->setBounds (r.removeFromRight (panelW));
     }
+
+    /* Reserve kVelocityLaneH at the BOTTOM of what remains -- the
+     * velocity strip lives only beneath the grid viewport, NOT
+     * beneath the docked panel.  Lane spans the same horizontal
+     * extent as the grid viewport so its lollipops line up with the
+     * notes above; horizontal scroll is mirrored from the viewport
+     * via the ScrollBar listener installed in the ctor. */
+    juce::Rectangle<int> velLaneArea;
+    if (velocityLane_ != nullptr && velocityLane_->isVisible())
+        velLaneArea = r.removeFromBottom (kVelocityLaneH);
 
     if (keyboard_ != nullptr)
     {
