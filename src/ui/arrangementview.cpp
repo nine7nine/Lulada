@@ -3130,6 +3130,14 @@ public:
                 if (m->looped != target)
                 {
                     m->looped = target;
+                    /* Snapshot loopLengthBeats at the moment Loop is
+                     * toggled on so subsequent right-edge drags extend
+                     * the number of repeats (not the loop pattern).
+                     * Skip when a non-zero value is already present --
+                     * preserves whatever the user previously dialed in
+                     * across Loop on -> off -> on cycles. */
+                    if (target && m->loopLengthBeats == 0.0 && m->lengthBeats > 0.0)
+                        m->loopLengthBeats = m->lengthBeats;
                     midiLanesTouched.insert (s.first);
                     changed = true;
                 }
@@ -4527,6 +4535,50 @@ private:
                                        r, borderTint, selected);
             }
 
+            /* Loop boundary markers -- audio regions whose drawn
+             * lengthBeats spans more than one source-length iteration
+             * get the same dashed-vertical-line cue as MIDI regions
+             * (see the MIDI block lower in this method).  Source
+             * length in beats is derived from the thumbnail's total
+             * seconds at the current tempo so the cue tracks what
+             * PlaybackDS actually does (wraps on source frames).
+             * Tracker regions (r.sequenceIdx >= 0) currently don't
+             * honour r.looped at playback time -- their dashed lines
+             * are gated on that wiring landing. */
+            if (r.looped && isAudio && r.sequenceIdx < 0)
+            {
+                if (auto* thumb = const_cast<Body*> (this)->getThumbnail (r.sourceId))
+                {
+                    const double totalSeconds = thumb->getTotalLength();
+                    const double bpm = owner.monitor_ != nullptr
+                                          ? (double) owner.monitor_->tempo.get()
+                                          : 120.0;
+                    if (totalSeconds > 0.0 && bpm > 0.0)
+                    {
+                        const double sourceBeats = totalSeconds * bpm / 60.0;
+                        if (sourceBeats > 0.0 && sourceBeats < r.lengthBeats)
+                        {
+                            const float dashTopY = (float) bodyRect.getY();
+                            const float dashBotY = (float) bodyRect.getBottom();
+                            const float dashLengths[] = { 3.0f, 3.0f };
+                            g.setColour (borderTint.withAlpha (0.6f));
+                            for (double k = sourceBeats;
+                                  k < r.lengthBeats;
+                                  k += sourceBeats)
+                            {
+                                const int bx = rect.getX()
+                                             + (int) std::round (k * kPxPerBeat);
+                                if (bx >= rect.getRight() - 2) break;
+                                if (bx <= rect.getX() + 2)     continue;
+                                const juce::Line<float> seg ((float) bx, dashTopY,
+                                                               (float) bx, dashBotY);
+                                g.drawDashedLine (seg, dashLengths, 2, 1.2f);
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Graph-block borders: tinted outer stroke + black inner
              * ring with rounded corners.  Selection is now signalled
              * by the brighter body / title fills above; the outer
@@ -4628,7 +4680,13 @@ private:
                  * Cheap: one drawHorizontalLine per visible note.
                  * Notes are sorted (onBeat, pitch); pitch range is
                  * compacted to the body's vertical extent so even a
-                 * narrow lane shows the shape of the pattern. */
+                 * narrow lane shows the shape of the pattern.
+                 *
+                 * For looped regions whose drawn lengthBeats spans
+                 * multiple loop iterations, the scatter is painted
+                 * once per iteration at successive x-offsets so the
+                 * user sees the pattern repeat -- mirrors what the
+                 * audio thread will emit at play time. */
                 if (bodyRect.getHeight() > 4)
                 {
                     if (const auto* snap = m.loadSnapshot())
@@ -4649,32 +4707,88 @@ private:
                             const int innerH = bodyRect.getHeight() - 2;
                             const float pxPerPitch = (float) innerH / (float) pSpan;
 
-                            g.setColour (midiTint.withMultipliedBrightness (1.4f));
-                            for (const auto& nn : *snap)
-                            {
-                                /* x relative to region start; clip to
-                                 * region width so notes past the end
-                                 * are visually trimmed. */
-                                const int nx = rect.getX()
-                                             + (int) (nn.onBeat * kPxPerBeat);
-                                const int nw = juce::jmax (1,
-                                    (int) (nn.lengthBeats * kPxPerBeat));
-                                const int nxEnd = juce::jmin (nx + nw,
-                                                              rect.getRight() - 2);
-                                if (nxEnd <= rect.getX() + 1) continue;
+                            /* Loop iterations: 1 unless looped + loop
+                             * period actually fits more than once. */
+                            const double loopPeriod = (m.looped
+                                                          && m.loopLengthBeats > 0.0)
+                                                          ? m.loopLengthBeats
+                                                          : m.lengthBeats;
+                            const int iterations = (m.looped
+                                                       && loopPeriod > 0.0
+                                                       && loopPeriod < m.lengthBeats)
+                                ? (int) std::ceil (m.lengthBeats / loopPeriod)
+                                : 1;
 
-                                /* Higher pitch = higher on screen.  +1
-                                 * to keep a 1 px margin off the title
-                                 * strip; -1 ditto on the bottom. */
-                                const int normPitch = pMax - nn.pitch;
-                                const int ny = bodyRect.getY() + 1
-                                             + (int) (normPitch * pxPerPitch);
-                                g.drawHorizontalLine (ny,
-                                                       (float) juce::jmax (nx,
-                                                                           rect.getX() + 2),
-                                                       (float) nxEnd);
+                            g.setColour (midiTint.withMultipliedBrightness (1.4f));
+                            for (int iter = 0; iter < iterations; ++iter)
+                            {
+                                const double iterOffsetBeats = (double) iter * loopPeriod;
+                                for (const auto& nn : *snap)
+                                {
+                                    /* Skip notes that fall past this
+                                     * iteration's loop window -- the
+                                     * audio thread won't emit them, the
+                                     * paint shouldn't show them either. */
+                                    if (iterations > 1 && nn.onBeat >= loopPeriod)
+                                        continue;
+
+                                    /* x relative to region start +
+                                     * iteration offset; clip to region
+                                     * width so notes past the end are
+                                     * visually trimmed. */
+                                    const int nx = rect.getX()
+                                                 + (int) ((iterOffsetBeats
+                                                           + nn.onBeat)
+                                                          * kPxPerBeat);
+                                    const int nw = juce::jmax (1,
+                                        (int) (nn.lengthBeats * kPxPerBeat));
+                                    const int nxEnd = juce::jmin (nx + nw,
+                                                                  rect.getRight() - 2);
+                                    if (nxEnd <= rect.getX() + 1) continue;
+                                    if (nx >= rect.getRight() - 2)  continue;
+
+                                    /* Higher pitch = higher on screen.
+                                     * +1 to keep a 1 px margin off the
+                                     * title strip; -1 ditto on the
+                                     * bottom. */
+                                    const int normPitch = pMax - nn.pitch;
+                                    const int ny = bodyRect.getY() + 1
+                                                 + (int) (normPitch * pxPerPitch);
+                                    g.drawHorizontalLine (ny,
+                                                           (float) juce::jmax (nx,
+                                                                               rect.getX() + 2),
+                                                           (float) nxEnd);
+                                }
                             }
                         }
+                    }
+                }
+            }
+
+            /* Loop boundary markers -- dashed vertical line at every
+             * loop-period repeat boundary inside the region.  Reads as
+             * "this section repeats from here" without paying the
+             * cost of repainting the full note scatter.  Same tint as
+             * the outer border so the visual idiom stays unified. */
+            if (m.looped)
+            {
+                const double loopPeriod = (m.loopLengthBeats > 0.0)
+                                              ? m.loopLengthBeats
+                                              : m.lengthBeats;
+                if (loopPeriod > 0.0 && loopPeriod < m.lengthBeats)
+                {
+                    const float dashTopY    = (float) bodyRect.getY();
+                    const float dashBotY    = (float) bodyRect.getBottom();
+                    const float dashLengths[] = { 3.0f, 3.0f };
+                    g.setColour (midiTint.withAlpha (0.6f));
+                    for (double k = loopPeriod; k < m.lengthBeats; k += loopPeriod)
+                    {
+                        const int bx = rect.getX() + (int) std::round (k * kPxPerBeat);
+                        if (bx >= rect.getRight() - 2) break;
+                        if (bx <= rect.getX() + 2)     continue;
+                        const juce::Line<float> seg ((float) bx, dashTopY,
+                                                       (float) bx, dashBotY);
+                        g.drawDashedLine (seg, dashLengths, 2, 1.2f);
                     }
                 }
             }
@@ -6744,6 +6858,7 @@ void ArrangementView::publishMidiBindingsForLane (int laneIdx)
         e.lengthBeats   = mp->lengthBeats;
         e.startBeats    = mp->startBeats;
         e.looped        = mp->looped;
+        e.loopLengthBeats = mp->loopLengthBeats;
         entries.push_back (e);
     }
     runtime.midiPlayerCache->setBoundRegions (std::move (entries));
