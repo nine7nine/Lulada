@@ -296,6 +296,7 @@ void SessionView::initializeView (Services& s)
 void SessionView::didBecomeActive()
 {
     rescanColumns();
+    reconcileSequencePlaying();
     startTimerHz (30);
 }
 
@@ -316,6 +317,39 @@ void SessionView::willBeRemoved()
 void SessionView::stabilizeContent()
 {
     rescanColumns();
+    reconcileSequencePlaying();
+}
+
+void SessionView::reconcileSequencePlaying()
+{
+    /* For each TrackerNode column, force any sequence not bound to a
+     * Playing / WaitingToStart SessionClip to playing=0.  This silences
+     * the rogue emit case where a sequence's playing flag was set
+     * without a session-view launch (e.g. legacy saves, future
+     * regressions, TrackerEditor experimentation).
+     *
+     * Cost: O(columns x sequences x clips) per call, but only called
+     * on view activate + stabilize -- not in the 30 Hz tick. */
+    for (const auto& col : columns_)
+    {
+        auto* trk = lookupTracker (col.trackerNodeId);
+        if (trk == nullptr) continue;
+        const int nseq = trk->numPatterns();
+        for (int seqIdx = 0; seqIdx < nseq; ++seqIdx)
+        {
+            bool bound = false;
+            for (const auto* c : clips_)
+            {
+                if (c->trackerNodeId != col.trackerNodeId) continue;
+                if (c->sequenceIdx   != seqIdx)            continue;
+                const LiveState s = c->state.load (std::memory_order_relaxed);
+                if (s == LiveState::Playing || s == LiveState::WaitingToStart)
+                    { bound = true; break; }
+            }
+            if (! bound && trk->isSequencePlaying (seqIdx))
+                trk->setSequencePlaying (seqIdx, false);
+        }
+    }
 }
 
 void SessionView::resized()
@@ -1601,6 +1635,14 @@ void SessionView::transitionClip (SessionClip& clip, double targetBeat)
 {
     auto* trk = lookupTracker (clip.trackerNodeId);
     if (trk == nullptr || clip.sequenceIdx < 0) return;
+
+    /* B.4 + E.4: validate the clip's sequenceIdx against the live
+     * tracker pattern count.  Stale clips from a saved session whose
+     * tracker has fewer sequences than at save time would otherwise
+     * write a valid=true slot in pendingActions_ that never drains
+     * (applyPendingForBlock caps iteration at mod_->nseq) and would
+     * misfire on a future re-added sequence at the same index. */
+    if (clip.sequenceIdx >= trk->numPatterns()) return;
 
     const LiveState cur = clip.state.load (std::memory_order_relaxed);
 

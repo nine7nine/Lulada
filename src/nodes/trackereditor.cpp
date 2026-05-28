@@ -1615,10 +1615,9 @@ public:
         repaint();
     }
 
-    /** Add a new empty pattern (same length as current). Engine
-     *  advances all sequences in mod->seq[], but only those with
-     *  playing=1 emit MIDI — we keep one-pattern-at-a-time semantics
-     *  by gating playing across the curr_seq pointer. */
+    /** Add a new empty pattern (same length as current).  C.1 makes
+     *  curr_seq the editing focus only -- playback comes from session
+     *  view or arrangement, not from the editor's pattern selection. */
     void newPattern()
     {
         if (trackerNode == nullptr) return;
@@ -1634,10 +1633,10 @@ public:
         sequence_add_track (seq, trk);
         module_add_sequence (mod, seq);
 
-        /* Pause all sequences except the new one. */
-        for (int i = 0; i < mod->nseq; ++i)
-            sequence_set_playing (mod->seq[i], 0);
-        sequence_set_playing (seq, 1);
+        /* Move editing focus; leave playing flags untouched.  The new
+         * sequence defaults to playing=0 (sequence_new); existing
+         * sequences keep whatever launch state the session/arrange
+         * surface assigned. */
         mod->curr_seq = seq;
 
         cursorRow = 0;
@@ -1646,7 +1645,9 @@ public:
         repaint();
     }
 
-    /** Switch the active pattern by delta (+1 / -1). */
+    /** Switch the editing focus by delta (+1 / -1).  C.1: navigating
+     *  patterns moves curr_seq only -- it does NOT start/stop playback.
+     *  Audition is the session/arrange surface's job. */
     void switchPattern (int delta)
     {
         if (trackerNode == nullptr) return;
@@ -1661,9 +1662,6 @@ public:
         idx = (idx + delta + mod->nseq) % mod->nseq;
         auto* target = mod->seq[idx];
 
-        for (int i = 0; i < mod->nseq; ++i)
-            sequence_set_playing (mod->seq[i], 0);
-        sequence_set_playing (target, 1);
         mod->curr_seq = target;
 
         /* Clamp cursor into new pattern bounds. */

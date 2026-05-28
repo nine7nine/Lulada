@@ -264,10 +264,14 @@ void TrackerNode::installDefaultPattern()
     mod_->curr_seq = seq;
     mod_->bpm = 120.0f;
 
-    /* sequence_new() defaults seq->playing = 0. Without this,
-     * sequence_advance() runs but skips track_advance(), so no MIDI
-     * is emitted even when module->playing is set. */
-    sequence_set_playing (seq, 1);
+    /* C.1: leave seq->playing = 0 (sequence_new default).  Previously
+     * this set playing=1 so a fresh TrackerNode emitted MIDI from the
+     * default pattern without any user action -- which under the
+     * session-view clip-launcher model meant rogue notes once any
+     * other clip was banged on the same tracker (both seq[0] and the
+     * banged seq[N] would emit concurrently).  Under the cleaner
+     * multi-surface model the user explicitly launches what they
+     * want to hear via session view or arrangement. */
 }
 
 void TrackerNode::refreshPorts()
@@ -472,13 +476,20 @@ int TrackerNode::createSequence (int rowsLength)
     sequence* seq = sequence_new (len);
     if (seq == nullptr) return -1;
 
-    /* One track per sequence — matches the "one clip = one track"
-     * mapping the session-view design rests on (see §2.2 of
-     * ~/wine-nspa-notes/session-view-design.md).  Multi-track clip
+    /* One track per sequence -- matches the "one clip = one track"
+     * mapping the session-view design rests on.  Multi-track clip
      * groups can be a later feature. */
     track* trk = track_new (0, 0, len, len, TRACK_DEF_CTRLPR);
     sequence_add_track (seq, trk);
     module_add_sequence (mod_, seq);
+
+    /* B.1 + B.3: pre-size the scheduler arrays so the audio thread
+     * never grows them under engineLock_.  drainLaunchFifo +
+     * sequenceWrappedSinceLastQuery become pure index reads. */
+    while (pendingActions_.size() < mod_->nseq)
+        pendingActions_.add ({});
+    while (lastSeqPos_.size() < mod_->nseq)
+        lastSeqPos_.add (0.0);
 
     /* sequence_new defaults playing=0; the clip launcher flips it
      * when the clip is banged.  Leave it untouched here. */
@@ -497,11 +508,18 @@ int TrackerNode::cloneSequence (int sourceIdx)
     sequence* clone = sequence_clone (src);
     if (clone == nullptr) return -1;
 
-    /* Force playing=0 on the clone regardless of source state — the
+    /* Force playing=0 on the clone regardless of source state -- the
      * clip launcher decides when it should fire, not the cloner. */
     sequence_set_playing (clone, 0);
 
     module_add_sequence (mod_, clone);
+
+    /* B.1 + B.3: pre-size scheduler arrays.  Same fix as createSequence. */
+    while (pendingActions_.size() < mod_->nseq)
+        pendingActions_.add ({});
+    while (lastSeqPos_.size() < mod_->nseq)
+        lastSeqPos_.add (0.0);
+
     return mod_->nseq - 1;
 }
 
@@ -515,7 +533,7 @@ void TrackerNode::removeSequence (int sequenceIdx)
     const bool removingCurr = (mod_->curr_seq == doomed);
 
     /* Capture the replacement curr_seq pointer BEFORE module_del_sequence
-     * runs — afterwards the splice has shifted everything and seq[1]
+     * runs -- afterwards the splice has shifted everything and seq[1]
      * doesn't exist if we removed index 0.  After deletion, what was
      * seq[1] occupies seq[0]; the pointer we stored still resolves. */
     sequence* nextCurr = removingCurr
@@ -530,6 +548,11 @@ void TrackerNode::removeSequence (int sequenceIdx)
     /* Keep wrap-detection cache aligned with vht's seq[] indexing. */
     if (sequenceIdx < lastSeqPos_.size())
         lastSeqPos_.remove (sequenceIdx);
+
+    /* B.2: also splice pendingActions_ so queued launches on the
+     * post-shift sequence don't misfire on the wrong target. */
+    if (sequenceIdx < pendingActions_.size())
+        pendingActions_.remove (sequenceIdx);
 }
 
 void TrackerNode::setSequencePlaying (int sequenceIdx, bool on)
@@ -585,6 +608,15 @@ int TrackerNode::getSequenceLengthRows (int sequenceIdx) const noexcept
     return seq != nullptr ? seq->length : 0;
 }
 
+double TrackerNode::getSequenceLengthBeats (int sequenceIdx) const noexcept
+{
+    juce::ScopedLock sl (const_cast<juce::CriticalSection&> (engineLock_));
+    if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return 0.0;
+    const sequence* seq = mod_->seq[sequenceIdx];
+    if (seq == nullptr || seq->rpb <= 0 || seq->length <= 0) return 0.0;
+    return (double) seq->length / (double) seq->rpb;
+}
+
 /* === Audio-thread launch scheduler ===================================== */
 
 void TrackerNode::schedulePlaying (int sequenceIdx, double beatTarget, bool wantPlaying) noexcept
@@ -613,11 +645,11 @@ void TrackerNode::drainLaunchFifo() noexcept
 
     auto apply = [this] (const LaunchReq& r) noexcept
     {
-        if (r.sequenceIdx < 0) return;
-        /* Grow pending array to cover this seqIdx.  Cheap; only on
-         * first request after a new sequence is created. */
-        while (pendingActions_.size() <= r.sequenceIdx)
-            pendingActions_.add ({});
+        /* B.1 + B.4: pendingActions_ is pre-sized by createSequence /
+         * cloneSequence / setState (message thread) so a valid
+         * sequenceIdx always has a slot.  Drop out-of-range requests
+         * silently rather than growing the array on the audio thread. */
+        if (r.sequenceIdx < 0 || r.sequenceIdx >= pendingActions_.size()) return;
         auto& slot = pendingActions_.getReference (r.sequenceIdx);
         slot.beatTarget  = r.beatTarget;
         slot.wantPlaying = (r.wantPlaying != 0);
@@ -676,10 +708,10 @@ bool TrackerNode::sequenceWrappedSinceLastQuery (int sequenceIdx) noexcept
     juce::ScopedLock sl (engineLock_);
     if (mod_ == nullptr || sequenceIdx < 0 || sequenceIdx >= mod_->nseq) return false;
 
-    /* Lazy grow the per-sequence cache to current nseq.  Shrinks
-     * happen in removeSequence; this only ever appends zeros. */
-    while (lastSeqPos_.size() < mod_->nseq)
-        lastSeqPos_.add (0.0);
+    /* B.3: lastSeqPos_ is pre-sized by createSequence / cloneSequence /
+     * setState so we never allocate here.  Defensive guard for the
+     * unlikely case it falls out of sync. */
+    if (sequenceIdx >= lastSeqPos_.size()) return false;
 
     const sequence* seq = mod_->seq[sequenceIdx];
     if (seq == nullptr) return false;
@@ -824,15 +856,29 @@ void TrackerNode::setState (const void* data, int size)
         module_add_sequence (mod_, seq);
     }
 
-    /* Activate curr_seq, pause others (one-pattern-at-a-time semantics). */
+    /* Restore curr_seq as the editing focus, but leave every sequence
+     * with playing=0 (C.1).  The user explicitly launches via session
+     * view or arrangement -- no rogue emit on session load. */
     if (mod_->nseq > 0)
     {
         const int idx = juce::jlimit (0, mod_->nseq - 1, currIdx);
         for (int i = 0; i < mod_->nseq; ++i)
             sequence_set_playing (mod_->seq[i], 0);
         mod_->curr_seq = mod_->seq[idx];
-        sequence_set_playing (mod_->curr_seq, 1);
     }
+
+    /* B.1 + B.3: setState rebuilt mod_->seq from scratch; reset the
+     * scheduler arrays to a clean slate sized to the new nseq so
+     * any stale slots from the prior state don't fire on the new
+     * sequences (different sequence pointers at the same index). */
+    pendingActions_.clearQuick();
+    lastSeqPos_.clearQuick();
+    for (int i = 0; i < mod_->nseq; ++i)
+    {
+        pendingActions_.add ({});
+        lastSeqPos_.add (0.0);
+    }
+
     mod_->bpm = bpm;
 
     mod_->clt->jack_sample_rate = (jack_nframes_t) currentSampleRate_;
