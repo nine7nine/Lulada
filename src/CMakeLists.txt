@@ -25,9 +25,8 @@ target_include_directories(element
 )
 
 # Re-glob marker: bump this file's mtime to force CMake to re-scan
-# after adding new sources under src/.  Updated 2026-05-27 evening for
-# C.1 quantize ops: dsp/quantize_options.{hpp,cpp} +
-# dsp/quantize_ops.{hpp,cpp}.
+# after adding new sources under src/.  Updated 2026-05-27 late for
+# C.2 quantize dialog: ui/pianoroll/quantize_dialog.{hpp,cpp}.
 file(GLOB_RECURSE ELEMENT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")

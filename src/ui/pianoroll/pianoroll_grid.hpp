@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "dsp/quantize_options.hpp"
+
 #include <element/juce/gui_basics.hpp>
 #include <element/services.hpp>
 #include <element/transport.hpp>
@@ -197,16 +199,43 @@ public:
     // these directly so the dsp/quantize_options.hpp dependency stays
     // confined to the .cpp.
 
-    /** Snap each selected note's onset to the current snap-division
-     *  grid (start-only, full amount, no swing / random).  No-op when
-     *  selection is empty.  Each invocation is one undo step. */
+    /** Default quantize: snap each selected note's onset to the
+     *  current snap-division grid (start-only, full amount, no
+     *  swing / random).  Reads PianoRollView's last-used QuantizeOptions
+     *  if one has been set via the dialog; otherwise derives defaults
+     *  from the current snap-division.  Each invocation is one undo
+     *  step. */
     void quantizeSelection();
 
-    /** Jitter each selected note's velocity within +/- 10 (range
-     *  documented in HumanizeOptions default; deterministic per
-     *  selection set so repeat-invocation reproducibility is stable).
-     *  No-op when selection is empty. */
+    /** Default humanize: velocity jitter +/- 10 (or last-used range
+     *  from the dialog).  Deterministic per selection set so repeat-
+     *  invocation reproducibility is stable. */
     void humanizeSelection();
+
+    /** Dialog-driven apply paths.  Each takes explicit options + runs
+     *  the corresponding op against the current selection on the bound
+     *  region, pushing one MidiNoteDiffCommand through the UndoManager.
+     *  Returns the number of notes touched (0 means nothing to commit
+     *  -- caller can suppress the undo-step). */
+    std::size_t applyQuantize (const dsp::quantize::QuantizeOptions&);
+    std::size_t applyHumanize (const dsp::quantize::HumanizeOptions&);
+    std::size_t applyScale    (dsp::quantize::Scale, int rootSemitone);
+
+    /** Compute the id list of notes that the given op would touch,
+     *  WITHOUT mutating the region or pushing anything to the undo
+     *  stack.  Used by QuantizeDialog's live preview.  Returns ids
+     *  drawn from the current selection -- callers that want
+     *  selection clamping can intersect with `selectedNoteIds_` or
+     *  just use the returned list directly. */
+    std::vector<std::uint64_t> previewQuantizeIds (const dsp::quantize::QuantizeOptions&) const;
+    std::vector<std::uint64_t> previewHumanizeIds (const dsp::quantize::HumanizeOptions&) const;
+    std::vector<std::uint64_t> previewScaleIds    (dsp::quantize::Scale, int rootSemitone) const;
+
+    /** Install / clear the live-preview overlay.  paintNotes draws a
+     *  highlight ring around each id in the set.  Empty set clears
+     *  the overlay.  Repaints. */
+    void setPreviewAffectedNotes (std::vector<std::uint64_t> ids);
+    void clearPreviewAffectedNotes() noexcept;
 
 private:
     PianoRollView&  parent_;
@@ -236,6 +265,12 @@ private:
     /* Active drag gesture.  Lifetime is one mouse-down-to-mouse-up
      * cycle.  Cleared on mouseUp after commit. */
     std::unique_ptr<NoteDrag> activeDrag_;
+
+    /* Preview-affected ids.  Notes whose id is in this set get a
+     * highlight ring at paint time so the dialog's live preview can
+     * show "here's what will change".  Cleared on apply / cancel /
+     * dialog close. */
+    std::unordered_set<std::uint64_t> previewAffectedIds_;
 
     void timerCallback() override;
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "dsp/quantize_options.hpp"
 #include "ui/blocktoolbutton.hpp"
 
 #include <element/juce/gui_basics.hpp>
@@ -77,6 +78,33 @@ public:
     std::function<void()>                  onResizeDragEnd;
     std::function<void()>                  onCloseClicked;
 
+    //==========================================================================
+    // Last-used quantize / humanize / scale state.  Survives dialog
+    // open/close so Ctrl+Q and the toolbar Q/H/S buttons replay the
+    // user's most recent settings.  Lives on the view (not the grid)
+    // because the grid is re-bound per region; the dialog parameters
+    // are per-editor-instance.
+
+    const dsp::quantize::QuantizeOptions& getLastQuantizeOptions() const noexcept { return lastQuantize_; }
+    const dsp::quantize::HumanizeOptions& getLastHumanizeOptions() const noexcept { return lastHumanize_; }
+    dsp::quantize::Scale                  getLastScale()           const noexcept { return lastScale_; }
+    int                                   getLastScaleRoot()       const noexcept { return lastScaleRoot_; }
+
+    void setLastQuantizeOptions (const dsp::quantize::QuantizeOptions& o) noexcept;
+    void setLastHumanizeOptions (const dsp::quantize::HumanizeOptions& o) noexcept { lastHumanize_ = o; lastHumanizeDirty_ = true; }
+    void setLastScale (dsp::quantize::Scale s, int root) noexcept { lastScale_ = s; lastScaleRoot_ = root; lastScaleDirty_ = true; }
+
+    /** True when the user has opened the dialog at least once and
+     *  adjusted the Quantize tab parameters.  Ctrl+Q uses last-used
+     *  options when true; otherwise it derives defaults from the
+     *  current snap division. */
+    bool isLastQuantizeUserAdjusted() const noexcept { return lastQuantizeDirty_; }
+
+    /** Open the quantize / humanize / scale dialog at the given tab.
+     *  No-op if a dialog is already open (button click re-focuses
+     *  rather than spawning a second instance). */
+    void openQuantizeDialog (int tabIndex);   /* 0 = Q, 1 = H, 2 = S */
+
     /** Fired after every region-mutating gesture commit (Move, Create,
      *  Resize, Erase, Delete-key) on the bound region.  StandardContent
      *  wires this to ArrangementView::body_->repaint() so the lane
@@ -126,6 +154,7 @@ private:
      * pending) will subsume both buttons + add the scale-snap tab. */
     BlockToolButton                     quantizeBtn_    { "Q" };
     BlockToolButton                     humanizeBtn_    { "H" };
+    BlockToolButton                     scaleBtn_       { "S" };
     BlockToolButton                     zoomOutBtn_     { "-" };
     BlockToolButton                     zoomInBtn_      { "+" };
     BlockToolButton                     zoomFitBtn_     { "Fit" };
@@ -135,6 +164,24 @@ private:
      * axes during edits. */
     BlockToolButton                     yZoomOutBtn_    { "Y-" };
     BlockToolButton                     yZoomInBtn_     { "Y+" };
+
+    /* Last-used dialog parameters.  Defaults match the C.1 toolbar
+     * behaviour: full-amount quantize, +/- 10 velocity humanize, C
+     * major scale.  Dirty flags track whether the user has actually
+     * touched a tab so Ctrl+Q falls back to snap-derived defaults
+     * pre-first-dialog-open. */
+    dsp::quantize::QuantizeOptions lastQuantize_;
+    dsp::quantize::HumanizeOptions lastHumanize_;
+    dsp::quantize::Scale           lastScale_     { dsp::quantize::Scale::Major };
+    int                            lastScaleRoot_ { 0 };
+    bool                           lastQuantizeDirty_ { false };
+    bool                           lastHumanizeDirty_ { false };
+    bool                           lastScaleDirty_    { false };
+
+    /* Modal dialog holder.  unique_ptr because juce::DialogWindow
+     * deletes itself on close via the holder reset() pattern (see
+     * SessionImportWizardDialog).  Null when no dialog is open. */
+    std::unique_ptr<juce::Component> quantizeDialog_;
 
     std::unique_ptr<PianoRollKeyboard>  keyboard_;
     /** juce::Viewport hosting the grid.  Horizontal scrolling only --
