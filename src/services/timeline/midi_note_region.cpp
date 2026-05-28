@@ -19,6 +19,7 @@ const juce::Identifier kPositionAttr  { "pos" };
 const juce::Identifier kLengthAttr    { "len" };
 const juce::Identifier kStartAttr     { "start" };
 const juce::Identifier kLoopedAttr    { "loop" };
+const juce::Identifier kLoopLenAttr   { "loopLen" };
 const juce::Identifier kColourAttr    { "col" };
 const juce::Identifier kNameAttr      { "name" };
 const juce::Identifier kNoteTag       { "n" };
@@ -74,6 +75,7 @@ std::unique_ptr<MidiNoteRegion> MidiNoteRegion::clone() const
     out->lengthBeats   = lengthBeats;
     out->startBeats    = startBeats;
     out->looped        = looped;
+    out->loopLengthBeats = loopLengthBeats;
     out->colour        = colour;
     out->name          = name;
 
@@ -236,6 +238,11 @@ juce::ValueTree MidiNoteRegion::toValueTree() const
     if (lengthBeats   != 0.0) v.setProperty (kLengthAttr,   lengthBeats,   nullptr);
     if (startBeats    != 0.0) v.setProperty (kStartAttr,    startBeats,    nullptr);
     if (looped)               v.setProperty (kLoopedAttr,   true,          nullptr);
+    /* Sparse-write loop period: 0 means "use lengthBeats" (the
+     * pre-fix default), so older sessions stay byte-identical and
+     * fresh non-looped regions don't carry it. */
+    if (loopLengthBeats != 0.0)
+        v.setProperty (kLoopLenAttr, loopLengthBeats, nullptr);
     /* Default colour matches the ctor; only persist when overridden. */
     if (colour.getARGB() != juce::Colour (0xff'5a'8a'5a).getARGB())
         v.setProperty (kColourAttr, (juce::int64) colour.getARGB(), nullptr);
@@ -274,6 +281,13 @@ std::unique_ptr<MidiNoteRegion> MidiNoteRegion::fromValueTree (const juce::Value
     r->lengthBeats   = (double) v.getProperty (kLengthAttr,   0.0);
     r->startBeats    = (double) v.getProperty (kStartAttr,    0.0);
     r->looped        = (bool)   v.getProperty (kLoopedAttr,   false);
+    r->loopLengthBeats = (double) v.getProperty (kLoopLenAttr, 0.0);
+    /* Migration for pre-loopLengthBeats sessions: a region saved as
+     * looped without loopLengthBeats used to use lengthBeats as the
+     * period.  Lock that period in now so a future right-edge drag
+     * doesn't silently change the loop behaviour. */
+    if (r->looped && r->loopLengthBeats == 0.0 && r->lengthBeats > 0.0)
+        r->loopLengthBeats = r->lengthBeats;
     if (v.hasProperty (kColourAttr))
         r->colour = juce::Colour ((juce::uint32) (juce::int64) v.getProperty (kColourAttr));
     r->name          = v.getProperty (kNameAttr, juce::String()).toString();

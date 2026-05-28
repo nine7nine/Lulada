@@ -9,6 +9,8 @@
 #include "ui/fontcache.hpp"
 #include "services/timeline/midi_note_region.hpp"
 #include "services/timeline/midi_note.hpp"
+#include "dsp/quantize_options.hpp"
+#include "dsp/quantize_ops.hpp"
 
 #include <element/audioengine.hpp>
 #include <element/context.hpp>
@@ -653,6 +655,18 @@ void PianoRollGrid::paintNotes (juce::Graphics& g, const MidiNoteRegion& region)
         g.setColour (edge);
         g.drawRoundedRectangle (rf, corner, selected ? 1.6f : 1.0f);
 
+        /* Preview-affected highlight ring.  Painted on top of the
+         * normal outline so the user can see which notes the dialog's
+         * pending op will touch.  Soft amber so it reads as "pending"
+         * rather than "selected" (which uses the accent green). */
+        if (! previewAffectedIds_.empty()
+            && previewAffectedIds_.find (n.id) != previewAffectedIds_.end())
+        {
+            const juce::Colour previewRing { 0xff'ff'b3'4a };
+            g.setColour (previewRing);
+            g.drawRoundedRectangle (rf.expanded (1.5f), corner + 1.0f, 1.4f);
+        }
+
         /* Pitch label inside wide-enough notes.  Skip for tiny rows
          * (would clip vertically) and short notes.  Always-white text
          * pairs cleanly with the dim shaded body across the velocity
@@ -823,6 +837,12 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
                     if (auto* v = safeView.getComponent())
                         v->notifyRegionEdited();
                 };
+                /* Start a fresh transaction so this diff doesn't
+                 * coalesce with whatever the ArrangementView /
+                 * SessionView left open -- without this, Ctrl+Z would
+                 * undo the cross-surface group rather than just the
+                 * piano-roll edit. */
+                gui->getUndoManager().beginNewTransaction ("Erase MIDI note");
                 gui->getUndoManager().perform (cmd.release(), "Erase MIDI note");
             }
             else
@@ -1013,6 +1033,7 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                 if (auto* v = safeView.getComponent())
                     v->notifyRegionEdited();
             };
+            gui->getUndoManager().beginNewTransaction ("Delete MIDI notes");
             gui->getUndoManager().perform (cmd.release(), "Delete MIDI notes");
         }
         else
@@ -1037,6 +1058,19 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                 selectedNoteIds_.insert (n.id);
             repaint();
         }
+        return true;
+    }
+
+    /* Ctrl+Q -- snap onsets of selected notes to the current grid
+     * division.  Primary trigger surface is the toolbar's Q button on
+     * the piano-roll header; this hotkey is the power-user alias.
+     * Routed through quantizeSelection() so the toolbar + hotkey share
+     * one implementation and stay in lockstep with future ops engine
+     * changes. */
+    if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'Q')
+    {
+        if (region == nullptr || selectedNoteIds_.empty()) return false;
+        quantizeSelection();
         return true;
     }
 
@@ -1076,6 +1110,7 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                 if (auto* v = safeView.getComponent())
                     v->notifyRegionEdited();
             };
+            gui->getUndoManager().beginNewTransaction ("Duplicate MIDI notes");
             gui->getUndoManager().perform (cmd.release(), "Duplicate MIDI notes");
         }
         else
@@ -1143,6 +1178,7 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                 if (auto* v = safeView.getComponent())
                     v->notifyRegionEdited();
             };
+            gui->getUndoManager().beginNewTransaction (label);
             gui->getUndoManager().perform (cmd.release(), label);
         }
         else
@@ -1171,6 +1207,272 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
     }
 
     return false;
+}
+
+namespace {
+
+/* Convert the grid's snapDivision (a beats double set by
+ * PianoRollView::applySnapFromComboBox) back to the (NoteLength,
+ * NoteType) pair the quantize ops engine consumes.  The mapping is the
+ * inverse of the snapBox id table -- each unique snapDivision value
+ * lines up with exactly one (NoteLength, NoteType) pair.  Falls back
+ * to (Sixteenth, Normal) when the division doesn't match a known
+ * preset (e.g. a future custom division). */
+std::pair<dsp::quantize::NoteLength, dsp::quantize::NoteType>
+divisionToNoteShape (double divisionBeats) noexcept
+{
+    using L = dsp::quantize::NoteLength;
+    using T = dsp::quantize::NoteType;
+    constexpr double eps = 1.0e-6;
+    auto near = [eps] (double a, double b) { return std::abs (a - b) < eps; };
+
+    if (near (divisionBeats, 4.0))         return { L::Whole,        T::Normal  };
+    if (near (divisionBeats, 2.0))         return { L::Half,         T::Normal  };
+    if (near (divisionBeats, 1.0))         return { L::Quarter,      T::Normal  };
+    if (near (divisionBeats, 0.5))         return { L::Eighth,       T::Normal  };
+    if (near (divisionBeats, 0.25))        return { L::Sixteenth,    T::Normal  };
+    if (near (divisionBeats, 0.125))       return { L::ThirtySecond, T::Normal  };
+    if (near (divisionBeats, 2.0 / 3.0))   return { L::Quarter,      T::Triplet };
+    if (near (divisionBeats, 1.0 / 3.0))   return { L::Eighth,       T::Triplet };
+    if (near (divisionBeats, 1.0 / 6.0))   return { L::Sixteenth,    T::Triplet };
+    return { L::Sixteenth, T::Normal };
+}
+
+} // namespace
+
+namespace {
+
+/* Shared apply-and-push template for all three ops.  `populate` runs
+ * the dsp::quantize op against the bound region + selection, filling
+ * `cmd` with updates.  If anything was touched, the command is pushed
+ * onto the GuiService UndoManager with `label`; the standard
+ * onApplied -> notifyRegionEdited hook is wired so the session XML
+ * write fires.  Falls back to direct cmd.perform() when no
+ * GuiService is available -- mirrors the delete-key path. */
+template <typename Populate>
+std::size_t applyOpAndPush (PianoRollGrid&           grid,
+                              MidiNoteRegion&          region,
+                              const std::unordered_set<std::uint64_t>& selection,
+                              PianoRollView&           parent,
+                              Services&                services,
+                              const juce::String&      label,
+                              Populate&&               populate)
+{
+    if (selection.empty()) return 0;
+
+    if (auto* gui = services.find<GuiService>())
+    {
+        auto cmd = std::make_unique<MidiNoteDiffCommand> (parent.getBoundRegionId(),
+                                                            parent.getRegionResolver());
+        const std::size_t touched = populate (region, selection, *cmd);
+        if (touched == 0 || cmd->isEmpty()) return 0;
+
+        juce::Component::SafePointer<PianoRollView> safeView (&parent);
+        cmd->onApplied = [safeView]() {
+            if (auto* v = safeView.getComponent())
+                v->notifyRegionEdited();
+        };
+        /* Fresh transaction so this diff doesn't coalesce with any
+         * still-open ArrangementView / SessionView transaction.  Same
+         * pattern as the other piano-roll perform sites. */
+        gui->getUndoManager().beginNewTransaction (label);
+        gui->getUndoManager().perform (cmd.release(), label);
+        grid.repaint();
+        return touched;
+    }
+
+    MidiNoteDiffCommand cmd (parent.getBoundRegionId(),
+                              parent.getRegionResolver());
+    const std::size_t touched = populate (region, selection, cmd);
+    if (touched == 0 || cmd.isEmpty()) return 0;
+    cmd.perform();
+    parent.notifyRegionEdited();
+    grid.repaint();
+    return touched;
+}
+
+/* Same population walk the apply path uses, but the result is the id
+ * list (not a diff command).  Used by the dialog's live preview --
+ * we want to know which notes WOULD change without mutating anything.
+ * Each helper mirrors the corresponding dsp::quantize op's
+ * skip-when-unchanged contract so the preview ring matches what
+ * Apply will actually touch. */
+std::vector<std::uint64_t> idsTouchedByQuantize (const MidiNoteRegion& region,
+                                                   const std::unordered_set<std::uint64_t>& selection,
+                                                   const dsp::quantize::QuantizeOptions& opts)
+{
+    /* Cheapest path: populate a throwaway diff cmd with a no-op
+     * resolver, then read out the updated ids.  Keeps preview /
+     * apply in lockstep with the same skip semantics. */
+    MidiNoteDiffCommand cmd (juce::Uuid::null(),
+                              [] (const juce::Uuid&) -> MidiNoteRegion* { return nullptr; });
+    dsp::quantize::quantizeNotes (region, selection, opts, cmd);
+    /* MidiNoteDiffCommand's updates_ is private; we can't read it
+     * directly.  Re-walk the snapshot ourselves with the same compare
+     * the op uses.  This is duplication but keeps the preview path
+     * free of friend access. */
+    std::vector<std::uint64_t> out;
+    const auto* snap = region.loadSnapshot();
+    if (snap == nullptr) return out;
+    const double lengthBeats = region.lengthBeats > 0.0 ? region.lengthBeats : 0.0;
+    if (lengthBeats <= 0.0) return out;
+    const auto points = dsp::quantize::buildQuantizePoints (opts, lengthBeats);
+    if (points.empty()) return out;
+    out.reserve (selection.size());
+    for (const auto& n : *snap)
+    {
+        if (selection.find (n.id) == selection.end()) continue;
+        double newOn = n.onBeat;
+        if (opts.adjustStart) newOn = dsp::quantize::snapBeatMixed (n.onBeat, points, opts.amount);
+        const bool changed = std::abs (newOn - n.onBeat) > 1.0e-9 || opts.adjustEnd;
+        if (changed) out.push_back (n.id);
+    }
+    return out;
+}
+
+std::vector<std::uint64_t> idsTouchedByHumanize (const MidiNoteRegion& region,
+                                                   const std::unordered_set<std::uint64_t>& selection,
+                                                   const dsp::quantize::HumanizeOptions& opts)
+{
+    /* Humanize touches every selected note with a non-zero range; the
+     * dialog can show the same set as "potentially affected". */
+    std::vector<std::uint64_t> out;
+    const auto* snap = region.loadSnapshot();
+    if (snap == nullptr) return out;
+    if (opts.velocityRange == 0 && opts.velocityBias == 0) return out;
+    out.reserve (selection.size());
+    for (const auto& n : *snap)
+        if (selection.find (n.id) != selection.end())
+            out.push_back (n.id);
+    return out;
+}
+
+std::vector<std::uint64_t> idsTouchedByScale (const MidiNoteRegion& region,
+                                                const std::unordered_set<std::uint64_t>& selection,
+                                                dsp::quantize::Scale scale,
+                                                int rootSemitone)
+{
+    std::vector<std::uint64_t> out;
+    const auto* snap = region.loadSnapshot();
+    if (snap == nullptr) return out;
+    out.reserve (selection.size());
+    for (const auto& n : *snap)
+    {
+        if (selection.find (n.id) == selection.end()) continue;
+        if (dsp::quantize::snapPitchToScale (n.pitch, scale, rootSemitone) != n.pitch)
+            out.push_back (n.id);
+    }
+    return out;
+}
+
+} // namespace
+
+std::size_t PianoRollGrid::applyQuantize (const dsp::quantize::QuantizeOptions& opts)
+{
+    auto* region = resolveBoundRegion();
+    if (region == nullptr) return 0;
+    return applyOpAndPush (*this, *region, selectedNoteIds_, parent_, services_,
+                            "Quantize MIDI notes",
+                            [&opts] (MidiNoteRegion& r,
+                                     const std::unordered_set<std::uint64_t>& sel,
+                                     MidiNoteDiffCommand& cmd)
+                            {
+                                return dsp::quantize::quantizeNotes (r, sel, opts, cmd);
+                            });
+}
+
+std::size_t PianoRollGrid::applyHumanize (const dsp::quantize::HumanizeOptions& opts)
+{
+    auto* region = resolveBoundRegion();
+    if (region == nullptr) return 0;
+    return applyOpAndPush (*this, *region, selectedNoteIds_, parent_, services_,
+                            "Humanize MIDI velocities",
+                            [&opts] (MidiNoteRegion& r,
+                                     const std::unordered_set<std::uint64_t>& sel,
+                                     MidiNoteDiffCommand& cmd)
+                            {
+                                return dsp::quantize::humanizeVelocity (r, sel, opts, cmd);
+                            });
+}
+
+std::size_t PianoRollGrid::applyScale (dsp::quantize::Scale scale, int rootSemitone)
+{
+    auto* region = resolveBoundRegion();
+    if (region == nullptr) return 0;
+    return applyOpAndPush (*this, *region, selectedNoteIds_, parent_, services_,
+                            "Scale-snap MIDI notes",
+                            [scale, rootSemitone] (MidiNoteRegion& r,
+                                                   const std::unordered_set<std::uint64_t>& sel,
+                                                   MidiNoteDiffCommand& cmd)
+                            {
+                                return dsp::quantize::scaleQuantize (r, sel, scale, rootSemitone, cmd);
+                            });
+}
+
+std::vector<std::uint64_t>
+PianoRollGrid::previewQuantizeIds (const dsp::quantize::QuantizeOptions& opts) const
+{
+    const auto* region = const_cast<PianoRollGrid*> (this)->resolveBoundRegion();
+    if (region == nullptr || selectedNoteIds_.empty()) return {};
+    return idsTouchedByQuantize (*region, selectedNoteIds_, opts);
+}
+
+std::vector<std::uint64_t>
+PianoRollGrid::previewHumanizeIds (const dsp::quantize::HumanizeOptions& opts) const
+{
+    const auto* region = const_cast<PianoRollGrid*> (this)->resolveBoundRegion();
+    if (region == nullptr || selectedNoteIds_.empty()) return {};
+    return idsTouchedByHumanize (*region, selectedNoteIds_, opts);
+}
+
+std::vector<std::uint64_t>
+PianoRollGrid::previewScaleIds (dsp::quantize::Scale scale, int rootSemitone) const
+{
+    const auto* region = const_cast<PianoRollGrid*> (this)->resolveBoundRegion();
+    if (region == nullptr || selectedNoteIds_.empty()) return {};
+    return idsTouchedByScale (*region, selectedNoteIds_, scale, rootSemitone);
+}
+
+void PianoRollGrid::setPreviewAffectedNotes (std::vector<std::uint64_t> ids)
+{
+    previewAffectedIds_.clear();
+    for (auto id : ids) previewAffectedIds_.insert (id);
+    repaint();
+}
+
+void PianoRollGrid::clearPreviewAffectedNotes() noexcept
+{
+    if (previewAffectedIds_.empty()) return;
+    previewAffectedIds_.clear();
+    repaint();
+}
+
+void PianoRollGrid::quantizeSelection()
+{
+    if (selectedNoteIds_.empty()) return;
+    /* Hotkey-driven default: use the view's last-used QuantizeOptions
+     * (set by the dialog).  If the user has never opened the dialog,
+     * fall back to options derived from the current snap division at
+     * full amount, start-only.  Lives here -- not on PianoRollView --
+     * because the snap-division -> NoteLength mapping is grid-private. */
+    dsp::quantize::QuantizeOptions opts = parent_.getLastQuantizeOptions();
+    if (! parent_.isLastQuantizeUserAdjusted())
+    {
+        const auto shape = divisionToNoteShape (snapDivision_);
+        opts.noteLength  = shape.first;
+        opts.noteType    = shape.second;
+        opts.amount      = 1.0;
+        opts.adjustStart = true;
+        opts.adjustEnd   = false;
+    }
+    applyQuantize (opts);
+}
+
+void PianoRollGrid::humanizeSelection()
+{
+    if (selectedNoteIds_.empty()) return;
+    const auto opts = parent_.getLastHumanizeOptions();
+    applyHumanize (opts);
 }
 
 } // namespace element

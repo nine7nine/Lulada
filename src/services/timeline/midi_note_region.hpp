@@ -108,6 +108,23 @@ public:
     double        startBeats    { 0.0 };
 
     bool          looped        { false };
+
+    /** Loop period in beats for the audio thread's modulo-into-source
+     *  wrap.  Mirrors how the audio kind's PlaybackDS wraps on the
+     *  underlying source file length rather than on the region's
+     *  drawn duration.
+     *
+     *  Default 0.0 means "use lengthBeats" -- preserves pre-fix
+     *  sessions that didn't carry this field.  When the user toggles
+     *  Loop on, ArrangementView snapshots `loopLengthBeats =
+     *  lengthBeats` at that moment so subsequent right-edge drags
+     *  extend the region (number of repeats) without stretching the
+     *  loop itself.  Sparse-write -- omitted when 0.
+     *
+     *  Audio-thread access is via the immutable RegionEntry; no torn
+     *  reads. */
+    double        loopLengthBeats { 0.0 };
+
     juce::Colour  colour        { 0xff'5a'8a'5a }; // muted green; distinct from audio (blue) + tracker (orange)
     juce::String  name;
 

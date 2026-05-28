@@ -134,6 +134,12 @@ public:
          *  (which the UI thread may be racing through during a drag). */
         double          startBeats    { 0.0 };
         bool            looped        { false };
+        /** Loop period in beats.  0 means "use lengthBeats" -- preserves
+         *  pre-fix sessions where the loop wrapped on the region's drawn
+         *  duration.  When non-zero, the audio thread's modulo uses this
+         *  value so a right-edge drag extends the number of repeats
+         *  rather than stretching the loop pattern. */
+        double          loopLengthBeats { 0.0 };
     };
 
     /** Replace the active region table.  Message thread only.  The

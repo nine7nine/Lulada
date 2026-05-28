@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "ui/pianoroll/pianoroll_view.hpp"
+#include "ui/pianoroll/quantize_dialog.hpp"
 #include "ui/pianoroll/pianoroll_keyboard.hpp"
 #include "ui/pianoroll/pianoroll_grid.hpp"
 #include "ui/pianoroll/velocity_lane.hpp"
@@ -231,6 +232,96 @@ PianoRollView::PianoRollView (Services& services)
                          juce::Colour (0xff'a0'a0'a0));
     addAndMakeVisible (snapBox_);
 
+    /* Bulk-edit ops -- Quantize + Humanize + Scale.  Click opens the
+     * three-tab dialog at the matching tab so the user can dial in
+     * parameters with live preview; Ctrl+Q remains the fast-replay
+     * hotkey that uses the last-applied settings (or snap-derived
+     * defaults pre-first-dialog-open). */
+    quantizeBtn_.setTooltip ("Quantize... (Ctrl+Q applies last settings)");
+    quantizeBtn_.setActiveTint (kActiveTint);
+    quantizeBtn_.onClick = [this]() {
+        openQuantizeDialog (0);
+    };
+    quantizeBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Stepped staircase glyph -- reads as "snap to grid":
+             * three rising right-angle steps. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float pad = juce::jmin (w, h) * 0.18f;
+            const float x0 = b.getX() + pad;
+            const float x3 = b.getRight() - pad;
+            const float y0 = b.getBottom() - pad;
+            const float y3 = b.getY() + pad;
+            const float stepW = (x3 - x0) / 3.0f;
+            const float stepH = (y0 - y3) / 3.0f;
+            juce::Path p;
+            p.startNewSubPath (x0,                y0);
+            p.lineTo          (x0 + stepW,        y0);
+            p.lineTo          (x0 + stepW,        y0 - stepH);
+            p.lineTo          (x0 + 2.0f * stepW, y0 - stepH);
+            p.lineTo          (x0 + 2.0f * stepW, y0 - 2.0f * stepH);
+            p.lineTo          (x3,                y0 - 2.0f * stepH);
+            p.lineTo          (x3,                y3);
+            g.setColour (fg);
+            g.strokePath (p, juce::PathStrokeType (1.6f));
+        });
+    addAndMakeVisible (quantizeBtn_);
+
+    humanizeBtn_.setTooltip ("Humanize...");
+    humanizeBtn_.setActiveTint (kActiveTint);
+    humanizeBtn_.onClick = [this]() {
+        openQuantizeDialog (1);
+    };
+    humanizeBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Uneven-height bar glyph -- reads as "varied velocities":
+             * four vertical bars with different heights. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float pad   = juce::jmin (w, h) * 0.18f;
+            const float baseY = b.getBottom() - pad;
+            const float topY  = b.getY() + pad;
+            const float totalW = b.getWidth() - 2.0f * pad;
+            const float barW   = totalW / 7.0f;            /* 4 bars + 3 gaps */
+            const float heights[] = { 0.55f, 0.85f, 0.40f, 0.70f };
+            g.setColour (fg);
+            for (int i = 0; i < 4; ++i)
+            {
+                const float x = b.getX() + pad + barW * (2.0f * i);
+                const float y = baseY - (baseY - topY) * heights[i];
+                g.fillRect (x, y, barW, baseY - y);
+            }
+        });
+    addAndMakeVisible (humanizeBtn_);
+
+    scaleBtn_.setTooltip ("Scale-snap...");
+    scaleBtn_.setActiveTint (kActiveTint);
+    scaleBtn_.onClick = [this]() {
+        openQuantizeDialog (2);
+    };
+    scaleBtn_.setIcon (
+        [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
+        {
+            /* Treble-clef-ish stack of three short dashes ascending --
+             * reads as "notes in a scale".  Simple + recognisable at
+             * 24 px. */
+            const float w = b.getWidth(), h = b.getHeight();
+            const float pad   = juce::jmin (w, h) * 0.20f;
+            const float dashW = (w - 2.0f * pad) * 0.85f;
+            const float baseY = b.getBottom() - pad;
+            const float topY  = b.getY() + pad;
+            const float stepH = (baseY - topY) / 4.0f;
+            g.setColour (fg);
+            for (int i = 0; i < 3; ++i)
+            {
+                const float y = baseY - stepH * (1.0f + (float) i);
+                const float x = b.getX() + pad + (3 - i) * 1.5f;
+                g.fillRect (x, y, dashW * (0.7f + 0.10f * (float) i), 1.4f);
+            }
+        });
+    addAndMakeVisible (scaleBtn_);
+
     /* Zoom controls -- X axis (beat span).  Mirrors ArrangementView's
      * [- + Fit] triplet. */
     zoomOutBtn_.onClick = [this]() { if (grid_) grid_->zoomBy (1.0 / 1.20); };
@@ -289,7 +380,19 @@ PianoRollView::PianoRollView (Services& services)
     applySnapFromComboBox();
 }
 
-PianoRollView::~PianoRollView() = default;
+PianoRollView::~PianoRollView()
+{
+    /* Close any open dialog before our members vanish.  Without this the
+     * juce::DialogWindow can outlive the PianoRollView and call back into
+     * a destroyed grid. */
+    quantizeDialog_.reset();
+}
+
+void PianoRollView::setLastQuantizeOptions (const dsp::quantize::QuantizeOptions& o) noexcept
+{
+    lastQuantize_      = o;
+    lastQuantizeDirty_ = true;
+}
 
 void PianoRollView::notifyRegionEdited()
 {
@@ -423,6 +526,13 @@ void PianoRollView::resized()
     layoutLeftBtn (snapBtn_,   kToolBtnW);
     layoutLeftBtn (snapBox_,   kSnapBoxW, 12);
 
+    /* Bulk-edit ops: Q (Quantize), H (Humanize), S (Scale).  Click
+     * opens the dialog at the matching tab; Ctrl+Q applies last
+     * settings without the dialog. */
+    layoutLeftBtn (quantizeBtn_, kZoomBtnW);
+    layoutLeftBtn (humanizeBtn_, kZoomBtnW);
+    layoutLeftBtn (scaleBtn_,    kZoomBtnW, 12);
+
     layoutLeftBtn (zoomOutBtn_, kZoomBtnW);
     layoutLeftBtn (zoomInBtn_,  kZoomBtnW);
     layoutLeftBtn (zoomFitBtn_, kZoomBtnW + 6, 12);
@@ -485,6 +595,25 @@ void PianoRollView::resized()
     if (grid_ != nullptr && gridViewport_ != nullptr)
         grid_->updateSizeForViewport (gridViewport_->getMaximumVisibleWidth(),
                                        gridViewport_->getMaximumVisibleHeight());
+}
+
+void PianoRollView::openQuantizeDialog (int tabIndex)
+{
+    /* If a dialog is already open just bring it forward; we don't want
+     * a second instance to race the first on writeBackParameters. */
+    if (quantizeDialog_ != nullptr)
+    {
+        quantizeDialog_->toFront (true);
+        return;
+    }
+    /* Clamp + map to enum.  Caller passes 0/1/2 from the toolbar
+     * buttons; defensive clamp handles any future call site that
+     * forgets the contract. */
+    auto tab = QuantizeDialog::Tab::Quantize;
+    if      (tabIndex == 1) tab = QuantizeDialog::Tab::Humanize;
+    else if (tabIndex == 2) tab = QuantizeDialog::Tab::Scale;
+
+    new QuantizeDialogWindow (quantizeDialog_, *this, tab);
 }
 
 } // namespace element

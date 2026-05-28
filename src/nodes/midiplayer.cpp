@@ -293,18 +293,25 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
     const double regionLen   = entry.lengthBeats;
     const double regionEnd   = regionStart + regionLen;
     const double srcOffset   = entry.startBeats;
+    /* Loop period: explicit when non-zero, else fall back to the
+     * region's drawn length (pre-fix sessions + non-looped regions
+     * never read this).  Lets the user drag the right edge to extend
+     * the number of repeats without stretching the loop pattern. */
+    const double loopPeriod  = (entry.looped && entry.loopLengthBeats > 0.0)
+                                  ? entry.loopLengthBeats
+                                  : regionLen;
 
     /* Map the block's transport beat range into the region's local
-     * beat coordinates.  For looped regions, modulo into [0, len).
+     * beat coordinates.  For looped regions, modulo into [0, loopPeriod).
      * srcOffset is applied AFTER the modulo so the loop wraps the
-     * audible slice [srcOffset, srcOffset+regionLen) of the source. */
-    auto toLocal = [regionStart, regionLen, looped = entry.looped]
+     * audible slice [srcOffset, srcOffset+loopPeriod) of the source. */
+    auto toLocal = [regionStart, loopPeriod, looped = entry.looped]
                    (double beat) noexcept -> double {
         const double lb = beat - regionStart;
         if (! looped) return lb;
-        if (regionLen <= 0.0) return lb;
-        double m = std::fmod (lb, regionLen);
-        if (m < 0.0) m += regionLen;
+        if (loopPeriod <= 0.0) return lb;
+        double m = std::fmod (lb, loopPeriod);
+        if (m < 0.0) m += loopPeriod;
         return m;
     };
 
@@ -319,18 +326,18 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
     {
         localStart = toLocal (blockStartBeat);
         localEnd   = localStart + (blockEndBeat - blockStartBeat);
-        /* If localEnd wraps past regionLen, we have to split into
-         * two windows: [localStart, regionLen) + [0, localEnd-regionLen).
+        /* If localEnd wraps past loopPeriod, we have to split into
+         * two windows: [localStart, loopPeriod) + [0, localEnd-loopPeriod).
          * Implementation: just call the inner loop twice with adjusted
          * sample offsets. */
-        if (localEnd > regionLen)
+        if (localEnd > loopPeriod)
         {
-            const double tailLen = regionLen - localStart;
+            const double tailLen = loopPeriod - localStart;
 
-            /* First chunk: timeline-local [localStart, regionLen).
-             * Source-local: [srcOffset + localStart, srcOffset + regionLen). */
+            /* First chunk: timeline-local [localStart, loopPeriod).
+             * Source-local: [srcOffset + localStart, srcOffset + loopPeriod). */
             const double srcLo1 = srcOffset + localStart;
-            const double srcHi1 = srcOffset + regionLen;
+            const double srcHi1 = srcOffset + loopPeriod;
             for (const auto& n : *snap)
             {
                 const double noteEnd = n.onBeat + n.lengthBeats;
@@ -362,10 +369,10 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
                 }
             }
 
-            /* Second chunk: timeline-local [0, localEnd-regionLen).
-             * Source-local: [srcOffset, srcOffset + (localEnd-regionLen)).
+            /* Second chunk: timeline-local [0, localEnd-loopPeriod).
+             * Source-local: [srcOffset, srcOffset + (localEnd-loopPeriod)).
              * Sample offset begins at tailLen-into-the-block. */
-            const double wrapEnd = localEnd - regionLen;
+            const double wrapEnd = localEnd - loopPeriod;
             const double srcLo2  = srcOffset;
             const double srcHi2  = srcOffset + wrapEnd;
             const int wrapBaseOffset =
@@ -416,10 +423,16 @@ void MidiPlayerNode::emitRegionInBlock (const RegionEntry& entry,
     /* Common emission for non-looped + looped-no-wrap.  Translate the
      * timeline-local window to source-local for comparison against
      * note onBeats.  Notes are sorted by (onBeat, pitch) so the early
-     * break on onBeat >= srcLocalEnd remains correct. */
+     * break on onBeat >= srcLocalEnd remains correct.
+     *
+     * srcRegionEnd bounds the audible source slice -- for non-looped
+     * regions it's the right edge of the region; for looped regions
+     * it's the end of one loop iteration (loopPeriod, not lengthBeats)
+     * so notes past the loop boundary don't double-fire from the
+     * within-loop block. */
     const double srcLocalStart = srcOffset + localStart;
     const double srcLocalEnd   = srcOffset + localEnd;
-    const double srcRegionEnd  = srcOffset + regionLen;
+    const double srcRegionEnd  = srcOffset + (entry.looped ? loopPeriod : regionLen);
 
     for (const auto& n : *snap)
     {

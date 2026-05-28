@@ -104,6 +104,88 @@ BOOST_AUTO_TEST_CASE (clone_propagates_start_beats)
     BOOST_CHECK_EQUAL (c->startBeats, 1.25);
 }
 
+/* ---------- loopLengthBeats (A.1 fix: MIDI loop period decoupled
+ *            from drawn length so right-edge drag extends the
+ *            number of repeats rather than stretching the loop) */
+
+BOOST_AUTO_TEST_CASE (loop_length_beats_defaults_to_zero)
+{
+    MidiNoteRegion r;
+    BOOST_CHECK_EQUAL (r.loopLengthBeats, 0.0);
+}
+
+BOOST_AUTO_TEST_CASE (loop_length_beats_round_trips_through_value_tree)
+{
+    MidiNoteRegion r;
+    r.id              = juce::Uuid();
+    r.lengthBeats     = 8.0;
+    r.looped          = true;
+    r.loopLengthBeats = 2.0;
+
+    const auto vt = r.toValueTree();
+    auto restored = MidiNoteRegion::fromValueTree (vt);
+    BOOST_REQUIRE (restored != nullptr);
+    BOOST_CHECK_EQUAL (restored->loopLengthBeats, 2.0);
+    BOOST_CHECK_EQUAL (restored->lengthBeats,     8.0);
+    BOOST_CHECK       (restored->looped);
+}
+
+BOOST_AUTO_TEST_CASE (loop_length_beats_omitted_when_zero)
+{
+    MidiNoteRegion r;
+    r.id          = juce::Uuid();
+    r.lengthBeats = 4.0;
+    /* loopLengthBeats default 0 -- sparse-write should skip it so
+     * pre-fix sessions stay byte-identical. */
+    const auto vt = r.toValueTree();
+    BOOST_CHECK (! vt.hasProperty (juce::Identifier ("loopLen")));
+}
+
+BOOST_AUTO_TEST_CASE (clone_propagates_loop_length_beats)
+{
+    MidiNoteRegion r;
+    r.looped          = true;
+    r.loopLengthBeats = 3.0;
+    auto c = r.clone();
+    BOOST_REQUIRE (c != nullptr);
+    BOOST_CHECK_EQUAL (c->loopLengthBeats, 3.0);
+    BOOST_CHECK       (c->looped);
+}
+
+BOOST_AUTO_TEST_CASE (loaded_looped_region_without_loop_len_migrates_to_length)
+{
+    /* Pre-fix sessions carry looped=true but no loopLen attribute.
+     * The audio thread used lengthBeats as the loop period back then;
+     * fromValueTree locks that period in by setting loopLengthBeats
+     * to the loaded lengthBeats, so a subsequent right-edge drag in
+     * the new build doesn't silently change the playback behaviour. */
+    juce::ValueTree vt (juce::Identifier ("midiNoteRegion"));
+    vt.setProperty (juce::Identifier ("id"),   juce::Uuid().toString(), nullptr);
+    vt.setProperty (juce::Identifier ("len"),  4.0,                       nullptr);
+    vt.setProperty (juce::Identifier ("loop"), true,                      nullptr);
+    /* deliberately NO "loopLen" property -- simulating a pre-fix file */
+
+    auto restored = MidiNoteRegion::fromValueTree (vt);
+    BOOST_REQUIRE (restored != nullptr);
+    BOOST_CHECK (restored->looped);
+    BOOST_CHECK_EQUAL (restored->loopLengthBeats, 4.0);
+}
+
+BOOST_AUTO_TEST_CASE (non_looped_region_does_not_auto_migrate_loop_length)
+{
+    /* Sanity: a non-looped legacy region must NOT acquire a loop
+     * length on load.  The migration is gated on looped=true. */
+    juce::ValueTree vt (juce::Identifier ("midiNoteRegion"));
+    vt.setProperty (juce::Identifier ("id"),  juce::Uuid().toString(), nullptr);
+    vt.setProperty (juce::Identifier ("len"), 4.0,                       nullptr);
+    /* No loop, no loopLen */
+
+    auto restored = MidiNoteRegion::fromValueTree (vt);
+    BOOST_REQUIRE (restored != nullptr);
+    BOOST_CHECK (! restored->looped);
+    BOOST_CHECK_EQUAL (restored->loopLengthBeats, 0.0);
+}
+
 /* ---------- setNotes ---------- */
 
 BOOST_AUTO_TEST_CASE (set_notes_publishes_snapshot)
