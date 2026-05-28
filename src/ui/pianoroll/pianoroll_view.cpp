@@ -237,10 +237,11 @@ PianoRollView::PianoRollView (Services& services)
      * parameters with live preview; Ctrl+Q remains the fast-replay
      * hotkey that uses the last-applied settings (or snap-derived
      * defaults pre-first-dialog-open). */
+    quantizeBtn_.setClickingTogglesState (true);
     quantizeBtn_.setTooltip ("Quantize... (Ctrl+Q applies last settings)");
     quantizeBtn_.setActiveTint (kActiveTint);
     quantizeBtn_.onClick = [this]() {
-        openQuantizeDialog (0);
+        toggleQuantizePanel (0);
     };
     quantizeBtn_.setIcon (
         [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
@@ -268,10 +269,11 @@ PianoRollView::PianoRollView (Services& services)
         });
     addAndMakeVisible (quantizeBtn_);
 
+    humanizeBtn_.setClickingTogglesState (true);
     humanizeBtn_.setTooltip ("Humanize...");
     humanizeBtn_.setActiveTint (kActiveTint);
     humanizeBtn_.onClick = [this]() {
-        openQuantizeDialog (1);
+        toggleQuantizePanel (1);
     };
     humanizeBtn_.setIcon (
         [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
@@ -295,10 +297,11 @@ PianoRollView::PianoRollView (Services& services)
         });
     addAndMakeVisible (humanizeBtn_);
 
+    scaleBtn_.setClickingTogglesState (true);
     scaleBtn_.setTooltip ("Scale-snap...");
     scaleBtn_.setActiveTint (kActiveTint);
     scaleBtn_.onClick = [this]() {
-        openQuantizeDialog (2);
+        toggleQuantizePanel (2);
     };
     scaleBtn_.setIcon (
         [] (juce::Graphics& g, juce::Rectangle<float> b, juce::Colour fg)
@@ -382,10 +385,9 @@ PianoRollView::PianoRollView (Services& services)
 
 PianoRollView::~PianoRollView()
 {
-    /* Close any open dialog before our members vanish.  Without this the
-     * juce::DialogWindow can outlive the PianoRollView and call back into
-     * a destroyed grid. */
-    quantizeDialog_.reset();
+    /* Tear down the panel before our other members vanish so its
+     * clearPreview() destructor hook can still reach the grid. */
+    quantizePanel_.reset();
 }
 
 void PianoRollView::setLastQuantizeOptions (const dsp::quantize::QuantizeOptions& o) noexcept
@@ -563,6 +565,15 @@ void PianoRollView::resized()
     if (velocityLane_ != nullptr && velocityLane_->isVisible())
         velLaneArea = r.removeFromBottom (kVelocityLaneH);
 
+    /* Quantize/Humanize/Scale panel docks on the RIGHT edge of the
+     * body when visible.  Reserved first so the grid viewport gets
+     * what's left between the keyboard column and the panel. */
+    if (quantizePanel_ != nullptr && quantizePanelVisible_)
+    {
+        const int panelW = juce::jmin (r.getWidth() / 2, kQuantizePanelW);
+        quantizePanel_->setBounds (r.removeFromRight (panelW));
+    }
+
     if (keyboard_ != nullptr)
     {
         auto kbCol = r.removeFromLeft (kKeyboardW);
@@ -597,23 +608,68 @@ void PianoRollView::resized()
                                        gridViewport_->getMaximumVisibleHeight());
 }
 
-void PianoRollView::openQuantizeDialog (int tabIndex)
+void PianoRollView::toggleQuantizePanel (int tabIndex)
 {
-    /* If a dialog is already open just bring it forward; we don't want
-     * a second instance to race the first on writeBackParameters. */
-    if (quantizeDialog_ != nullptr)
-    {
-        quantizeDialog_->toFront (true);
-        return;
-    }
-    /* Clamp + map to enum.  Caller passes 0/1/2 from the toolbar
-     * buttons; defensive clamp handles any future call site that
-     * forgets the contract. */
+    /* Map tabIndex -> enum.  Defensive clamp keeps a stray call from
+     * landing on an out-of-range value. */
     auto tab = QuantizeDialog::Tab::Quantize;
     if      (tabIndex == 1) tab = QuantizeDialog::Tab::Humanize;
     else if (tabIndex == 2) tab = QuantizeDialog::Tab::Scale;
 
-    new QuantizeDialogWindow (quantizeDialog_, *this, tab);
+    /* If panel exists + visible + click is on the SAME tab, hide it
+     * (button acts as a true toggle).  If the click is on a DIFFERENT
+     * tab while already open, stay open + switch tab. */
+    if (quantizePanel_ != nullptr && quantizePanelVisible_)
+    {
+        const bool sameTab = (quantizePanel_->getActiveTab() == tab);
+        if (sameTab)
+        {
+            hideQuantizePanel();
+            return;
+        }
+        quantizePanel_->switchTab (tab);
+        syncToolbarTabToggles();
+        return;
+    }
+
+    /* No panel yet, or hidden -- (re)build + show on `tab`. */
+    if (quantizePanel_ == nullptr)
+    {
+        quantizePanel_ = std::make_unique<QuantizeDialog> (*this, tab);
+        quantizePanel_->onCloseRequested = [this]() { hideQuantizePanel(); };
+        addChildComponent (*quantizePanel_);
+    }
+    else
+    {
+        quantizePanel_->switchTab (tab);
+    }
+    quantizePanel_->setVisible (true);
+    quantizePanelVisible_ = true;
+    syncToolbarTabToggles();
+    resized();
+}
+
+void PianoRollView::hideQuantizePanel()
+{
+    if (quantizePanel_ != nullptr)
+    {
+        quantizePanel_->setVisible (false);
+        if (auto* grid = grid_.get())
+            grid->clearPreviewAffectedNotes();
+    }
+    quantizePanelVisible_ = false;
+    syncToolbarTabToggles();
+    resized();
+}
+
+void PianoRollView::syncToolbarTabToggles()
+{
+    using Tab = QuantizeDialog::Tab;
+    const bool vis = quantizePanelVisible_ && quantizePanel_ != nullptr;
+    const Tab active = vis ? quantizePanel_->getActiveTab() : Tab::Quantize;
+    quantizeBtn_.setToggleState (vis && active == Tab::Quantize, juce::dontSendNotification);
+    humanizeBtn_.setToggleState (vis && active == Tab::Humanize, juce::dontSendNotification);
+    scaleBtn_   .setToggleState (vis && active == Tab::Scale,    juce::dontSendNotification);
 }
 
 } // namespace element

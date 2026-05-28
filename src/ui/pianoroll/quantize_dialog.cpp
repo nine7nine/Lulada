@@ -461,11 +461,19 @@ void QuantizeDialog::buttonClicked (juce::Button* b)
     if (b == &cancelBtn_)
     {
         clearPreview();
-        /* Defer the close: onCancel deletes the host dialog window
-         * (and us) -- can't run it on the stack we're returning into. */
-        juce::MessageManager::callAsync ([cb = onCancel]() { if (cb) cb(); });
+        /* Defer the close: onCloseRequested may hide / destroy us.
+         * Run via callAsync so the button callback can unwind first. */
+        juce::MessageManager::callAsync ([cb = onCloseRequested]() {
+            if (cb) cb();
+        });
         return;
     }
+}
+
+void QuantizeDialog::switchTab (Tab t)
+{
+    if (t == activeTab_) return;
+    setActiveTab (t);
 }
 
 void QuantizeDialog::sliderValueChanged (juce::Slider*)
@@ -546,7 +554,10 @@ void QuantizeDialog::applyActive (bool closeAfter)
     auto* grid = view_.getGrid();
     if (grid == nullptr)
     {
-        if (closeAfter && onApply) onApply (true);
+        if (closeAfter)
+            juce::MessageManager::callAsync ([cb = onCloseRequested]() {
+                if (cb) cb();
+            });
         return;
     }
 
@@ -560,23 +571,21 @@ void QuantizeDialog::applyActive (bool closeAfter)
     else
         touched = grid->applyScale (view_.getLastScale(), view_.getLastScaleRoot());
 
-    (void) touched;   /* future: update a "X notes affected" footer label */
+    if (onApplied) onApplied (touched);
 
-    /* Apply doesn't clear the preview ring -- the now-committed notes
-     * keep their highlight so the user sees what just changed.
-     * Cancel + close-after-OK clears it instead. */
     if (closeAfter)
     {
         clearPreview();
-        /* Defer the close hook so we don't return into a freed dialog. */
-        juce::MessageManager::callAsync ([cb = onApply]() { if (cb) cb (true); });
+        /* Defer the close hook so we don't return into a freed panel. */
+        juce::MessageManager::callAsync ([cb = onCloseRequested]() {
+            if (cb) cb();
+        });
     }
     else
     {
         /* Re-snapshot the preview now that the diff has been committed
          * (most ids will no longer trigger -- they're already on-grid). */
         refreshPreview();
-        if (onApply) onApply (false);
     }
 }
 
@@ -584,46 +593,6 @@ void QuantizeDialog::clearPreview()
 {
     if (auto* grid = view_.getGrid())
         grid->clearPreviewAffectedNotes();
-}
-
-//==============================================================================
-
-QuantizeDialogWindow::QuantizeDialogWindow (std::unique_ptr<juce::Component>& holder,
-                                              PianoRollView& view,
-                                              QuantizeDialog::Tab initialTab)
-    : DialogWindow ("Quantize", juce::Colour (0xff'1a'1a'1a), true /*escape closes*/, true),
-      holder_ (holder)
-{
-    holder_.reset (this);
-    setUsingNativeTitleBar (true);
-    setResizable (false, false);
-
-    auto* content = new QuantizeDialog (view, initialTab);
-    content_ = content;
-    content->onApply  = [this] (bool closeAfter) {
-        if (closeAfter) closeButtonPressed();
-    };
-    content->onCancel = [this]() {
-        closeButtonPressed();
-    };
-    setContentOwned (content, true);
-    setAlwaysOnTop (false);
-    centreWithSize (QuantizeDialog::kPreferredW, QuantizeDialog::kPreferredH + 28);
-    setVisible (true);
-}
-
-QuantizeDialogWindow::~QuantizeDialogWindow() = default;
-
-bool QuantizeDialogWindow::escapeKeyPressed()
-{
-    closeButtonPressed();
-    return true;
-}
-
-void QuantizeDialogWindow::closeButtonPressed()
-{
-    /* Holder reset deletes this -- match SessionImportWizardDialog. */
-    holder_.reset();
 }
 
 } // namespace element
