@@ -82,6 +82,12 @@ public:
 
     Tab getActiveTab() const noexcept { return activeTab_; }
 
+    /** External hook for the host to ask the panel to re-evaluate
+     *  the live preview against the current grid state.  Used after
+     *  the bound region changes or the selection set mutates outside
+     *  the panel's own listener pumps. */
+    void refreshPreviewFromExternal() { refreshPreview(); }
+
     static constexpr int kPreferredW = 280;   /* embedded width */
     static constexpr int kPreferredH = 320;
 
@@ -154,6 +160,12 @@ private:
     juce::TextButton applyBtn_   { "Apply" };
     juce::TextButton okBtn_      { "OK" };
     juce::TextButton cancelBtn_  { "Cancel" };
+
+    /** Status text shown in the footer.  Today it surfaces the "no
+     *  notes selected" warning so Apply / OK don't read as silent
+     *  no-ops; future use can reuse it for "X notes affected" after
+     *  an Apply commit. */
+    juce::Label      statusLabel_;
 
     bool             previewEnabled_ { true };
     bool             initialising_   { true };

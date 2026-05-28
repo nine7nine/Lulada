@@ -409,7 +409,18 @@ void PianoRollView::setRegion (const juce::Uuid& regionId)
     boundRegionId_ = regionId;
     refreshLabel();
     if (grid_ != nullptr)
+    {
+        /* Stale preview rings would survive a region rebind otherwise
+         * -- a panel left open against region A would have its
+         *  highlight ids still painted when the user navigates to
+         *  region B.  Drop them at the rebind boundary (A.4 fix). */
+        grid_->clearPreviewAffectedNotes();
         grid_->boundRegionChanged();
+    }
+    /* Re-run preview against the new region's selection so the panel
+     * stays useful if it's open. */
+    if (quantizePanel_ != nullptr && quantizePanelVisible_)
+        quantizePanel_->refreshPreviewFromExternal();
     repaint();
 }
 

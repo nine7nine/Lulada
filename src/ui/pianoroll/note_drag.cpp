@@ -107,13 +107,15 @@ public:
         const double curBeat  = (double) e.x / (double) juce::jmax (1, grid.getPxPerBeat());
         const int    curPitch = grid.pitchForY (e.y);
 
-        /* Snap the BEAT delta (not the absolute position) so the
-         * gesture feels relative.  Pitch is integer so no snap
-         * needed.  When snap is off, drag is continuous. */
-        const double rawDeltaBeats = curBeat - anchorBeat_;
+        /* Keep-offset snap: the drag's effective delta is the snapped
+         * change between cursor + anchor, so the dragged notes keep
+         * their original sub-grid offset under the cursor instead of
+         * jumping to the snap point on the first tick.  Matches the
+         * arranger's a2a18109 keep-offset semantic.  Pitch is integer
+         * so no snap needed.  When snap is off, drag is continuous. */
         double dBeats = grid.isSnapEnabled()
-            ? grid.snapBeat (rawDeltaBeats)
-            : rawDeltaBeats;
+            ? (grid.snapBeatKeepOffset (curBeat, anchorBeat_) - anchorBeat_)
+            : (curBeat - anchorBeat_);
         int    dPitch = curPitch - anchorPitch_;
 
         /* Shift-held axis lock.  Mirrors the arranger's Slice-6

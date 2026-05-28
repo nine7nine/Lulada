@@ -247,6 +247,12 @@ QuantizeDialog::QuantizeDialog (PianoRollView& view, Tab initialTab)
     previewBtn_.addListener (this);
     addAndMakeVisible (previewBtn_);
 
+    statusLabel_.setFont (juce::Font (juce::FontOptions (11.0f)));
+    statusLabel_.setColour (juce::Label::textColourId, juce::Colour (0xff'd0'a0'40));
+    statusLabel_.setJustificationType (juce::Justification::centredLeft);
+    statusLabel_.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (statusLabel_);
+
     applyBtn_.addListener (this);
     okBtn_.addListener (this);
     cancelBtn_.addListener (this);
@@ -326,13 +332,16 @@ void QuantizeDialog::resized()
 
     r.removeFromTop (kPad / 2);
 
-    /* Footer. */
+    /* Footer.  Narrower panel -- shrink button widths to fit
+     * (Preview, Apply, OK, Cancel still need to coexist) and the
+     * status label takes whatever middle slack remains. */
     auto footer = r.removeFromBottom (kFooterH).reduced (0, 4);
-    const int btnW = 80;
+    const int btnW = juce::jmin (60, footer.getWidth() / 5);
     cancelBtn_ .setBounds (footer.removeFromRight (btnW).reduced (2));
     okBtn_     .setBounds (footer.removeFromRight (btnW).reduced (2));
     applyBtn_  .setBounds (footer.removeFromRight (btnW).reduced (2));
     previewBtn_.setBounds (footer.removeFromLeft  (btnW + 18).reduced (2));
+    statusLabel_.setBounds (footer.reduced (4, 0));
 
     r.removeFromBottom (kPad / 2);
 
@@ -530,10 +539,41 @@ void QuantizeDialog::writeBackParameters() const
 
 void QuantizeDialog::refreshPreview()
 {
-    if (! previewEnabled_) return;
-
     auto* grid = view_.getGrid();
     if (grid == nullptr) return;
+
+    /* Reflect the "is there anything to do" check in the footer so a
+     * user who opens the panel with no notes selected sees why Apply
+     * is disabled instead of clicking through to no-op (closes C.4). */
+    const bool haveSelection = grid->selection().size() > 0;
+    applyBtn_.setEnabled (haveSelection);
+    okBtn_   .setEnabled (haveSelection);
+    if (! haveSelection)
+        statusLabel_.setText ("No notes selected", juce::dontSendNotification);
+    else
+        statusLabel_.setText (juce::String(), juce::dontSendNotification);
+
+    if (! previewEnabled_) return;
+    if (! haveSelection) { clearPreview(); return; }
+
+    /* Re-tune the random-beats slider's max to half the current
+     * note-length division on the Quantize tab so the user can't
+     * dial a jitter wider than the grid spacing (closes C.3).
+     * Recomputed on every refresh because the user might have just
+     * changed the note-length or note-type combos. */
+    if (activeTab_ == Tab::Quantize)
+    {
+        const auto opts = view_.getLastQuantizeOptions();
+        const double D    = dsp::quantize::divisionBeats (opts.noteLength, opts.noteType);
+        const double cap  = std::max (0.001, D * 0.5);
+        if (std::abs (qRandomSlider_.getMaximum() - cap) > 1e-6)
+        {
+            const double held = qRandomSlider_.getValue();
+            qRandomSlider_.setRange (0.0, cap, std::max (0.001, cap / 100.0));
+            qRandomSlider_.setValue (std::min (held, cap),
+                                      juce::dontSendNotification);
+        }
+    }
 
     writeBackParameters();
 

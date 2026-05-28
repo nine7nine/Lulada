@@ -164,6 +164,13 @@ public:
      *  otherwise rounds to the nearest multiple of `snapDivision_`. */
     double snapBeat (double localBeat) const noexcept;
 
+    /** Keep-offset variant of snapBeat: snaps the DELTA between
+     *  `localBeat` and `anchorBeat` to the grid, then adds the
+     *  delta to the anchor.  Preserves the cursor's original offset
+     *  to the nearest snap point so drag gestures don't jump on the
+     *  first snap.  Matches the arranger's keep-offset semantic. */
+    double snapBeatKeepOffset (double localBeat, double anchorBeat) const noexcept;
+
     //==========================================================================
     // Selection API.
 
