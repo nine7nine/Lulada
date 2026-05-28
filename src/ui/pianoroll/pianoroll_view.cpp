@@ -3,6 +3,9 @@
 
 #include "ui/pianoroll/pianoroll_view.hpp"
 #include "ui/pianoroll/quantize_dialog.hpp"
+
+#include <element/settings.hpp>
+#include <element/ui.hpp>
 #include "ui/pianoroll/pianoroll_keyboard.hpp"
 #include "ui/pianoroll/pianoroll_grid.hpp"
 #include "ui/pianoroll/velocity_lane.hpp"
@@ -381,6 +384,11 @@ PianoRollView::PianoRollView (Services& services)
     /* Seed the grid with the comboBox's default snap pick so the
      * displayed division + the runtime division agree from frame 0. */
     applySnapFromComboBox();
+
+    /* Hydrate last-used quantize/humanize/scale options from the
+     * user's settings file so Ctrl+Q replays the user's most recent
+     * dialed-in parameters across Element restarts (A.6 fix). */
+    loadLastUsedFromSettings();
 }
 
 PianoRollView::~PianoRollView()
@@ -394,6 +402,125 @@ void PianoRollView::setLastQuantizeOptions (const dsp::quantize::QuantizeOptions
 {
     lastQuantize_      = o;
     lastQuantizeDirty_ = true;
+    persistLastUsedToSettings();
+}
+
+void PianoRollView::setLastHumanizeOptions (const dsp::quantize::HumanizeOptions& o) noexcept
+{
+    lastHumanize_      = o;
+    lastHumanizeDirty_ = true;
+    persistLastUsedToSettings();
+}
+
+void PianoRollView::setLastScale (dsp::quantize::Scale s, int root) noexcept
+{
+    lastScale_      = s;
+    lastScaleRoot_  = juce::jlimit (0, 11, root);
+    lastScaleDirty_ = true;
+    persistLastUsedToSettings();
+}
+
+namespace {
+
+constexpr const char* kPropPrefix = "pianoRoll.quantize.";
+
+juce::PropertiesFile* getUserProps (Services& svc) noexcept
+{
+    if (auto* gui = svc.find<GuiService>())
+        return gui->settings().getUserSettings();
+    return nullptr;
+}
+
+} // namespace
+
+void PianoRollView::persistLastUsedToSettings()
+{
+    auto* props = getUserProps (services_);
+    if (props == nullptr) return;
+
+    if (lastQuantizeDirty_)
+    {
+        const auto& q = lastQuantize_;
+        props->setValue (juce::String (kPropPrefix) + "noteLength", (int) q.noteLength);
+        props->setValue (juce::String (kPropPrefix) + "noteType",   (int) q.noteType);
+        props->setValue (juce::String (kPropPrefix) + "amount",     q.amount);
+        props->setValue (juce::String (kPropPrefix) + "adjustStart",(bool) q.adjustStart);
+        props->setValue (juce::String (kPropPrefix) + "adjustEnd",  (bool) q.adjustEnd);
+        props->setValue (juce::String (kPropPrefix) + "swing",      q.swing);
+        props->setValue (juce::String (kPropPrefix) + "randomBeats",q.randomBeats);
+    }
+    if (lastHumanizeDirty_)
+    {
+        const auto& h = lastHumanize_;
+        props->setValue (juce::String (kPropPrefix) + "velRange", h.velocityRange);
+        props->setValue (juce::String (kPropPrefix) + "velBias",  h.velocityBias);
+    }
+    if (lastScaleDirty_)
+    {
+        props->setValue (juce::String (kPropPrefix) + "scale",    (int) lastScale_);
+        props->setValue (juce::String (kPropPrefix) + "root",     lastScaleRoot_);
+    }
+}
+
+void PianoRollView::loadLastUsedFromSettings()
+{
+    auto* props = getUserProps (services_);
+    if (props == nullptr) return;
+
+    /* Quantize options.  Missing keys land as defaults via the
+     * struct initialiser, then we overlay whatever the user
+     * previously committed.  Dirty flag goes true if ANY key was
+     * present, so subsequent Ctrl+Q hotkeys use last-used. */
+    bool anyQuantize = false;
+    const auto getDouble = [&] (const juce::String& key, double dflt) {
+        if (! props->containsKey (key)) return dflt;
+        anyQuantize = true;
+        return props->getDoubleValue (key, dflt);
+    };
+    const auto getInt = [&] (const juce::String& key, int dflt) {
+        if (! props->containsKey (key)) return dflt;
+        anyQuantize = true;
+        return props->getIntValue (key, dflt);
+    };
+    const auto getBool = [&] (const juce::String& key, bool dflt) {
+        if (! props->containsKey (key)) return dflt;
+        anyQuantize = true;
+        return props->getBoolValue (key, dflt);
+    };
+
+    lastQuantize_.noteLength = static_cast<dsp::quantize::NoteLength> (
+        juce::jlimit (0, 6, getInt (juce::String (kPropPrefix) + "noteLength",
+                                      (int) lastQuantize_.noteLength)));
+    lastQuantize_.noteType   = static_cast<dsp::quantize::NoteType> (
+        juce::jlimit (0, 2, getInt (juce::String (kPropPrefix) + "noteType",
+                                      (int) lastQuantize_.noteType)));
+    lastQuantize_.amount      = getDouble (juce::String (kPropPrefix) + "amount",      lastQuantize_.amount);
+    lastQuantize_.adjustStart = getBool   (juce::String (kPropPrefix) + "adjustStart", lastQuantize_.adjustStart);
+    lastQuantize_.adjustEnd   = getBool   (juce::String (kPropPrefix) + "adjustEnd",   lastQuantize_.adjustEnd);
+    lastQuantize_.swing       = getDouble (juce::String (kPropPrefix) + "swing",       lastQuantize_.swing);
+    lastQuantize_.randomBeats = getDouble (juce::String (kPropPrefix) + "randomBeats", lastQuantize_.randomBeats);
+    if (anyQuantize) lastQuantizeDirty_ = true;
+
+    if (props->containsKey (juce::String (kPropPrefix) + "velRange")
+        || props->containsKey (juce::String (kPropPrefix) + "velBias"))
+    {
+        lastHumanize_.velocityRange = props->getIntValue (
+            juce::String (kPropPrefix) + "velRange", lastHumanize_.velocityRange);
+        lastHumanize_.velocityBias  = props->getIntValue (
+            juce::String (kPropPrefix) + "velBias",  lastHumanize_.velocityBias);
+        lastHumanizeDirty_ = true;
+    }
+
+    if (props->containsKey (juce::String (kPropPrefix) + "scale")
+        || props->containsKey (juce::String (kPropPrefix) + "root"))
+    {
+        lastScale_     = static_cast<dsp::quantize::Scale> (
+            juce::jlimit (0, 11, props->getIntValue (
+                juce::String (kPropPrefix) + "scale", (int) lastScale_)));
+        lastScaleRoot_ = juce::jlimit (0, 11,
+            props->getIntValue (juce::String (kPropPrefix) + "root", lastScaleRoot_));
+        lastScaleDirty_ = true;
+    }
 }
 
 void PianoRollView::notifyRegionEdited()

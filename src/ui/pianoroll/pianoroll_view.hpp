@@ -92,8 +92,8 @@ public:
     int                                   getLastScaleRoot()       const noexcept { return lastScaleRoot_; }
 
     void setLastQuantizeOptions (const dsp::quantize::QuantizeOptions& o) noexcept;
-    void setLastHumanizeOptions (const dsp::quantize::HumanizeOptions& o) noexcept { lastHumanize_ = o; lastHumanizeDirty_ = true; }
-    void setLastScale (dsp::quantize::Scale s, int root) noexcept { lastScale_ = s; lastScaleRoot_ = root; lastScaleDirty_ = true; }
+    void setLastHumanizeOptions (const dsp::quantize::HumanizeOptions& o) noexcept;
+    void setLastScale (dsp::quantize::Scale s, int root) noexcept;
 
     /** True when the user has opened the dialog at least once and
      *  adjusted the Quantize tab parameters.  Ctrl+Q uses last-used
@@ -214,6 +214,8 @@ private:
     void applySnapFromComboBox();
     void hideQuantizePanel();
     void syncToolbarTabToggles();
+    void persistLastUsedToSettings();
+    void loadLastUsedFromSettings();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PianoRollView)
 };
