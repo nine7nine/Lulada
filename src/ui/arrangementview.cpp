@@ -254,6 +254,12 @@ public:
             g.drawVerticalLine (xe - 1,    (float) kRulerH, (float) yLanes);
         }
 
+        /* Marker hairlines down the lane area.  Drawn AFTER the range
+         * overlay so a range outline doesn't obscure a coincident
+         * marker, but BEFORE ghosts / marquee / sticky ruler so drag
+         * overlays read on top. */
+        paintMarkerHairlines (g);
+
         if (dropHover_)
         {
             const Rectangle<int> hover = dropHoverLaneIdx_ >= 0
@@ -495,12 +501,20 @@ public:
 
     void mouseDown (const MouseEvent& e) override
     {
-        /* Ruler clicks (the bars:beats strip at the top): seek
-         * transport to the clicked beat; if a drag follows, redefine
-         * the range from the click point.  Mirrors Ardour/Bitwig
-         * convention: ruler = locator + range surface. */
+        /* Ruler clicks (the bars:beats strip at the top).  Right-click
+         * routes to the marker context menu (per-marker if the click
+         * hits a triangle; "Add marker here" otherwise).  Left-click
+         * seeks transport to the clicked beat; if a drag follows,
+         * redefines the range from the click point.  Mirrors Ardour /
+         * Bitwig convention: ruler = locator + range + marker surface. */
         if (e.y < kRulerH && e.x >= kLabelW)
         {
+            if (e.mods.isPopupMenu())
+            {
+                showRulerContextMenu (e.x, e.y);
+                return;
+            }
+
             const double beat = juce::jmax (0.0,
                 (double) (e.x - kLabelW) / (double) kPxPerBeat);
             owner.seekToBeat (beat);
@@ -2018,6 +2032,135 @@ public:
     }
 
     //==========================================================================
+    // Marker-track helpers -- ruler right-click + per-marker context
+    // menu (rename / recolour / delete).  Marker mutations persist via
+    // owner.writeMarkersOnly() so they skip the lanes_ undo snapshot.
+
+    static const juce::Colour* markerPalette() noexcept
+    {
+        static const juce::Colour palette[] = {
+            juce::Colour { 0xff'e0'c0'70 }, // amber (default)
+            juce::Colour { 0xff'c5'5a'5a }, // red
+            juce::Colour { 0xff'c5'8a'4a }, // orange
+            juce::Colour { 0xff'6a'b5'5a }, // green
+            juce::Colour { 0xff'4a'a5'b5 }, // cyan
+            juce::Colour { 0xff'5a'7a'c5 }, // blue
+            juce::Colour { 0xff'9a'5a'c5 }, // purple
+            juce::Colour { 0xff'c5'5a'9a }  // pink
+        };
+        return palette;
+    }
+    static constexpr int kMarkerPaletteSize = 8;
+
+    void addMarkerAtBeat (double atBeat)
+    {
+        owner.markerTrack_.addMarker (juce::jmax (0.0, atBeat), juce::String());
+        owner.writeMarkersOnly();
+        repaint();
+    }
+
+    void renameMarker (const juce::Uuid& markerId)
+    {
+        const auto* m = owner.markerTrack_.findMarker (markerId);
+        if (m == nullptr) return;
+        auto* aw = new juce::AlertWindow ("Rename marker",
+                                           "New name for marker:",
+                                           juce::AlertWindow::NoIcon);
+        aw->addTextEditor ("name", m->name);
+        aw->addButton ("OK",     1, juce::KeyPress (juce::KeyPress::returnKey));
+        aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+        juce::Component::SafePointer<Body> safe (this);
+        const juce::Uuid id = markerId;
+        aw->enterModalState (true,
+            juce::ModalCallbackFunction::create (
+                [safe, id, aw] (int result)
+                {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr) return;
+                    if (result == 1)
+                    {
+                        const auto newName = aw->getTextEditorContents ("name").trim();
+                        if (self->owner.markerTrack_.renameMarker (id, newName))
+                        {
+                            self->owner.writeMarkersOnly();
+                            self->repaint();
+                        }
+                    }
+                }),
+            true);
+    }
+
+    void cycleMarkerColour (const juce::Uuid& markerId)
+    {
+        const auto* m = owner.markerTrack_.findMarker (markerId);
+        if (m == nullptr) return;
+        const auto* palette = markerPalette();
+        int curIdx = -1;
+        for (int i = 0; i < kMarkerPaletteSize; ++i)
+            if (palette[i].getARGB() == m->colour.getARGB()) { curIdx = i; break; }
+        const int nextIdx = (curIdx + 1) % kMarkerPaletteSize;
+        owner.markerTrack_.setMarkerColour (markerId, palette[nextIdx]);
+        owner.writeMarkersOnly();
+        repaint();
+    }
+
+    void deleteMarker (const juce::Uuid& markerId)
+    {
+        if (owner.markerTrack_.removeMarker (markerId))
+        {
+            owner.writeMarkersOnly();
+            repaint();
+        }
+    }
+
+    /** Ruler right-click router.  Hits a marker triangle -> per-marker
+     *  menu; empty ruler area -> "Add marker here". */
+    void showRulerContextMenu (int x, int y)
+    {
+        const double atBeat = juce::jmax (0.0,
+            (double) (x - kLabelW) / (double) kPxPerBeat);
+
+        const juce::Uuid hit = markerAtRulerPx (x, y);
+        juce::Component::SafePointer<Body> safe (this);
+
+        if (! hit.isNull())
+        {
+            enum { ItemRename = 1, ItemColour, ItemDelete };
+            juce::PopupMenu menu;
+            menu.addItem (ItemRename, "Rename marker...");
+            menu.addItem (ItemColour, "Cycle colour");
+            menu.addSeparator();
+            menu.addItem (ItemDelete, "Delete marker");
+            menu.showMenuAsync (juce::PopupMenu::Options(),
+                [safe, hit] (int result)
+                {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr || result == 0) return;
+                    switch (result)
+                    {
+                        case ItemRename: self->renameMarker      (hit); break;
+                        case ItemColour: self->cycleMarkerColour (hit); break;
+                        case ItemDelete: self->deleteMarker      (hit); break;
+                        default: break;
+                    }
+                });
+            return;
+        }
+
+        enum { ItemAdd = 1 };
+        juce::PopupMenu menu;
+        menu.addItem (ItemAdd, "Add marker here");
+        menu.showMenuAsync (juce::PopupMenu::Options(),
+            [safe, atBeat] (int result)
+            {
+                auto* self = safe.getComponent();
+                if (self == nullptr || result == 0) return;
+                if (result == ItemAdd) self->addMarkerAtBeat (atBeat);
+            });
+    }
+
+    //==========================================================================
     // Active gesture (move / resize) data.  Declared HERE -- above the
     // Multi-region gesture helpers -- because those helpers reference
     // Gesture::Member + Gesture::Kind in their function signatures;
@@ -2043,9 +2186,9 @@ public:
          * Mirrors Zrythm v1's shift_held/ctrl_held branches. */
         enum MarqueeMode { Replace, Add, Toggle };
         /* Resize gestures track which edge was grabbed.  Right (default)
-         * mutates lengthBeats; Left also shifts positionBeats + for MIDI
-         * re-bases the note list, for audio advances startBeats (source
-         * offset).  B13 in midi-implementation-audit-20260526.md. */
+         * mutates lengthBeats; Left also shifts positionBeats + advances
+         * startBeats (source offset) for both audio + MIDI -- notes /
+         * audio source survive the trim and reappear on drag-back. */
         enum Edge { RightEdge, LeftEdge };
         /* Shift-axis constrain on Move.  Locks the drag to either
          * horizontal (time) or vertical (lane) once Shift is first
@@ -3002,6 +3145,26 @@ public:
 
     bool keyPressed (const juce::KeyPress& key) override
     {
+        /* Numpad 1-9 -- jump to marker N (1-indexed against the
+         * position-sorted marker list).  Handled before the modifier
+         * branches so an unmodified numpad press works the way DAW
+         * users expect.  Numpad 0 left free for a future "next/prev"
+         * pair or zoom-to-fit shortcut. */
+        for (int i = 1; i <= 9; ++i)
+        {
+            const int numPad = juce::KeyPress::numberPad0 + i;
+            if (key.getKeyCode() == numPad)
+            {
+                if (const auto* m = owner.markerTrack_.markerAt ((std::size_t) (i - 1)))
+                {
+                    owner.seekToBeat (m->positionBeats);
+                    repaint();
+                    return true;
+                }
+                return false;
+            }
+        }
+
         /* Ctrl/Cmd shortcuts -- handled before the legacy Delete /
          * zoom branches so the modifier-bearing keys don't fall
          * through to a parent's command dispatcher. */
@@ -3565,6 +3728,14 @@ private:
             }
         }
 
+        /* Marker triangles + names on the ruler.  Painted between the
+         * range band and the playhead so the playhead's vertical line
+         * stays on top.  Triangle sits in the LOWER half of the ruler
+         * (where the beat ticks are), 6 px wide pointing down; the
+         * name (if any) prints to the right of the triangle in the
+         * remaining ruler space, clipped to ~6 chars to avoid clutter. */
+        paintMarkersOnRuler (g, rulerY);
+
         /* Playhead overlay on the ruler. */
         const int phx = stripX + (int) (owner.lastBeat_ * kPxPerBeat);
         if (phx >= stripX && phx < getWidth())
@@ -3572,6 +3743,93 @@ private:
             g.setColour (Colours::limegreen);
             g.drawVerticalLine (phx, (float) rulerY, (float) (rulerY + kRulerH));
         }
+    }
+
+    /** Marker triangle on the ruler row.  Called from paintRuler so the
+     *  triangles stick to the visible top during vertical scroll. */
+    void paintMarkersOnRuler (juce::Graphics& g, int rulerY)
+    {
+        const auto& markers = owner.markerTrack_.markers();
+        if (markers.empty()) return;
+
+        const auto clip = g.getClipBounds();
+        const int rulerLeft  = clip.getX();
+        const int rulerRight = clip.getRight();
+
+        g.setFont (monoFont (9.0f, juce::Font::bold));
+        for (const auto& m : markers)
+        {
+            const int mx = kLabelW + (int) (m.positionBeats * kPxPerBeat);
+            if (mx < rulerLeft - 64 || mx > rulerRight + 8) continue;
+            if (mx < kLabelW) continue;
+
+            /* Triangle 6 px wide, 7 px tall, base at rulerY+2, apex
+             * pointing DOWN to rulerY+9 -- sits over the bar-tick zone
+             * without obscuring the LCD bar-number text. */
+            juce::Path tri;
+            tri.startNewSubPath ((float) (mx - 3), (float) (rulerY + 2));
+            tri.lineTo          ((float) (mx + 3), (float) (rulerY + 2));
+            tri.lineTo          ((float) mx,       (float) (rulerY + 9));
+            tri.closeSubPath();
+            g.setColour (m.colour);
+            g.fillPath (tri);
+            g.setColour (m.colour.darker (0.4f));
+            g.strokePath (tri, juce::PathStrokeType (1.0f));
+
+            if (m.name.isNotEmpty())
+            {
+                g.setColour (m.colour.brighter (0.2f));
+                g.drawText (m.name,
+                            mx + 5, rulerY + 1, 60, kRulerH - 4,
+                            juce::Justification::topLeft, true);
+            }
+        }
+    }
+
+    /** Vertical hairline through the lane area at each marker's X.
+     *  Called from Body::paint after the lanes + range overlay but
+     *  before the ghost / marquee / sticky ruler so drag overlays read
+     *  on top of decorations. */
+    void paintMarkerHairlines (juce::Graphics& g)
+    {
+        const auto& markers = owner.markerTrack_.markers();
+        if (markers.empty()) return;
+
+        const int laneCount = owner.lanes_.size();
+        const int yTop      = kRulerH;
+        const int yBot      = kRulerH + juce::jmax (1, laneCount) * kLaneH;
+
+        const auto clip = g.getClipBounds();
+        if (clip.getBottom() <= yTop) return;
+
+        for (const auto& m : markers)
+        {
+            const int mx = kLabelW + (int) (m.positionBeats * kPxPerBeat);
+            if (mx < clip.getX() - 1 || mx > clip.getRight() + 1) continue;
+            if (mx < kLabelW) continue;
+            g.setColour (m.colour.withAlpha (0.35f));
+            g.drawVerticalLine (mx, (float) yTop, (float) yBot);
+        }
+    }
+
+    /** Hit-test the ruler band against the marker triangles.  Returns
+     *  the marker id under (x, y) in BODY coordinates, or null if none.
+     *  Used by ruler right-click to open the per-marker menu (rename /
+     *  colour / delete). */
+    juce::Uuid markerAtRulerPx (int x, int y) const noexcept
+    {
+        const int rulerY = owner.viewport_.getViewPositionY();
+        if (y < rulerY || y >= rulerY + kRulerH) return {};
+        const auto& markers = owner.markerTrack_.markers();
+        /* Triangle hit zone: +/- 5 px around the X; full ruler height
+         * so the entire triangle column is clickable. */
+        for (const auto& m : markers)
+        {
+            const int mx = kLabelW + (int) (m.positionBeats * kPxPerBeat);
+            if (mx < kLabelW) continue;
+            if (std::abs (x - mx) <= 5) return m.id;
+        }
+        return {};
     }
 
     /** ARM / MUTE / SOLO button stack lives on the right side of
@@ -5715,6 +5973,7 @@ void ArrangementView::rescanLaneTargets()
 void ArrangementView::loadLanesFromSession()
 {
     lanes_.clearQuick();
+    markerTrack_.clear();
     if (services_ == nullptr) return;
     auto sess = services_->context().session();
     if (sess == nullptr) return;
@@ -5722,14 +5981,22 @@ void ArrangementView::loadLanesFromSession()
     auto tree = sess->data().getChildWithName (tags::arrangement);
     if (! tree.isValid()) return;
     auto lanesTree = tree.getChildWithName ("lanes");
-    if (! lanesTree.isValid()) return;
-
-    for (int i = 0; i < lanesTree.getNumChildren(); ++i)
+    if (lanesTree.isValid())
     {
-        const auto laneTree = lanesTree.getChild (i);
-        if (laneTree.getType() != juce::Identifier ("lane")) continue;
-        lanes_.add (Lane::fromValueTree (laneTree));
+        for (int i = 0; i < lanesTree.getNumChildren(); ++i)
+        {
+            const auto laneTree = lanesTree.getChild (i);
+            if (laneTree.getType() != juce::Identifier ("lane")) continue;
+            lanes_.add (Lane::fromValueTree (laneTree));
+        }
     }
+
+    /* Markers sit beside <lanes> under <arrangement>.  Older sessions
+     * predating Q6 simply have no <markers> child; loadFromValueTree
+     * leaves the in-memory list empty in that case. */
+    auto markersTree = tree.getChildWithName ("markers");
+    if (markersTree.isValid())
+        markerTrack_.loadFromValueTree (markersTree);
 }
 
 /* Undoable snapshot action for ArrangementView mutations.  Stored
@@ -5812,6 +6079,8 @@ void ArrangementView::writeLanesToSession()
     lanesTree.removeAllChildren (nullptr);
     for (const auto& l : lanes_)
         lanesTree.appendChild (l.toValueTree(), nullptr);
+
+    writeMarkersToSessionTree (tree);
 }
 
 void ArrangementView::flushLanesToSession()
@@ -5833,7 +6102,38 @@ void ArrangementView::flushLanesToSession()
     for (const auto& l : lanes_)
         lanesTree.appendChild (l.toValueTree(), nullptr);
 
+    writeMarkersToSessionTree (tree);
+
     lastCommittedSnapshot_ = lanes_;
+}
+
+void ArrangementView::writeMarkersToSessionTree (juce::ValueTree& arrTree)
+{
+    /* Mirror the lanes-tree shape: clear + rebuild the <markers>
+     * child every write so deletions / renames flush cleanly.  Marker
+     * mutations themselves (add/rename/recolour/delete) go through
+     * writeMarkersOnly so a marker edit doesn't accidentally push an
+     * ArrangementSnapshotAction for the unchanged lanes_. */
+    for (int i = arrTree.getNumChildren() - 1; i >= 0; --i)
+    {
+        const auto child = arrTree.getChild (i);
+        if (child.hasType (juce::Identifier ("markers")))
+            arrTree.removeChild (i, nullptr);
+    }
+    if (! markerTrack_.markers().empty())
+        arrTree.appendChild (markerTrack_.toValueTree(), nullptr);
+}
+
+void ArrangementView::writeMarkersOnly()
+{
+    /* Marker mutations skip the lanes_ undo snapshot.  Markers ride
+     * outside the per-action undo system for v1 -- they're cheap to
+     * recreate manually and not in the hot lane-edit loop. */
+    if (services_ == nullptr) return;
+    auto sess = services_->context().session();
+    if (sess == nullptr) return;
+    auto tree = sess->data().getOrCreateChildWithName (tags::arrangement, nullptr);
+    writeMarkersToSessionTree (tree);
 }
 
 void ArrangementView::applyLaneSnapshot (const juce::Array<Lane>& snap)

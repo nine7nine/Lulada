@@ -25,8 +25,8 @@ target_include_directories(element
 )
 
 # Re-glob marker: bump this file's mtime to force CMake to re-scan
-# after adding new sources under src/.  Updated 2026-05-26 for the
-# Tier 1 batch: ui/pianoroll/velocity_lane.{hpp,cpp}.
+# after adding new sources under src/.  Updated 2026-05-27 for Q6
+# marker-track: services/timeline/marker_track.{hpp,cpp}.
 file(GLOB_RECURSE ELEMENT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c")

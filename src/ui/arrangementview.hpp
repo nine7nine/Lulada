@@ -20,6 +20,7 @@
 
 #include "services/timeline/audiolaneadapter.hpp"
 #include "services/timeline/lane.hpp"
+#include "services/timeline/marker_track.hpp"
 
 #define EL_VIEW_ARRANGEMENT "ArrangementView"
 
@@ -206,6 +207,8 @@ private:
 
     void loadLanesFromSession();
     void writeLanesToSession();
+    void writeMarkersToSessionTree (juce::ValueTree& arrTree);
+    void writeMarkersOnly();
 
 public:
     /** Flush the current lanes_ snapshot to the session ValueTree
@@ -400,6 +403,12 @@ private:
 
     juce::Array<Lane>              lanes_;
     juce::Array<LaneRuntimeState>  laneRuntime_;
+
+    /** Named cue points on the timeline.  Painted by Body inside the
+     *  ruler (triangle) + as a vertical hairline down the lane area;
+     *  jump-to via Numpad 1-9 (in sorted order).  Sibling to <lanes>
+     *  under tags::arrangement; loaded + written together. */
+    MarkerTrack                    markerTrack_;
 
     bool lanesLoadedFromSession_ = false;
 
