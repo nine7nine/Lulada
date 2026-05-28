@@ -266,6 +266,10 @@ void VelocityLane::mouseUp (const juce::MouseEvent& e)
             if (auto* v = safeView.getComponent())
                 v->notifyRegionEdited();
         };
+        /* Fresh transaction segregates this edit from any open
+         * ArrangementView / SessionView transaction so Ctrl+Z stays
+         * scoped to the velocity edit. */
+        gui->getUndoManager().beginNewTransaction ("Edit MIDI velocity");
         gui->getUndoManager().perform (cmd.release(), "Edit MIDI velocity");
     }
     else

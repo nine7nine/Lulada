@@ -837,6 +837,12 @@ void PianoRollGrid::mouseDown (const juce::MouseEvent& e)
                     if (auto* v = safeView.getComponent())
                         v->notifyRegionEdited();
                 };
+                /* Start a fresh transaction so this diff doesn't
+                 * coalesce with whatever the ArrangementView /
+                 * SessionView left open -- without this, Ctrl+Z would
+                 * undo the cross-surface group rather than just the
+                 * piano-roll edit. */
+                gui->getUndoManager().beginNewTransaction ("Erase MIDI note");
                 gui->getUndoManager().perform (cmd.release(), "Erase MIDI note");
             }
             else
@@ -1027,6 +1033,7 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                 if (auto* v = safeView.getComponent())
                     v->notifyRegionEdited();
             };
+            gui->getUndoManager().beginNewTransaction ("Delete MIDI notes");
             gui->getUndoManager().perform (cmd.release(), "Delete MIDI notes");
         }
         else
@@ -1103,6 +1110,7 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                 if (auto* v = safeView.getComponent())
                     v->notifyRegionEdited();
             };
+            gui->getUndoManager().beginNewTransaction ("Duplicate MIDI notes");
             gui->getUndoManager().perform (cmd.release(), "Duplicate MIDI notes");
         }
         else
@@ -1170,6 +1178,7 @@ bool PianoRollGrid::keyPressed (const juce::KeyPress& key)
                 if (auto* v = safeView.getComponent())
                     v->notifyRegionEdited();
             };
+            gui->getUndoManager().beginNewTransaction (label);
             gui->getUndoManager().perform (cmd.release(), label);
         }
         else
@@ -1263,6 +1272,10 @@ std::size_t applyOpAndPush (PianoRollGrid&           grid,
             if (auto* v = safeView.getComponent())
                 v->notifyRegionEdited();
         };
+        /* Fresh transaction so this diff doesn't coalesce with any
+         * still-open ArrangementView / SessionView transaction.  Same
+         * pattern as the other piano-roll perform sites. */
+        gui->getUndoManager().beginNewTransaction (label);
         gui->getUndoManager().perform (cmd.release(), label);
         grid.repaint();
         return touched;

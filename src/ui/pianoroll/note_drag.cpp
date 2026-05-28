@@ -44,7 +44,12 @@ void commitDiff (PianoRollGrid& grid,
     {
         /* GuiService::getUndoManager() returns a reference, not a
          * pointer -- always valid in a live session.  perform() will
-         * fire onApplied internally; no manual notify needed here. */
+         * fire onApplied internally; no manual notify needed here.
+         *
+         * beginNewTransaction segregates this diff from any
+         * still-open ArrangementView / SessionView transaction so
+         * Ctrl+Z stays scoped to the piano-roll edit. */
+        gui->getUndoManager().beginNewTransaction (displayName);
         gui->getUndoManager().perform (cmd.release(), displayName);
     }
     else
