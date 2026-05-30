@@ -49,7 +49,7 @@ inline static String appName (const String& beforeText = String(),
     if (beforeText.isNotEmpty())
         name << beforeText;
 
-    name << "Element";
+    name << "Lulada"; // wine-nspa: surface-level rebrand (titlebar / about / version)
 
     if (afterText.isNotEmpty())
         name << afterText;

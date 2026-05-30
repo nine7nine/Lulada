@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="rind" cx="50%" cy="50%" r="52%">
+      <stop offset="78%" stop-color="#EF8B1F"/>
+      <stop offset="100%" stop-color="#D9731A"/>
+    </radialGradient>
+    <radialGradient id="flesh" cx="50%" cy="46%" r="55%">
+      <stop offset="0%" stop-color="#BBC94F"/>
+      <stop offset="100%" stop-color="#9AAB38"/>
+    </radialGradient>
+    <radialGradient id="pulp" cx="50%" cy="42%" r="60%">
+      <stop offset="0%" stop-color="#F4ECC8"/>
+      <stop offset="100%" stop-color="#E9DBA6"/>
+    </radialGradient>
+  </defs>
+
+  <!-- rind -->
+  <circle cx="256" cy="256" r="244" fill="url(#rind)"/>
+  <!-- greenish flesh -->
+  <circle cx="256" cy="256" r="212" fill="url(#flesh)"/>
+
+  <!-- four pulp wedges + seed outlines, rotated round the centre -->
+  <g transform="translate(256 256)">
+    <!-- one wedge group, replicated by 90deg -->
+    <g>
+      <!-- TR wedge -->
+      <g transform="rotate(0)">
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="url(#pulp)"/>
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="none" stroke="#B59A24" stroke-width="18" stroke-linecap="round" stroke-dasharray="0.5 23"/>
+      </g>
+      <g transform="rotate(90)">
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="url(#pulp)"/>
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="none" stroke="#B59A24" stroke-width="18" stroke-linecap="round" stroke-dasharray="0.5 23"/>
+      </g>
+      <g transform="rotate(180)">
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="url(#pulp)"/>
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="none" stroke="#B59A24" stroke-width="18" stroke-linecap="round" stroke-dasharray="0.5 23"/>
+      </g>
+      <g transform="rotate(270)">
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="url(#pulp)"/>
+        <path d="M16 -34 L16 -168 Q16 -188 36 -184 A188 188 0 0 1 184 -36 Q188 -16 168 -16 L34 -16 Q16 -16 16 -34 Z"
+              fill="none" stroke="#B59A24" stroke-width="18" stroke-linecap="round" stroke-dasharray="0.5 23"/>
+      </g>
+    </g>
+
+    <!-- centre pith -->
+    <circle cx="0" cy="0" r="15" fill="#F4ECC8"/>
+  </g>
+</svg>
