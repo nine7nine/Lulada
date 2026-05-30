@@ -1,44 +1,58 @@
-[![REUSE status](https://api.reuse.software/badge/github.com/kushview/element)](https://api.reuse.software/info/github.com/kushview/element) [![Build and Test](https://github.com/kushview/element/actions/workflows/build.yml/badge.svg)](https://github.com/kushview/element/actions/workflows/build.yml) [![Generate Lua Documentation](https://github.com/kushview/element/actions/workflows/ldoc.yml/badge.svg)](https://github.com/kushview/element/actions/workflows/ldoc.yml)
+# Lulada
 
-# Element
-![Element Screenshot](data/screenshot.png)
+**Lulada is a fork of [Element](https://github.com/kushview/element)** -- the modular
+audio plugin host -- extended into a full DAW and built to run on
+[Wine-NSPA](https://github.com/nine7nine), a real-time Wine fork for low-latency audio.
 
-### ADVANCED AUDIO PLUGIN HOST
-This is the community version of Element, a modular AU/LV2/VST/VST3/CLAP audio plugin host. Create powerful effects, racks and instruments by connecting nodes to one another. Integrates with your existing hardware via standard protocols such as MIDI. See [kushview.net](https://kushview.net/element/) for more information and [pre-built binaries](https://kushview.net/element/download/). 
+> **Status: work in progress.** Under active development, not yet release-ready --
+> features land fast and things may break.
 
-_See also:_ [Element User Manual](https://element.readthedocs.io)
+### A Winelib / Wayland DAW
 
-### Compatibility
-Element currently loads most major plugin formats.
+Lulada is a winelib application -- native Linux code that hosts **Win32 plugins
+directly on Linux** through Wine-NSPA, at realtime priority.
 
-| OS       | Version       | Formats         |
-| -------- |:-------------:| ---------------:|
-| Linux*   |       -       | LADSPA/LV2/VST3/CLAP |
-| Mac OSX  | 10.8 and up   | AU/VST/VST3/LV2/CLAP |
-| Windows  | XP and up     | VST/VST3/LV2/CLAP    |
+* **Plugin hosting** -- Win32 **VST2 / VST3 / CLAP** (loaded through Wine-NSPA),
+  plus **native Element plugins** (its built-in nodes: sampler, tracker, audio FX,
+  MIDI tools, ...); plugin editor UIs embed directly into the graph
+* **Real-time** -- runs at realtime priority on Wine-NSPA; librtpi PI-mutex sync on
+  the audio / disk-streaming hot paths (no priority inversion)
+* **Wayland-native windowing** -- experimental libdecor/EGL path for the main window
+  and plugin embedding, alongside the standard X11 backend
 
-_*Ubuntu is the most tested, but should run on any major distribution_
+_LV2 / LADSPA / AU are not built in the winelib configuration._
 
-### Features
-* Runs standalone or as a plugin in your DAW**
-* Route Audio and MIDI from anywhere to anywhere
-* Play virtual instruments and effects live
-* Create re-usable instruments and effect graphs
-* External Sync with MIDI Clock
-* Sub Graphing – Nest Graphs within each other
-* Custom Keyboard Shortcuts
-* Placeholder Nodes
-* Built In Virtual Keyboard
-* Multiple Undo/Redo
-* Scripting - Custom DSP and DSP UI's
-* Embed plugin UIs directly in Graphs
-* And more...
+### DAW surfaces
 
-### Building 
-See [building.md](./docs/building.md) for instructions and dependency details.
+Tracker and piano-roll are equal first-class MIDI authoring surfaces; clips live in
+both a clip-launcher and a linear timeline.
 
-### Contributing
-If you'd like to contribute code please review the [code style](./docs/cppstyle.md) and [contributor notes](CONTRIBUTING.md) before submitting pull requests.  You may also want to join the [#element](https://discord.gg/fAsQ5fMuHy) channel on the Kushview [Discord](https://discord.gg/fAsQ5fMuHy) server.
+* **Tracker** -- vendored `vht` engine: pattern grid, QWERTY note entry, per-cell FX
+  columns, multi-pattern sequences, MUTE/SOLO, MIDI recording
+* **Piano-roll** -- viewport/zoom/tools, velocity lane, snap divisions, and
+  quantize / humanize / scale-snap with live preview
+* **Session View** -- Ableton/Bitwig-style clip grid: scenes, follow actions,
+  per-scene tempo/sig master column, sample-accurate audio-thread launch scheduler
+* **Arrangement / Timeline** -- audio + MIDI lanes, disk-streamed record/playback,
+  region authoring (move/resize/split/snap), looped regions, gain + Bezier fades
+* **MIDI clips are first-class in both surfaces** -- one graph node = one clip
+  source, shown in Session *and* Arrangement at once
 
-### Issue Reporting
-Please report bugs and feature requests on Gitlab. [Element issue tracker](https://gitlab.com/kushview/element/-/issues).
+### Engine
+
+* **Sampler** -- FT2-clone mixer DSP, multi-instrument with vol/pan envelopes, paged
+  editor (Bank / Inst / Sample / FX), AVX2 SIMD mix kernel, session-global
+  128-bank x 32-slot sample pool
+* **Automation** -- COW data model, sample-accurate MIDI CC, touch-record, session
+  save/load round-trip
+* **Modular graph core** (from Element) -- route audio/MIDI anywhere, nest
+  sub-graphs, embed plugin UIs, Lua scripting, multi-undo
+
+### Building
+Lulada builds against Wine-NSPA (winelib), not upstream Element's standard CMake
+flow. See [building.md](./docs/building.md) for Element's base dependencies.
+
+### Upstream
+Lulada tracks [Element](https://github.com/kushview/element) by Kushview (docs and
+upstream binaries at [kushview.net](https://kushview.net/element/)). Element is
+GPL-3.0-or-later; Lulada inherits the same license.
