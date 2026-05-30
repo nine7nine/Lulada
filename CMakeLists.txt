@@ -86,6 +86,16 @@ target_link_libraries(element_app PRIVATE kv::element)
 if(DEFINED __WINE__ OR CMAKE_CXX_COMPILER MATCHES "wineg\\+\\+")
     target_link_libraries(element_app PRIVATE ole32)
 endif()
+
+# JUCE Wayland support (plugdata-team/JUCE port, NSPA-adapted).  Element's
+# main window + dialogs + popups + native node editors use Wayland surfaces
+# on Wayland sessions, falling back to X11 at runtime when WAYLAND_DISPLAY
+# is absent.  Wine plugin (VST/VST3/CLAP) editor windows embed natively via
+# wl_subsurface (wine winewayland.drv NSPA embed + JUCE WineHWNDEmbedComponent
+# wayland branch) -- no X11-force needed.  Set to 0 to disable Wayland.
+if(UNIX AND NOT APPLE)
+    target_compile_definitions(element_app PRIVATE JUCE_WAYLAND=1)
+endif()
 set_target_properties(element_app PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden
