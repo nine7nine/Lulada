@@ -26,42 +26,6 @@
 #include "auth.hpp"
 #include "utils.hpp"
 
-#if defined (__WINE__) && JUCE_WAYLAND
-// NSPA: hand Element's wayland wl_display to winewayland.drv so the host
-// and the in-process wine plugins share ONE wayland client connection --
-// the precondition for native wl_subsurface plugin embedding (a subsurface
-// cannot span two clients).
-//
-// Self-contained on purpose, mirroring how juce_WineHWNDEmbedComponent
-// duplicates the wine-nspa message constants rather than pulling wine
-// headers: the system wineg++ resolves <wine/...> against /usr/include/wine,
-// not the custom wine submodule, so we encode the published contract from
-// <wine/nspa_wayland_embed.h> directly.  winewayland.drv reads
-// WINE_NSPA_WAYLAND_DISPLAY ("<pid>:<hexptr>") at driver init and adopts the
-// pointer only when <pid> matches its own getpid(), so child wine helpers
-// that inherit the environment fall back to a normal wl_display_connect.
-#include <cstdio>
-#include <cstdlib>
-#include <unistd.h>
-
-namespace {
-void nspaInjectWaylandDisplay()
-{
-    auto* wsys = juce::WaylandWindowSystem::getInstance();
-    if (wsys == nullptr || ! wsys->isWaylandAvailable())
-        return;
-
-    void* display = wsys->getDisplay();
-    if (display == nullptr)
-        return;
-
-    char buf[64];
-    std::snprintf (buf, sizeof (buf), "%ld:%p", (long) ::getpid(), display);
-    ::setenv ("WINE_NSPA_WAYLAND_DISPLAY", buf, 1);
-}
-} // namespace
-#endif
-
 /** Define to force the application to behave as if running for the first time.
     When enabled (set to 1), the application will:
     - Skip checking for existing settings files
@@ -264,16 +228,6 @@ void Application::initialise (const String& commandLine)
 
 #if JUCE_MAC
     registerURLSchemeHandler();
-#endif
-
-#if defined (__WINE__) && JUCE_WAYLAND
-    // Share our wayland display with winewayland.drv BEFORE any wine plugin
-    // window is created -- that creation is the first thing to load the
-    // driver, and Element's own main window is JUCE-native (not a wine
-    // window), so the driver has not loaded yet at this point.  Must run
-    // after the scanner-worker early-return above (workers are separate
-    // wine processes and the PID-stamped value would not match theirs).
-    nspaInjectWaylandDisplay();
 #endif
 
     launchApplication();

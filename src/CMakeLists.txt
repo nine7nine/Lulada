@@ -90,15 +90,6 @@ target_compile_definitions(element
         JUCE_ALSA=0
         JUCE_USE_ALSA=0)
 
-# JUCE Wayland support must be defined for the element LIBRARY too, not just
-# the element_app executable -- application.cpp (the wl_display injection that
-# winewayland.drv needs) and any other element-lib source that touches JUCE
-# windowing compiles here.  PUBLIC so every consumer sees JUCE headers with
-# the SAME flag (avoids an ODR/ABI split between the lib and the app).
-if(UNIX AND NOT APPLE)
-    target_compile_definitions(element PUBLIC JUCE_WAYLAND=1)
-endif()
-
 target_link_libraries(element
     PUBLIC
         juce::juce_core
